@@ -41,10 +41,11 @@ using FaultCallback = bool(*)(uintptr_t fault_addr, void* context);
 // Read-vs-write classification of the in-flight fault, for the decompress
 // callback (soft-dirty ROI). signalHandler sets it on the faulting thread just
 // before calling the callback, so a thread_local is race-free across concurrent
-// faults. 1 = write, 0 = read, -1 = unknown (Mach path / non-x86). NOTE: we
-// rely on REG_ERR/ucontext_t already being visible via <csignal> — do NOT add
-// <ucontext.h>, which conflicts with the signal includes on glibc and corrupts
-// the handler's ucontext view (caused a teardown SIGSEGV/SIGBUS).
+// faults. 1 = write, 0 = read, -1 = unknown (Mach path, or an abort we cannot
+// classify). NOTE: we rely on REG_ERR/ucontext_t already being visible via
+// <csignal> — do NOT add <ucontext.h> or <asm/sigcontext.h>, which conflict
+// with the signal includes on glibc and corrupt the handler's ucontext view
+// (caused a teardown SIGSEGV/SIGBUS).
 // Accessor over a FUNCTION-LOCAL thread_local. A namespace-scope inline
 // thread_local in this widely-included, LD_PRELOAD'd header broke the static
 // TLS block (teardown SIGSEGV); a single .cpp definition fails to link in the
@@ -65,9 +66,9 @@ using FaultCallback = bool(*)(uintptr_t fault_addr, void* context);
 //     miscompiles into a TLS-descriptor sequence that traps with SIGILL inside
 //     the fault handler under a live compressor (caught by macOS CI; Linux is
 //     fine). macOS uses the signal-handler path too, but the write-bit
-//     classification below is __x86_64__-only, so on Apple silicon faultWasWrite
-//     is only ever -1 and the default-model lazy init is not exercised the way
-//     Linux's recursive case is.
+//     classification below is guarded on __linux__, so on Apple silicon
+//     faultWasWrite is only ever -1 and the default-model lazy init is not
+//     exercised the way Linux's recursive case is.
 #if defined(__linux__)
 inline int& faultWasWrite() {
     static thread_local __attribute__((tls_model("initial-exec"))) int v = -1;
@@ -79,6 +80,74 @@ inline int& faultWasWrite() {
     return v;
 }
 #endif
+
+// Decode the read/write classification of an aarch64 data abort from the
+// signal frame's __reserved area. Returns 1 = write, 0 = read, -1 = unknown.
+//
+// The kernel appends an esr_context record ({u32 magic, u32 size, u64 esr},
+// magic == ESR_MAGIC) to the chain of _aarch64_ctx records that lives in
+// sigcontext::__reserved, right after the fpsimd record. ESR_EL1 bit 6 (WnR)
+// is the write-not-read bit. We walk the chain by hand rather than including
+// <asm/sigcontext.h>: the note on faultWasWrite() above applies — the kernel
+// and glibc signal headers conflict here, and pulling either in corrupts the
+// handler's ucontext view.
+//
+// Split out as a pure function over bytes (no arch-specific types) so it is
+// testable on any host — see tests/test_esr_write_bit.cpp, which feeds it
+// synthetic frames. Async-signal-safe: bounded loop, fixed-size memcpys,
+// no allocation.
+inline int aarch64EsrWriteBit(const void* reserved, size_t reserved_len) {
+    constexpr uint32_t kEsrMagic   = 0x45535201u;  // ESR_MAGIC
+    constexpr uint32_t kExtraMagic = 0x45585401u;  // EXTRA_MAGIC
+    constexpr size_t kCtxHeaderLen = 8;            // {u32 magic, u32 size}
+
+    if (!reserved) return -1;
+    const unsigned char* p = static_cast<const unsigned char*>(reserved);
+    const unsigned char* const end = p + reserved_len;
+
+    // The chain is bounded by __reserved (4 KiB), so records are few; the
+    // iteration cap is belt-and-braces against a malformed size field that
+    // still passes the bounds check.
+    for (int guard = 0; guard < 64 && p + kCtxHeaderLen <= end; ++guard) {
+        uint32_t magic = 0, size = 0;
+        __builtin_memcpy(&magic, p, sizeof(magic));
+        __builtin_memcpy(&size, p + 4, sizeof(size));
+        // magic == 0 is the end-of-chain terminator. A size that is too small
+        // or runs past the buffer means the frame is not what we expect.
+        if (magic == 0 || size < kCtxHeaderLen ||
+            static_cast<size_t>(size) > static_cast<size_t>(end - p)) {
+            return -1;
+        }
+        if (magic == kEsrMagic) {
+            if (size < kCtxHeaderLen + sizeof(uint64_t)) return -1;
+            uint64_t esr = 0;
+            __builtin_memcpy(&esr, p + kCtxHeaderLen, sizeof(esr));
+            // EC is ESR bits 31:26.
+            const uint32_t ec = static_cast<uint32_t>((esr >> 26) & 0x3fu);
+            if (ec == 0x20 || ec == 0x21) {
+                // Instruction abort (lower EL / same EL): an instruction
+                // fetch, never a store.
+                return 0;
+            }
+            if (ec == 0x24 || ec == 0x25) {
+                // Data abort. WnR (bit 6) is only meaningful when CM (bit 8,
+                // "fault from a cache-maintenance or address-translation
+                // instruction") is clear — the architecture reports WnR == 1
+                // for those regardless of direction, so report unknown rather
+                // than a write we did not observe.
+                if (esr & (1ull << 8)) return -1;
+                return (esr & (1ull << 6)) ? 1 : 0;
+            }
+            return -1;  // Not an abort we can classify.
+        }
+        // EXTRA_MAGIC continues the chain in an out-of-line buffer. The
+        // kernel emits esr_context before it, so reaching this means there is
+        // no ESR record to find.
+        if (magic == kExtraMagic) return -1;
+        p += size;
+    }
+    return -1;
+}
 
 // Per-thread recursion depth for the SIGSEGV/SIGBUS handler (bounded re-entry
 // guard — see signalHandler). LINUX ONLY.
@@ -200,13 +269,16 @@ class FaultHandler {
             uintptr_t addr = reinterpret_cast<uintptr_t>(info->si_addr);
             // Classify read vs write for the soft-dirty ROI re-dirty signal.
             // x86-64: bit 1 of the page-fault error code (gregs[REG_ERR]) is the
-            // write bit. ucontext_t/REG_ERR come from <csignal> (already
-            // included); we deliberately do NOT include <ucontext.h>.
+            // write bit. aarch64: bit 6 (WnR) of ESR_EL1, which the kernel
+            // passes in an esr_context record inside the signal frame — see
+            // aarch64EsrWriteBit(). Both reach it through the ucontext_t that
+            // <csignal> already gives us; we deliberately do NOT include
+            // <ucontext.h> or <asm/sigcontext.h>.
             //
             // LINUX ONLY: touch faultWasWrite() here. On macOS the value is
-            // never set meaningfully (the write-bit read below is Linux-x86
-            // only) and the lone reader (compressor_thread.h) already treats
-            // the unset/-1 case as "write". More importantly, the macOS
+            // never set meaningfully (the classification is guarded on
+            // __linux__) and the lone reader (compressor_thread.h) already
+            // treats the unset/-1 case as "write". More importantly, the macOS
             // function-local thread_local carries a lazy-init guard that, when
             // first run INSIDE this signal handler under a live compressor,
             // traps with SIGILL (observed deterministically in macOS CI:
@@ -221,6 +293,23 @@ class FaultHandler {
                 auto* uc = static_cast<const ucontext_t*>(ucontext);
                 faultWasWrite() =
                     (uc->uc_mcontext.gregs[REG_ERR] & 0x2) ? 1 : 0;
+            }
+#elif defined(__aarch64__)
+            // aarch64: the write bit lives in ESR_EL1 (bit 6, WnR), which the
+            // kernel hands us in an esr_context record inside the signal
+            // frame's __reserved area. Without this the value stayed -1 on
+            // every aarch64 fault and the sole reader
+            // (compressor_thread.h's soft-dirty ROI re-dirty signal) counted
+            // every decompress fault as a write — safe, but blind: a
+            // read-faulting page would have kept its blob and should not have
+            // been scored as churn. sigcontext::__reserved is reachable
+            // through the ucontext_t that <csignal> already gives us, so no
+            // extra header is needed.
+            if (ucontext) {
+                auto* uc = static_cast<const ucontext_t*>(ucontext);
+                faultWasWrite() =
+                    aarch64EsrWriteBit(&uc->uc_mcontext.__reserved,
+                                       sizeof(uc->uc_mcontext.__reserved));
             }
 #endif
 #else

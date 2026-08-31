@@ -52,6 +52,15 @@ smash_add_test(test_page_size test_page_size.cpp)
 # and advances its watermark anyway, so callers get PROT_NONE memory back.
 smash_add_test(test_vm_granularity test_vm_granularity.cpp)
 
+# test_esr_write_bit: the aarch64 read-vs-write fault classification. The
+# signal handler's write-bit decode was x86-only (gregs[REG_ERR] bit 1), so on
+# aarch64 faultWasWrite() stayed -1 for every fault and the compressor's
+# soft-dirty ROI re-dirty signal counted every decompress as a write.
+# aarch64EsrWriteBit() decodes ESR_EL1's WnR bit out of the esr_context record
+# in the signal frame; it is a pure function over bytes, so this test feeds it
+# synthetic frames and runs on any host — there is no aarch64 CI runner.
+smash_add_test(test_esr_write_bit test_esr_write_bit.cpp)
+
 smash_add_test(test_size_classes test_size_classes.cpp)
 smash_add_test(test_bootstrap test_bootstrap.cpp)
 smash_add_test(test_span test_span.cpp)
