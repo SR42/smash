@@ -141,6 +141,10 @@ const char* vmGib() {
 } // namespace
 
 int main() {
+    // Unbuffered stdout: under full mode the compressor can zero the tail of
+    // glibc's buffered stdout page (see tests/stdout_buffer_integrity_test.cpp),
+    // which would silently eat this test's own verdict lines.
+    setvbuf(stdout, nullptr, _IONBF, 0);
     long ps = sysconf(_SC_PAGESIZE);
     if (ps > 0) g_page = static_cast<size_t>(ps);
 

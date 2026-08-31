@@ -484,6 +484,10 @@ const char* modeName() {
 } // namespace
 
 int main() {
+    // Unbuffered stdout: under full mode the compressor can zero the tail of
+    // glibc's buffered stdout page (see tests/stdout_buffer_integrity_test.cpp),
+    // which would silently eat this test's own verdict lines.
+    setvbuf(stdout, nullptr, _IONBF, 0);
     printf("alloc_contract_test: mode=%s\n", modeName());
     printInterposeBanner();
 

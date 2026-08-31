@@ -453,3 +453,85 @@ add_executable(vm_exhaustion_test vm_exhaustion_test.cpp)
 set_target_properties(vm_exhaustion_test PROPERTIES CXX_STANDARD 20)
 target_link_libraries(vm_exhaustion_test PRIVATE ${CMAKE_DL_LIBS})
 add_smash_mode_test(test_vm_exhaustion vm_exhaustion_test 0 300 "SMASH_VM_GIB=1")
+
+# ── Hugepage / VMA-pressure guards ──────────────────────────────────────────
+# Follow-ups to the aarch64 std::bad_alloc investigation for the case where the
+# application allocates hugepages with mmap. Both are Linux-only and skip
+# cleanly elsewhere (and, for the hugepage test, on hosts with no hugepages
+# reserved — CI runners have none).
+
+# smash's mmap interposer filters on `anon && writable` with no MAP_HUGETLB
+# carve-out, so every 4 KiB slice of an application hugepage mapping is
+# registered as an external page. hugetlb VMAs require huge-page-aligned
+# addresses and lengths, so every page operation smash then performs on them is
+# rejected (mprotect/madvise EINVAL, MAP_FIXED mmap ENOMEM — all three verified
+# on a host with hugepages reserved). The test asserts what must hold: the
+# app's mmap still succeeds, its data stays byte-exact (smash's restore path is
+# MAP_FIXED|MAP_ANON, which would shred a hugetlb VMA), and allocation keeps
+# working while the mapping is registered.
+add_executable(hugepage_mmap_test hugepage_mmap_test.cpp)
+set_target_properties(hugepage_mmap_test PROPERTIES CXX_STANDARD 20)
+add_smash_mode_test(test_hugepage_mmap hugepage_mmap_test 0 120
+  "SMASH_TRACK_EXTERNAL=1"
+  "SMASH_COLD_TIMEOUT_SEC=1"
+  "SMASH_TRACE_MPROTECT_FAIL=1")
+
+# Same binary, but SMASH_TEST_STRICT_HUGEPAGE=1 promotes the wasted-work
+# finding from a WARN to a failure: smash retries the rejected page operations
+# on every compressor tick forever (~8192 failing mprotect calls in a few
+# seconds for a 16 MiB mapping) and the slices permanently occupy VmRegion's
+# 128 Ki-page external budget while being permanently uncompressible.
+# Registered DISABLED with the known_issue label — the same treatment
+# test_fault_cycle gets — because it documents a real defect that is not fixed
+# yet. Enable it once the mmap interposer skips MAP_HUGETLB.
+add_smash_mode_test(test_hugepage_no_mprotect_storm hugepage_mmap_test 0 120
+  "SMASH_TRACK_EXTERNAL=1"
+  "SMASH_COLD_TIMEOUT_SEC=1"
+  "SMASH_TRACE_MPROTECT_FAIL=1"
+  "SMASH_TEST_STRICT_HUGEPAGE=1")
+set_tests_properties(test_hugepage_no_mprotect_storm PROPERTIES
+  LABELS "known_issue"
+  DISABLED TRUE)  # registerLinuxExternalRange has no MAP_HUGETLB carve-out
+
+# VMA pressure: crossing vm.max_map_count makes mmap return ENOMEM, which makes
+# malloc return nullptr, which makes operator new throw std::bad_alloc. smash
+# mitigates this with soft-dirty tracking, chunked mprotect and a reclaim-loop
+# VMA budget; this pins them in place. Drives a 576 MiB compress-and-refault
+# workload including a THP-hinted region (a partial mprotect inside a
+# transparent hugepage splits it, up to 512 VMAs per 2 MiB) and asserts the VMA
+# count stays far below the cap.
+add_executable(vma_pressure_test vma_pressure_test.cpp)
+set_target_properties(vma_pressure_test PROPERTIES CXX_STANDARD 20)
+add_smash_mode_test(test_vma_pressure vma_pressure_test 0 180
+  "SMASH_COLD_TIMEOUT_SEC=1")
+
+# ── Buffered-stdio integrity under compression ──────────────────────────────
+# glibc allocates stdout's 4 KiB buffer with malloc, so in full mode it is an
+# ordinary smash slab object. An application writing in bursts separated by
+# quiet stretches lets that page go cold; the compressor compresses it while it
+# still holds unflushed bytes, and everything written afterwards is flushed as
+# NUL at exit. Measured here: 228 of 513 bytes zeroed and 4 of 9 marker lines
+# lost, identically on every run. Byte-perfect with no libsmash, in large-only
+# mode, and in full mode with compression deferred.
+#
+# The check re-execs itself (not a bare fork — fork clones only the calling
+# thread, so a forked child has no compressor and never compresses anything)
+# with the child's stdout pointed at a temp file, then inspects the file after
+# the child exits, because the damage only appears at the exit-time flush.
+add_executable(stdout_buffer_integrity_test stdout_buffer_integrity_test.cpp)
+set_target_properties(stdout_buffer_integrity_test PROPERTIES CXX_STANDARD 20)
+
+# Large-only is the production-supported mode and is unaffected; this guards
+# that it stays that way.
+add_smash_mode_test(test_stdout_buffer_integrity_large_only
+  stdout_buffer_integrity_test 1 180 "SMASH_COLD_TIMEOUT_SEC=1")
+
+# Full mode reproduces the corruption deterministically. Registered DISABLED
+# with the known_issue label — the same treatment test_fault_cycle gets —
+# because it documents a real, currently-unfixed defect. Enable it once
+# writes into a compressed page are no longer lost.
+add_smash_mode_test(test_stdout_buffer_integrity_full
+  stdout_buffer_integrity_test 0 180 "SMASH_COLD_TIMEOUT_SEC=1")
+set_tests_properties(test_stdout_buffer_integrity_full PROPERTIES
+  LABELS "known_issue"
+  DISABLED TRUE)  # writes into a compressed slab page are flushed as NUL

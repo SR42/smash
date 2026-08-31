@@ -129,6 +129,10 @@ const char* modeName() {
 } // namespace
 
 int main() {
+    // Unbuffered stdout: under full mode the compressor can zero the tail of
+    // glibc's buffered stdout page (see tests/stdout_buffer_integrity_test.cpp),
+    // which would silently eat this test's own verdict lines.
+    setvbuf(stdout, nullptr, _IONBF, 0);
     const long page = sysconf(_SC_PAGESIZE);
     printf("aligned_alloc_footprint_test: mode=%s kernel_page=%ld\n",
            modeName(), page);
