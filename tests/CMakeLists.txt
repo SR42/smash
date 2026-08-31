@@ -29,6 +29,29 @@ function(smash_add_test name source)
   add_test(NAME ${name} COMMAND ${name})
 endfunction()
 
+# ── aarch64 / page-geometry regression guards ────────────────────────────────
+# An application running under libsmash on aarch64 was throwing std::bad_alloc.
+# The only way smash produces that exception is malloc returning nullptr (the
+# operator-new wrappers in src/linux_syscall_wrappers.cpp turn nullptr into
+# `throw std::bad_alloc()`), so these tests attack the arch-dependent geometry
+# that makes malloc fail. See tests/alloc_contract_test.cpp for the full chain.
+#
+# test_page_size: constants. alloc8 hard-codes ALLOC8_PAGE_SIZE=4096 for every
+# Linux target, but aarch64 kernels commonly use 16 KiB or 64 KiB base pages
+# (RHEL/Rocky/Oracle aarch64 ship 64 KiB). It asserts kPageSize == the running
+# kernel's page size, that kPageShift actually describes kPageSize (config.h
+# derives it with a ternary that only knows 4 KiB and 16 KiB), that this
+# machine's addresses fit the hard-coded kAddressBits=48 PageMap, and that
+# every size class still has a valid span geometry at this page size.
+smash_add_test(test_page_size test_page_size.cpp)
+
+# test_vm_granularity: the same mismatch at the syscall level. Issues the exact
+# reserve/commit/protect/decommit sequence VmRegion and the compressor depend
+# on, at kPageSize offsets. Under a page-size mismatch each call is rejected
+# with EINVAL; VmRegion::ensureCommitted ignores commitPages()' return value
+# and advances its watermark anyway, so callers get PROT_NONE memory back.
+smash_add_test(test_vm_granularity test_vm_granularity.cpp)
+
 smash_add_test(test_size_classes test_size_classes.cpp)
 smash_add_test(test_bootstrap test_bootstrap.cpp)
 smash_add_test(test_span test_span.cpp)
@@ -315,3 +338,118 @@ else()
   )
 endif()
 set_tests_properties(test_syscall_efault PROPERTIES TIMEOUT 180)
+
+# ── Allocation-contract tests (run under interposition, both modes) ──────────
+# Registered through a shared helper because each one, like
+# add_mode_compression_test above, is ONE executable run twice with only
+# SMASH_LARGE_ONLY differing — the mode is read from the environment at
+# runtime, never a compile flag, so full mode and the production-supported
+# large-only mode provably execute identical assertions.
+#
+# add_smash_mode_test(<ctest-name> <target> <SMASH_LARGE_ONLY> <timeout> [extra env...])
+function(add_smash_mode_test test_name target large_only timeout)
+  set(_env
+    "SMASH_LARGE_ONLY=${large_only}"
+    "SMASH_DEFER_PHASES_MS=0"
+    ${ARGN})
+  if(APPLE)
+    add_test(
+      NAME ${test_name}
+      COMMAND ${CMAKE_COMMAND} -E env
+        "DYLD_INSERT_LIBRARIES=$<TARGET_FILE:smash>"
+        "DYLD_FORCE_FLAT_NAMESPACE=1"
+        "MallocNanoZone=0"
+        ${_env}
+        $<TARGET_FILE:${target}>
+    )
+  else()
+    add_test(
+      NAME ${test_name}
+      COMMAND ${CMAKE_COMMAND} -E env
+        "LD_PRELOAD=$<TARGET_FILE:smash>"
+        ${_env}
+        $<TARGET_FILE:${target}>
+    )
+  endif()
+  set_tests_properties(${test_name} PROPERTIES TIMEOUT ${timeout})
+endfunction()
+
+# Allocation contract: a satisfiable request must never yield nullptr (which
+# operator new turns into std::bad_alloc). Sweeps every routing boundary —
+# size-class edges, kMaxSmallSize (16 KiB), kLargeAllocVmThreshold (1 MiB),
+# page multiples for 4/16/64 KiB pages, and alignments from 16 B to 64 KiB —
+# across malloc, operator new/new[]/nothrow/align_val_t, posix_memalign,
+# aligned_alloc, calloc, realloc chains, and sustained mixed churn. This is
+# the direct regression test for the reported aarch64 std::bad_alloc.
+add_executable(alloc_contract_test alloc_contract_test.cpp)
+set_target_properties(alloc_contract_test PROPERTIES CXX_STANDARD 20)
+target_link_libraries(alloc_contract_test PRIVATE ${CMAKE_DL_LIBS})
+add_smash_mode_test(test_alloc_contract_full       alloc_contract_test 0 300)
+add_smash_mode_test(test_alloc_contract_large_only alloc_contract_test 1 300)
+
+# Over-aligned footprint: SmashHeap::memalign() sends every alignment > 16 B to
+# LargeAlloc, which rounds up to a whole page — so an `alignas(64)` 64-byte
+# object costs a full kernel page (64x on 4 KiB pages, 256x on macOS arm64's
+# 16 KiB, 1024x on a 64 KiB-page aarch64 kernel). Two-tier like
+# test_compression_ratio: a hard RSS budget that a 64 KiB page size blows
+# through, plus a WARN documenting the amplification on smaller pages.
+# SMASH_DEFER_PHASES_MS keeps the compressor out of the measurement window so
+# the test reads allocation footprint, not compression.
+add_executable(aligned_alloc_footprint_test aligned_alloc_footprint_test.cpp)
+set_target_properties(aligned_alloc_footprint_test PROPERTIES CXX_STANDARD 20)
+target_link_libraries(aligned_alloc_footprint_test PRIVATE ${CMAKE_DL_LIBS})
+if(APPLE)
+  add_test(
+    NAME test_aligned_alloc_footprint_full
+    COMMAND ${CMAKE_COMMAND} -E env
+      "DYLD_INSERT_LIBRARIES=$<TARGET_FILE:smash>"
+      "DYLD_FORCE_FLAT_NAMESPACE=1"
+      "MallocNanoZone=0"
+      "SMASH_LARGE_ONLY=0"
+      "SMASH_DEFER_PHASES_MS=60000"
+      $<TARGET_FILE:aligned_alloc_footprint_test>
+  )
+  add_test(
+    NAME test_aligned_alloc_footprint_large_only
+    COMMAND ${CMAKE_COMMAND} -E env
+      "DYLD_INSERT_LIBRARIES=$<TARGET_FILE:smash>"
+      "DYLD_FORCE_FLAT_NAMESPACE=1"
+      "MallocNanoZone=0"
+      "SMASH_LARGE_ONLY=1"
+      "SMASH_DEFER_PHASES_MS=60000"
+      $<TARGET_FILE:aligned_alloc_footprint_test>
+  )
+else()
+  add_test(
+    NAME test_aligned_alloc_footprint_full
+    COMMAND ${CMAKE_COMMAND} -E env
+      "LD_PRELOAD=$<TARGET_FILE:smash>"
+      "SMASH_LARGE_ONLY=0"
+      "SMASH_DEFER_PHASES_MS=60000"
+      $<TARGET_FILE:aligned_alloc_footprint_test>
+  )
+  add_test(
+    NAME test_aligned_alloc_footprint_large_only
+    COMMAND ${CMAKE_COMMAND} -E env
+      "LD_PRELOAD=$<TARGET_FILE:smash>"
+      "SMASH_LARGE_ONLY=1"
+      "SMASH_DEFER_PHASES_MS=60000"
+      $<TARGET_FILE:aligned_alloc_footprint_test>
+  )
+endif()
+set_tests_properties(test_aligned_alloc_footprint_full
+                     test_aligned_alloc_footprint_large_only
+                     PROPERTIES TIMEOUT 120)
+
+# VmRegion exhaustion: with SMASH_VM_GIB=1 the contiguous arena is 1 GiB, and
+# 1.5 GiB of live 4 MiB chunks overflows it, forcing LargeAlloc's direct-mmap
+# fallback. config.h names the failure this guards against by name — exhausting
+# the region "trigger[s] malloc=NULL -> std::bad_alloc". Also covers the mixed
+# arena/fallback free routing (issue #84's class) by freeing everything and
+# reallocating. Full mode only: large-only routes the same >= 1 MiB chunks
+# through the identical LargeAlloc path, so a second registration would add no
+# coverage for a gigabyte of reservation.
+add_executable(vm_exhaustion_test vm_exhaustion_test.cpp)
+set_target_properties(vm_exhaustion_test PROPERTIES CXX_STANDARD 20)
+target_link_libraries(vm_exhaustion_test PRIVATE ${CMAKE_DL_LIBS})
+add_smash_mode_test(test_vm_exhaustion vm_exhaustion_test 0 300 "SMASH_VM_GIB=1")
