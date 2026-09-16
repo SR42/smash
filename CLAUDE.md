@@ -22,7 +22,7 @@ cmake .. -DSMASH_BUILD_BENCH=ON && make -j$(nproc)
 cd build && ctest --output-on-failure
 ```
 
-All 33 enabled tests must pass (3 more are registered `DISABLED` with the `known_issue` label — see below). CI (`.github/workflows/ci.yml`) runs the full suite on `ubuntu-latest` and `macos-latest` on every push and PR. Sixteen of the tests are end-to-end under `DYLD_INSERT_LIBRARIES` / `LD_PRELOAD`:
+All 35 enabled tests must pass (3 more are registered `DISABLED` with the `known_issue` label — see below). CI (`.github/workflows/ci.yml`) runs the full suite on `ubuntu-latest` and `macos-latest` on every push and PR. Eighteen of the tests are end-to-end under `DYLD_INSERT_LIBRARIES` / `LD_PRELOAD`:
 
 - `test_arena_routing` guards call-site arena routing — the invariant behind the paper's compression-homogeneity claim. Runs a program with 32 distinct noinline allocation sites under interposition and asserts, via the exported `smash_arena_for(ptr)` query, that they do **not** all collapse into one arena. This is the regression guard for the LTO/wrapper return-address bug: under dynamic interposition the return address seen inside the allocator can point into the wrapper library instead of the app, collapsing every call site into one arena (homogeneity 0%). Fast and deterministic (no compressor): full mode routes 256 B allocations through the slab, and `SMASH_CPU_ARENA=0` + default thread-hash-off make the arena a pure function of the return address, so a buggy capture yields exactly 1 distinct arena. Verified as a real discriminator (injecting a constant RA makes it fail with `distinct_arenas=1`). Must run under interposition — a direct-linked call would never exercise the wrapper path where the bug lives.
 
@@ -34,6 +34,24 @@ All 33 enabled tests must pass (3 more are registered `DISABLED` with the `known
     - routing freed node pages to the shared free lists fails the arena test's shared-list and reuse checks on all 4 nodes. End to end, 0 of 16 frees come back at the same address, and the binding leaks into a later `malloc(256)`;
     - never marking node blocks `ACTIVE` fails the compression check: 0 of 4096 pages leave RSS in 30 s on every node.
   - Skips on `ENOSYS`/`EPERM` from `mbind`. Single-node CI runners cover node 0 only, with no off-node pin.
+
+- `test_numa_compressor_{full,large_only}` guard the per-node compressor groups (`numa_compressor_test.cpp`, both modes, `SMASH_COLD_TIMEOUT_SEC=1`). It leaves a 16 MiB block cold on every node, written from off-node CPUs. Once most of each block has left RSS, it uses the diagnostic exports `smash_numa_compressor_info` and `smash_compressed_blob_for` to check, per node, that:
+  - the group's threads have CPU affinity inside the node, and none of their compressions ran on another CPU;
+  - the group counted at least as many compressions as the block has evicted pages;
+  - worker state, page and compress buffers, and the zstd context are bound (`MPOL_BIND`) to the node, and on it wherever already touched;
+  - every compressed page's blob is on the node, and reading the block back from off-node CPUs is byte-exact with every page on the node.
+
+  Nothing after the cold wait writes to malloc'd memory, because in full mode a write into a heap page that went cold can be lost (the `test_stdout_buffer_integrity_full` defect). An earlier version that read the node CPU lists after the wait saw an empty list in full mode.
+  - **Ordinary `malloc` memory** is covered by the same test: a block per node, written from that node's own CPUs (with no binding, first touch is what places it), must end up with its blobs on that node. Measured 4096/4096 per node in both modes.
+  - **Verified as a real discriminator** on a 4-node host:
+    - disabling `routeByNode` sends every blob of the ordinary blocks to the shared store's node: 0 of 4096 on-node for three of the four blocks, and a pass only for the block that happens to share that node;
+    - capping the node-query batch per range instead of rolling it does the same — the bug this actually caught;
+    - not pinning the group threads fails the affinity check on all 4 nodes, and the off-node-compression check on 3 of them;
+    - storing node blobs in the shared store leaves most blobs off the node on every node, from 2234 of 2901 to 3221 of 4096;
+    - a node allocator that doesn't bind its memory fails the working-memory binding check;
+    - letting the default workers compress node chunks failed the compression-count check in 3 of 3 runs, but on only one or two nodes per run, so that check is probabilistic;
+    - pointing `storeOfBlob` at the shared store is **not** detectable, and should not be: `CompressStore::release` forwards by region owner, so the stale lookup costs one extra call and corrupts nothing. Before that routing existed this mutation passed the test while silently letting two stores mutate one region's free list under different locks.
+  - Skips on single-node hosts (CI runners), when `mbind` is refused, and with `SMASH_NUMA_COMPRESSOR=0`.
 
 - `test_external_mapping` (uses a live compressor) exercises the `SMASH_TRACK_EXTERNAL=1` registration path. The ctest invocation sets the env var; without it the test would silently no-op (registration path gated).
 - `test_malloc_compression` and `test_large_only_compression` are the **same executable** (`mode_compression_test.cpp`) run twice, differing only in `SMASH_LARGE_ONLY` (`0` = full, `1` = large-only — the production-supported config). The mode is read from the env at runtime, never a compile flag, so the two modes execute byte-identical assertions and cannot drift apart in coverage. The body allocates large chunks (≥ 1 MiB, so they clear `kLargeAllocVmThreshold` and enter the compressible VmRegion in **both** modes) interleaved with small chunks (≤ 16 KiB — smash slab in full mode, system passthrough in large-only). It sleeps past `SMASH_COLD_TIMEOUT_SEC`, sends `SIGUSR2`, parses `compressed=N` from the stats line, asserts `N > 0`, then verifies a byte-exact read-back of **both** classes — proving full-mode slab integrity / large-only passthrough is never corrupted, and that fault-decompress restores the compressed large chunks. (Registered via the `add_mode_compression_test(name, large_only)` helper in `tests/CMakeLists.txt`.)
@@ -111,6 +129,14 @@ bench/                  Benchmarks (throughput, compression ratio, RSS, latency)
 - **Per-fault-slot DCtx**: Each of 32 fault slots has its own `ZSTD_DCtx*`, fixing data race between concurrent decompressions from app threads and prefetch.
 - **Per-origin sliding-window stats**: `SizeClassStats` keyed by `(arena, size_class, worker)` — `sc_stats[kNumArenas * kNumClasses]` per worker, indexed via `statsIndex(arena, sc)`. Each bucket holds a 64-entry ratio window (0–255) plus per-tier compression-time EMAs. Aggregating across arenas would wash out the homogeneity arena routing produces.
 - **Signal handler path**: No malloc allowed. Decompression uses pre-allocated per-slot contexts only.
+- **NUMA compressor groups** (Linux, hosts with ≥2 memory nodes): every page — a `malloc_numa` node arena page or an ordinary heap page — is compressed by a group of threads dedicated to its own node, not by the default workers.
+  - **Threads:** pinned to the node's CPUs; they park on a futex between phases.
+  - **Memory:** worker state, scratch buffers, zstd/LZ4 contexts and stacks come from memory bound to the node (`vm::NodeBumpAlloc`, `src/vm/node_memory.h`). Blobs go to a per-node `CompressStore` whose regions are bound to the node.
+  - **Scheduling (arena pages):** each tick `assignNodeChunks()` lists each node's chunks. Every group thread takes an equal address slice of each chunk and runs phases 1–4 on it, while the default workers skip those chunks (`ownedByRunningNodeGroup`).
+  - **Ordinary heap pages** carry no binding, so their node has to be discovered. `page_node_` holds a per-page hint, learned free in the fault handler (`notePageNode`: a restored page lands on the faulting thread's node) and otherwise resolved in one `move_pages` batch per Phase 2 range (`flushNodeQueries`). Phase 2 hands each eligible page to its node's queue (`routeByNode` → `enqueueForNode`) instead of compressing it, and the group drains that queue in **phase 5**, on its own threads and into its own store. A wrong hint costs locality, never correctness.
+    - The batch must be **rolling**: flush it when full and keep deferring. A fixed cap per range routed only the first batch and sent everything after it to the local worker and the shared store — measured as three of four blocks' blobs landing on one node.
+  - **Lifetime:** groups are created once in `start()` and never freed. Never create them mid-tick: `pthread_create` is unsafe once pages may be compressed.
+  - **Still shared:** the coordinator, the deferred-madvise sweep and fault-time decompression. Decompression runs on the faulting thread; the arena binding puts the restored page back on the node.
 
 ## Syscall & Buffered I/O Compatibility
 
@@ -172,6 +198,7 @@ libsmash is built **fat** (arm64 + arm64e) so it can interpose into both ordinar
   - **No fixed per-node slices:** the compressor walks `[0, committedPages())` page by page every tick (chunk-bitmap rebuild, deferred-madvise sweep, soft-dirty pagemap read). Slices above the shared heap would stretch that walk across the whole region.
   - **Freeing:** freed node pages must go back to their own arena, never the shared free lists, or the binding leaks into ordinary allocations.
   - **Remaps:** any `MAP_FIXED` over a node page drops its policy. `remapPages()` calls `vm::g_after_remap_hook` to bind it again; a new `MAP_FIXED` site must do the same.
+- Compressed blobs: a worker stores through `workerStore(worker)` (its node's store, or the shared one) and releases through `storeOfBlob(page_idx)`, which reads the `blob_node_` byte recorded at store time. That lookup is a **performance** hint only — `CompressStore::release` routes by the region's recorded `owner`, so a release arriving at the wrong store is forwarded instead of pushing onto that region's free list under the wrong shard lock. Keep it that way: an ordinary heap page migrates between nodes, so the owning store can never be derived from where the page lives now, and a wrong guess must stay harmless. A blob in a node store never spills to the file-backed store (`blobIsNodeLocal`).
 - Compressor startup: constructor at priority 201 (after alloc8 pthread hooks at 200) calls `xxthread_init()` twice on macOS, once on Linux, ensuring the compressor starts even for non-ObjC programs (e.g., Python) and single-threaded programs
 - Fault handler handles ACTIVE state (not just ACTIVE_MONITORING) to cover the race where Phase 3's batched mprotect overwrites a per-page PROT_RW restoration
 - ThreadCache `drain()`/`drainAll()` bucket pointers by `span->arena_id` before returning to correct arena's slab
@@ -242,3 +269,5 @@ Runtime environment variables:
 - `SMASH_DEEP_COMP_MBS_HI/LO`, `SMASH_DEEP_DECOMP_MBS_HI/LO`: Override deep-tier calibration
 - `SMASH_CALIBRATE=always|never`: Force/skip startup calibration
 - `SMASH_CALIBRATION_FILE=path`: Cache and reload calibration
+- `SMASH_NUMA_COMPRESSOR=0`: Disable the per-node compressor groups. `malloc_numa` pages are then compressed by the default workers into the shared store
+- `SMASH_NUMA_WORKERS=N`: Threads per node compressor group (default `kCompressorWorkers`, capped by the node's CPU count and 8)

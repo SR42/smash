@@ -1420,6 +1420,45 @@ void* malloc_numa(uint32_t numa, size_t size) {
     return SmashRedirect::getHeap()->mallocNuma(numa, size);
 }
 
+// Diagnostic / test hooks for the NUMA compressor groups (not public API).
+// test_numa_compressor declares the same struct; `size` guards the layout.
+struct SmashNumaCompressorInfo {
+    uint32_t size;                  // set by the caller to sizeof(struct)
+    uint32_t workers;               // running compressor threads for the node
+    int32_t  tids[8];
+    uint64_t pages_compressed;
+    uint64_t off_node_compressions; // compressions that ran off the node's CPUs
+    void*    memory[8][4];          // per worker: state, page buf, compress buf, zstd ctx
+};
+
+// 0 on success, -1 if `node` has no compressor group, -2 on a layout mismatch.
+extern "C" __attribute__((visibility("default")))
+int smash_numa_compressor_info(uint32_t node, SmashNumaCompressorInfo* out) {
+    if (!out || out->size != sizeof(SmashNumaCompressorInfo)) return -2;
+#if defined(__linux__)
+    smash::CompressorThread::NodeGroupStats s;
+    static_assert(sizeof(s.tids) == sizeof(out->tids) &&
+                  sizeof(s.memory) == sizeof(out->memory));
+    if (!SmashRedirect::getHeap()->numaCompressorStats(node, &s)) return -1;
+    out->workers = s.workers;
+    __builtin_memcpy(out->tids, s.tids, sizeof(out->tids));
+    out->pages_compressed = s.pages_compressed;
+    out->off_node_compressions = s.off_node_compressions;
+    __builtin_memcpy(out->memory, s.memory, sizeof(out->memory));
+    return 0;
+#else
+    (void)node;
+    return -1;
+#endif
+}
+
+// The blob holding a compressed page's data, or NULL if `addr` is not a
+// compressed smash page.
+extern "C" __attribute__((visibility("default")))
+void* smash_compressed_blob_for(const void* addr) {
+    return SmashRedirect::getHeap()->compressedBlobFor(addr);
+}
+
 __attribute__((constructor(202)))  // After smash_start_main_thread (201)
 static void smash_register_atfork() {
     pthread_atfork(smash_atfork_prepare,

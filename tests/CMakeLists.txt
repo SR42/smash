@@ -419,6 +419,21 @@ add_smash_mode_test(test_malloc_numa_full       malloc_numa_test 0 120
 add_smash_mode_test(test_malloc_numa_large_only malloc_numa_test 1 120
                     "SMASH_COLD_TIMEOUT_SEC=1")
 
+# NUMA compressor groups: on a host with two or more memory nodes, each node's
+# malloc_numa pages are compressed by threads pinned to that node, with working
+# memory and compressed blobs on the node. Checks thread affinity, on-node
+# compression counts, the placement of worker memory and of every blob, and an
+# on-node byte-exact restore, via the smash_numa_compressor_info and
+# smash_compressed_blob_for diagnostic exports. Skips on single-node hosts
+# (CI runners).
+add_executable(numa_compressor_test numa_compressor_test.cpp)
+set_target_properties(numa_compressor_test PROPERTIES CXX_STANDARD 20)
+target_link_libraries(numa_compressor_test PRIVATE ${CMAKE_DL_LIBS})
+add_smash_mode_test(test_numa_compressor_full       numa_compressor_test 0 120
+                    "SMASH_COLD_TIMEOUT_SEC=1")
+add_smash_mode_test(test_numa_compressor_large_only numa_compressor_test 1 120
+                    "SMASH_COLD_TIMEOUT_SEC=1")
+
 # Over-aligned footprint: SmashHeap::memalign() sends every alignment > 16 B to
 # LargeAlloc, which rounds up to a whole page — so an `alignas(64)` 64-byte
 # object costs a full kernel page (64x on 4 KiB pages, 256x on macOS arm64's

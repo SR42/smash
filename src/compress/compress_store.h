@@ -35,6 +35,7 @@ class CompressStore {
     enum class PinMode : uint8_t { kOff = 0, kMlock = 1, kWillNeed = 2 };
 
     PinMode pin_mode_ = PinMode::kOff;
+    int node_ = -1;  // NUMA node every region is bound to, or -1 for none
 
     static PinMode detectPinMode() {
         const char* v = std::getenv("SMASH_MLOCK_STORE");
@@ -71,6 +72,7 @@ class CompressStore {
         std::atomic<size_t> live_bytes;  // bytes currently in use (not freed)
         uint32_t free_head;              // offset of first free slot, 0 = none
         Region* next;
+        CompressStore* owner;            // the store that mapped this region
     };
 
     static constexpr size_t kRegionSize = 16 * 1024 * 1024;  // 16MB per region
@@ -102,6 +104,16 @@ class CompressStore {
         if (suffix > 0)
             vm::unmapPages(reinterpret_cast<void*>(aligned_addr + kRegionSize), suffix);
 
+#if defined(__linux__)
+        // Bind before the header below is written, so every page of a node
+        // store lands on its node whichever thread touches it first.
+        if (node_ >= 0 &&
+            !vm::bindPagesToNode(reinterpret_cast<void*>(aligned_addr), kRegionSize,
+                                 static_cast<uint32_t>(node_))) {
+            vm::unmapPages(reinterpret_cast<void*>(aligned_addr), kRegionSize);
+            return nullptr;
+        }
+#endif
         auto* r = reinterpret_cast<Region*>(aligned_addr);
         r->base = reinterpret_cast<char*>(aligned_addr);
         r->capacity = kRegionSize;
@@ -109,6 +121,7 @@ class CompressStore {
         r->live_bytes.store(0, std::memory_order_relaxed);
         r->free_head = 0;
         r->next = nullptr;
+        r->owner = this;
 
         if (pin_mode_ == PinMode::kMlock) {
             if (!vm::lockPages(r->base, kRegionSize)) {
@@ -263,7 +276,9 @@ class CompressStore {
     }
 
 public:
-    void init() {
+    // node >= 0 binds every region of this store to that NUMA node (Linux).
+    void init(int node = -1) {
+        node_ = node;
         pin_mode_ = detectPinMode();
         for (int s = 0; s < kCompressStoreShards; ++s)
             shards_[s].current = newRegion();
@@ -321,12 +336,22 @@ public:
     void release(void* ptr, size_t alloc_size, size_t page_idx = 0) {
         if (!ptr) return;
 
+        // Route by the region itself, never by the caller's idea of which store
+        // holds the blob. With a store per NUMA node, a page compressed by one
+        // node's worker can be released through another store's lookup; taking
+        // the wrong store's shard lock would leave two stores mutating the same
+        // region's free list under different locks — silent corruption that no
+        // accounting check would notice. The region knows its owner, so a stale
+        // lookup costs one extra call and nothing else.
+        Region* r = regionOf(ptr);
+        if (r->owner && r->owner != this)
+            return r->owner->release(ptr, alloc_size, page_idx);
+
         int shard_idx = static_cast<int>(page_idx % kCompressStoreShards);
         Shard& shard = shards_[shard_idx];
 
         LockGuard guard(shard.lock);
 
-        Region* r = regionOf(ptr);
         size_t prev = r->live_bytes.fetch_sub(alloc_size, std::memory_order_relaxed);
 
         if (prev <= alloc_size) {

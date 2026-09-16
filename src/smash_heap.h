@@ -1700,6 +1700,18 @@ public:
         return static_cast<int>(span->arena_id);
     }
 
+    // Back the diagnostic exports smash_numa_compressor_info() and
+    // smash_compressed_blob_for().
+#if defined(__linux__)
+    bool numaCompressorStats(uint32_t node, CompressorThread::NodeGroupStats* out) const {
+        return compression_inited_ && compressor_.nodeGroupStats(node, out);
+    }
+#endif
+    void* compressedBlobFor(const void* ptr) {
+        return compression_inited_
+            ? compressor_.compressedBlobFor(reinterpret_cast<uintptr_t>(ptr)) : nullptr;
+    }
+
     // Whole-heap lock/unlock used by the pthread_atfork prepare/parent handlers
     // to quiesce every slab + the large-alloc lock across fork(). Clang Thread
     // Safety Analysis cannot reason about acquiring an *array* of mutexes in a

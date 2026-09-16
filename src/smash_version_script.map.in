@@ -80,6 +80,11 @@
     # Public NUMA allocation API (include/smash/smash.h).
     malloc_numa;
 
+    # Diagnostic / test hooks for the NUMA compressor groups
+    # (test_numa_compressor).
+    smash_numa_compressor_info;
+    smash_compressed_blob_for;
+
     # alloc8 getcwd hooks (function pointers set by Smash constructor)
     xx_getcwd_prepare_hook;
     xx_getcwd_finish_hook;
