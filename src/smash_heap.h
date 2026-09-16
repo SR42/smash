@@ -1533,6 +1533,28 @@ public:
         return large_alloc_.allocate(size, alignment, arena);
     }
 
+    // malloc_numa(): malloc whose pages are bound to one NUMA node. Only the
+    // full and large-only heaps can own the block. Passthrough answers
+    // malloc_usable_size() from the system allocator, and compress-only also
+    // frees through it, so either would hand libc an mmap'd block it never made.
+    void* mallocNuma(uint32_t node, size_t size) {
+        if (isPassthroughMode() || isCompressOnlyMode()) {
+            errno = ENOTSUP;
+            return nullptr;
+        }
+        if (size == 0) size = 1;
+#if defined(__linux__)
+        return large_alloc_.allocateOnNode(size, node);
+#else
+        // No NUMA here: a single memory node, so node 0 is every page.
+        if (node != 0) {
+            errno = EINVAL;
+            return nullptr;
+        }
+        return this->malloc(size);
+#endif
+    }
+
     void* calloc(size_t count, size_t size) {
         // SMASH_PASSTHROUGH=1: pass calloc to system allocator.
         if (isPassthroughMode()) {

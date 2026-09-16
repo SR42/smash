@@ -1413,6 +1413,13 @@ int smash_arena_for(const void* ptr) {
     return heap ? heap->arenaFor(ptr) : -1;
 }
 
+// Public NUMA allocation API, declared in smash/smash.h. Exported the same way
+// as smash_arena_for: default visibility plus a version-script entry.
+extern "C" __attribute__((visibility("default")))
+void* malloc_numa(uint32_t numa, size_t size) {
+    return SmashRedirect::getHeap()->mallocNuma(numa, size);
+}
+
 __attribute__((constructor(202)))  // After smash_start_main_thread (201)
 static void smash_register_atfork() {
     pthread_atfork(smash_atfork_prepare,

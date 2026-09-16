@@ -69,6 +69,13 @@ smash_add_test(test_slab test_slab.cpp)
 # VM region test (no LZ4 dependency)
 smash_add_test(test_vm_region test_vm_region.cpp)
 
+# test_numa_arena: VmRegion's per-node arenas behind malloc_numa, direct-linked
+# so every step is deterministic. Checks grid-aligned chunks bound to the node,
+# freed pages reused only by the same node, no node pages in the shared free
+# lists, and remapPages() binding a replaced node page again (the fallback that
+# otherwise drops the policy). Linux only; skips when mbind is refused.
+smash_add_test(test_numa_arena test_numa_arena.cpp)
+
 # SpillStore test (file-backed very-cold blob storage; no codec dependency)
 smash_add_test(test_spill_store test_spill_store.cpp)
 
@@ -395,6 +402,22 @@ set_target_properties(alloc_contract_test PROPERTIES CXX_STANDARD 20)
 target_link_libraries(alloc_contract_test PRIVATE ${CMAKE_DL_LIBS})
 add_smash_mode_test(test_alloc_contract_full       alloc_contract_test 0 300)
 add_smash_mode_test(test_alloc_contract_large_only alloc_contract_test 1 300)
+
+# malloc_numa(node, size), the exported NUMA API. Checks the MPOL_BIND |
+# MPOL_F_STATIC_NODES binding (get_mempolicy) and physical placement on every
+# online node with the writer pinned off-node (move_pages). Then checks that
+# cold blocks are compressed out of RSS and read back byte-exact with every
+# page on the node. Also checks heap-block semantics (usable size, realloc,
+# free returns pages to the node arena), EINVAL for bad nodes, and that no
+# binding leaks into ordinary malloc memory. Same one-body-two-modes contract
+# as alloc_contract_test.
+add_executable(malloc_numa_test malloc_numa_test.cpp)
+set_target_properties(malloc_numa_test PROPERTIES CXX_STANDARD 20)
+target_link_libraries(malloc_numa_test PRIVATE ${CMAKE_DL_LIBS})
+add_smash_mode_test(test_malloc_numa_full       malloc_numa_test 0 120
+                    "SMASH_COLD_TIMEOUT_SEC=1")
+add_smash_mode_test(test_malloc_numa_large_only malloc_numa_test 1 120
+                    "SMASH_COLD_TIMEOUT_SEC=1")
 
 # Over-aligned footprint: SmashHeap::memalign() sends every alignment > 16 B to
 # LargeAlloc, which rounds up to a whole page — so an `alignas(64)` 64-byte

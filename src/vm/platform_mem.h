@@ -15,6 +15,7 @@
 #include <unistd.h>
 #if defined(__linux__)
 #include <sys/syscall.h>
+#include <linux/mempolicy.h>
 // MADV_COLD / MADV_PAGEOUT are stable kernel ABI constants (Linux 5.4+) but
 // only appear in <sys/mman.h> from glibc 2.31. We build release artifacts on
 // an older glibc (manylinux, glibc 2.28) for drop-in portability, so define
@@ -282,6 +283,14 @@ inline bool protectPages(void* addr, size_t size, bool read, bool write) {
 #endif
 }
 
+// Called by remapPages() after it replaces a range. A mempolicy lives on the
+// VMA, and MAP_FIXED installs a fresh default-policy VMA, so any NUMA binding
+// on the range is gone. VmRegion sets this when its NUMA node arenas are
+// created, to bind the node pieces again. Must be async-signal-safe, because
+// remapPages runs in fault-handler paths. Set once, before any node page
+// exists, like g_external_page_check.
+inline void (*g_after_remap_hook)(void* addr, size_t size) = nullptr;
+
 // Replace pages with a fresh anonymous mapping at the same address.
 // Returns true on success. Used to collapse the per-page VMA fragmentation
 // that mprotect-PROT_NONE creates so we don't hit vm.max_map_count.
@@ -316,7 +325,9 @@ inline bool remapPages(void* addr, size_t size, bool read, bool write) {
     // would both risk lazy-resolution and re-enter smash's own interposer.
     void* p = rawMmap(addr, size, prot,
                       MAP_PRIVATE | MAP_ANON | MAP_FIXED);
-    return p == addr;
+    if (p != addr) return false;
+    if (g_after_remap_hook) g_after_remap_hook(addr, size);
+    return true;
 #endif
 }
 
@@ -348,5 +359,41 @@ inline void willNeedPages(void* addr, size_t size) {
     madvise(addr, size, MADV_WILLNEED);
 #endif
 }
+
+#if defined(__linux__)
+// Largest node id + 1 that bindPagesToNode accepts: the kernel's MAX_NUMNODES
+// ceiling (CONFIG_NODES_SHIFT tops out at 10 on x86-64 and arm64).
+inline constexpr uint32_t kMaxNumaNodes = 1024;
+
+// Bind [addr, addr+size) to NUMA node `node` (backs malloc_numa).
+//
+// MPOL_BIND, not MPOL_PREFERRED: the caller named a node, and PREFERRED
+// silently spills onto other nodes under memory pressure, so the locality the
+// caller asked for disappears with no error. MPOL_F_STATIC_NODES keeps `node`
+// a physical id; without it a later cpuset change rebinds the policy
+// *relatively* and places new pages on a different node even while `node` is
+// still allowed. `flags` is 0 for a range with no pages yet, or MPOL_MF_MOVE
+// to also migrate pages that were already placed elsewhere.
+//
+// Raw syscall: glibc has no mbind wrapper (libnuma does), and smash does not
+// link libnuma. Fails with EINVAL if the node is out of range, offline,
+// memoryless, or outside the process's cpuset.
+inline bool bindPagesToNode(void* addr, size_t size, uint32_t node,
+                            unsigned flags = 0) {
+    if (node >= kMaxNumaNodes) { errno = EINVAL; return false; }
+    constexpr size_t kBitsPerWord = 8 * sizeof(unsigned long);
+    unsigned long mask[kMaxNumaNodes / kBitsPerWord] = {};
+    mask[node / kBitsPerWord] = 1UL << (node % kBitsPerWord);
+    // maxnode is one past the mask width: the kernel's get_nodes() decrements
+    // it before reading (the same +1 libnuma passes).
+    return syscall(SYS_mbind, addr, size, MPOL_BIND | MPOL_F_STATIC_NODES,
+                   mask, kMaxNumaNodes + 1, flags) == 0;
+}
+
+// Reset the range to MPOL_DEFAULT. Best effort.
+inline void unbindPages(void* addr, size_t size) {
+    (void)syscall(SYS_mbind, addr, size, MPOL_DEFAULT, nullptr, 0, 0);
+}
+#endif
 
 } // namespace smash::vm

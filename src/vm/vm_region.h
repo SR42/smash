@@ -127,6 +127,7 @@ class VmRegion {
         size_t num_pages;
         size_t page_index;
         size_t shard_idx;
+        int node;  // owning NUMA node arena, or -1 for the shared free lists
         DecommitEntry* next;
     };
 
@@ -153,12 +154,14 @@ class VmRegion {
         decommit_pool_ = e;
     }
 
-    void queueForDecommit(void* addr, size_t num_pages, size_t page_index, size_t shard_idx) {
+    void queueForDecommit(void* addr, size_t num_pages, size_t page_index,
+                          size_t shard_idx, int node) {
         DecommitEntry* e = newDecommitEntry();
         e->addr = addr;
         e->num_pages = num_pages;
         e->page_index = page_index;
         e->shard_idx = shard_idx;
+        e->node = node;
         // Lock-free push to MPSC queue
         DecommitEntry* head = decommit_head_.load(std::memory_order_relaxed);
         do {
@@ -196,14 +199,13 @@ class VmRegion {
         // hold shard.lock. Proven by model/SmashFreePoolRace.{lean,tla}.
         // Deadlock-safe: newFreeRun's only nested lock is BootstrapAlloc's
         // expand_lock_ (taken after, never before, shard.lock) — no inversion.
-        FreeShard& shard = shards_[e->shard_idx];
+        // A node arena's pages go back to that arena only (see NodeArena).
+        FreeShard& shard = (e->node >= 0)
+            ? node_arenas_.load(std::memory_order_acquire)[e->node].free
+            : shards_[e->shard_idx];
         {
             LockGuard guard(shard.lock);
-            FreeRun* run = newFreeRun(shard);
-            run->page_index = e->page_index;
-            run->page_count = e->num_pages;
-            run->next = shard.free_list;
-            shard.free_list = run;
+            pushFreeRun(shard, e->page_index, e->num_pages);
         }
     }
 
@@ -407,6 +409,10 @@ public:
     }
 
     ~VmRegion() {
+        // Stop binding remapped ranges again for a region that is going away.
+        VmRegion* self = this;
+        if (numa_region_.compare_exchange_strong(self, nullptr))
+            vm::g_after_remap_hook = nullptr;
         stopDecommitThread();
     }
 
@@ -608,7 +614,7 @@ public:
         // pages can't be reallocated before decommit completes.
         size_t page_idx = pageIndex(reinterpret_cast<uintptr_t>(addr));
         size_t shard_idx = getShardIdx();
-        queueForDecommit(addr, num_pages, page_idx, shard_idx);
+        queueForDecommit(addr, num_pages, page_idx, shard_idx, nodeOfPage(page_idx));
     }
 
     // ── Page tracking (compress-only mode) ──────────────────────────────────
@@ -885,6 +891,211 @@ public:
         // and contig_pages_ are EMPTY → cheap to skip via the chunk bitmap.
         return contig_pages_ + ext;
     }
+
+    // ── NUMA node arenas (malloc_numa) ──────────────────────────────────────
+    // One arena per NUMA node inside the contiguous region. An arena grows by
+    // carving whole chunks of kNodeChunkPages off the shared bump pointer,
+    // aligned to a fixed grid, and binds each chunk to its node once with
+    // mbind. It keeps its own free list, so its pages are only ever reused by
+    // the same node. That means no mbind per allocation, no policy reset on
+    // free, and no binding leaking into ordinary allocations. The pages share
+    // the index space of every other region page, so the compressor and the
+    // fault handler treat them like any other page.
+    //
+    // Why not a fixed slice per node: the compressor walks page indices
+    // [0, committedPages()) page by page every tick (chunk-bitmap rebuild,
+    // deferred-madvise sweep, soft-dirty pagemap read). Slices above the
+    // shared heap would stretch that walk past the whole shared region as
+    // soon as one node arena was used. Carving from the bump pointer keeps it
+    // compact.
+    //
+    // A remap of a node page (vm::remapPages) replaces its VMA and drops the
+    // policy. rebindAfterRemap(), installed as vm::g_after_remap_hook, binds
+    // the page again.
+    static constexpr size_t kNodeChunkPages = (64 * 1024 * 1024) / kPageSize;
+
+    // NUMA node owning contiguous page `idx`, or -1. Lock-free and
+    // async-signal-safe.
+    int nodeOfPage(size_t idx) const {
+        const auto* table = node_of_chunk_.load(std::memory_order_acquire);
+        if (!table || idx >= contig_pages_) return -1;
+        return static_cast<int>(
+            table[idx / kNodeChunkPages].load(std::memory_order_acquire)) - 1;
+    }
+
+#if defined(__linux__)
+    // Allocate `num_pages` from `node`'s arena: its free list first, then the
+    // unused tail of its newest chunk, then a newly carved and bound chunk.
+    // Returns nullptr with errno EINVAL (bad node, from mbind), EPERM/ENOSYS
+    // (mbind refused), or ENOMEM (region exhausted).
+    void* allocatePagesOnNode(size_t num_pages, uint32_t node) {
+        if (tracking_mode_ || !base_ || num_pages == 0 || num_pages > contig_pages_) {
+            errno = ENOMEM;
+            return nullptr;
+        }
+        if (node >= vm::kMaxNumaNodes) {
+            errno = EINVAL;
+            return nullptr;
+        }
+        NodeArena* arenas = ensureNodeArenas();
+        if (!arenas) {
+            errno = ENOMEM;
+            return nullptr;
+        }
+        NodeArena& na = arenas[node];
+        LockGuard guard(na.free.lock);
+
+        FreeRun** prev = &na.free.free_list;
+        for (FreeRun* run = na.free.free_list; run; prev = &run->next, run = run->next) {
+            if (run->page_count < num_pages) continue;
+            size_t idx = run->page_index;
+            if (run->page_count == num_pages) {
+                *prev = run->next;
+                recycleFreeRun(run, na.free);
+            } else {
+                run->page_index += num_pages;
+                run->page_count -= num_pages;
+            }
+            return base_ + idx * kPageSize;
+        }
+
+        if (na.end - na.cur < num_pages) {
+            const size_t chunk_pages =
+                (num_pages + kNodeChunkPages - 1) / kNodeChunkPages * kNodeChunkPages;
+            const size_t start = carveNodeChunk(chunk_pages);
+            if (start == kNoChunk) {
+                errno = ENOMEM;
+                return nullptr;
+            }
+            void* chunk = base_ + start * kPageSize;
+            // Freshly carved, so nothing in the chunk has been touched: no
+            // pages to move.
+            if (!vm::bindPagesToNode(chunk, chunk_pages * kPageSize, node)) {
+                const int err = errno;
+                // mbind can fail after binding part of the range.
+                vm::unbindPages(chunk, chunk_pages * kPageSize);
+                donateToShared(start, chunk_pages);
+                errno = err;
+                return nullptr;
+            }
+            auto* table = node_of_chunk_.load(std::memory_order_acquire);
+            for (size_t c = start / kNodeChunkPages;
+                 c < (start + chunk_pages) / kNodeChunkPages; ++c)
+                table[c].store(static_cast<uint16_t>(node + 1), std::memory_order_release);
+            if (na.end > na.cur) pushFreeRun(na.free, na.cur, na.end - na.cur);
+            na.cur = start;
+            na.end = start + chunk_pages;
+        }
+        const size_t idx = na.cur;
+        na.cur += num_pages;
+        return base_ + idx * kPageSize;
+    }
+#endif
+
+private:
+    struct NodeArena {
+        FreeShard free;  // free_list + FreeRun pool, guarded by free.lock
+        size_t cur = 0;  // unused tail of the newest chunk, [cur, end);
+        size_t end = 0;  // guarded by free.lock
+    };
+    static constexpr size_t kNoChunk = ~size_t{0};
+
+    // Both created on first use, indexed by node id and by grid chunk.
+    // node_of_chunk_[c] is node+1, or 0 for a chunk no node arena owns. It is
+    // written before any of the chunk's pages are handed out.
+    std::atomic<NodeArena*> node_arenas_{nullptr};
+    std::atomic<std::atomic<uint16_t>*> node_of_chunk_{nullptr};
+    Spinlock numa_init_lock_;
+    // Region that vm::g_after_remap_hook binds pages again for.
+    static inline std::atomic<VmRegion*> numa_region_{nullptr};
+
+    void pushFreeRun(FreeShard& shard, size_t page_index, size_t page_count)
+        SMASH_REQUIRES(shard.lock) {
+        FreeRun* run = newFreeRun(shard);
+        run->page_index = page_index;
+        run->page_count = page_count;
+        run->next = shard.free_list;
+        shard.free_list = run;
+    }
+
+#if defined(__linux__)
+    NodeArena* ensureNodeArenas() {
+        if (NodeArena* a = node_arenas_.load(std::memory_order_acquire)) [[likely]]
+            return a;
+        LockGuard guard(numa_init_lock_);
+        if (NodeArena* a = node_arenas_.load(std::memory_order_relaxed)) return a;
+        auto* table = bootstrapArray<std::atomic<uint16_t>>(
+            (contig_pages_ + kNodeChunkPages - 1) / kNodeChunkPages);
+        auto* arenas = bootstrapArray<NodeArena>(vm::kMaxNumaNodes);
+        if (!table || !arenas) return nullptr;
+        node_of_chunk_.store(table, std::memory_order_release);
+        // The first region to use node arenas owns the remap hook: the heap's
+        // region in production, while tests may create others.
+        VmRegion* none = nullptr;
+        if (numa_region_.compare_exchange_strong(none, this))
+            vm::g_after_remap_hook = &rebindAfterRemap;
+        node_arenas_.store(arenas, std::memory_order_release);
+        return arenas;
+    }
+
+    // Claim `pages` (a multiple of kNodeChunkPages) off the shared bump
+    // pointer, starting on the chunk grid. The pages skipped below the grid
+    // line are fresh and unbound, so they go to the shared free lists.
+    size_t carveNodeChunk(size_t pages) {
+        size_t cur = next_page_.load(std::memory_order_acquire);
+        size_t start = 0;
+        size_t end = 0;
+        do {
+            // An overflowing allocatePages() bump briefly leaves next_page_
+            // past contig_pages_ before undoing it. That value always fails
+            // this check, so the CAS never commits on top of it.
+            start = (cur + kNodeChunkPages - 1) / kNodeChunkPages * kNodeChunkPages;
+            end = start + pages;
+            if (end > contig_pages_) return kNoChunk;
+        } while (!next_page_.compare_exchange_weak(cur, end, std::memory_order_acq_rel));
+        // Commit before donating the gap: allocatePages() hands out free-list
+        // pages without committing them.
+        ensureCommitted(end);
+        if (start > cur) donateToShared(cur, start - cur);
+        return start;
+    }
+
+    void donateToShared(size_t page_index, size_t page_count) {
+        FreeShard& shard = shards_[getShardIdx()];
+        LockGuard guard(shard.lock);
+        pushFreeRun(shard, page_index, page_count);
+    }
+
+    // vm::g_after_remap_hook. remapPages() just replaced [addr, addr+size)
+    // with a default-policy VMA; bind each run of pages that belongs to a node
+    // arena back to its node. MPOL_MF_MOVE because an RW remap is visible to
+    // other threads before this runs, and one of them may already have placed
+    // a page by touching it. Runs in fault-handler context: lock-free lookups
+    // and raw syscalls only, errno preserved.
+    static void rebindAfterRemap(void* addr, size_t size) {
+        VmRegion* self = numa_region_.load(std::memory_order_acquire);
+        if (!self) return;
+        const int saved_errno = errno;
+        const auto a = reinterpret_cast<uintptr_t>(addr);
+        const size_t pages = size / kPageSize;
+        auto nodeAt = [&](size_t i) {
+            const uintptr_t p = a + i * kPageSize;
+            return self->inContigArena(p) ? self->nodeOfPage(self->contigPageIndex(p)) : -1;
+        };
+        for (size_t i = 0; i < pages;) {
+            const int node = nodeAt(i);
+            size_t j = i + 1;
+            while (j < pages && nodeAt(j) == node) ++j;
+            if (node >= 0) {
+                (void)vm::bindPagesToNode(reinterpret_cast<void*>(a + i * kPageSize),
+                                          (j - i) * kPageSize,
+                                          static_cast<uint32_t>(node), MPOL_MF_MOVE);
+            }
+            i = j;
+        }
+        errno = saved_errno;
+    }
+#endif
 };
 
 } // namespace smash

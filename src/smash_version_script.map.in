@@ -77,6 +77,9 @@
     # to guard the call-site-arena invariant.
     smash_arena_for;
 
+    # Public NUMA allocation API (include/smash/smash.h).
+    malloc_numa;
+
     # alloc8 getcwd hooks (function pointers set by Smash constructor)
     xx_getcwd_prepare_hook;
     xx_getcwd_finish_hook;

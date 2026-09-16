@@ -435,7 +435,11 @@ smash_hint_hot(ptr, size);    // Suggest region should stay decompressed
 
 SmashStats stats;
 smash_get_stats(&stats);      // Query compression statistics
+
+void* buf = malloc_numa(1, 64 << 20);  // 64 MiB bound to NUMA node 1; free() as usual
 ```
+
+`malloc_numa(node, size)` binds the block with `MPOL_BIND | MPOL_F_STATIC_NODES`. Pages come only from `node`, with no silent spill to other nodes under memory pressure, and the node id stays physical across cpuset changes. Blocks are rounded up to whole pages and come from a per-node arena inside smash's heap region, bound once per 64 MiB chunk. smash compresses their cold pages like any other allocation, and they decompress back onto `node`. `realloc` returns an unbound block. An offline, memoryless, or out-of-cpuset node fails with `NULL`/`EINVAL`.
 
 ## Testing
 

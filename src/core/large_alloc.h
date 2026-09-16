@@ -92,6 +92,52 @@ public:
         return mem;
     }
 
+#if defined(__linux__)
+    // NUMA-bound allocation (malloc_numa). Pages come from the VmRegion's
+    // arena for `node` (VmRegion::allocatePagesOnNode), so the compressor
+    // tracks them like any other large allocation, and deallocate() returns
+    // them to that arena. With no VmRegion, or one that is exhausted, the
+    // block is a separate bound mapping, which is never compressed.
+    void* allocateOnNode(size_t size, uint32_t node) {
+        size_t alloc_size = roundUp(size, kPageSize);
+        if (alloc_size < size || alloc_size / kPageSize > UINT32_MAX) {
+            errno = ENOMEM;
+            return nullptr;
+        }
+        const auto num_pages = static_cast<uint32_t>(alloc_size / kPageSize);
+
+        void* mem = nullptr;
+        if (vm_region_) {
+            mem = vm_region_->allocatePagesOnNode(num_pages, node);
+            // Any failure but exhaustion (bad node, mbind refused) would fail
+            // the same way on a separate mapping.
+            if (!mem && errno != ENOMEM) return nullptr;
+            if (mem && page_states_) {
+                size_t idx = vm_region_->pageIndex(reinterpret_cast<uintptr_t>(mem));
+                for (uint32_t p = 0; p < num_pages; ++p)
+                    page_states_->set(idx + p, PageState::ACTIVE);
+            }
+        }
+        if (!mem) {
+            mem = vm::mapPages(alloc_size);
+            if (!mem) return nullptr;
+            if (!vm::bindPagesToNode(mem, alloc_size, node)) {
+                int err = errno;
+                vm::unmapPages(mem, alloc_size);
+                errno = err;
+                return nullptr;
+            }
+        }
+
+        // Arena 0: call-site arenas group slab pages by allocation site, and a
+        // whole-page NUMA block has no slab.
+        Span* span = newSpanDescriptor();
+        span->initLarge(mem, size, num_pages);
+        page_map_->set(reinterpret_cast<uintptr_t>(mem), span);
+        return mem;
+    }
+#endif
+
     void deallocate(Span* span) {
         void* base = span->base;
         size_t num_pages = span->page_count;
