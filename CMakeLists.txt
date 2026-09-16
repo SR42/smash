@@ -103,6 +103,37 @@ if(NOT WIN32)
   )
 endif()
 
+# ── Sanitizers ────────────────────────────────────────────────────────────────
+# -DSMASH_SANITIZE=undefined (also: address, or address,undefined) instruments
+# smash and everything built beside it. Set here, before the tests and bench
+# subdirectories, so the library and the executables that preload it are built
+# and linked alike — a sanitized library loaded by an uninstrumented program
+# still works, but then only the library's own frames are checked.
+#
+# Always use a separate build directory: the sanitized libsmash is slower and
+# pulls in libubsan/libasan, so it is neither what you benchmark nor what you
+# ship, and reusing the normal build directory is how you end up testing a
+# library you did not mean to test.
+#
+# UBSan is the one that fits this project. ASan replaces malloc, which is
+# exactly what smash exists to do, so an ASan build of a malloc-replacement
+# library fights itself; the option still accepts it for instrumenting a single
+# test binary, but not for the preloaded library.
+#
+# Findings are recoverable by default so the first one does not mask the rest.
+# Set UBSAN_OPTIONS=halt_on_error=1 to stop at the first instead.
+set(SMASH_SANITIZE "" CACHE STRING
+    "Sanitizers to build with, e.g. undefined / address / address,undefined")
+if(SMASH_SANITIZE)
+  add_compile_options(-fsanitize=${SMASH_SANITIZE} -fno-omit-frame-pointer -g)
+  add_link_options(-fsanitize=${SMASH_SANITIZE})
+  # vptr instrumentation needs RTTI and fails to build without it.
+  if(CMAKE_CXX_FLAGS MATCHES "-fno-rtti")
+    add_compile_options(-fno-sanitize=vptr)
+  endif()
+  message(STATUS "Sanitizers ENABLED: -fsanitize=${SMASH_SANITIZE}")
+endif()
+
 # ── Pull in alloc8 ────────────────────────────────────────────────────────────
 # By default smash is self-contained: it clones alloc8 from GitHub via
 # FetchContent. To build against a local checkout instead (developer workflow,
