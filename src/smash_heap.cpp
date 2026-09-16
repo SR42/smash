@@ -238,8 +238,11 @@ smash::PageLockTable* smash::g_smash_page_locks_for_external = nullptr;
 __attribute__((tls_model("initial-exec")))
 thread_local smash::ThreadCache* smash::g_thread_cache = nullptr;
 
+// constinit: keeps this out of the thread_local dynamic-init path, so reads do
+// not go through the `_ZTH...` wrapper guard. See the declaration in
+// smash_heap.h for what that guard costs and the GCC sanitizer bug it feeds.
 __attribute__((tls_model("initial-exec")))
-thread_local int smash::g_full_mode_cached = -1;
+constinit thread_local int smash::g_full_mode_cached = -1;
 
 // g_compressor_thread is now defined as inline thread_local in
 // compressor_thread.h (C++17 inline variable, single definition).

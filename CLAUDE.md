@@ -53,16 +53,40 @@ both are easy to mis-attribute:
   (`vm::warmPages`), and instrumenting the application's own buffer accesses
   disturbs that. Do not chase it as a wrapper regression — the natural reading,
   and the wrong one.
-- One finding, six occurrences, all the same site:
-  `smash_heap.h:315` "load of null pointer of type 'int'" in `fullMallocPath()`,
-  reported only from the direct-linked `test_integration`, which still **passes**
-  — so it is diagnostic-only. `g_full_mode_cached` is an ordinary
-  `extern ... thread_local int` with `tls_model("initial-exec")`, and the read is
-  a plain load. **Unexplained so far:** minimal reproducers (two TUs,
-  `always_inline`, LTO, and a shared-library split) all emit the same
-  weak-undefined `_ZTH` TLS-init wrapper as the real binary and stay clean, so
-  the wrapper alone is not the trigger. Treat as open rather than as a known
-  false positive.
+- "load of null pointer of type 'int'" at `smash_heap.h:315` in
+  `fullMallocPath()`, plus the matching "store to null pointer" at line 321,
+  reported only from direct-linked test binaries — which still **pass**. It was a
+  **GCC codegen bug**, not a smash defect, and the fix is `constinit` on
+  `g_full_mode_cached`.
+
+  Without `constinit` the compiler treats an `extern thread_local` as possibly
+  dynamically initialized and guards each read with its init wrapper. The
+  generated sequence is:
+
+  ```
+  cmpq $0x0, _ZTHN5smash18g_full_mode_cachedE   # is the INIT WRAPPER null?
+  je   .Lskip
+  call _ZTHN5smash18g_full_mode_cachedE@plt
+  .Lskip:
+  mov  %fs:0x0,%rax                            # thread pointer   (no flag write)
+  lea  -0x1088(%rax),%rax                      # &g_full_mode_cached (no flag write)
+  je   .Lreport                                # branches on the STALE flags above!
+  mov  %fs:...,%eax                            # the real, correct load
+  ```
+
+  `mov` and `lea` do not touch flags, so the "is this address null?" branch reuses
+  ZF from the comparison of the **wrapper**, which is weak-undefined (nothing to
+  initialize) and therefore always zero. The handler is called every time with a
+  literal `0` (`xor %esi,%esi`) and control then rejoins and performs the correct
+  `%fs:` load — a spurious diagnostic over working code.
+
+  Needs `-O2` or above; gcc 13.3 and 14.2 both reproduce, clang 18 is clean.
+  `constinit` keeps the variable out of the dynamic-init path, which deletes the
+  wrapper guard and the false report together: **14 findings → 0**. It also
+  removes a `cmpq`/`je`/`call` from the malloc fast path of direct-linked
+  binaries. `libsmash.so` itself never had the guard — inside the library GCC
+  sees the definition and the use in one LTO unit and proves no dynamic init —
+  so this cost only ever fell on the direct-linked tests.
 
 ## Test
 

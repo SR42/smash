@@ -95,8 +95,19 @@ extern PageLockTable* g_smash_page_locks_for_external;
 extern __attribute__((tls_model("initial-exec")))
     thread_local ThreadCache* g_thread_cache;
 
+// constinit is load-bearing, not decoration. Without it the compiler treats
+// this as possibly dynamically initialized and guards every read with the
+// thread_local init wrapper (`_ZTH...`): a `cmpq $0, _ZTH...` plus a
+// conditional `call` on the malloc fast path. The wrapper is weak-undefined
+// (nothing to initialize), so the comparison always sets ZF — and GCC's
+// -fsanitize=null instrumentation then branches on those *stale* flags to
+// decide whether the variable's address is null, because the address
+// computation in between (`mov %fs:0`, `lea`) writes no flags. The result is a
+// spurious "load of null pointer of type 'int'" on every call, over a load
+// that is in fact correct. Reproduced on gcc 13.3 and 14.2 at -O2 and above;
+// clang 18 is clean. See CLAUDE.md, "Sanitizers".
 extern __attribute__((tls_model("initial-exec")))
-    thread_local int g_full_mode_cached;  // -1 = unknown, 0 = bypass, 1 = full
+    constinit thread_local int g_full_mode_cached;  // -1 = unknown, 0 = bypass, 1 = full
 
 // Compressor thread bypass flag — defined as inline thread_local in
 // compressor_thread.h (included above). Used here on the malloc fast path.
