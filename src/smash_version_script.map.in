@@ -185,6 +185,15 @@
     # getcwd wrapper (buffer write from kernel)
     getcwd;
 
+    # CPU affinity: the kernel reads (set) or writes (get) a cpu_set_t that
+    # thread pools routinely keep on the heap.
+    sched_setaffinity;
+    sched_getaffinity;
+    # glibc's pthread_*affinity_np call the kernel through an internal
+    # __sched_setaffinity, so the sched_* wrappers above never see them.
+    pthread_setaffinity_np;
+    pthread_getaffinity_np;
+
     # execve / execv* — pre-warm argv/envp pages before exec, so the
     # kernel can read them after the new image takes over (these are
     # one-shot syscalls; no EFAULT-retry possible).
@@ -301,6 +310,31 @@ GLIBC_2.33 {
     fstatat_233;
     fstatat64_233;
 } @SMASH_GLIBC_BASE_VERSION@;
+
+# CPU affinity. glibc exports sched_*@GLIBC_2.3.4,
+# pthread_setaffinity_np@GLIBC_2.34 and pthread_getaffinity_np@GLIBC_2.32, and
+# callers bind those exact versions — base-version definitions alone lose to
+# libc (measured: the wrappers never ran until these sections existed). The
+# *_234 / *_232 aliases carry .symver directives in linux_syscall_wrappers.cpp.
+GLIBC_2.3.4 {
+  global:
+    sched_setaffinity;
+    sched_getaffinity;
+    sched_setaffinity_234;
+    sched_getaffinity_234;
+} @SMASH_GLIBC_BASE_VERSION@;
+
+GLIBC_2.32 {
+  global:
+    pthread_getaffinity_np;
+    pthread_getaffinity_np_232;
+} @SMASH_GLIBC_BASE_VERSION@;
+
+GLIBC_2.34 {
+  global:
+    pthread_setaffinity_np;
+    pthread_setaffinity_np_234;
+} GLIBC_2.32;
 
 # C++ operator new/delete with libstdc++ versioning
 # libBIR.so and other walrus libraries request these versions, not GLIBC_2.2.5.

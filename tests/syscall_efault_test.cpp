@@ -34,6 +34,7 @@
 #endif
 
 #include <cerrno>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -52,6 +53,12 @@
 
 #ifdef __APPLE__
 #include <sys/attr.h>
+#endif
+
+#ifdef __linux__
+#include <pthread.h>
+#include <sched.h>
+#include <sys/mman.h>
 #endif
 
 namespace {
@@ -135,6 +142,26 @@ bool waitForCompression(const char* phase) {
             "cannot exercise EFAULT path\n", phase, kMaxWaitSec);
     return false;
 }
+
+#ifdef __linux__
+// True once the page holding `p` has left RSS, so the syscall under test really
+// does hand the kernel a protected page. waitForCompression only proves that
+// *some* page compressed; a phase whose own buffer stayed resident would pass
+// without exercising the EFAULT path at all.
+bool waitPageNonResident(const void* p, const char* phase) {
+    const size_t ps = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    void* page = reinterpret_cast<void*>(
+        reinterpret_cast<uintptr_t>(p) & ~(static_cast<uintptr_t>(ps) - 1));
+    for (int i = 0; i < 120; ++i) {
+        unsigned char resident = 1;
+        if (mincore(page, ps, &resident) == 0 && !(resident & 1)) return true;
+        usleep(250 * 1000);
+    }
+    fprintf(stderr, "FAIL: [%s] the buffer page never left RSS within 30s, so the "
+            "EFAULT path was never exercised\n", phase);
+    return false;
+}
+#endif
 
 bool bytesAllEqual(const unsigned char* p, size_t bytes, unsigned char want) {
     for (size_t i = 0; i < bytes; ++i)
@@ -714,6 +741,69 @@ int main() {
         return 1;
     }
     fprintf(stderr, "syscall_efault_test: getattrlist() with heap attrBuf PASSED\n");
+#endif
+
+#ifdef __linux__
+    // ── Phase 18: CPU affinity with a heap cpu_set_t (Linux only) ─────────
+    // The kernel reads the mask for sched_setaffinity / pthread_setaffinity_np
+    // and writes it for sched_getaffinity. Thread pools keep one mask per
+    // worker on the heap, so the mask lands on a compressed page like any
+    // other heap object. Without the wrappers these return EFAULT and the pin
+    // silently does not happen — measured before the wrappers existed.
+    auto* mask = reinterpret_cast<cpu_set_t*>(buf);
+    CPU_ZERO(mask);
+    if (sched_getaffinity(0, sizeof(cpu_set_t), mask) != 0) {
+        fprintf(stderr, "FAIL: sched_getaffinity() on a warm page errno=%d (%s)\n",
+                errno, std::strerror(errno));
+        return 1;
+    }
+    const int baseline_cpus = CPU_COUNT(mask);
+    if (baseline_cpus == 0) {
+        fprintf(stderr, "FAIL: sched_getaffinity() reported an empty CPU mask\n");
+        return 1;
+    }
+
+    // Kernel READS the mask: the pin must still happen once it is compressed.
+    fillCompressible(buf + sizeof(cpu_set_t), kBufBytes - sizeof(cpu_set_t), 0xD1);
+    if (!waitForCompression("pre-sched_setaffinity")) return 1;
+    if (!waitPageNonResident(mask, "pre-sched_setaffinity")) return 1;
+    if (sched_setaffinity(0, sizeof(cpu_set_t), mask) != 0) {
+        fprintf(stderr, "FAIL: sched_setaffinity() errno=%d (%s) — the kernel could "
+                "not read a mask on a compressed page\n", errno, std::strerror(errno));
+        return 1;
+    }
+    fprintf(stderr, "syscall_efault_test: sched_setaffinity() with heap cpu_set_t PASSED\n");
+
+    // Kernel WRITES the mask: zero it first so a silent no-op is visible.
+    CPU_ZERO(mask);
+    fillCompressible(buf + sizeof(cpu_set_t), kBufBytes - sizeof(cpu_set_t), 0xD2);
+    if (!waitForCompression("pre-sched_getaffinity")) return 1;
+    if (!waitPageNonResident(mask, "pre-sched_getaffinity")) return 1;
+    if (sched_getaffinity(0, sizeof(cpu_set_t), mask) != 0) {
+        fprintf(stderr, "FAIL: sched_getaffinity() errno=%d (%s)\n",
+                errno, std::strerror(errno));
+        return 1;
+    }
+    if (CPU_COUNT(mask) != baseline_cpus) {
+        fprintf(stderr, "FAIL: sched_getaffinity() returned 0 but wrote %d CPUs, "
+                "expected %d — the kernel did not populate the mask\n",
+                CPU_COUNT(mask), baseline_cpus);
+        return 1;
+    }
+    fprintf(stderr, "syscall_efault_test: sched_getaffinity() with heap cpu_set_t PASSED\n");
+
+    // glibc reaches the kernel through an internal __sched_setaffinity here,
+    // so this needs its own wrapper and returns the error code directly.
+    fillCompressible(buf + sizeof(cpu_set_t), kBufBytes - sizeof(cpu_set_t), 0xD3);
+    if (!waitForCompression("pre-pthread_setaffinity_np")) return 1;
+    if (!waitPageNonResident(mask, "pre-pthread_setaffinity_np")) return 1;
+    int pt_rc = pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), mask);
+    if (pt_rc != 0) {
+        fprintf(stderr, "FAIL: pthread_setaffinity_np() returned %d (%s)\n",
+                pt_rc, std::strerror(pt_rc));
+        return 1;
+    }
+    fprintf(stderr, "syscall_efault_test: pthread_setaffinity_np() with heap cpu_set_t PASSED\n");
 #endif
 
     std::free(recv_buf);

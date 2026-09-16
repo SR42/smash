@@ -42,6 +42,8 @@
 #include <sys/mman.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <pthread.h>
+#include <sched.h>
 #include <signal.h>
 #include <cstdarg>
 #include <cstdio>
@@ -866,6 +868,110 @@ SMASH_VISIBLE ssize_t getrandom(void* buf, size_t buflen, unsigned int flags) {
         [&] { return real_getrandom(buf, buflen, flags); },
         buf, buflen);
 }
+
+// ── CPU affinity ────────────────────────────────────────────────────────────
+// The kernel reads (set) or writes (get) a cpu_set_t, and thread pools keep one
+// per worker on the heap. Measured: with the mask on a compressed page,
+// sched_setaffinity returns EFAULT and the pin silently does not happen.
+//
+// pthread_{set,get}affinity_np need their own wrappers. glibc reaches the
+// kernel through an internal __sched_setaffinity, so interposing
+// sched_setaffinity does not cover them. They also report failure by return
+// value rather than through errno, so they warm the mask up front rather than
+// relying only on the EFAULT retry.
+SMASH_VISIBLE int sched_setaffinity(pid_t pid, size_t cpusetsize,
+                                    const cpu_set_t* mask) {
+    using fn_t = int(*)(pid_t, size_t, const cpu_set_t*);
+    SMASH_LAZY_RESOLVE(fn_t, sched_setaffinity);
+    if (!real_sched_setaffinity)
+        return static_cast<int>(syscall(SYS_sched_setaffinity, pid, cpusetsize, mask));
+    return smash::vm::retryWith1Buf(
+        [&] { return real_sched_setaffinity(pid, cpusetsize, mask); },
+        mask, cpusetsize);
+}
+
+SMASH_VISIBLE int sched_getaffinity(pid_t pid, size_t cpusetsize, cpu_set_t* mask) {
+    using fn_t = int(*)(pid_t, size_t, cpu_set_t*);
+    SMASH_LAZY_RESOLVE(fn_t, sched_getaffinity);
+    if (!real_sched_getaffinity)
+        return static_cast<int>(syscall(SYS_sched_getaffinity, pid, cpusetsize, mask));
+    return smash::vm::retryWith1Buf(
+        [&] { return real_sched_getaffinity(pid, cpusetsize, mask); },
+        mask, cpusetsize);
+}
+
+SMASH_VISIBLE int pthread_setaffinity_np(pthread_t thread, size_t cpusetsize,
+                                         const cpu_set_t* mask) {
+    using fn_t = int(*)(pthread_t, size_t, const cpu_set_t*);
+    SMASH_LAZY_RESOLVE(fn_t, pthread_setaffinity_np);
+    auto* vm = smash::g_smash_vm_region;
+    // Through a void* so the nonnull-declared parameter still gets checked:
+    // an interposer sees whatever the application actually passes.
+    const void* mask_mem = mask;
+    if (vm && mask_mem && cpusetsize) smash::vm::warmPages(mask_mem, cpusetsize, vm);
+    if (!real_pthread_setaffinity_np) {
+        // dlsym recursion during early init. The raw syscall covers the common
+        // self-pinning case; anything else has to wait for a later call.
+        if (pthread_equal(thread, pthread_self()))
+            return syscall(SYS_sched_setaffinity, 0, cpusetsize, mask) == 0 ? 0 : errno;
+        return ENOSYS;
+    }
+    int rc = real_pthread_setaffinity_np(thread, cpusetsize, mask);
+    for (int attempt = 0; rc == EFAULT && attempt < 8; ++attempt) {
+        if (vm && mask_mem && cpusetsize) smash::vm::warmPages(mask_mem, cpusetsize, vm);
+        rc = real_pthread_setaffinity_np(thread, cpusetsize, mask);
+    }
+    return rc;
+}
+
+SMASH_VISIBLE int pthread_getaffinity_np(pthread_t thread, size_t cpusetsize,
+                                         cpu_set_t* mask) {
+    using fn_t = int(*)(pthread_t, size_t, cpu_set_t*);
+    SMASH_LAZY_RESOLVE(fn_t, pthread_getaffinity_np);
+    auto* vm = smash::g_smash_vm_region;
+    const void* mask_mem = mask;
+    if (vm && mask_mem && cpusetsize) smash::vm::warmPages(mask_mem, cpusetsize, vm);
+    if (!real_pthread_getaffinity_np) {
+        if (pthread_equal(thread, pthread_self()))
+            return syscall(SYS_sched_getaffinity, 0, cpusetsize, mask) >= 0 ? 0 : errno;
+        return ENOSYS;
+    }
+    int rc = real_pthread_getaffinity_np(thread, cpusetsize, mask);
+    for (int attempt = 0; rc == EFAULT && attempt < 8; ++attempt) {
+        if (vm && mask_mem && cpusetsize) smash::vm::warmPages(mask_mem, cpusetsize, vm);
+        rc = real_pthread_getaffinity_np(thread, cpusetsize, mask);
+    }
+    return rc;
+}
+
+// Callers bind the versioned symbols glibc actually exports —
+// sched_*@GLIBC_2.3.4, pthread_setaffinity_np@GLIBC_2.34,
+// pthread_getaffinity_np@GLIBC_2.32 — and a versioned reference does not match
+// the base-version definitions above, so libc keeps winning. (Same trap as
+// fstat@GLIBC_2.33; see smash_version_script.map.in.) Export aliases at those
+// versions too, following the epoll_wait@GLIBC_2.3.2 pattern.
+SMASH_VISIBLE int sched_setaffinity_234(pid_t pid, size_t cpusetsize,
+                                        const cpu_set_t* mask) {
+    return sched_setaffinity(pid, cpusetsize, mask);
+}
+__asm__(".symver sched_setaffinity_234,sched_setaffinity@GLIBC_2.3.4");
+
+SMASH_VISIBLE int sched_getaffinity_234(pid_t pid, size_t cpusetsize, cpu_set_t* mask) {
+    return sched_getaffinity(pid, cpusetsize, mask);
+}
+__asm__(".symver sched_getaffinity_234,sched_getaffinity@GLIBC_2.3.4");
+
+SMASH_VISIBLE int pthread_setaffinity_np_234(pthread_t thread, size_t cpusetsize,
+                                             const cpu_set_t* mask) {
+    return pthread_setaffinity_np(thread, cpusetsize, mask);
+}
+__asm__(".symver pthread_setaffinity_np_234,pthread_setaffinity_np@GLIBC_2.34");
+
+SMASH_VISIBLE int pthread_getaffinity_np_232(pthread_t thread, size_t cpusetsize,
+                                             cpu_set_t* mask) {
+    return pthread_getaffinity_np(thread, cpusetsize, mask);
+}
+__asm__(".symver pthread_getaffinity_np_232,pthread_getaffinity_np@GLIBC_2.32");
 
 // ── getcwd wrapper ──────────────────────────────────────────────────────────
 // getcwd writes the current working directory path into a user-provided buffer.

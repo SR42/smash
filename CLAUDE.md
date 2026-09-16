@@ -140,7 +140,7 @@ bench/                  Benchmarks (throughput, compression ratio, RSS, latency)
 
 ## Syscall & Buffered I/O Compatibility
 
-See [agents/syscall-compat.md](agents/syscall-compat.md) for details on EFAULT-driven decompress-and-retry, DYLD interposition limitations, buffered-I/O carve-outs, and the full list of interposed functions per platform.
+See [agents/syscall-compat.md](agents/syscall-compat.md) for details on EFAULT-driven decompress-and-retry, DYLD interposition limitations, buffered-I/O carve-outs, and the full list of interposed functions per platform. It also records two things worth knowing before adding a wrapper: a wrapper exported only at the base glibc version never runs when glibc versions that symbol (the caller binds the versioned one), and a measured audit of which syscalls still return `EFAULT` when their buffer is on a compressed page.
 
 ## External-Mapping Tracking (`SMASH_TRACK_EXTERNAL=1`)
 

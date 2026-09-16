@@ -24,7 +24,8 @@ For these paths the EFAULT-retry model does not help — those syscalls happen i
 ## Interposed functions
 
 - macOS (`smash_heap.cpp`): `read`, `write`, `pread`, `pwrite`, `readv`, `writev`, `recv`, `send`, `recvfrom`, `sendto`, `recvmsg`, `sendmsg`, `poll`, `kevent`, `kevent64`, `mach_msg`, `mach_msg_overwrite`, `mach_msg2_internal`, plus the buffered-I/O carve-out above.
-- Linux (`linux_syscall_wrappers.cpp`): everything macOS has minus the Mach trio plus `ppoll`, `select`, `pselect`, `accept`, `accept4`, `recvmmsg`, `sendmmsg`, `getsockopt`, `getsockname`, `getpeername`, `getrandom`, `epoll_wait`, `epoll_pwait`.
+- Linux (`linux_syscall_wrappers.cpp`): everything macOS has minus the Mach trio plus `ppoll`, `select`, `pselect`, `accept`, `accept4`, `recvmmsg`, `sendmmsg`, `getsockopt`, `getsockname`, `getpeername`, `getrandom`, `epoll_wait`, `epoll_pwait`, `sched_setaffinity`, `sched_getaffinity`, `pthread_setaffinity_np`, `pthread_getaffinity_np`, plus the `stat`/`statx`, xattr, `statvfs`/`getrusage`/`prlimit64`, `getdents64`/`readlink` and `preadv`/`pwritev` families and `getcwd` (see the file for the full set).
+  - The affinity four are wrapped because a thread pool keeps one `cpu_set_t` per worker on the heap. `pthread_{set,get}affinity_np` need wrappers of their own: glibc reaches the kernel through an internal `__sched_setaffinity`, so interposing `sched_setaffinity` does not cover them, and they report failure by return value rather than through `errno`, so they warm the mask up front instead of relying only on the EFAULT retry.
 
 ## Platform-specific interposition patterns
 
@@ -46,3 +47,28 @@ extern "C" ssize_t smash_read(int fd, void* buf, size_t count) {
 SMASH_VISIBLE int epoll_wait_232(...) { return epoll_wait(...); }
 __asm__(".symver epoll_wait_232,epoll_wait@GLIBC_2.3.2");
 ```
+
+**A wrapper only wins if it is exported at the version the caller binds.** This is not a corner case: glibc versions `sched_setaffinity@GLIBC_2.3.4`, `pthread_setaffinity_np@GLIBC_2.34` and `pthread_getaffinity_np@GLIBC_2.32`, every caller binary references those exact versions, and the base-version (`GLIBC_2.2.5`) definitions added first never ran at all — the syscalls kept returning EFAULT with the wrappers apparently in place. Check both sides:
+
+```bash
+objdump -T <caller-binary> | grep <symbol>          # the version a caller asks for
+nm -D --with-symbol-versions libsmash.so | grep <symbol>   # must list that version too
+```
+
+## Audit: syscalls that still break on a compressed buffer (2026-09-16, Linux)
+
+`retryWithDecompress` only helps for the syscalls smash interposes; everything else hands the application the kernel's EFAULT. Measured with a scratch probe (not in the tree): a 16 MiB heap block, each syscall called twice — once warm, once with `mincore` confirming its page had left RSS — in full mode with `SMASH_COLD_TIMEOUT_SEC=1`. **21 of 31 probes still fail.**
+
+Not exposed:
+- interposed syscalls (`read`, `writev`, `fstat` controls — all recovered);
+- vDSO calls such as `clock_gettime`: they run in userspace, so a compressed page faults normally and the handler decompresses it;
+- libc functions that bounce through a stack buffer and copy in userspace: `gethostname`, `sigaction`'s `oldact`, `times`.
+
+Still exposed, ordered by how often the buffer is a heap object:
+
+| Risk | Syscalls |
+| --- | --- |
+| Heap buffers are idiomatic | `epoll_ctl` (event structs in heap arrays), `ioctl` (arbitrary app structs), `futex` (a `pthread_mutex_t`/`pthread_cond_t` embedded in a heap object), `bind`, `setsockopt`, `sendfile` (offset), `process_vm_readv`, `mincore` |
+| Usually stack, occasionally heap | `uname`, `sysinfo`, `statfs`, `getrlimit`, `getgroups`, `getcpu`, `prctl(PR_GET_NAME)`, `sigprocmask` (oldset), `nanosleep`, `utimensat`, `pipe2`, `socketpair` |
+
+A syscall only breaks when the application passes a *smash-managed heap* buffer; stack and static buffers are never compressed, which is why this class rarely surfaces. Affinity surfaced because thread pools keep their masks on the heap.
