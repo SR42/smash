@@ -236,7 +236,7 @@ smash::PageLockTable* smash::g_smash_page_locks_for_external = nullptr;
 // reservation, and accesses use a direct tpidr_el0 + offset load instead
 // of a __tls_get_addr indirection.
 __attribute__((tls_model("initial-exec")))
-thread_local smash::ThreadCache* smash::g_thread_cache = nullptr;
+constinit thread_local smash::ThreadCache* smash::g_thread_cache = nullptr;
 
 // constinit: keeps this out of the thread_local dynamic-init path, so reads do
 // not go through the `_ZTH...` wrapper guard. See the declaration in
@@ -251,22 +251,22 @@ constinit thread_local int smash::g_full_mode_cached = -1;
 // range is [0,0) so no address can hit it before the first resolve, and the
 // sentinel generation never matches the live one.
 __attribute__((tls_model("initial-exec")))
-thread_local smash::Span* smash::g_free_cache_span = nullptr;
+constinit thread_local smash::Span* smash::g_free_cache_span = nullptr;
 
 __attribute__((tls_model("initial-exec")))
-thread_local uintptr_t smash::g_free_cache_base = 0;
+constinit thread_local uintptr_t smash::g_free_cache_base = 0;
 
 __attribute__((tls_model("initial-exec")))
-thread_local uintptr_t smash::g_free_cache_end = 0;
+constinit thread_local uintptr_t smash::g_free_cache_end = 0;
 
 __attribute__((tls_model("initial-exec")))
-thread_local uint64_t smash::g_free_cache_gen = ~0ULL;
+constinit thread_local uint64_t smash::g_free_cache_gen = ~0ULL;
 
 __attribute__((tls_model("initial-exec")))
-thread_local uint32_t smash::g_free_cache_skip = 0;
+constinit thread_local uint32_t smash::g_free_cache_skip = 0;
 
 __attribute__((tls_model("initial-exec")))
-thread_local uintptr_t smash::g_arena_stack_base = 0;
+constinit thread_local uintptr_t smash::g_arena_stack_base = 0;
 
 // ── Syscall interposition for kernel buffer compatibility ────────────────────
 //

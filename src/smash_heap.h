@@ -92,8 +92,11 @@ extern PageLockTable* g_smash_page_locks_for_external;
 // Without this, the compiler emits __tls_get_addr indirections for
 // every static-local thread_local in an inline function, costing one
 // dependent indirect call per TLS access on the hot path.
+// Every extern thread_local below is constinit — see the note on
+// g_full_mode_cached for what that prevents (a TLS init-wrapper guard on the
+// malloc/free fast paths, and the GCC sanitizer false positive it feeds).
 extern __attribute__((tls_model("initial-exec")))
-    thread_local ThreadCache* g_thread_cache;
+    constinit thread_local ThreadCache* g_thread_cache;
 
 // constinit is load-bearing, not decoration. Without it the compiler treats
 // this as possibly dynamically initialized and guards every read with the
@@ -127,13 +130,13 @@ extern __attribute__((tls_model("initial-exec")))
 // stale cached span (its own cache miss) before falling through to the table
 // load. On a miss we touch only TLS scalars, then resolve via the table once.
 extern __attribute__((tls_model("initial-exec")))
-    thread_local Span* g_free_cache_span;
+    constinit thread_local Span* g_free_cache_span;
 extern __attribute__((tls_model("initial-exec")))
-    thread_local uintptr_t g_free_cache_base;
+    constinit thread_local uintptr_t g_free_cache_base;
 extern __attribute__((tls_model("initial-exec")))
-    thread_local uintptr_t g_free_cache_end;
+    constinit thread_local uintptr_t g_free_cache_end;
 extern __attribute__((tls_model("initial-exec")))
-    thread_local uint64_t g_free_cache_gen;
+    constinit thread_local uint64_t g_free_cache_gen;
 // Populate-throttle countdown. On a miss the cache is repopulated only when
 // this hits 0, then reset to (interval-1); otherwise it counts down and the
 // stale entry is left in place. Hits reset it to 0 so the next miss repopulates
@@ -141,7 +144,7 @@ extern __attribute__((tls_model("initial-exec")))
 // repopulates (max locality benefit); larger intervals amortize the populate
 // stores away on locality-free workloads where they are pure overhead.
 extern __attribute__((tls_model("initial-exec")))
-    thread_local uint32_t g_free_cache_skip;
+    constinit thread_local uint32_t g_free_cache_skip;
 
 // Stack-base anchor for callsiteArena()'s LLAMA-style depth bucket. Caches the
 // thread's TRUE stack base (highest address), computed once. depth_bucket is the
@@ -156,7 +159,7 @@ extern __attribute__((tls_model("initial-exec")))
 // assignments / RSS on rocksdb. Anchoring to the real stack base removes the
 // drift while preserving the depth signal.
 extern __attribute__((tls_model("initial-exec")))
-    thread_local uintptr_t g_arena_stack_base;
+    constinit thread_local uintptr_t g_arena_stack_base;
 
 // Resolve the thread's true stack base once and cache it in g_arena_stack_base.
 // Cold: only the first allocation per thread (plus any reentrant allocations the

@@ -82,11 +82,21 @@ both are easy to mis-attribute:
 
   Needs `-O2` or above; gcc 13.3 and 14.2 both reproduce, clang 18 is clean.
   `constinit` keeps the variable out of the dynamic-init path, which deletes the
-  wrapper guard and the false report together: **14 findings → 0**. It also
-  removes a `cmpq`/`je`/`call` from the malloc fast path of direct-linked
-  binaries. `libsmash.so` itself never had the guard — inside the library GCC
-  sees the definition and the use in one LTO unit and proves no dynamic init —
-  so this cost only ever fell on the direct-linked tests.
+  wrapper guard and the false report together: **14 findings → 0**, and the whole
+  sanitized suite now reports **0 findings**. It also removes a
+  `cmpq`/`je`/`call` from the fast path of direct-linked binaries.
+
+  All eight extern `thread_local`s in `smash_heap.h` are `constinit` for this
+  reason — `g_full_mode_cached`, `g_thread_cache`, the five `g_free_cache_*` and
+  `g_arena_stack_base` — which took the init-wrapper references in
+  `test_integration` from **204 to 0**, with no wrapper symbols left. Only these
+  file-scope `extern` declarations generate wrappers; `inline thread_local` and
+  function-local `static thread_local` (e.g. `g_compressor_thread`,
+  `tl_numa_worker_`) generate none, so they need nothing.
+
+  `libsmash.so` itself never had the guard — inside the library GCC sees the
+  definition and the use in one LTO unit and proves no dynamic init — so this
+  cost only ever fell on the direct-linked test binaries.
 
 ## Test
 
@@ -345,6 +355,7 @@ libsmash is built **fat** (arm64 + arm64e) so it can interpose into both ordinar
 - Thread hooks must be exported at the version the caller binds. `pthread_create`/`pthread_exit` are exported **twice** — at the base version and at `GLIBC_2.34` (`.symver` aliases in `linux_syscall_wrappers.cpp`, both names listed in the version script). glibc 2.34 merged libpthread into libc and made `GLIBC_2.34` the default for these, so a base-only export means alloc8's interposer never sees an application thread and every thread leaks its 92 KiB `ThreadCache`. The same rule as for versioned syscall wrappers (see [agents/syscall-compat.md](agents/syscall-compat.md)); it applies to thread hooks too, and it failed silently for both.
 - A thread cache must be reclaimable without the interposer. `getOrCreateThreadCache()` arms a `pthread_key_t` whose destructor drains and pools the cache on any thread exit, however the thread was created; `threadCleanup()` clears that key's value so a wrapped thread cannot return the same cache twice, and the destructor re-checks `currentThreadCache()` before acting. Keep both guards if you touch either path.
 - `newThreadCache()` returns nullptr when BootstrapAlloc is exhausted, and every `getOrCreateThreadCache()` caller handles it: `mallocSlow` falls back to the system allocator, and both `freeSlow` paths return the object straight to its slab via `Slab::deallocate(span, ptr)` rather than dropping it.
+- Every file-scope `extern thread_local` must be declared **and** defined `constinit`. Without it the compiler treats the variable as possibly dynamically initialized and guards each read with a `cmpq`/`je`/`call` on its `_ZTH...` init wrapper — on the malloc and free fast paths — and that guard also feeds a GCC `-fsanitize=null` bug that reports a spurious null load over correct code (see "Sanitizers"). `constinit` is a compile-time assertion, so a non-constant initializer fails the build rather than silently reinstating the guard.
 - A thread that parks on a futex must check its exit flag **before** parking, not only after it observes a work-generation change. The publisher sets the flag, bumps the generation and wakes, in that order; a thread whose first instructions run after all three has nothing left to observe and sleeps forever, taking the joiner down with it. Re-checking after a generation change is not enough, because a thread that starts late never sees one. This cost a 2.3% hang of short-lived processes (see "Compressor shutdown race").
 - A smash thread must never be what keeps a process alive. glibc ends a process when its thread count hits zero, so any thread smash creates has to register with `exit_guard::ThreadRegistration` (`util/exit_guard.h`) and be stopped by `SmashHeap::stopAllSmashThreads()`. A new background thread that skips either one re-introduces the `pthread_exit()`-from-main hang, and does so silently — the process just never exits. Any stop path must also skip joining the calling thread.
 - Compressor startup: constructor at priority 201 (after alloc8 pthread hooks at 200) calls `xxthread_init()` twice on macOS, once on Linux, ensuring the compressor starts even for non-ObjC programs (e.g., Python) and single-threaded programs
