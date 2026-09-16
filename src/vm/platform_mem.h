@@ -123,6 +123,25 @@ inline void* reservePages(size_t size) {
 #endif
 }
 
+// Map read/write address space whose pages the kernel backs lazily on first
+// touch. Same RSS behaviour as reservePages() followed by commitPages() — an
+// untouched page costs nothing either way — but with no commit step, so a
+// caller never has to serialize an mprotect inside its allocation path. The
+// >= 64 KiB allocateZeroed path already maps read/write directly.
+inline void* mapPagesNoReserve(size_t size) {
+#if defined(_WIN32)
+    return VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#elif defined(__linux__)
+    void* p = rawMmap(nullptr, size, PROT_READ | PROT_WRITE,
+                      MAP_PRIVATE | MAP_ANON | MAP_NORESERVE);
+    return (p == MAP_FAILED) ? nullptr : p;
+#else
+    void* p = rawMmap(nullptr, size, PROT_READ | PROT_WRITE,
+                      MAP_PRIVATE | MAP_ANON);
+    return (p == MAP_FAILED) ? nullptr : p;
+#endif
+}
+
 // Commit pages within a reserved region (make them accessible).
 inline bool commitPages(void* addr, size_t size) {
 #if defined(_WIN32)

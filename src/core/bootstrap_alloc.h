@@ -26,7 +26,6 @@ class BootstrapAlloc {
         char* base;
         size_t capacity;
         std::atomic<size_t> offset;
-        std::atomic<size_t> committed;  // high-water of committed bytes (page-aligned)
     };
 
     Region regions_[kBootstrapMaxRegions];
@@ -43,31 +42,6 @@ class BootstrapAlloc {
     std::atomic<uintptr_t> bounds_lo_{UINTPTR_MAX};
     std::atomic<uintptr_t> bounds_hi_{0};
 
-    static size_t pageSize() {
-        static const size_t ps = static_cast<size_t>(sysconf(_SC_PAGESIZE));
-        return ps;
-    }
-
-    static size_t roundUpToPage(size_t n) {
-        size_t ps = pageSize();
-        return (n + ps - 1) & ~(ps - 1);
-    }
-
-    void ensureCommitted(Region& r, size_t end) {
-        if (end <= r.committed.load(std::memory_order_acquire)) return;
-        size_t target = roundUpToPage(end);
-        if (target > r.capacity) target = r.capacity;
-        // Serialize commits: mprotect must complete before any thread
-        // may write to the newly-committed range. The lock is only
-        // contended when multiple threads cross a page boundary
-        // simultaneously (rare — bump allocator is fast).
-        LockGuard guard(expand_lock_);
-        size_t cur = r.committed.load(std::memory_order_relaxed);
-        if (cur >= target) return;
-        vm::commitPages(r.base + cur, target - cur);
-        r.committed.store(target, std::memory_order_release);
-    }
-
     void* tryAllocFrom(Region& r, size_t size, size_t align) {
         size_t off = r.offset.load(std::memory_order_relaxed);
         for (;;) {
@@ -75,14 +49,32 @@ class BootstrapAlloc {
             size_t end = aligned + size;
             if (end > r.capacity) return nullptr;
             if (r.offset.compare_exchange_weak(off, end, std::memory_order_relaxed)) {
-                ensureCommitted(r, end);
+                // No commit step: the region is mapped read/write already and
+                // the kernel backs each page on first touch. This path must
+                // stay lock-free — see addRegion() for what happened when it
+                // was not.
                 return r.base + aligned;
             }
         }
     }
 
+    // Regions are mapped read/write up front (MAP_NORESERVE, so an untouched
+    // page still costs nothing).
+    //
+    // They used to be reserved PROT_NONE and mprotect'd forward by an
+    // ensureCommitted() called from tryAllocFrom() on every allocation that
+    // crossed a page — under the global expand_lock_. That was a self-deadlock:
+    // expandAndAllocate() takes expand_lock_ and then calls tryAllocFrom(), so
+    // the first allocation that had to grow the arena re-entered the same
+    // non-recursive spinlock, spun forever while holding it, and every other
+    // thread piled up behind it. Reproduced with mimalloc's test-stress: a
+    // ThreadCache is 92 KiB and goes through allocate(), so ~728 of them
+    // exhaust the 64 MiB initial region and the next one wedges the process.
+    // Four threads were enough; it is a function of total allocation, not
+    // concurrency. Mapping read/write removes the commit path, the syscall
+    // under a spinlock, and the recursion in one go.
     bool addRegion(size_t size) {
-        void* mem = vm::reservePages(size);
+        void* mem = vm::mapPagesNoReserve(size);
         if (!mem) return false;
         size_t idx = num_regions_.load(std::memory_order_relaxed);
         if (idx >= kBootstrapMaxRegions) {
@@ -92,7 +84,6 @@ class BootstrapAlloc {
         regions_[idx].base = static_cast<char*>(mem);
         regions_[idx].capacity = size;
         regions_[idx].offset.store(0, std::memory_order_relaxed);
-        regions_[idx].committed.store(0, std::memory_order_relaxed);
         num_regions_.store(idx + 1, std::memory_order_release);
 
         // Extend [lo, hi] envelope so owns() can fast-reject pointers

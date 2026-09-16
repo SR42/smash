@@ -73,6 +73,16 @@ Only the first and last page of each chunk is touched in `test_vm_exhaustion`, s
 
 A sixth test, `test_esr_write_bit`, covers a different aarch64 gap found while reading the same code — not a `bad_alloc` route. `FaultHandler::signalHandler` classifies each fault as a read or a write for the compressor's soft-dirty ROI re-dirty signal, but the decode was x86-only (`gregs[REG_ERR]` bit 1), so on aarch64 `faultWasWrite()` stayed `-1` for every fault and the sole reader (`recordRedirtyForPage`) counted every decompress as a write. Safe — an over-reported re-dirty defers compression — but blind: a read fault would have kept its blob valid and should not have been scored as churn. `aarch64EsrWriteBit()` decodes ESR_EL1's WnR bit (bit 6) out of the `esr_context` record the kernel puts in `sigcontext::__reserved`, walking the `_aarch64_ctx` chain by hand rather than including `<asm/sigcontext.h>` (which conflicts with the signal includes, per the note on `faultWasWrite`). It reports unknown rather than guessing when WnR carries no information — a cache-maintenance fault (CM bit set), or an exception class that is not a data or instruction abort. The decoder is a pure function over bytes, so the test feeds it synthetic signal frames and runs on any host; there is no aarch64 CI runner, and the aarch64 branch of the handler itself is therefore unbuilt by CI.
 
+### BootstrapAlloc growth (self-deadlock guard)
+
+`test_bootstrap`'s `testGrowPastFirstRegion` allocates 1 MiB at a time until it passes the 64 MiB initial region, forcing `addRegion()`, and touches both ends of every chunk so the new region is proven writable. It is single-threaded and takes milliseconds.
+
+It guards the deadlock described in Key Conventions: `expandAndAllocate()` holds `expand_lock_` and calls `tryAllocFrom()`, which used to call `ensureCommitted()`, which took the same non-recursive spinlock to `mprotect` the next pages. The first allocation that had to grow the arena spun forever holding the lock, and every other thread piled up behind it — 25 threads in `R` state at ~730% CPU, 23 of them innermost in `spinRelax`.
+
+Found with mimalloc's `test-stress` built with `USE_STD_MALLOC=1` (the only test in that suite that exercises smash rather than mimalloc's own `mi_*` API), run under a plain `LD_PRELOAD` with no smash environment — i.e. the default, experimental full mode. The trigger is total allocation, not concurrency: a `ThreadCache` is 92 KiB and goes through `allocate()`, so ~728 of them exhaust the initial region. 16 threads × 20 iterations passed; 4 × 250, 8 × 120, 16 × 60 and 32 × 50 all hung, and all four complete in 1–16 s after the fix.
+
+**Verified as a real discriminator:** reverted to the pre-fix `bootstrap_alloc.h`, this test hangs (killed at 45 s); restored, it passes. The RSS-budget tests (`test_aligned_alloc_footprint_{full,large_only}`, `test_vm_exhaustion`, `test_vma_pressure`) all still pass, which is the check that mapping regions read/write up front did not cost footprint — a budget check, not a direct before/after RSS measurement.
+
 ### Hugepages, VMA pressure, and buffered-stdio integrity
 
 Follow-ups for the case where the application allocates hugepages with `mmap`. All Linux-only; they skip cleanly elsewhere.
@@ -190,6 +200,7 @@ libsmash is built **fat** (arm64 + arm64e) so it can interpose into both ordinar
 ## Key Conventions
 
 - Never allocate from the managed heap inside smash internals — use BootstrapAlloc
+- `BootstrapAlloc`'s allocation path is lock-free by design: regions are mapped read/write up front (`vm::mapPagesNoReserve`, `MAP_NORESERVE` so untouched pages still cost nothing) and `tryAllocFrom()` is a pure CAS bump. `expand_lock_` guards `addRegion()` alone. **Never take that lock from the allocation path**: `expandAndAllocate()` already holds it when it calls `tryAllocFrom()`, so re-entering it self-deadlocks on a non-recursive spinlock and wedges every other thread behind the holder. That is exactly what the old `ensureCommitted()` did — it `mprotect`-ed the next pages under `expand_lock_` on every allocation that crossed a page — and it hung the process the first time the arena had to grow. Trigger is total allocation, not concurrency: a `ThreadCache` is 92 KiB and goes through `allocate()`, so ~728 of them exhaust the 64 MiB initial region, and 4 threads were enough to reach it.
 - Data pages never contain metadata (bitmap-based free tracking, pointer arrays in thread cache)
 - Fine-grained locking: per-slab spinlocks, per-page spinlocks. No global heap lock. 4 arenas reduce slab lock contention.
 - `PageLockTable::tryLock()` used for prefetch to avoid deadlock

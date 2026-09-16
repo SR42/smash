@@ -16,6 +16,44 @@ static int failures = 0;
     } \
 } while (0)
 
+// Growing past the initial region must not deadlock.
+//
+// expandAndAllocate() holds expand_lock_ and calls tryAllocFrom(). While
+// tryAllocFrom() also called ensureCommitted() — which took that same
+// non-recursive spinlock to mprotect the next pages — the first allocation
+// that had to grow the arena spun forever holding the lock, wedging every
+// other thread behind it. Regions are mapped read/write up front now, so the
+// allocation path takes no lock at all.
+//
+// This is a pure allocation-volume trigger, not a concurrency one: a single
+// thread reaches it. Under smash the arena fills with 92 KiB ThreadCaches
+// (~728 of them exhaust the 64 MiB initial region); here we just allocate
+// past it directly. Before the fix this function hangs; after it, it returns
+// in milliseconds.
+static void testGrowPastFirstRegion() {
+    auto& ba = BootstrapAlloc::instance();
+    constexpr size_t kChunk = 1024 * 1024;                       // 1 MiB a time
+    const size_t chunks = (kBootstrapInitialSize / kChunk) + 8;  // past the end
+
+    void* first = nullptr;
+    void* last = nullptr;
+    for (size_t i = 0; i < chunks; ++i) {
+        void* p = ba.allocate(kChunk, 16);
+        CHECK(p != nullptr, "allocation %zu of %zu failed while growing", i, chunks);
+        if (!p) return;
+        // Touch both ends: the pages are mapped read/write but only backed on
+        // first touch, so this also proves the new region is writable.
+        static_cast<char*>(p)[0] = 1;
+        static_cast<char*>(p)[kChunk - 1] = 2;
+        CHECK(ba.owns(p), "grown region's pointer %p not owned", p);
+        if (!first) first = p;
+        last = p;
+    }
+    CHECK(first != last, "expected several distinct allocations");
+    fprintf(stderr, "bootstrap: grew past the %zu MiB initial region (%zu MiB allocated)\n",
+            kBootstrapInitialSize / (1024 * 1024), (chunks * kChunk) / (1024 * 1024));
+}
+
 static void testBasicAlloc() {
     auto& ba = BootstrapAlloc::instance();
 
@@ -77,6 +115,8 @@ int main() {
     testBasicAlloc();
     testAlignment();
     testManyAllocations();
+    // Last: it consumes the initial region on purpose.
+    testGrowPastFirstRegion();
 
     if (failures == 0) {
         fprintf(stderr, "bootstrap: all tests passed\n");
