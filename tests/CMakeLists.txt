@@ -443,6 +443,17 @@ add_smash_mode_test(test_numa_compressor_large_only numa_compressor_test 1 120
 add_executable(thread_cache_reclaim_test thread_cache_reclaim_test.cpp)
 set_target_properties(thread_cache_reclaim_test PROPERTIES CXX_STANDARD 20)
 target_link_libraries(thread_cache_reclaim_test PRIVATE ${CMAKE_DL_LIBS} pthread)
+# Shutdown race: stop() joins the NUMA node workers at process exit, and a
+# worker that reached its park loop after the stop signal slept forever on a
+# futex nothing would wake — hanging the join under __cxa_finalize. Needs
+# startup and teardown to nearly coincide, so the test spawns many very
+# short-lived preloaded children (2.3% of them hung before the fix).
+add_executable(shutdown_race_test shutdown_race_test.cpp)
+set_target_properties(shutdown_race_test PROPERTIES CXX_STANDARD 20)
+target_link_libraries(shutdown_race_test PRIVATE ${CMAKE_DL_LIBS} pthread)
+add_smash_mode_test(test_shutdown_race_full       shutdown_race_test 0 180)
+add_smash_mode_test(test_shutdown_race_large_only shutdown_race_test 1 180)
+
 # Process exit after main retires with pthread_exit(): smash's background
 # threads keep glibc's thread count above zero, so the process hung forever
 # until the exit guard stopped them when the last application thread went away.

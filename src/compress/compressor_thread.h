@@ -3424,6 +3424,22 @@ private:
         nw->tid.store(static_cast<int>(syscall(SYS_gettid)), std::memory_order_release);
         uint32_t last = self->numa_work_gen_.load(std::memory_order_acquire);
         for (;;) {
+            // Check the exit signal BEFORE parking, not only after a generation
+            // change. stopNodeThreads() stores numa_exit_, bumps the generation
+            // and wakes, in that order; a worker whose first instructions run
+            // after all three have happened samples the already-bumped
+            // generation into `last`, finds gen == last, and parks on a futex
+            // that nothing will ever bump again — and the pthread_join in
+            // stopNodeThreads() then waits on it forever. The window between
+            // the load below and futexWait() is already safe (the value
+            // changed, so FUTEX_WAIT returns EAGAIN); this is the thread-start-
+            // after-stop ordering, which is not.
+            //
+            // Caught as a ~2% hang of short-lived programs: a gdb backtrace of
+            // a hung run showed main in pthread_join under __cxa_finalize and a
+            // node worker asleep in futexWait here. Only hosts with >= 2 memory
+            // nodes create node groups, which is why CI never saw it.
+            if (self->numa_exit_.load(std::memory_order_acquire)) break;
             const uint32_t gen = self->numa_work_gen_.load(std::memory_order_acquire);
             if (gen == last) {
                 futexWait(self->numa_work_gen_, gen);

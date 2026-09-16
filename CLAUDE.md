@@ -16,13 +16,61 @@ cmake .. && make -j$(nproc)
 cmake .. -DSMASH_BUILD_BENCH=ON && make -j$(nproc)
 ```
 
+### Sanitizers
+
+`-DSMASH_SANITIZE=undefined` builds smash and its tests with UBSan. Always use a
+separate build directory: the sanitized library is slower and links libubsan, so
+it is neither what you benchmark nor what you ship, and reusing the normal build
+directory is how you end up testing a library you did not mean to test.
+
+```bash
+cmake -S . -B build-ubsan -DSMASH_SANITIZE=undefined \
+      -DALLOC8_DIR=$PWD/build/_deps/alloc8-src
+cmake --build build-ubsan -j$(nproc)
+cd build-ubsan && UBSAN_OPTIONS=print_stacktrace=1:log_path=/tmp/ubsan ctest
+```
+
+`log_path` is worth setting: it gives every test process its own report file, so
+a finding inside a test that still *passes* is not lost — ctest only shows the
+output of tests that fail. Findings are recoverable by default so the first does
+not mask the rest; `UBSAN_OPTIONS=halt_on_error=1` stops at the first instead.
+
+The option also accepts `address`, but ASan is not useful for the preloaded
+library: ASan replaces malloc, which is exactly what smash exists to do, so the
+two fight over the same job. Use it to instrument a single direct-linked test
+binary, not libsmash.
+
+**Measured on the first full UBSan run (2026-09-16):** 39 of 40 then-enabled
+tests pass, with one failure and one finding. Neither is a smash defect, and
+both are easy to mis-attribute:
+
+- `test_syscall_efault` fails under UBSan **deterministically** (3 of 3, at ~5 s)
+  and passes in the normal build (3 of 3, ~48 s). Isolated by swapping sides: a
+  stock test binary against the **instrumented library** passes, while the
+  **instrumented test binary** fails against *either* library. So the EFAULT
+  decompress-and-retry wrapper is not what breaks. The retry recovers by
+  touching each page to provoke the fault that decompresses it
+  (`vm::warmPages`), and instrumenting the application's own buffer accesses
+  disturbs that. Do not chase it as a wrapper regression — the natural reading,
+  and the wrong one.
+- One finding, six occurrences, all the same site:
+  `smash_heap.h:315` "load of null pointer of type 'int'" in `fullMallocPath()`,
+  reported only from the direct-linked `test_integration`, which still **passes**
+  — so it is diagnostic-only. `g_full_mode_cached` is an ordinary
+  `extern ... thread_local int` with `tls_model("initial-exec")`, and the read is
+  a plain load. **Unexplained so far:** minimal reproducers (two TUs,
+  `always_inline`, LTO, and a shared-library split) all emit the same
+  weak-undefined `_ZTH` TLS-init wrapper as the real binary and stay clean, so
+  the wrapper alone is not the trigger. Treat as open rather than as a known
+  false positive.
+
 ## Test
 
 ```bash
 cd build && ctest --output-on-failure
 ```
 
-All 40 enabled tests must pass (3 more are registered `DISABLED` with the `known_issue` label — see below). CI (`.github/workflows/ci.yml`) runs the full suite on `ubuntu-latest` and `macos-latest` on every push and PR. Twenty-three of the tests are end-to-end under `DYLD_INSERT_LIBRARIES` / `LD_PRELOAD`:
+All 42 enabled tests must pass (3 more are registered `DISABLED` with the `known_issue` label — see below). CI (`.github/workflows/ci.yml`) runs the full suite on `ubuntu-latest` and `macos-latest` on every push and PR. Twenty-five of the tests are end-to-end under `DYLD_INSERT_LIBRARIES` / `LD_PRELOAD`:
 
 - `test_arena_routing` guards call-site arena routing — the invariant behind the paper's compression-homogeneity claim. Runs a program with 32 distinct noinline allocation sites under interposition and asserts, via the exported `smash_arena_for(ptr)` query, that they do **not** all collapse into one arena. This is the regression guard for the LTO/wrapper return-address bug: under dynamic interposition the return address seen inside the allocator can point into the wrapper library instead of the app, collapsing every call site into one arena (homogeneity 0%). Fast and deterministic (no compressor): full mode routes 256 B allocations through the slab, and `SMASH_CPU_ARENA=0` + default thread-hash-off make the arena a pure function of the return address, so a buggy capture yields exactly 1 distinct arena. Verified as a real discriminator (injecting a constant RA makes it fail with `distinct_arenas=1`). Must run under interposition — a direct-linked call would never exercise the wrapper path where the bug lives.
 
@@ -92,6 +140,39 @@ Reclaiming the cache used to depend entirely on alloc8's `pthread_create` interp
 Two independent mechanisms now cover it, and the three registrations isolate them: `_full` exercises the versioned alias path, `_tls_only` sets `SMASH_NO_THREAD_HOOKS=1` so `threadInit`/`threadCleanup` are no-ops and only the `pthread_key_t` destructor can reclaim, and `_large_only` is the control where small allocations never create a cache. Measured after the fix: 0.3, 0.2 and 0.2 KiB per thread respectively, with RSS flat from thread 500 to thread 14000.
 
 A separate hang on the same idiom — an application whose *main* thread retires with `pthread_exit(NULL)` — was found while testing this and is fixed by the process-exit guard described in the next section.
+
+### Compressor shutdown race (node-worker park loop)
+
+`test_shutdown_race_{full,large_only}` spawn 200 very short-lived preloaded
+children and assert every one exits. `CompressorThread::stop()` joins the NUMA
+node-group workers at process exit, and a worker could be asleep on a futex that
+nothing would ever wake again, so the `pthread_join` inside `__cxa_finalize`
+waited forever and the process never exited.
+
+`stopNodeThreads()` stores `numa_exit_`, bumps `numa_work_gen_` and wakes, in
+that order. The worker's park loop sampled the generation once at thread start
+and only consulted `numa_exit_` *after* observing a generation **change**. A
+worker whose first instructions ran after all three stop operations had already
+happened therefore sampled the already-bumped generation into `last`, found
+`gen == last`, and parked forever. The window between the load and the
+`futexWait` is already safe — the value changed, so `FUTEX_WAIT` returns EAGAIN
+— it is the thread-start-after-stop ordering that was not. The fix is to check
+`numa_exit_` **before** parking.
+
+It needs startup and teardown to nearly coincide, so it hit short-lived
+programs. Measured on `arena_routing_test` (0.02 s): **7 hangs in 300 runs
+(2.3%) before the fix, 0 in 300 after**. It first surfaced as an intermittent
+`test_arena_routing` timeout — a poor guard, since that test only catches the
+race by accident, which is why `test_shutdown_race_*` provokes it directly. A
+gdb backtrace of a caught hang showed main in `pthread_join` under
+`__cxa_finalize` → `stop()` → `stopNodeThreads()`, with a node worker asleep in
+`futexWait`. Node groups only exist on hosts with ≥ 2 memory nodes, which is why
+single-node CI runners never saw it.
+
+**Verified as a real discriminator:** rebuilt against the pre-fix park loop,
+`test_shutdown_race_full` and `test_shutdown_race_large_only` both fail (0% of 2
+passed, ~11 s each as they hit a hung child); with the fix restored both pass in
+~3.5 s.
 
 ### Process exit after `pthread_exit()` from main
 
@@ -240,6 +321,7 @@ libsmash is built **fat** (arm64 + arm64e) so it can interpose into both ordinar
 - Thread hooks must be exported at the version the caller binds. `pthread_create`/`pthread_exit` are exported **twice** — at the base version and at `GLIBC_2.34` (`.symver` aliases in `linux_syscall_wrappers.cpp`, both names listed in the version script). glibc 2.34 merged libpthread into libc and made `GLIBC_2.34` the default for these, so a base-only export means alloc8's interposer never sees an application thread and every thread leaks its 92 KiB `ThreadCache`. The same rule as for versioned syscall wrappers (see [agents/syscall-compat.md](agents/syscall-compat.md)); it applies to thread hooks too, and it failed silently for both.
 - A thread cache must be reclaimable without the interposer. `getOrCreateThreadCache()` arms a `pthread_key_t` whose destructor drains and pools the cache on any thread exit, however the thread was created; `threadCleanup()` clears that key's value so a wrapped thread cannot return the same cache twice, and the destructor re-checks `currentThreadCache()` before acting. Keep both guards if you touch either path.
 - `newThreadCache()` returns nullptr when BootstrapAlloc is exhausted, and every `getOrCreateThreadCache()` caller handles it: `mallocSlow` falls back to the system allocator, and both `freeSlow` paths return the object straight to its slab via `Slab::deallocate(span, ptr)` rather than dropping it.
+- A thread that parks on a futex must check its exit flag **before** parking, not only after it observes a work-generation change. The publisher sets the flag, bumps the generation and wakes, in that order; a thread whose first instructions run after all three has nothing left to observe and sleeps forever, taking the joiner down with it. Re-checking after a generation change is not enough, because a thread that starts late never sees one. This cost a 2.3% hang of short-lived processes (see "Compressor shutdown race").
 - A smash thread must never be what keeps a process alive. glibc ends a process when its thread count hits zero, so any thread smash creates has to register with `exit_guard::ThreadRegistration` (`util/exit_guard.h`) and be stopped by `SmashHeap::stopAllSmashThreads()`. A new background thread that skips either one re-introduces the `pthread_exit()`-from-main hang, and does so silently — the process just never exits. Any stop path must also skip joining the calling thread.
 - Compressor startup: constructor at priority 201 (after alloc8 pthread hooks at 200) calls `xxthread_init()` twice on macOS, once on Linux, ensuring the compressor starts even for non-ObjC programs (e.g., Python) and single-threaded programs
 - Fault handler handles ACTIVE state (not just ACTIVE_MONITORING) to cover the race where Phase 3's batched mprotect overwrites a per-page PROT_RW restoration
