@@ -21,6 +21,7 @@
 #include "../core/bootstrap_alloc.h"
 #include "../core/page_map.h"
 #include "../util/spinlock.h"
+#include "../util/exit_guard.h"
 #include "../util/safe_printf.h"  // signal-handler-safe snprintf for SIGUSR2 stats
 
 namespace smash {
@@ -3417,6 +3418,7 @@ private:
         g_compressor_thread = true;
         tl_numa_worker_ = true;
         blockAsyncSignalsOnSelf();
+        exit_guard::ThreadRegistration exit_reg;  // not an application thread
         auto* nw = static_cast<NodeWorker*>(arg);
         CompressorThread* self = nw->self;
         nw->tid.store(static_cast<int>(syscall(SYS_gettid)), std::memory_order_release);
@@ -4960,6 +4962,7 @@ private:
     __attribute__((cold)) static void* coordEntry(void* arg) {
         g_compressor_thread = true;
         blockAsyncSignalsOnSelf();
+        exit_guard::ThreadRegistration exit_reg;  // not an application thread
         auto* self = static_cast<CompressorThread*>(arg);
         while (self->running_.load(std::memory_order_relaxed)) {
             // Sleep in 10ms intervals, checking running_ flag each time.
@@ -4972,6 +4975,14 @@ private:
                 usleep(kSleepIntervalMs * 1000);
             }
             if (!self->running_.load(std::memory_order_relaxed)) break;
+            // Process-exit guard fallback: an application thread smash never
+            // saw start cannot run the TLS-destructor trigger, so re-check
+            // here once the main thread has retired via pthread_exit(). Costs
+            // one relaxed atomic load per tick until that happens.
+            if (exit_guard::applicationIsGone()) {
+                exit_guard::runShutdown();   // stop() skips joining this thread
+                break;
+            }
             // Skip the tick if a fork is in progress. The atfork prepare
             // handler set paused_ and is waiting for in_tick_ to be 0;
             // entering tick() now would race the impending fork().
@@ -5009,6 +5020,7 @@ private:
     __attribute__((cold)) static void* helperEntry(void* arg) {
         g_compressor_thread = true;
         blockAsyncSignalsOnSelf();
+        exit_guard::ThreadRegistration exit_reg;  // not an application thread
         auto* ha = static_cast<HelperArg*>(arg);
         auto* self = ha->self;
         int helper_id = ha->id;
@@ -5776,12 +5788,19 @@ public:
         }
         trace_msg("setting running=false");
         running_.store(false, std::memory_order_release);
+        // The process-exit guard can call this from the coordinator itself
+        // (its fallback path), and a thread cannot join itself: pthread_join
+        // would return EDEADLK and leave the handle unjoined. Skip self — the
+        // caller returns from its entry function immediately afterwards.
+        const pthread_t me = pthread_self();
         trace_msg("joining coord_thread...");
-        pthread_join(coord_thread_, nullptr);
+        if (!pthread_equal(coord_thread_, me))
+            pthread_join(coord_thread_, nullptr);
         trace_msg("coord_thread joined");
         trace_msg("joining helper threads...");
         for (int i = 0; i < helpers_created_; ++i)
-            pthread_join(helper_threads_[i], nullptr);
+            if (!pthread_equal(helper_threads_[i], me))
+                pthread_join(helper_threads_[i], nullptr);
         trace_msg("all helpers joined");
 #if defined(__linux__)
         stopNodeThreads();

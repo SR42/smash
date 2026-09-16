@@ -9,6 +9,7 @@
 #include "core/slab.h"
 #include "core/large_alloc.h"
 #include "core/thread_cache.h"
+#include "util/exit_guard.h"
 #include "vm/vm_region.h"
 #include "vm/page_state.h"
 #include "vm/fault_handler.h"
@@ -1229,9 +1230,45 @@ public:
         pthread_setspecific(s_tc_key_, tc);
     }
 
+    // ── Process-exit guard ──────────────────────────────────────────────────
+    // A second key, armed for every thread whether or not it ever allocates,
+    // so smash sees each thread exit. That is what detects the application's
+    // last thread going away after main retired with pthread_exit(), which
+    // otherwise hangs the process forever — see util/exit_guard.h for the
+    // measurements and why the check is a /proc scan rather than a counter.
+    static inline pthread_key_t s_exit_key_{};
+    static inline pthread_once_t s_exit_key_once_ = PTHREAD_ONCE_INIT;
+
+    static void makeExitWatchKey() {
+        pthread_key_create(&s_exit_key_, &SmashHeap::onThreadExiting);
+    }
+
+    static void onThreadExiting(void*) { exit_guard::noteThreadExiting(); }
+
+    // Stops every thread smash created — the compressor's coordinator,
+    // helpers and node groups, plus VmRegion's lazily started decommit
+    // thread. Stops threads only: the compress store stays intact so that
+    // atexit handlers and static destructors running afterwards still fault
+    // in compressed pages normally (decompression runs on the faulting
+    // thread and needs no compressor thread).
+    static void stopAllSmashThreads() {
+        SmashHeap* self = s_self_;
+        if (!self) return;
+        self->shutdownCompressor();
+        self->vm_region_.stopBackgroundThread();
+    }
+
+    void armExitWatch() {
+        s_self_ = this;
+        exit_guard::setShutdownHook(&SmashHeap::stopAllSmashThreads);
+        pthread_once(&s_exit_key_once_, &SmashHeap::makeExitWatchKey);
+        pthread_setspecific(s_exit_key_, reinterpret_cast<void*>(1));
+    }
+
     ThreadCache* getOrCreateThreadCache() {
         ThreadCache*& tc = currentThreadCache();
         if (!tc) {
+            armExitWatch();
             tc = newThreadCache();
             if (tc) armThreadCacheReclaim(tc);
         }
@@ -1803,6 +1840,9 @@ public:
     }
 
     void threadInit() {
+        // Before any early return: a thread that never allocates, and a thread
+        // in a mode with no cache at all, still has to be seen exiting.
+        armExitWatch();
         if (noThreadHooks()) return;
         if (!isCompressOnlyMode()) {
             getOrCreateThreadCache();

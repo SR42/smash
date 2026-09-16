@@ -1398,6 +1398,8 @@ static void smash_atfork_child() {
     // getHeap() here doesn't allocate.
     auto* heap = SmashRedirect::getHeap();
     if (heap) heap->resetForFork();
+    // Drop the parent's thread registry: none of those threads exist here.
+    smash::exit_guard::resetAfterFork();
 }
 }
 

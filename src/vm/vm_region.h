@@ -19,6 +19,7 @@
 #include "page_state.h"
 #include "../core/bootstrap_alloc.h"
 #include "../util/spinlock.h"
+#include "../util/exit_guard.h"
 
 #include <atomic>
 #include <cstddef>
@@ -225,6 +226,9 @@ class VmRegion {
             sigdelset(&set, SIGILL);
             pthread_sigmask(SIG_BLOCK, &set, nullptr);
         }
+        // Not an application thread: the process-exit guard must not count
+        // this one as a reason to keep the process alive (util/exit_guard.h).
+        exit_guard::ThreadRegistration exit_reg;
         auto* self = static_cast<VmRegion*>(arg);
         while (self->decommit_running_.load(std::memory_order_relaxed)) {
             // Drain the queue
@@ -279,7 +283,9 @@ class VmRegion {
     void stopDecommitThread() {
         if (!decommit_running_.load(std::memory_order_relaxed)) return;
         decommit_running_.store(false, std::memory_order_release);
-        pthread_join(decommit_thread_, nullptr);
+        // Never join self — see the same guard in CompressorThread::stop().
+        if (!pthread_equal(decommit_thread_, pthread_self()))
+            pthread_join(decommit_thread_, nullptr);
         // Drain any remaining entries
         DecommitEntry* batch = decommit_head_.exchange(nullptr, std::memory_order_acquire);
         while (batch) {
@@ -415,6 +421,11 @@ public:
             vm::g_after_remap_hook = nullptr;
         stopDecommitThread();
     }
+
+    // Stop the lazily started decommit thread from outside the destructor.
+    // The process-exit guard (util/exit_guard.h) has to stop every thread
+    // smash created, and this one is not the compressor's to stop.
+    void stopBackgroundThread() { stopDecommitThread(); }
 
     bool isTrackingMode() const { return tracking_mode_; }
 

@@ -443,6 +443,16 @@ add_smash_mode_test(test_numa_compressor_large_only numa_compressor_test 1 120
 add_executable(thread_cache_reclaim_test thread_cache_reclaim_test.cpp)
 set_target_properties(thread_cache_reclaim_test PROPERTIES CXX_STANDARD 20)
 target_link_libraries(thread_cache_reclaim_test PRIVATE ${CMAKE_DL_LIBS} pthread)
+# Process exit after main retires with pthread_exit(): smash's background
+# threads keep glibc's thread count above zero, so the process hung forever
+# until the exit guard stopped them when the last application thread went away.
+# Both modes hang without the fix, so both are registered.
+add_executable(main_pthread_exit_test main_pthread_exit_test.cpp)
+set_target_properties(main_pthread_exit_test PROPERTIES CXX_STANDARD 20)
+target_link_libraries(main_pthread_exit_test PRIVATE ${CMAKE_DL_LIBS} pthread)
+add_smash_mode_test(test_main_pthread_exit_full       main_pthread_exit_test 0 120)
+add_smash_mode_test(test_main_pthread_exit_large_only main_pthread_exit_test 1 120)
+
 add_smash_mode_test(test_thread_cache_reclaim_full       thread_cache_reclaim_test 0 180)
 add_smash_mode_test(test_thread_cache_reclaim_tls_only   thread_cache_reclaim_test 0 180
                     "SMASH_NO_THREAD_HOOKS=1")
