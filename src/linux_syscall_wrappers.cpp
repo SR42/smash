@@ -973,6 +973,32 @@ SMASH_VISIBLE int pthread_getaffinity_np_232(pthread_t thread, size_t cpusetsize
 }
 __asm__(".symver pthread_getaffinity_np_232,pthread_getaffinity_np@GLIBC_2.32");
 
+// ── pthread_create / pthread_exit at the version modern glibc uses ──────────
+// alloc8 exports pthread_create/pthread_exit (linux_threads.cpp) to wrap every
+// thread in a trampoline that calls xxthread_init / xxthread_cleanup. glibc
+// 2.34 merged libpthread into libc and moved the default version to
+// GLIBC_2.34, so a caller built against it binds libc directly and alloc8's
+// interposer never runs for application threads. Measured on this tree before
+// these aliases existed: of 200 application threads, 16 were wrapped — and all
+// 16 were smash's own compressor threads, whose internal calls bind inside
+// libsmash. Every unwrapped thread leaked its ~92 KiB ThreadCache.
+//
+// Forcing a caller to request pthread_create@GLIBC_2.2.5 flipped it: 216
+// wrapped, 199 cache reuses, RSS growth 91.2 -> 0.3 KiB per thread. These
+// aliases make that the default. The calls below resolve inside libsmash
+// (-Bsymbolic), i.e. to alloc8's interposer.
+SMASH_VISIBLE int pthread_create_234(pthread_t* thread, const pthread_attr_t* attr,
+                                     void* (*start_routine)(void*), void* arg) {
+    return pthread_create(thread, attr, start_routine, arg);
+}
+__asm__(".symver pthread_create_234,pthread_create@GLIBC_2.34");
+
+SMASH_VISIBLE void pthread_exit_234(void* value_ptr) {
+    pthread_exit(value_ptr);
+    __builtin_unreachable();
+}
+__asm__(".symver pthread_exit_234,pthread_exit@GLIBC_2.34");
+
 // ── getcwd wrapper ──────────────────────────────────────────────────────────
 // getcwd writes the current working directory path into a user-provided buffer.
 // Uses the standard EFAULT-retry pattern like other syscall wrappers.

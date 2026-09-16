@@ -181,8 +181,11 @@ inline ThreadCache* newThreadCache() {
     ThreadCache* tc = ThreadCachePool::instance().acquire();
     if (tc) return tc;
 
-    // Allocate from bootstrap
+    // Allocate from bootstrap. Returns nullptr when the arena is exhausted;
+    // callers must handle that rather than placement-new onto null (which
+    // segfaulted at ~12k threads once caches started leaking).
     void* mem = BootstrapAlloc::instance().allocate(sizeof(ThreadCache), alignof(ThreadCache));
+    if (!mem) return nullptr;
     return new (mem) ThreadCache();
 }
 

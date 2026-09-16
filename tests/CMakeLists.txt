@@ -434,6 +434,20 @@ add_smash_mode_test(test_numa_compressor_full       numa_compressor_test 0 120
 add_smash_mode_test(test_numa_compressor_large_only numa_compressor_test 1 120
                     "SMASH_COLD_TIMEOUT_SEC=1")
 
+# Thread-cache reclaim: a ~92 KiB ThreadCache is created lazily on a thread's
+# first allocation and must be returned when the thread exits. Registered three
+# ways so each reclaim mechanism is covered on its own: full mode (alloc8's
+# interposer, reachable only because pthread_create is now exported at
+# GLIBC_2.34), full mode with the thread hooks disabled (smash's pthread_key_t
+# destructor alone), and large-only (no cache is ever created).
+add_executable(thread_cache_reclaim_test thread_cache_reclaim_test.cpp)
+set_target_properties(thread_cache_reclaim_test PROPERTIES CXX_STANDARD 20)
+target_link_libraries(thread_cache_reclaim_test PRIVATE ${CMAKE_DL_LIBS} pthread)
+add_smash_mode_test(test_thread_cache_reclaim_full       thread_cache_reclaim_test 0 180)
+add_smash_mode_test(test_thread_cache_reclaim_tls_only   thread_cache_reclaim_test 0 180
+                    "SMASH_NO_THREAD_HOOKS=1")
+add_smash_mode_test(test_thread_cache_reclaim_large_only thread_cache_reclaim_test 1 180)
+
 # Over-aligned footprint: SmashHeap::memalign() sends every alignment > 16 B to
 # LargeAlloc, which rounds up to a whole page — so an `alignas(64)` 64-byte
 # object costs a full kernel page (64x on 4 KiB pages, 256x on macOS arm64's

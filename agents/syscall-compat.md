@@ -48,7 +48,9 @@ SMASH_VISIBLE int epoll_wait_232(...) { return epoll_wait(...); }
 __asm__(".symver epoll_wait_232,epoll_wait@GLIBC_2.3.2");
 ```
 
-**A wrapper only wins if it is exported at the version the caller binds.** This is not a corner case: glibc versions `sched_setaffinity@GLIBC_2.3.4`, `pthread_setaffinity_np@GLIBC_2.34` and `pthread_getaffinity_np@GLIBC_2.32`, every caller binary references those exact versions, and the base-version (`GLIBC_2.2.5`) definitions added first never ran at all — the syscalls kept returning EFAULT with the wrappers apparently in place. Check both sides:
+**A wrapper only wins if it is exported at the version the caller binds.** This is not a corner case: glibc versions `sched_setaffinity@GLIBC_2.3.4`, `pthread_setaffinity_np@GLIBC_2.34` and `pthread_getaffinity_np@GLIBC_2.32`, every caller binary references those exact versions, and the base-version (`GLIBC_2.2.5`) definitions added first never ran at all — the syscalls kept returning EFAULT with the wrappers apparently in place.
+
+The same trap applies beyond the EFAULT wrappers: alloc8 exports `pthread_create`/`pthread_exit` to wrap every thread in its init/cleanup trampoline, glibc 2.34 merged libpthread into libc and made `GLIBC_2.34` their default version, and the base-only export meant the interposer **never ran for a single application thread** on any modern glibc — measured 16 wrapped out of 200, all 16 smash's own threads, each unwrapped thread leaking a 92 KiB `ThreadCache`. Both are now aliased at `GLIBC_2.34` as well. When adding any interposed function, check both sides:
 
 ```bash
 objdump -T <caller-binary> | grep <symbol>          # the version a caller asks for

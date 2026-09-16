@@ -1187,9 +1187,54 @@ public:
         log_time("TOTAL_CONSTRUCTOR");
     }
 
+    // ── Thread-cache reclaim ────────────────────────────────────────────────
+    // A ThreadCache is ~92 KiB and is created lazily on a thread's first
+    // allocation. Returning it on thread exit used to depend entirely on
+    // alloc8's pthread_create interposer calling xxthread_cleanup — and on
+    // glibc >= 2.34 that interposer never runs for application threads: callers
+    // bind pthread_create@GLIBC_2.34 while libsmash exported only the base
+    // version, so libc wins. Measured: 16 of 200 threads wrapped (all 16 were
+    // smash's own), 91.2 KiB leaked per application thread, and a segfault once
+    // BootstrapAlloc ran out at ~12k threads.
+    //
+    // The versioned aliases in linux_syscall_wrappers.cpp fix the interposition,
+    // but this TLS destructor is the belt: it fires on every thread exit
+    // whatever created the thread and however it terminates, so a cache is
+    // reclaimed even when nothing interposes pthread_create at all.
+    static inline SmashHeap* s_self_ = nullptr;
+    static inline pthread_key_t s_tc_key_{};
+    static inline pthread_once_t s_tc_key_once_ = PTHREAD_ONCE_INIT;
+
+    static void makeThreadCacheKey() {
+        pthread_key_create(&s_tc_key_, &SmashHeap::reclaimThreadCache);
+    }
+
+    // pthread_key destructor. glibc clears the value before calling this, so it
+    // runs at most once per thread.
+    static void reclaimThreadCache(void* value) {
+        auto* tc = static_cast<ThreadCache*>(value);
+        if (!tc) return;
+        ThreadCache*& slot = currentThreadCache();
+        // threadCleanup() may have got here first (a wrapped thread runs it
+        // before TLS destructors); it clears the slot and disarms the key.
+        if (slot != tc) return;
+        if (s_self_) tc->drainAll(s_self_->slabs_, &s_self_->page_map_);
+        returnThreadCache(tc);
+        slot = nullptr;
+    }
+
+    void armThreadCacheReclaim(ThreadCache* tc) {
+        s_self_ = this;
+        pthread_once(&s_tc_key_once_, &SmashHeap::makeThreadCacheKey);
+        pthread_setspecific(s_tc_key_, tc);
+    }
+
     ThreadCache* getOrCreateThreadCache() {
         ThreadCache*& tc = currentThreadCache();
-        if (!tc) tc = newThreadCache();
+        if (!tc) {
+            tc = newThreadCache();
+            if (tc) armThreadCacheReclaim(tc);
+        }
         return tc;
     }
 
@@ -1262,6 +1307,14 @@ public:
         uint8_t sc = sizeToClass(size);
         if (sc < kNumClasses) {
             ThreadCache* tc = getOrCreateThreadCache();
+            if (!tc) [[unlikely]] {
+                // BootstrapAlloc exhausted. Hand the request to the system
+                // allocator rather than dereferencing null; free() already
+                // routes pointers it does not own back there.
+                if (!g_system_alloc.malloc) g_system_alloc.resolve();
+                if (g_system_alloc.malloc) return g_system_alloc.malloc(size);
+                return nullptr;
+            }
             uintptr_t ra_for_arena = caller_ra ? caller_ra : appCallerRA();
             uint8_t arena = callsiteArena(sc, ra_for_arena);
             void* ptr = tc->allocate(sc, arena);
@@ -1418,6 +1471,12 @@ public:
                 // Smash-owned pointer slipped in before passthrough was active.
                 if (sp->is_large) { large_alloc_.deallocate(sp); return; }
                 ThreadCache* tc = getOrCreateThreadCache();
+                if (!tc) [[unlikely]] {
+                    // No cache to park it in: return the object straight to
+                    // its slab instead of dropping it.
+                    slab(sp->arena_id, sp->size_class).deallocate(sp, ptr);
+                    return;
+                }
                 if (!tc->deallocate(sp->size_class, sp->arena_id, ptr)) {
                     tc->drain(sp->size_class, sp->arena_id, slabs_, &page_map_);
                     tc->deallocate(sp->size_class, sp->arena_id, ptr);
@@ -1490,6 +1549,7 @@ public:
         uint8_t sc = span->size_class;
         uint8_t arena = span->arena_id;
         ThreadCache* tc = getOrCreateThreadCache();
+        if (!tc) [[unlikely]] { slab(arena, sc).deallocate(span, ptr); return; }
         if (!tc->deallocate(sc, arena, ptr)) { tc->drain(sc, arena, slabs_, &page_map_); tc->deallocate(sc, arena, ptr); }
     }
 
@@ -1766,7 +1826,13 @@ public:
         if (noThreadHooks()) return;
         if (isCompressOnlyMode()) return;
         ThreadCache*& tc = currentThreadCache();
-        if (tc) { tc->drainAll(slabs_, &page_map_); returnThreadCache(tc); tc = nullptr; }
+        if (tc) {
+            tc->drainAll(slabs_, &page_map_);
+            returnThreadCache(tc);
+            tc = nullptr;
+            // Disarm the TLS destructor: it must not pool the same cache twice.
+            pthread_setspecific(s_tc_key_, nullptr);
+        }
     }
 
     CohortPage* cohortPages() const { return cohort_pages_; }

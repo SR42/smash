@@ -334,6 +334,13 @@ GLIBC_2.34 {
   global:
     pthread_setaffinity_np;
     pthread_setaffinity_np_234;
+    # glibc 2.34 merged libpthread into libc and made GLIBC_2.34 the default
+    # version for these two. Exported only at the base version, alloc8's
+    # thread interposer never saw an application thread on any glibc >= 2.34.
+    pthread_create;
+    pthread_exit;
+    pthread_create_234;
+    pthread_exit_234;
 } GLIBC_2.32;
 
 # C++ operator new/delete with libstdc++ versioning
