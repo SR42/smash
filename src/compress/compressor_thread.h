@@ -5750,8 +5750,33 @@ public:
             if (!locks_->tryLock(i)) continue;
             PageState st = states_->get(i);
             void* page_addr = vm_->pageAddress(i);
-            if (st == PageState::COMPRESSED ||
-                st == PageState::COMPRESSED_SHADOW) {
+            if (st == PageState::COMPRESSED_SHADOW) {
+                // A shadow page was never reclaimed, so its backing is still
+                // mapped and holds the application's LIVE bytes — which may be
+                // newer than the blob. Nothing faults on a write to a PROT_RW
+                // shadow page, so the blob goes stale silently; only Phase B's
+                // content_matches check ever notices, and a page that never
+                // reaches Phase B never gets checked.
+                //
+                // Restoring the blob here reverts those writes. Measured: a
+                // glibc stdout buffer flushed 228 of its 513 bytes as NUL at
+                // exit, deterministically, because the drain reinstated a
+                // snapshot taken five marker lines earlier
+                // (test_stdout_buffer_integrity_full).
+                //
+                // The live page wins, exactly as in handleFault's
+                // COMPRESSED_SHADOW case and in reclaimShadowRange()'s
+                // mismatch branch: drop the blob, keep the page. Deliberately
+                // no remapPages() fallback — that would discard the very bytes
+                // being preserved (see restorePageContents()).
+                if (page_addr)
+                    vm::protectPages(page_addr, kPageSize, true, true);
+                releaseBlob(i);
+                compressed_[i] = {};
+                if (shadow_tick_) shadow_tick_[i] = 0;
+                if (page_tier_) page_tier_[i] = kTierNone;
+                states_->set(i, PageState::ACTIVE);
+            } else if (st == PageState::COMPRESSED) {
                 CompressAlgo algo = compressed_[i].algorithm();
                 uint8_t sc = lookupSizeClass(i);
                 int slot = -1;

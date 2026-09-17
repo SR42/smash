@@ -24,10 +24,12 @@
 // single-node hosts, when mbind is refused, and with SMASH_NUMA_COMPRESSOR=0.
 //
 // Nothing after the cold wait writes to malloc'd memory. CPU lists and pin
-// sets are read before the wait, and later scratch arrays are mmap'd. In full
-// mode (experimental) a write into a heap page that went cold can be lost
-// (the defect behind test_stdout_buffer_integrity_full), which would make this
-// test fail for a reason unrelated to NUMA.
+// sets are read before the wait, and later scratch arrays are mmap'd. This was
+// originally required because a write into a cold full-mode heap page could be
+// lost (the defect behind test_stdout_buffer_integrity_full, since fixed: the
+// shutdown drain reverted live COMPRESSED_SHADOW pages to their stale blobs).
+// The structure is kept so this test cannot fail for a reason unrelated to
+// NUMA if that path ever regresses.
 
 #include <cerrno>
 #include <cstdarg>

@@ -632,12 +632,10 @@ set_target_properties(stdout_buffer_integrity_test PROPERTIES CXX_STANDARD 20)
 add_smash_mode_test(test_stdout_buffer_integrity_large_only
   stdout_buffer_integrity_test 1 180 "SMASH_COLD_TIMEOUT_SEC=1")
 
-# Full mode reproduces the corruption deterministically. Registered DISABLED
-# with the known_issue label — the same treatment test_fault_cycle gets —
-# because it documents a real, currently-unfixed defect. Enable it once
-# writes into a compressed page are no longer lost.
+# Full mode used to reproduce the corruption deterministically (228 of 513
+# bytes flushed as NUL). Fixed: drainAllForShutdown() no longer overwrites a
+# COMPRESSED_SHADOW page — which is still mapped and holds the application's
+# live bytes — with its stale blob. Enabled, and it is the regression guard
+# for that: with the drain's shadow branch removed it fails again.
 add_smash_mode_test(test_stdout_buffer_integrity_full
   stdout_buffer_integrity_test 0 180 "SMASH_COLD_TIMEOUT_SEC=1")
-set_tests_properties(test_stdout_buffer_integrity_full PROPERTIES
-  LABELS "known_issue"
-  DISABLED TRUE)  # writes into a compressed slab page are flushed as NUL

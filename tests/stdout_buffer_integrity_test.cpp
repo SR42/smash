@@ -7,11 +7,27 @@
 // unflushed bytes, and the application keeps writing into it afterwards.
 //
 // Observed on x86-64 with the compressor active: bytes written into the
-// buffer AFTER it was first compressed are flushed as NUL. A run producing
-// 447 bytes of output emitted 257 correct bytes followed by 190 zero bytes —
+// buffer AFTER it was first compressed were flushed as NUL. A run producing
+// 513 bytes of output emitted 285 correct bytes followed by 228 zero bytes —
 // the tail was silently replaced, deterministically, on every run. Without
 // the compressor (SMASH_DEFER_PHASES_MS large), in large-only mode, or with
 // no libsmash at all, the same workload is byte-perfect.
+//
+// FIXED, and this test is the regression guard. The cause was not compression
+// losing writes: it was drainAllForShutdown() reinstating a stale snapshot
+// over live data at exit. That walker treated COMPRESSED and
+// COMPRESSED_SHADOW alike and decompressed the blob back over the page — but
+// a shadow page is still mapped PROT_RW and holds the application's LIVE
+// bytes. Nothing faults on a write to it, so its blob goes stale silently and
+// only reclaimShadowRange()'s content_matches check ever notices; a page that
+// is never reclaimed is never checked. The drain now keeps the page and drops
+// the blob, as handleFault's COMPRESSED_SHADOW case already did.
+//
+// The surviving prefix is the tell: it ends exactly where the buffer's write
+// pointer stood when the snapshot was taken (offset 285, on a marker-line
+// boundary, with a single NUL run to EOF and no non-zero byte after it). That
+// is a reverted page, not a zeroed one — the never-written tail of the buffer
+// was simply still zero in the blob.
 //
 // This is silent data corruption, and it is a plausible route to the
 // std::bad_alloc reports that motivated this test group: a zeroed or
@@ -29,10 +45,24 @@
 // LD_PRELOAD / DYLD_INSERT_LIBRARIES survive exec, so the child gets its own
 // fully initialised libsmash.
 //
-// Notable knobs that do NOT change the outcome (each measured over 3 runs,
-// identical byte counts): SMASH_SOFTDIRTY=0, SMASH_DEFER_MADVISE=0,
-// SMASH_NO_DECOMMIT=1, SMASH_MADV_FREE=1, SMASH_NO_MONITOR=1. Only disabling
-// compression outright avoids it.
+// Knobs that do NOT change the outcome, and why that is misleading rather
+// than informative: SMASH_SOFTDIRTY=0, SMASH_DEFER_MADVISE=0,
+// SMASH_DEFER_MADVISE_TICKS, SMASH_NO_DECOMMIT=1, SMASH_MADV_FREE=1,
+// SMASH_NO_MONITOR=1, SMASH_FIXAV and SMASH_P2_CHUNK all give byte-identical
+// output. Every one of them steers an arm of the non-deferred `else` in
+// compressPage(), while SMASH_DEFERRED_RECLAIM (default ON, in
+// include/smash/config.h) takes the `if`. Byte-identical results across
+// supposedly different configs mean the flag is inert, not that the suspect
+// is innocent — read the enclosing branch before trusting an A/B.
+//
+// The flags that DO discriminate: SMASH_DEFERRED_RECLAIM=0 (no shadow state
+// exists, so nothing can be reverted) and SMASH_DEFERRED_RECLAIM_DELAY.
+// DELAY=1 reclaims to a real COMPRESSED page before the late writes, so they
+// fault and invalidate the blob; DELAY=100000 never reclaims, keeping the
+// OLDEST blob, and makes the loss predictably worse — 399 NUL with the
+// boundary at offset 114 instead of 228 at 285. Note also that the
+// corruption is deterministic (byte-identical across runs), so it was never
+// a race, and strace perturbs it away completely.
 
 #include <cerrno>
 #include <cstdio>
