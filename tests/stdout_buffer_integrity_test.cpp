@@ -63,6 +63,19 @@
 // boundary at offset 114 instead of 228 at 285. Note also that the
 // corruption is deterministic (byte-identical across runs), so it was never
 // a race, and strace perturbs it away completely.
+//
+// Reproduced independently on unmodified third-party code, which is stronger
+// evidence than this test on its own: mimalloc's test-stress (USE_STD_MALLOC=1)
+// with stdout redirected to a file, run under the pre-fix library with
+// SMASH_DEFERRED_RECLAIM_DELAY=100000, emits 177 bytes of which 53 are NUL from
+// offset 124 to EOF, identically on every run; post-fix it is byte-identical to
+// a no-libsmash control. Its surviving prefix ends with mi-stress's one-line
+// banner printed TWICE — the blob snapshotted the buffer while it held the
+// banner, glibc flushed and rewound _IO_write_ptr, and the drain then put the
+// old page contents back under the newer write pointer. The file length stays
+// correct because it lives in the FILE struct, which is a separate allocation
+// and was never reverted. Ordinary mi-stress at the default reclaim delay is
+// unaffected: the page must still be COMPRESSED_SHADOW at exit.
 
 #include <cerrno>
 #include <cstdio>
