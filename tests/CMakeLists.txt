@@ -443,6 +443,18 @@ add_smash_mode_test(test_numa_compressor_large_only numa_compressor_test 1 120
 add_executable(thread_cache_reclaim_test thread_cache_reclaim_test.cpp)
 set_target_properties(thread_cache_reclaim_test PROPERTIES CXX_STANDARD 20)
 target_link_libraries(thread_cache_reclaim_test PRIVATE ${CMAKE_DL_LIBS} pthread)
+# Double-free hardening: Span::deallocate tests the bitmap bit before setting
+# it (1 = free), so an already-free slot is a double free. Registered in full
+# mode only — under SMASH_LARGE_ONLY=1 a 3-byte allocation passes through to
+# glibc, which aborts on the double free before the consistency probe runs.
+# The test forks the offending child so an abort policy cannot take the test
+# process down, and asserts detection fires, the slab stays consistent, and
+# SMASH_DOUBLE_FREE=off restores the historical silent behaviour.
+add_executable(double_free_test double_free_test.cpp)
+set_target_properties(double_free_test PROPERTIES CXX_STANDARD 20)
+target_link_libraries(double_free_test PRIVATE ${CMAKE_DL_LIBS})
+add_smash_mode_test(test_double_free_full double_free_test 0 60 "SMASH_DOUBLE_FREE=warn")
+
 # Malloc override + routing, ported from mimalloc's test/main-override.c. The
 # original asserts every pointer lands in mimalloc's own heap, proving the
 # malloc override took effect; this uses smash_arena_for() for the same

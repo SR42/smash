@@ -8,6 +8,7 @@
 #include "bootstrap_alloc.h"
 #include "size_classes.h"
 #include "../util/spinlock.h"
+#include "../util/double_free.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -87,6 +88,21 @@ public:
     // Free to the correct arena bucket. Returns false if full.
     bool deallocate(uint8_t sc, uint8_t arena, void* ptr) {
         auto& c = caches_[idx(arena, sc)];
+        // Opt-in double-free detection (SMASH_DOUBLE_FREE, default off). This
+        // is the only place the common `free(p); free(p);` can be caught: both
+        // pointers land here and never reach the slab bitmap, so the lane must
+        // be scanned. Bounded by kPerLaneDepth, but it is the free fast path —
+        // hence the cached flag test first, which is all a default build pays.
+        if (smash::doubleFreeChecksEnabled()) [[unlikely]] {
+            for (uint32_t i = 0; i < c.count; ++i) {
+                if (c.ptrs[i] == ptr) {
+                    // Swallow it: pushing again would put the same pointer in
+                    // the lane twice and hand it out to two callers.
+                    if (smash::handleDoubleFree("cache", ptr, i)) return true;
+                    break;
+                }
+            }
+        }
         if (c.count < kPerLaneDepth) [[likely]] {
             c.ptrs[c.count++] = ptr;
             return true;

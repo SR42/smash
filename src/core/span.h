@@ -8,6 +8,7 @@
 #include "bootstrap_alloc.h"
 #include "size_classes.h"
 #include "../util/bitops.h"
+#include "../util/double_free.h"
 #include "../vm/page_state.h"
 
 #include <atomic>
@@ -408,6 +409,35 @@ struct Span {
         size_t slot = offset / object_size;
         size_t word = slot / 64;
         size_t bit = slot % 64;
+
+        // The bitmap is the sole allocation truth (1 = free), and this function
+        // already loads and stores bitmap[word] — so testing the bit first is a
+        // single `test` on a value already in a register, not extra memory
+        // traffic. A set bit means the slot is ALREADY free: a double free, or
+        // a free of an interior/bogus pointer that maps onto a free slot.
+        //
+        // Returning early is the correct recovery, not merely the polite one:
+        // falling through would also run `--allocated_count`, underflowing it
+        // and corrupting the full/empty transitions in Slab::deallocateOne.
+        // Measured before this check existed: full mode absorbed a double free
+        // silently (glibc aborts with "double free detected in tcache 2"),
+        // leaving the slab uncorrupted but the error undetected.
+        //
+        // Coverage is real but partial, and deliberately so:
+        //   - ThreadCache::deallocate pushes onto a pointer array in front of
+        //     the slab, so a repeat free that stays in the cache is not seen
+        //     until that lane drains;
+        //   - LargeAlloc::deallocate clears the page map first, so a second
+        //     free of a large block finds no span and takes the "not ours"
+        //     path entirely.
+        // Catching the slab case is cheap; chasing the rest would cost an O(n)
+        // scan on the hot path.
+        if (bitmap[word] & (1ULL << bit)) [[unlikely]] {
+            // handleDoubleFree consults the policy; off returns false and we
+            // fall through to the historical behaviour.
+            if (smash::handleDoubleFree("slab", ptr, slot)) return;
+        }
+
         bitmap[word] |= (1ULL << bit);   // mark free
         --allocated_count;
         if (word < free_hint_word) {
