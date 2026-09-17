@@ -25,6 +25,7 @@ For these paths the EFAULT-retry model does not help — those syscalls happen i
 
 - macOS (`smash_heap.cpp`): `read`, `write`, `pread`, `pwrite`, `readv`, `writev`, `recv`, `send`, `recvfrom`, `sendto`, `recvmsg`, `sendmsg`, `poll`, `kevent`, `kevent64`, `mach_msg`, `mach_msg_overwrite`, `mach_msg2_internal`, plus the buffered-I/O carve-out above.
 - Linux (`linux_syscall_wrappers.cpp`): everything macOS has minus the Mach trio plus `ppoll`, `select`, `pselect`, `accept`, `accept4`, `recvmmsg`, `sendmmsg`, `getsockopt`, `getsockname`, `getpeername`, `getrandom`, `epoll_wait`, `epoll_pwait`, `sched_setaffinity`, `sched_getaffinity`, `pthread_setaffinity_np`, `pthread_getaffinity_np`, plus the `stat`/`statx`, xattr, `statvfs`/`getrusage`/`prlimit64`, `getdents64`/`readlink` and `preadv`/`pwritev` families and `getcwd` (see the file for the full set).
+  - Plus the fortified `__*_chk` aliases of the EFAULT-retry family (`__read_chk`, `__pread_chk`, `__pread64_chk`, `__recv_chk`, `__recvfrom_chk`, `__poll_chk`, `__ppoll_chk`, `__readlink_chk`, `__readlinkat_chk`) — see "_FORTIFY_SOURCE and the `__*_chk` aliases" below for why the plain names alone are not enough.
   - The affinity four are wrapped because a thread pool keeps one `cpu_set_t` per worker on the heap. `pthread_{set,get}affinity_np` need wrappers of their own: glibc reaches the kernel through an internal `__sched_setaffinity`, so interposing `sched_setaffinity` does not cover them, and they report failure by return value rather than through `errno`, so they warm the mask up front instead of relying only on the EFAULT retry.
 
 ## Platform-specific interposition patterns
@@ -56,6 +57,18 @@ The same trap applies beyond the EFAULT wrappers: alloc8 exports `pthread_create
 objdump -T <caller-binary> | grep <symbol>          # the version a caller asks for
 nm -D --with-symbol-versions libsmash.so | grep <symbol>   # must list that version too
 ```
+
+## _FORTIFY_SOURCE and the `__*_chk` aliases
+
+glibc's fortify headers rewrite a call whose destination object size is known at compile time into the `__*_chk` alias: `read(fd, buf, n)` becomes `__read_chk(fd, buf, n, sizeof buf)`. The plain symbol is then never referenced, so interposing `read` alone misses the call and the kernel's EFAULT goes straight back to the application. `_FORTIFY_SOURCE` is on by default on Ubuntu, Fedora and RHEL, and any read into a fixed-size buffer qualifies — measured with plain `gcc -O2` and no sanitizer, a read/pread/recv into a `char buf[4096]` emits `__read_chk`/`__pread_chk`/`__recv_chk`, and only `-U_FORTIFY_SOURCE` brings the plain names back. It surfaced as `test_syscall_efault` failing only under UBSan, because instrumentation made the object size knowable.
+
+Wrapped: `__read_chk`, `__pread_chk`, `__pread64_chk`, `__recv_chk`, `__recvfrom_chk`, `__poll_chk`, `__ppoll_chk`, `__readlink_chk`, `__readlinkat_chk` — the EFAULT-retry family only. `__fgets_chk` / `__fread_chk` / `__getcwd_chk` are deliberately **not** wrapped: they return a pointer or a count, so the retry predicate (`ret == -1 && errno == EFAULT`) cannot apply, and warming the buffer on every call would land on smash's own hot paths (the compressor reads `/proc/self/maps` with `fgets` in a loop). Note the argument-order traps: `__recv_chk` puts `buflen` **before** `flags`, and `__fread_chk` takes `ptrlen` second.
+
+**Export only the `_NN` alias, never the bare `__*_chk` name.** If libsmash defines both `__recv_chk@@GLIBC_2.4` (the wrapper) and `__recv_chk@GLIBC_2.4` (the alias), a versioned reference resolves to the exact-version match — the alias — whose body is `jmp __recv_chk@plt`, and whose GOT slot then points back at the alias. That is a jump to itself: 100% CPU, no stack growth, `rip` pinned on a two-instruction stub. With the bare name unlisted it falls under `local: *`, so the alias's internal call binds directly with no PLT, while callers still bind `__recv_chk@GLIBC_2.4` as intended.
+
+That failure is hard to see with the usual tools, so use the right ones: `.rela.plt` looks **correct** (it names the `@@` wrapper) because the dynamic linker overrides it at load time, and gdb backtraces hide the loop because tail calls leave no frames. What identifies it is the **runtime GOT value** (`x/gx` on the slot, which held the forwarder's address) and `perf record`, which put 84% of cycles in `__recv_chk@GLIBC_2.4`.
+
+Resolve the real `__*_chk` functions **eagerly**, in a constructor, not with a call-site `dlsym`: smash reads `/proc/self/pagemap` with `read()`, fortify turns that into `__read_chk`, and `-Bsymbolic` binds it to our own wrapper — so a first-call `dlsym` lands on the compressor's tick path. An earlier lazy version stopped the instrumented build compressing at all.
 
 ## Audit: syscalls that still break on a compressed buffer (2026-09-16, Linux)
 

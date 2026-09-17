@@ -114,6 +114,221 @@ SMASH_VISIBLE ssize_t read(int fd, void* buf, size_t count) {
         buf, count);
 }
 
+// ── _FORTIFY_SOURCE variants ────────────────────────────────────────────────
+// glibc's fortify headers rewrite a call whose destination object size is known
+// at compile time into the `__*_chk` alias: `read(fd, buf, n)` becomes
+// `__read_chk(fd, buf, n, sizeof buf)`. The plain symbol is then never
+// referenced, so interposing `read` alone misses the call and the EFAULT
+// decompress-and-retry never runs — the kernel's EFAULT goes straight back to
+// the application, which sees a spurious "Bad address".
+//
+// Not a corner case: _FORTIFY_SOURCE is on by default on Ubuntu, Fedora and
+// RHEL, and any read into a fixed-size buffer qualifies. Measured with plain
+// `gcc -O2` and no sanitizer, a read/pread/recv into a `char buf[4096]` emits
+// __read_chk/__pread_chk/__recv_chk; only -U_FORTIFY_SOURCE brings the plain
+// names back. Same lesson as the versioned aliases further down: a wrapper only
+// wins if it is exported under the exact name the caller binds.
+//
+// TWO DELIBERATE LIMITS, both learned the hard way:
+//
+//  1. Only the EFAULT-retry family is wrapped. retryWith1Buf costs nothing
+//     unless the syscall actually returns EFAULT. The proactive-warm functions
+//     (fgets/fread/getcwd) are NOT wrapped: warming walks and faults the whole
+//     buffer on every call, and smash's own code calls fgets in a loop over
+//     /proc/self/maps (readVmaCount), so wrapping them put that cost on the
+//     compressor's own path.
+//
+//  2. Resolved EAGERLY below, never with dlsym at the call site. smash reads
+//     /proc/self/pagemap with read(), which fortify turns into __read_chk, and
+//     -Bsymbolic binds that to this wrapper — so a first-call dlsym lands on
+//     the compressor's tick path. An earlier version that resolved lazily
+//     stopped the instrumented build compressing at all (compressed=0), and
+//     SMASH_NO_SYSCALL_WRAP=1 did not help because the dlsym ran before the
+//     passthrough check.
+static ssize_t (*g_real_read_chk)(int, void*, size_t, size_t) = nullptr;
+static ssize_t (*g_real_pread_chk)(int, void*, size_t, off_t, size_t) = nullptr;
+static ssize_t (*g_real_pread64_chk)(int, void*, size_t, off64_t, size_t) = nullptr;
+static ssize_t (*g_real_recv_chk)(int, void*, size_t, size_t, int) = nullptr;
+static ssize_t (*g_real_recvfrom_chk)(int, void*, size_t, size_t, int,
+                                      struct sockaddr*, socklen_t*) = nullptr;
+static int (*g_real_poll_chk)(struct pollfd*, nfds_t, int, size_t) = nullptr;
+static int (*g_real_ppoll_chk)(struct pollfd*, nfds_t, const struct timespec*,
+                               const sigset_t*, size_t) = nullptr;
+static ssize_t (*g_real_readlink_chk)(const char*, char*, size_t, size_t) = nullptr;
+static ssize_t (*g_real_readlinkat_chk)(int, const char*, char*, size_t, size_t) = nullptr;
+
+// Resolve one fortified alias, refusing any pointer that lands back inside
+// libsmash. RTLD_NEXT is NOT trustworthy here: resolved from a constructor it
+// returned our OWN versioned alias (__recv_chk@GLIBC_2.4, i.e. __recv_chk_24),
+// so the wrapper tail-called itself. At -O3 that is a jump, not a call, so it
+// span forever with no stack growth — two gdb backtraces caught the main thread
+// in state R inside __recv_chk_24 and __readlink_chk_24. Take the pointers from
+// an explicit libc handle instead, and keep the self-reference check as a
+// belt: a null pointer just means the wrapper falls back to the plain syscall,
+// which is correct, only without the fortified EFAULT retry.
+static void* resolveFortified(void* libc, const char* name, const void* self_base) {
+    void* p = libc ? dlsym(libc, name) : nullptr;
+    if (!p) p = dlsym(RTLD_NEXT, name);
+    if (!p) return nullptr;
+    Dl_info info;
+    if (dladdr(p, &info) && info.dli_fbase == self_base) return nullptr;
+    return p;
+}
+
+// Priority 102: after alloc8 installs its wrappers (101), well before the
+// compressor starts (201). The recursion guard mirrors SMASH_LAZY_RESOLVE's —
+// dlsym allocates, and that allocation lands in smash's own malloc.
+__attribute__((constructor(102)))
+static void smash_resolve_fortified_syscalls() {
+    g_resolving_syscalls.store(true, std::memory_order_relaxed);
+    Dl_info self{};
+    const void* self_base =
+        dladdr(reinterpret_cast<void*>(&smash_resolve_fortified_syscalls), &self)
+            ? self.dli_fbase : nullptr;
+    void* libc = dlopen("libc.so.6", RTLD_LAZY | RTLD_NOLOAD);  // already mapped
+    g_real_read_chk = reinterpret_cast<decltype(g_real_read_chk)>(resolveFortified(libc, "__read_chk", self_base));
+    g_real_pread_chk = reinterpret_cast<decltype(g_real_pread_chk)>(resolveFortified(libc, "__pread_chk", self_base));
+    g_real_pread64_chk = reinterpret_cast<decltype(g_real_pread64_chk)>(resolveFortified(libc, "__pread64_chk", self_base));
+    g_real_recv_chk = reinterpret_cast<decltype(g_real_recv_chk)>(resolveFortified(libc, "__recv_chk", self_base));
+    g_real_recvfrom_chk = reinterpret_cast<decltype(g_real_recvfrom_chk)>(resolveFortified(libc, "__recvfrom_chk", self_base));
+    g_real_poll_chk = reinterpret_cast<decltype(g_real_poll_chk)>(resolveFortified(libc, "__poll_chk", self_base));
+    g_real_ppoll_chk = reinterpret_cast<decltype(g_real_ppoll_chk)>(resolveFortified(libc, "__ppoll_chk", self_base));
+    g_real_readlink_chk = reinterpret_cast<decltype(g_real_readlink_chk)>(resolveFortified(libc, "__readlink_chk", self_base));
+    g_real_readlinkat_chk = reinterpret_cast<decltype(g_real_readlinkat_chk)>(resolveFortified(libc, "__readlinkat_chk", self_base));
+    // Intentionally no dlclose: the handle is RTLD_NOLOAD on a library that is
+    // never unloaded, and dropping the refcount buys nothing.
+    g_resolving_syscalls.store(false, std::memory_order_relaxed);
+}
+
+SMASH_VISIBLE ssize_t __read_chk(int fd, void* buf, size_t count, size_t buflen) {
+    if (!g_real_read_chk) return read(fd, buf, count);
+    if (g_syscall_wrap_disabled) return g_real_read_chk(fd, buf, count, buflen);
+    return smash::vm::retryWith1Buf(
+        [&] { return g_real_read_chk(fd, buf, count, buflen); },
+        buf, count);
+}
+SMASH_VISIBLE ssize_t __read_chk_24(int fd, void* buf, size_t count, size_t buflen) {
+    return __read_chk(fd, buf, count, buflen);
+}
+__asm__(".symver __read_chk_24,__read_chk@GLIBC_2.4");
+
+SMASH_VISIBLE ssize_t __pread_chk(int fd, void* buf, size_t count, off_t offset,
+                                  size_t buflen) {
+    if (!g_real_pread_chk) return pread(fd, buf, count, offset);
+    if (g_syscall_wrap_disabled) return g_real_pread_chk(fd, buf, count, offset, buflen);
+    return smash::vm::retryWith1Buf(
+        [&] { return g_real_pread_chk(fd, buf, count, offset, buflen); },
+        buf, count);
+}
+SMASH_VISIBLE ssize_t __pread_chk_24(int fd, void* buf, size_t count, off_t offset,
+                                     size_t buflen) {
+    return __pread_chk(fd, buf, count, offset, buflen);
+}
+__asm__(".symver __pread_chk_24,__pread_chk@GLIBC_2.4");
+
+SMASH_VISIBLE ssize_t __pread64_chk(int fd, void* buf, size_t count, off64_t offset,
+                                    size_t buflen) {
+    if (!g_real_pread64_chk) return pread(fd, buf, count, static_cast<off_t>(offset));
+    if (g_syscall_wrap_disabled) return g_real_pread64_chk(fd, buf, count, offset, buflen);
+    return smash::vm::retryWith1Buf(
+        [&] { return g_real_pread64_chk(fd, buf, count, offset, buflen); },
+        buf, count);
+}
+SMASH_VISIBLE ssize_t __pread64_chk_24(int fd, void* buf, size_t count,
+                                       off64_t offset, size_t buflen) {
+    return __pread64_chk(fd, buf, count, offset, buflen);
+}
+__asm__(".symver __pread64_chk_24,__pread64_chk@GLIBC_2.4");
+
+// buflen comes BEFORE flags here — not the base recv() argument order.
+SMASH_VISIBLE ssize_t __recv_chk(int s, void* buf, size_t len, size_t buflen, int flags) {
+    if (!g_real_recv_chk) return recv(s, buf, len, flags);
+    if (g_syscall_wrap_disabled) return g_real_recv_chk(s, buf, len, buflen, flags);
+    return smash::vm::retryWith1Buf(
+        [&] { return g_real_recv_chk(s, buf, len, buflen, flags); },
+        buf, len);
+}
+SMASH_VISIBLE ssize_t __recv_chk_24(int s, void* buf, size_t len, size_t buflen,
+                                    int flags) {
+    return __recv_chk(s, buf, len, buflen, flags);
+}
+__asm__(".symver __recv_chk_24,__recv_chk@GLIBC_2.4");
+
+SMASH_VISIBLE ssize_t __recvfrom_chk(int s, void* buf, size_t len, size_t buflen,
+                                     int flags, struct sockaddr* addr,
+                                     socklen_t* addr_len) {
+    if (!g_real_recvfrom_chk) return recvfrom(s, buf, len, flags, addr, addr_len);
+    if (g_syscall_wrap_disabled)
+        return g_real_recvfrom_chk(s, buf, len, buflen, flags, addr, addr_len);
+    return smash::vm::retryWith1Buf(
+        [&] { return g_real_recvfrom_chk(s, buf, len, buflen, flags, addr, addr_len); },
+        buf, len);
+}
+SMASH_VISIBLE ssize_t __recvfrom_chk_24(int s, void* buf, size_t len, size_t buflen,
+                                        int flags, struct sockaddr* addr,
+                                        socklen_t* addr_len) {
+    return __recvfrom_chk(s, buf, len, buflen, flags, addr, addr_len);
+}
+__asm__(".symver __recvfrom_chk_24,__recvfrom_chk@GLIBC_2.4");
+
+SMASH_VISIBLE int __poll_chk(struct pollfd* fds, nfds_t nfds, int timeout, size_t fdslen) {
+    if (!g_real_poll_chk) return poll(fds, nfds, timeout);
+    if (g_syscall_wrap_disabled) return g_real_poll_chk(fds, nfds, timeout, fdslen);
+    return smash::vm::retryWith1Buf(
+        [&] { return g_real_poll_chk(fds, nfds, timeout, fdslen); },
+        fds, nfds * sizeof(struct pollfd));
+}
+SMASH_VISIBLE int __poll_chk_216(struct pollfd* fds, nfds_t nfds, int timeout,
+                                 size_t fdslen) {
+    return __poll_chk(fds, nfds, timeout, fdslen);
+}
+__asm__(".symver __poll_chk_216,__poll_chk@GLIBC_2.16");
+
+SMASH_VISIBLE int __ppoll_chk(struct pollfd* fds, nfds_t nfds,
+                              const struct timespec* timeout,
+                              const sigset_t* ss, size_t fdslen) {
+    if (!g_real_ppoll_chk) return ppoll(fds, nfds, timeout, ss);
+    if (g_syscall_wrap_disabled) return g_real_ppoll_chk(fds, nfds, timeout, ss, fdslen);
+    return smash::vm::retryWith1Buf(
+        [&] { return g_real_ppoll_chk(fds, nfds, timeout, ss, fdslen); },
+        fds, nfds * sizeof(struct pollfd));
+}
+SMASH_VISIBLE int __ppoll_chk_216(struct pollfd* fds, nfds_t nfds,
+                                  const struct timespec* timeout,
+                                  const sigset_t* ss, size_t fdslen) {
+    return __ppoll_chk(fds, nfds, timeout, ss, fdslen);
+}
+__asm__(".symver __ppoll_chk_216,__ppoll_chk@GLIBC_2.16");
+
+SMASH_VISIBLE ssize_t __readlink_chk(const char* path, char* buf, size_t len,
+                                     size_t buflen) {
+    if (!g_real_readlink_chk) return readlink(path, buf, len);
+    if (g_syscall_wrap_disabled) return g_real_readlink_chk(path, buf, len, buflen);
+    return smash::vm::retryWith1Buf(
+        [&] { return g_real_readlink_chk(path, buf, len, buflen); },
+        buf, len);
+}
+SMASH_VISIBLE ssize_t __readlink_chk_24(const char* path, char* buf, size_t len,
+                                        size_t buflen) {
+    return __readlink_chk(path, buf, len, buflen);
+}
+__asm__(".symver __readlink_chk_24,__readlink_chk@GLIBC_2.4");
+
+// readlinkat's fortified alias is versioned GLIBC_2.5, not 2.4.
+SMASH_VISIBLE ssize_t __readlinkat_chk(int fd, const char* path, char* buf,
+                                       size_t len, size_t buflen) {
+    if (!g_real_readlinkat_chk) return readlinkat(fd, path, buf, len);
+    if (g_syscall_wrap_disabled) return g_real_readlinkat_chk(fd, path, buf, len, buflen);
+    return smash::vm::retryWith1Buf(
+        [&] { return g_real_readlinkat_chk(fd, path, buf, len, buflen); },
+        buf, len);
+}
+SMASH_VISIBLE ssize_t __readlinkat_chk_25(int fd, const char* path, char* buf,
+                                          size_t len, size_t buflen) {
+    return __readlinkat_chk(fd, path, buf, len, buflen);
+}
+__asm__(".symver __readlinkat_chk_25,__readlinkat_chk@GLIBC_2.5");
+
 SMASH_VISIBLE ssize_t write(int fd, const void* buf, size_t count) {
     using fn_t = ssize_t(*)(int, const void*, size_t);
     SMASH_LAZY_RESOLVE(fn_t, write);

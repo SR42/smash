@@ -306,6 +306,14 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     "LINKER:--version-script=${SMASH_VERSION_SCRIPT}"
     "-Bsymbolic"
   )
+  # The version script controls which symbols (and at which versions) libsmash
+  # exports, so a change to it changes the library — but CMake does not infer a
+  # link dependency from a linker flag. Without this, editing
+  # smash_version_script.map.in regenerates the .map and `make` relinks nothing,
+  # so the next build silently tests the previous library. That cost a full
+  # verification cycle: two rounds of results were measured against a stale .so
+  # while the generated map already held the new content.
+  set_target_properties(smash PROPERTIES LINK_DEPENDS "${SMASH_VERSION_SCRIPT}")
 else()
   target_link_libraries(smash PRIVATE alloc8::interpose)
 endif()
@@ -380,6 +388,8 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     "LINKER:--version-script=${SMASH_VERSION_SCRIPT}"
     "-Bsymbolic"
   )
+  # Same link dependency as the smash target — see the note there.
+  set_target_properties(smash_noopt PROPERTIES LINK_DEPENDS "${SMASH_VERSION_SCRIPT}")
 else()
   target_link_libraries(smash_noopt PRIVATE alloc8::interpose)
 endif()

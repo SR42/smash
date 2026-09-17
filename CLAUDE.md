@@ -40,19 +40,18 @@ library: ASan replaces malloc, which is exactly what smash exists to do, so the
 two fight over the same job. Use it to instrument a single direct-linked test
 binary, not libsmash.
 
-**Measured on the first full UBSan run (2026-09-16):** 39 of 40 then-enabled
-tests pass, with one failure and one finding. Neither is a smash defect, and
-both are easy to mis-attribute:
+**The suite is clean under UBSan: 42/42 with 0 findings.** Getting there took two
+real fixes, both found *because* UBSan changed what the compiler could prove:
 
-- `test_syscall_efault` fails under UBSan **deterministically** (3 of 3, at ~5 s)
-  and passes in the normal build (3 of 3, ~48 s). Isolated by swapping sides: a
-  stock test binary against the **instrumented library** passes, while the
-  **instrumented test binary** fails against *either* library. So the EFAULT
-  decompress-and-retry wrapper is not what breaks. The retry recovers by
-  touching each page to provoke the fault that decompresses it
-  (`vm::warmPages`), and instrumenting the application's own buffer accesses
-  disturbs that. Do not chase it as a wrapper regression — the natural reading,
-  and the wrong one.
+- `test_syscall_efault` failed under UBSan while passing in the normal build.
+  That was **a genuine coverage gap, not a sanitizer artifact** — see
+  "_FORTIFY_SOURCE and the `__*_chk` aliases" in
+  [agents/syscall-compat.md](agents/syscall-compat.md). Instrumentation made the
+  destination object size knowable, which flipped the test's `read` to
+  `__read_chk`, a symbol libsmash did not export, so the EFAULT retry was
+  bypassed. Plain `gcc -O2` with no sanitizer does the same to any read into a
+  fixed-size buffer. An earlier note here claimed this was not a smash defect;
+  that was wrong.
 - "load of null pointer of type 'int'" at `smash_heap.h:315` in
   `fullMallocPath()`, plus the matching "store to null pointer" at line 321,
   reported only from direct-linked test binaries — which still **pass**. It was a
@@ -352,6 +351,8 @@ libsmash is built **fat** (arm64 + arm64e) so it can interpose into both ordinar
   - **Freeing:** freed node pages must go back to their own arena, never the shared free lists, or the binding leaks into ordinary allocations.
   - **Remaps:** any `MAP_FIXED` over a node page drops its policy. `remapPages()` calls `vm::g_after_remap_hook` to bind it again; a new `MAP_FIXED` site must do the same.
 - Compressed blobs: a worker stores through `workerStore(worker)` (its node's store, or the shared one) and releases through `storeOfBlob(page_idx)`, which reads the `blob_node_` byte recorded at store time. That lookup is a **performance** hint only — `CompressStore::release` routes by the region's recorded `owner`, so a release arriving at the wrong store is forwarded instead of pushing onto that region's free list under the wrong shard lock. Keep it that way: an ordinary heap page migrates between nodes, so the owning store can never be derived from where the page lives now, and a wrong guess must stay harmless. A blob in a node store never spills to the file-backed store (`blobIsNodeLocal`).
+- Never export both `name@@VER` and `name@VER` from libsmash for the same interposed function. A versioned reference resolves to the exact-version match — the `@` alias — and if that alias is a thin `jmp name@plt` forwarder, the GOT slot points back at it: a jump to itself that spins at 100% CPU. List only the `_NN` alias in the version script and let the bare name fall under `local: *`. See "_FORTIFY_SOURCE and the `__*_chk` aliases" in [agents/syscall-compat.md](agents/syscall-compat.md).
+- The generated version script must be a declared `LINK_DEPENDS` of the `smash` and `smash_noopt` targets. CMake infers no link dependency from a `--version-script=` linker flag, so without it a change to `smash_version_script.map.in` regenerates the map and relinks **nothing** — and the next test run silently measures the previous library. (`configure_file` only rewrites the generated map when its content changes, so `touch`ing the `.in` correctly does nothing.)
 - Thread hooks must be exported at the version the caller binds. `pthread_create`/`pthread_exit` are exported **twice** — at the base version and at `GLIBC_2.34` (`.symver` aliases in `linux_syscall_wrappers.cpp`, both names listed in the version script). glibc 2.34 merged libpthread into libc and made `GLIBC_2.34` the default for these, so a base-only export means alloc8's interposer never sees an application thread and every thread leaks its 92 KiB `ThreadCache`. The same rule as for versioned syscall wrappers (see [agents/syscall-compat.md](agents/syscall-compat.md)); it applies to thread hooks too, and it failed silently for both.
 - A thread cache must be reclaimable without the interposer. `getOrCreateThreadCache()` arms a `pthread_key_t` whose destructor drains and pools the cache on any thread exit, however the thread was created; `threadCleanup()` clears that key's value so a wrapped thread cannot return the same cache twice, and the destructor re-checks `currentThreadCache()` before acting. Keep both guards if you touch either path.
 - `newThreadCache()` returns nullptr when BootstrapAlloc is exhausted, and every `getOrCreateThreadCache()` caller handles it: `mallocSlow` falls back to the system allocator, and both `freeSlow` paths return the object straight to its slab via `Slab::deallocate(span, ptr)` rather than dropping it.

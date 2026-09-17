@@ -248,6 +248,53 @@
     *;
 };
 
+# _FORTIFY_SOURCE rewrites a call whose destination size is known at compile
+# time into the __*_chk alias, so a program built with hardening on (the
+# default on Ubuntu/Fedora/RHEL) never references the plain symbol and the
+# EFAULT decompress-and-retry wrappers never run. glibc versions these at
+# GLIBC_2.4, 2.5 and 2.16, and callers bind those exact versions — exporting
+# them at the base version alone would lose to libc, exactly as it did for
+# sched_setaffinity and pthread_create below.
+#
+# Only the EFAULT-retry family is here. The proactive-warm functions
+# (__fgets_chk / __fread_chk / __getcwd_chk) are deliberately not wrapped —
+# see linux_syscall_wrappers.cpp for why.
+# Export ONLY the _NN aliases here, never the bare __*_chk names. Exporting
+# both makes libsmash define two symbols matching the same name and version —
+# __recv_chk@@GLIBC_2.4 (the wrapper) and __recv_chk@GLIBC_2.4 (the alias) —
+# and the dynamic linker resolves the versioned reference to the exact-version
+# match, i.e. the alias. The alias is a tail call `jmp __recv_chk@plt`, whose
+# GOT slot then points back at the alias: a jump to itself. Measured directly —
+# the GOT slot held the forwarder's address, and perf put 83% of cycles in
+# __recv_chk@GLIBC_2.4 while the process spun at 100% CPU.
+#
+# The static relocation looks correct (it names the @@ wrapper), so .rela.plt
+# does not reveal this; only the runtime GOT value does.
+#
+# With the bare names unlisted they fall under `local: *`, so the alias's
+# internal call binds directly to the wrapper with no PLT and no loop, while
+# applications still bind __recv_chk@GLIBC_2.4 to the alias as intended.
+GLIBC_2.4 {
+  global:
+    __read_chk_24;
+    __pread_chk_24;
+    __pread64_chk_24;
+    __recv_chk_24;
+    __recvfrom_chk_24;
+    __readlink_chk_24;
+} @SMASH_GLIBC_BASE_VERSION@;
+
+GLIBC_2.5 {
+  global:
+    __readlinkat_chk_25;
+} GLIBC_2.4;
+
+GLIBC_2.16 {
+  global:
+    __poll_chk_216;
+    __ppoll_chk_216;
+} GLIBC_2.5;
+
 # libevent requests epoll_wait@GLIBC_2.3.2
 # Aliases epoll_wait_232/epoll_pwait_232 provide these versioned symbols
 GLIBC_2.3.2 {
