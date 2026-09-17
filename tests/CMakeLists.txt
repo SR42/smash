@@ -443,6 +443,18 @@ add_smash_mode_test(test_numa_compressor_large_only numa_compressor_test 1 120
 add_executable(thread_cache_reclaim_test thread_cache_reclaim_test.cpp)
 set_target_properties(thread_cache_reclaim_test PROPERTIES CXX_STANDARD 20)
 target_link_libraries(thread_cache_reclaim_test PRIVATE ${CMAKE_DL_LIBS} pthread)
+# Malloc override + routing, ported from mimalloc's test/main-override.c. The
+# original asserts every pointer lands in mimalloc's own heap, proving the
+# malloc override took effect; this uses smash_arena_for() for the same
+# purpose, and additionally asserts the opposite truth per mode — small
+# allocations are smash-owned in full mode and passed through in large-only,
+# while a 2 MiB block is owned in both. Fast and deterministic (no compressor).
+add_executable(malloc_override_test malloc_override_test.cpp)
+set_target_properties(malloc_override_test PROPERTIES CXX_STANDARD 20)
+target_link_libraries(malloc_override_test PRIVATE ${CMAKE_DL_LIBS})
+add_smash_mode_test(test_malloc_override_full       malloc_override_test 0 60)
+add_smash_mode_test(test_malloc_override_large_only malloc_override_test 1 60)
+
 # Shutdown race: stop() joins the NUMA node workers at process exit, and a
 # worker that reached its park loop after the stop signal slept forever on a
 # futex nothing would wake — hanging the join under __cxa_finalize. Needs
