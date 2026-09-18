@@ -457,6 +457,23 @@ class CompressorThread {
     [[maybe_unused]] int page_idle_fd_ = -1;     // /sys/kernel/mm/page_idle/bitmap
     [[maybe_unused]] int idle_read_ok_ = -1;     // -1 unprobed, 0 unavailable, 1 active
 
+    // Per page: 1 iff escalateToDeepMonitoring() armed it through the idle
+    // bitmap AND read the bit back set. Only then does phase1 trust the idle
+    // bit as the read signal; every other page uses the PROT_READ/PROT_NONE
+    // fault path. Two reasons the global idle_read_ok_ is not enough:
+    //  - The kernel silently ignores an idle mark on a page that is not on the
+    //    LRU yet, and freshly written anonymous pages sit in a per-CPU
+    //    LRU-add batch until something drains it. Such a page reads back
+    //    "not idle" = "read" on every tick and never goes cold. Measured as
+    //    root: 0/8 fresh pages take the mark, 8/8 after 256 MiB of other
+    //    faults; test_prefetch, test_compression and test_syscall_efault all
+    //    failed as root for this reason and passed as a normal user.
+    //  - A page never armed, or whose read was already counted, has a
+    //    meaningless idle bit, and treating it as "read" every tick would keep
+    //    it hot until it left monitoring.
+    // Allocated only when the probe succeeds, so unprivileged runs pay nothing.
+    uint8_t* idle_armed_ = nullptr;
+
     // /proc/self/mem fd (Linux). Used to populate a page's physical backing
     // *while it is still PROT_NONE*, before flipping it readable — closing the
     // decompress-restore TOCTOU window where a concurrent app thread could read
@@ -1318,10 +1335,16 @@ private:
                 // escalateToDeepMonitoring) whose idle bit was CLEARED has been
                 // read since — count that as an access, fault-free. soft-dirty
                 // (accessed_) only covers writes; this adds the read signal.
-                if (!accessed && idle_read_ok_ == 1 &&
+                // Only for pages whose arm was verified (see idle_armed_); the
+                // flag is consumed by the first read it reports, since the bit
+                // stays clear until the page is armed again.
+                if (!accessed && idle_armed_ && idle_armed_[i] &&
                     st == PageState::ACTIVE_MONITORING) {
                     uint64_t pfn = pfnForPage(i);
-                    if (pfn && !isPageIdle(pfn)) accessed = true;  // read since armed
+                    if (pfn && !isPageIdle(pfn)) {           // read since armed
+                        accessed = true;
+                        idle_armed_[i] = 0;
+                    }
                 }
 #endif
                 if (accessed) {
@@ -1776,10 +1799,16 @@ private:
         // avoids both the mprotect arm here and the per-read SIGSEGV. Only taken
         // when the privileged probe passed — otherwise falls through to the
         // legacy PROT_NONE path below, byte-identical to before.
-        if (idle_read_ok_ == 1) {
+        if (idle_read_ok_ == 1 && idle_armed_) {
             uint64_t pfn = pfnForPage(page_idx);
-            if (pfn) { markPageIdle(pfn); return; }
-            // PFN vanished (page swapped/migrated) → fall through to PROT_NONE.
+            if (pfn) {
+                markPageIdle(pfn);
+                // Verify the mark took: the kernel ignores it for a page not
+                // yet on the LRU, which then reads "not idle" forever.
+                if (isPageIdle(pfn)) { idle_armed_[page_idx] = 1; return; }
+            }
+            // Mark ignored, or PFN vanished (swapped/migrated) → PROT_NONE arm.
+            idle_armed_[page_idx] = 0;
         }
 #endif
 #if defined(__APPLE__)
@@ -1912,8 +1941,11 @@ private:
                 return;
             }
 
-            if (!states_->transition(i, PageState::ACTIVE,
-                                        PageState::ACTIVE_MONITORING)) {
+            if (states_->transition(i, PageState::ACTIVE,
+                                       PageState::ACTIVE_MONITORING)) {
+                // Fresh monitoring cycle: no idle arm until escalation sets one.
+                if (idle_armed_) idle_armed_[i] = 0;
+            } else {
                 // Run breaks here — flush whatever we accumulated.
                 if (run_end > run_start && run_start != ~size_t{0}) {
                     flushPhase3Run(run_start, run_end);
@@ -3752,6 +3784,13 @@ private:
                 const char m[] = "[smash] SMASH_IDLE_READ_TRACK=1 but /sys/kernel/mm/page_idle/bitmap unavailable; falling back\n";
                 (void)!::write(2, m, sizeof(m) - 1);
             }
+            return false;
+        }
+        if (!idle_armed_ && vm_)
+            idle_armed_ = bootstrapArray<uint8_t>(vm_->totalPages());
+        if (!idle_armed_) {  // no per-page arm state → cannot use the bit safely
+            close(page_idle_fd_);
+            page_idle_fd_ = -1;
             return false;
         }
         idle_read_ok_ = 1;

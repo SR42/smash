@@ -151,6 +151,15 @@ add_test(NAME test_prefetch COMMAND test_prefetch)
 set_tests_properties(test_prefetch PROPERTIES
   ENVIRONMENT "SMASH_COLD_TICKS=2;SMASH_SOFTDIRTY=0;SMASH_FIXAV=0")
 
+# Idle-page read tracking: the root-only read-detection path (see the file
+# header). Skips unprivileged — i.e. in CI — so run it as root to cover it.
+add_executable(test_idle_read_tracking idle_read_tracking_test.cpp ${printf_SOURCE_DIR}/printf.cpp)
+target_include_directories(test_idle_read_tracking PRIVATE ${SMASH_TEST_INCLUDE_DIRS})
+target_link_libraries(test_idle_read_tracking PRIVATE alloc8::headers lz4_static libzstd_static)
+add_test(NAME test_idle_read_tracking COMMAND test_idle_read_tracking)
+set_tests_properties(test_idle_read_tracking PROPERTIES
+  ENVIRONMENT "SMASH_COLD_TICKS=2;SMASH_SOFTDIRTY=0;SMASH_FIXAV=0")
+
 # Contention test (needs LZ4 + zstd + smash_heap.cpp)
 add_executable(test_contention
   test_contention.cpp
