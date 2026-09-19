@@ -378,10 +378,27 @@ public:
             // Full mode: reserve contiguous VM region. total_pages_ covers
             // both the contiguous range AND a tail reserved for external
             // pages, so PageStateTable / PageLockTable have room for both.
+            // Reserve the arena; if the address space will not take the
+            // requested size (39-bit arm64 VA, RLIMIT_AS), halve it down to
+            // the 256 MiB floor rather than running with no compression at
+            // all, which is what a failed reservation used to mean.
+            const size_t requested = region_size;
+            constexpr size_t kFloor = size_t{256} << 20;
+            for (;;) {
+                base_ = static_cast<char*>(vm::reservePages(region_size));
+                if (base_ || region_size / 2 < kFloor) break;
+                region_size = region_size / 2 / kPageSize * kPageSize;
+            }
+            if (!base_) return false;
+            if (region_size != requested) {
+                char buf[192];
+                int n = smash::safe_snprintf(buf, sizeof(buf),
+                    "[smash] could not reserve a %zu MiB arena; using %zu MiB "
+                    "(SMASH_VM_GIB)\n", requested >> 20, region_size >> 20);
+                if (n > 0) (void)!::write(2, buf, static_cast<size_t>(n));
+            }
             contig_pages_ = region_size / kPageSize;
             total_pages_ = contig_pages_ + kTrackMaxPages;
-            base_ = static_cast<char*>(vm::reservePages(region_size));
-            if (!base_) return false;
             vm::setVmBounds(base_, region_size);
         } else {
             // Compress-only mode: contiguous arena is unused; tracked pages

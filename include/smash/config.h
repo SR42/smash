@@ -617,7 +617,15 @@ inline constexpr size_t kLargeAllocVmThreshold = SMASH_LARGE_ALLOC_VM_THRESHOLD;
 // ~270 MiB of bootstrap/lazy-mapped metadata — negligible vs the heap
 // it tracks. The mmap reservation itself is virtual-only (MAP_NORESERVE),
 // so the actual RSS cost is committed-pages × kPageSize.
-inline constexpr size_t kVmMaxPages = 16 * 1024 * 1024;  // 16M pages
+// Ceiling for SMASH_VM_GIB: 1 TiB. It only bounds a request — the arena is a
+// PROT_NONE MAP_NORESERVE reservation, and the per-page metadata sized from it
+// is demand-paged, so an unused arena costs address space, not memory
+// (measured: 16 vs 64 GiB arenas, identical 23.3 MB RSS). The previous 64 GiB
+// ceiling was an estimate of metadata cost, not a limit. Page indices are
+// 32-bit, so the hard bound is far higher (16 TiB). VmRegion::init halves the
+// request if the reservation fails (39-bit arm64 VA, RLIMIT_AS).
+inline constexpr size_t kVmMaxBytes = size_t{1} << 40;  // 1 TiB
+inline constexpr size_t kVmMaxPages = kVmMaxBytes / kPageSize;
 inline constexpr size_t kVmRegionSize = kVmMaxPages * kPageSize;
 
 // Runtime override: SMASH_VM_GIB=N, default 16. Clamped to [0.25, kVmMaxPages*kPageSize/GiB].
