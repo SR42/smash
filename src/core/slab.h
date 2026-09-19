@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <atomic>
+#include <unistd.h>
 
 namespace smash {
 
@@ -210,21 +211,55 @@ class Slab {
         }
     }
 
+    [[gnu::cold, gnu::noinline]] static void warnArenaExhausted() {
+        static std::atomic<bool> warned{false};
+        if (warned.exchange(true, std::memory_order_relaxed)) return;
+        static const char msg[] =
+            "[smash WARN] the compressible VmRegion arena is exhausted; new small-object "
+            "spans now come from direct mmap and are not compressed. Raise SMASH_VM_GIB "
+            "to keep them compressible.\n";
+        (void)!::write(2, msg, sizeof(msg) - 1);
+    }
+
+    // True if the span's pages are in the compressible VmRegion arena. A span
+    // can also come from direct mmap once the arena is exhausted (see
+    // allocateNewSpan); those pages have no page-state entries and are never
+    // compressed, so every region-only step must be skipped for them.
+    bool inRegion(const Span* span) const {
+        return vm_region_ &&
+               vm_region_->inContigArena(reinterpret_cast<uintptr_t>(span->base));
+    }
+
     Span* allocateNewSpan() {
         const auto& info = kSizeClasses[size_class_];
         size_t span_bytes = info.pages * kPageSize;
-        void* mem;
+        void* mem = nullptr;
+        bool from_region = false;
 
         if (vm_region_) {
             mem = vm_region_->allocatePages(info.pages);
-            if (!mem) return nullptr;
-            if (page_states_) {
-                size_t idx = vm_region_->pageIndex(reinterpret_cast<uintptr_t>(mem));
-                page_states_->setRange(idx, info.pages, PageState::ACTIVE);
+            if (mem) {
+                from_region = true;
+                if (page_states_) {
+                    size_t idx = vm_region_->pageIndex(reinterpret_cast<uintptr_t>(mem));
+                    page_states_->setRange(idx, info.pages, PageState::ACTIVE);
+                }
             }
-        } else {
+        }
+        if (!mem) {
+            // No VmRegion (no compression), or the arena is exhausted. The
+            // latter used to return nullptr here, which operator new turns
+            // into std::bad_alloc: small objects had no fallback, unlike
+            // LargeAlloc. The arena runs out without a large live set because
+            // an empty span's pages stay with its (arena, size class) — a
+            // program that moves between size classes consumes a fresh share
+            // of the arena for each (reproduced: 800 MiB of 64-byte objects,
+            // all freed, then 128-byte objects failed after 173 MiB in a
+            // 1 GiB arena). A direct mapping keeps the program running; its
+            // pages are simply not compressed.
             mem = vm::mapPages(span_bytes);
             if (!mem) return nullptr;
+            if (vm_region_) warnArenaExhausted();
         }
 
         Span* span = newSpanDescriptor();
@@ -233,7 +268,7 @@ class Slab {
         // out chunks on COMPRESSED pages (would fault on first user access),
         // and the cold-count array so allocate() can reset coldness on the
         // page it just handed a chunk out on.
-        if (vm_region_ && page_states_) {
+        if (from_region && page_states_) {
             span->page_states = page_states_;
             span->first_page_vm_idx = static_cast<uint32_t>(
                 vm_region_->pageIndex(reinterpret_cast<uintptr_t>(mem)));
@@ -248,7 +283,7 @@ class Slab {
 
     void releaseSpan(Span* span) {
         page_map_->clearRange(reinterpret_cast<uintptr_t>(span->base), span->page_count);
-        if (vm_region_) {
+        if (inRegion(span)) {
             if (release_hook_) {
                 size_t idx = vm_region_->pageIndex(reinterpret_cast<uintptr_t>(span->base));
                 release_hook_(idx, span->page_count, release_ctx_);
@@ -264,13 +299,15 @@ class Slab {
     // discover, zero, and compress them.  The span stays in the empty list
     // for reuse; recommitEmptySpan() restores page state on reuse.
     void decommitEmptySpan(Span* span) {
-        if (release_hook_ && vm_region_) {
+        const bool in_region = inRegion(span);
+        if (release_hook_ && in_region) {
             size_t idx = vm_region_->pageIndex(reinterpret_cast<uintptr_t>(span->base));
             release_hook_(idx, span->page_count, release_ctx_);
         }
         size_t bytes = span->page_count * kPageSize;
-        vm::decommitPages(span->base, bytes);
-        if (page_states_ && vm_region_) {
+        if (in_region) vm::decommitPages(span->base, bytes);
+        else vm::decommitOwnMapping(span->base, bytes);
+        if (page_states_ && in_region) {
             size_t idx = vm_region_->pageIndex(reinterpret_cast<uintptr_t>(span->base));
             page_states_->setRange(idx, span->page_count, PageState::EMPTY);
         }
@@ -281,7 +318,7 @@ class Slab {
     // array is indexed by VM page and keeps whatever streak the previous
     // occupant left behind.
     void resetColdCounts(Span* span) {
-        if (!cold_counts_ || !vm_region_) return;
+        if (!cold_counts_ || !inRegion(span)) return;
         size_t idx = vm_region_->pageIndex(reinterpret_cast<uintptr_t>(span->base));
         __builtin_memset(cold_counts_ + idx, 0, span->page_count);
     }
@@ -290,7 +327,7 @@ class Slab {
     // Physical pages are zero-filled by the kernel on first access
     // (MADV_DONTNEED on Linux, MADV_FREE on macOS).
     void recommitEmptySpan(Span* span) {
-        if (page_states_ && vm_region_) {
+        if (page_states_ && inRegion(span)) {
             size_t idx = vm_region_->pageIndex(reinterpret_cast<uintptr_t>(span->base));
             page_states_->setRange(idx, span->page_count, PageState::ACTIVE);
         }

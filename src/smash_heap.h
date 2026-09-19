@@ -10,6 +10,7 @@
 #include "core/large_alloc.h"
 #include "core/thread_cache.h"
 #include "util/exit_guard.h"
+#include "util/alloc_failure.h"
 #include "vm/vm_region.h"
 #include "vm/page_state.h"
 #include "vm/fault_handler.h"
@@ -1370,6 +1371,9 @@ public:
             uint8_t arena = callsiteArena(sc, ra_for_arena);
             void* ptr = tc->allocate(sc, arena);
             if (!ptr) ptr = tc->refill(sc, arena, &slab(arena, sc));
+            if (!ptr) [[unlikely]]
+                reportAllocFailure("small (slab span: no VmRegion pages)", size, 0,
+                                   vm_region_.rawNextPage(), vm_region_.contigPages());
             if constexpr (kMeasureCohorts) {
                 if (ptr) {
                     uintptr_t ra = ra_for_arena;
@@ -1385,12 +1389,9 @@ public:
         uintptr_t ra_for_arena = caller_ra ? caller_ra : appCallerRA();
         uint8_t arena = callsiteArenaForLarge(ra_for_arena);
         void* ptr = large_alloc_.allocate(size, kMinAlignment, arena);
-        if (!ptr) {
-            char dbg[128];
-            int n = smash::safe_snprintf(dbg, sizeof(dbg),
-                "[smash debug] large_alloc_.allocate(%zu) returned NULL\n", size);
-            if (n > 0) (void)!::write(STDERR_FILENO, dbg, n);
-        }
+        if (!ptr) [[unlikely]]
+            reportAllocFailure("large (VmRegion and direct mmap)", size, 0,
+                               vm_region_.rawNextPage(), vm_region_.contigPages());
         if (ptr && isEagerZeroMode()) __builtin_memset(ptr, 0, size);
         return ptr;
     }
@@ -1641,7 +1642,11 @@ public:
         if (alignment <= kMinAlignment) return this->malloc(size);
         uintptr_t caller_ra = appCallerRA();
         uint8_t arena = callsiteArenaForLarge(caller_ra);
-        return large_alloc_.allocate(size, alignment, arena);
+        void* ptr = large_alloc_.allocate(size, alignment, arena);
+        if (!ptr) [[unlikely]]
+            reportAllocFailure("aligned (direct mmap)", size, alignment,
+                               vm_region_.rawNextPage(), vm_region_.contigPages());
+        return ptr;
     }
 
     // malloc_numa(): malloc whose pages are bound to one NUMA node. Only the

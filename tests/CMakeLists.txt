@@ -670,3 +670,12 @@ target_link_libraries(test_uffd_write_tracking PRIVATE alloc8::headers lz4_stati
 add_test(NAME test_uffd_write_tracking COMMAND test_uffd_write_tracking)
 set_tests_properties(test_uffd_write_tracking PROPERTIES
   ENVIRONMENT "SMASH_WRITE_TRACK=uffd;SMASH_COLD_TICKS=2;SMASH_FIXAV=0")
+
+# Small allocations after the VmRegion arena is exhausted: slab spans used to
+# have no fallback, so operator new threw std::bad_alloc (multithreaded apps
+# died with "terminate called recursively"). A 1 GiB arena and three phases of
+# different size classes exhaust it; every object's pattern is verified.
+add_executable(small_arena_exhaustion_test small_arena_exhaustion_test.cpp)
+set_target_properties(small_arena_exhaustion_test PROPERTIES CXX_STANDARD 20)
+add_smash_mode_test(test_small_arena_exhaustion small_arena_exhaustion_test 0 300
+  "SMASH_VM_GIB=1")

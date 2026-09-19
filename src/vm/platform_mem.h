@@ -226,6 +226,23 @@ inline void decommitPages(void* addr, size_t size) {
 #endif
 }
 
+// decommitPages() for smash's OWN direct mappings outside the VmRegion — a
+// small-object span mapped after the arena was exhausted (Slab::
+// allocateNewSpan). Same release, minus the bounds check: that check exists to
+// trap a wild pointer, and the caller has established the range is a mapping
+// it created. Not used on Windows, where the region path recommits explicitly.
+inline void decommitOwnMapping(void* addr, size_t size) {
+    if (noDecommitEnabled()) return;
+#if defined(__linux__)
+    static const int madv = madvMode();
+    madvise(addr, size, madv);
+#elif defined(__APPLE__)
+    madvise(addr, size, MADV_FREE_REUSABLE);
+#else
+    (void)addr; (void)size;
+#endif
+}
+
 // Unmap pages entirely (release virtual + physical).
 inline void unmapPages(void* addr, size_t size) {
 #if defined(_WIN32)
