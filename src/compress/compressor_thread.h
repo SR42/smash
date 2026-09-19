@@ -22,7 +22,8 @@
 #include "../core/page_map.h"
 #include "../util/spinlock.h"
 #include "../util/exit_guard.h"
-#include "../util/safe_printf.h"  // signal-handler-safe snprintf for SIGUSR2 stats
+#include "../util/safe_printf.h"
+#include "../util/thread_stack.h"  // signal-handler-safe snprintf for SIGUSR2 stats
 
 namespace smash {
 // Set true when a loaded profile says external pages were hot, so the mmap/
@@ -3282,16 +3283,23 @@ private:
     }
 
     // A worker thread's stack: node memory above a PROT_NONE guard page.
+    // A node worker's stack: its own 1 MiB plus what glibc needs for the
+    // application's static TLS, with a guard page below — all in RUNTIME
+    // pages. kPageSize is a compile-time 4 KiB, which a 64 KiB-page kernel
+    // rejects for the guard mprotect (see util/thread_stack.h).
+    static size_t nodeStackBytes() { return smashThreadStackSize(kNodeWorkerStackBytes); }
+
     static void* allocNodeStack(uint32_t node) {
-        const size_t bytes = kNodeWorkerStackBytes + kPageSize;
+        const size_t guard = runtimePageSize();
+        const size_t bytes = nodeStackBytes() + guard;
         void* m = vm::mapPages(bytes);
         if (!m) return nullptr;
         if (!vm::bindPagesToNode(m, bytes, node) ||
-            syscall(SYS_mprotect, m, kPageSize, PROT_NONE) != 0) {
+            syscall(SYS_mprotect, m, guard, PROT_NONE) != 0) {
             vm::unmapPages(m, bytes);
             return nullptr;
         }
-        return static_cast<char*>(m) + kPageSize;
+        return static_cast<char*>(m) + guard;
     }
 
     // Start every group's threads. Called from start(), and again after
@@ -3309,7 +3317,7 @@ private:
                 if (!nw.stack) break;
                 pthread_attr_t attr;
                 pthread_attr_init(&attr);
-                pthread_attr_setstack(&attr, nw.stack, kNodeWorkerStackBytes);
+                pthread_attr_setstack(&attr, nw.stack, nodeStackBytes());
                 if (g->pinned) pthread_attr_setaffinity_np(&attr, sizeof(g->cpus), &g->cpus);
                 const int rc = pthread_create(&nw.thread, &attr, nodeWorkerEntry, &nw);
                 pthread_attr_destroy(&attr);
@@ -5565,14 +5573,17 @@ public:
         // loaded modules' link_maps, some of which live on smash-compressed
         // (PROT_NONE) pages. The signal handler handles a few faults but the
         // kernel stops delivering SIGSEGV after ~3 rapid cycles.
-        // Use a small stack (128 KiB) since helpers only run compressTick
-        // which uses BootstrapAlloc-backed buffers, not stack allocations.
-        pthread_attr_t helper_attr;
-        pthread_attr_init(&helper_attr);
-        pthread_attr_setstacksize(&helper_attr, 128 * 1024);
+        // Helpers only run compressTick, which uses BootstrapAlloc-backed
+        // buffers rather than the stack, so 128 KiB of their OWN stack is
+        // plenty. createSmashThread() adds what glibc needs on top (the
+        // application's static TLS + guard): a fixed 128 KiB total failed for
+        // every thread once an app carried ~128 KiB of static TLS, silently
+        // disabling compression (see util/thread_stack.h).
+        constexpr size_t kSmashThreadStack = 128 * 1024;
 
         for (int w = 0; w < kMaxCompressorWorkers; ++w) ensureWorkerState(w);
         int created = 0;
+        int helper_err = 0;
         for (int i = 0; i < kMaxHelpers; ++i) {
             auto* ha = static_cast<HelperArg*>(
                 BootstrapAlloc::instance().allocate(sizeof(HelperArg), alignof(HelperArg)));
@@ -5582,11 +5593,20 @@ public:
             // Record only the helpers that actually exist: helpers_created_
             // drives both the adaptive worker cap and stop()'s joins, and
             // joining a never-created pthread_t{} is undefined behavior.
-            if (pthread_create(&helper_threads_[i], &helper_attr, helperEntry, ha) != 0)
-                break;
+            helper_err = createSmashThread(&helper_threads_[i], kSmashThreadStack,
+                                           helperEntry, ha);
+            if (helper_err != 0) break;
             ++created;
         }
         helpers_created_ = created;
+        if (created < kMaxHelpers) {
+            char buf[160];
+            int n = smash::safe_snprintf(buf, sizeof(buf),
+                "[smash WARN] created %d of %d compressor helper threads "
+                "(pthread_create error %d); compression runs with fewer workers\n",
+                created, kMaxHelpers, helper_err);
+            if (n > 0) (void)!write(2, buf, (size_t)n);
+        }
 
 #if defined(__linux__)
         // Node compressor groups: created here for the same reason as the
@@ -5599,15 +5619,18 @@ public:
         // exit, stop() early-returns instead of joining a never-created
         // handle, and the library degrades to a plain allocator instead of
         // crashing at shutdown.
-        if (pthread_create(&coord_thread_, &helper_attr, coordEntry, this) != 0) {
+        if (int err = createSmashThread(&coord_thread_, kSmashThreadStack, coordEntry, this);
+            err != 0) {
             running_.store(false, std::memory_order_release);
-            char buf[128];
+            char buf[160];
             int n = smash::safe_snprintf(buf, sizeof(buf),
-                "[smash WARN] pthread_create(coordinator) failed; "
-                "compression disabled\n");
+                "[smash WARN] pthread_create(coordinator) failed (error %d: %s); "
+                "compression disabled\n", err,
+                err == EAGAIN ? "thread or memory limit" :
+                err == EINVAL ? "invalid stack size" :
+                err == EPERM ? "not permitted" : "see errno.h");
             if (n > 0) (void)!write(2, buf, (size_t)n);
         }
-        pthread_attr_destroy(&helper_attr);
     }
 
     static inline CompressorThread* s_stats_instance_ = nullptr;

@@ -648,3 +648,15 @@ add_smash_mode_test(test_stdout_buffer_integrity_large_only
 # for that: with the drain's shadow branch removed it fails again.
 add_smash_mode_test(test_stdout_buffer_integrity_full
   stdout_buffer_integrity_test 0 180 "SMASH_COLD_TIMEOUT_SEC=1")
+
+# smash's threads must start in an application with a lot of static TLS.
+# glibc puts static TLS inside each thread's stack; smash's fixed 128 KiB
+# stacks made every pthread_create fail once an app carried ~128 KiB of it,
+# silently disabling compression ("pthread_create(coordinator) failed").
+# The test checks that a cold, compressible block actually leaves RSS.
+add_executable(static_tls_threads_test static_tls_threads_test.cpp)
+set_target_properties(static_tls_threads_test PROPERTIES CXX_STANDARD 20)
+add_smash_mode_test(test_static_tls_threads_full static_tls_threads_test 0 60
+  "SMASH_COLD_TIMEOUT_SEC=1")
+add_smash_mode_test(test_static_tls_threads_large_only static_tls_threads_test 1 60
+  "SMASH_COLD_TIMEOUT_SEC=1")
