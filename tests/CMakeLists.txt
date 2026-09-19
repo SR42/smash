@@ -690,3 +690,13 @@ add_executable(arena_reuse_test arena_reuse_test.cpp)
 set_target_properties(arena_reuse_test PROPERTIES CXX_STANDARD 20)
 target_link_libraries(arena_reuse_test PRIVATE ${CMAKE_DL_LIBS})
 add_smash_mode_test(test_arena_reuse arena_reuse_test 0 600 "SMASH_VM_GIB=1")
+
+# Concurrent LargeAlloc traffic must not corrupt the span-descriptor free list
+# (was a lock-free Treiber stack with an ABA race: aborts / segfaults under
+# many threads). Both modes: aligned objects in full mode, 32 KiB blocks in
+# large-only. Probabilistic: the old stack crashed about 2 runs in 3 here.
+add_executable(span_descriptor_race_test span_descriptor_race_test.cpp)
+set_target_properties(span_descriptor_race_test PROPERTIES CXX_STANDARD 20)
+target_link_libraries(span_descriptor_race_test PRIVATE Threads::Threads)
+add_smash_mode_test(test_span_descriptor_race_full span_descriptor_race_test 0 300)
+add_smash_mode_test(test_span_descriptor_race_large_only span_descriptor_race_test 1 300)
