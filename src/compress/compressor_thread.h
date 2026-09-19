@@ -23,7 +23,8 @@
 #include "../util/spinlock.h"
 #include "../util/exit_guard.h"
 #include "../util/safe_printf.h"
-#include "../util/thread_stack.h"  // signal-handler-safe snprintf for SIGUSR2 stats
+#include "../util/thread_stack.h"
+#include "../vm/uffd_uapi.h"  // signal-handler-safe snprintf for SIGUSR2 stats
 
 namespace smash {
 // Set true when a loaded profile says external pages were hot, so the mmap/
@@ -440,6 +441,22 @@ class CompressorThread {
     // soft-dirty wipe at tick end (kernel does it lazily by zapping PTEs).
     [[maybe_unused]] int clear_refs_fd_ = -1;
     [[maybe_unused]] int pagemap_fd_ = -1;
+
+    // Which kernel mechanism tells phase 1 that a page was written; chosen
+    // once per process by selectWriteTracker().
+    //   kSoftDirty  clear_refs + pagemap bit 55 (x86 and most distros)
+    //   kUffd       async userfaultfd write-protect + PAGEMAP_SCAN (Linux 6.7+;
+    //               the replacement where soft-dirty does not exist — arm64)
+    //   kNone       the files open but neither works: no write signal, only
+    //               Phase B's content check (what arm64 got before, minus the
+    //               per-tick clear_refs/pagemap work that did nothing)
+    //   kProtRead   Phase 3 mprotect(PROT_READ) monitoring (SMASH_SOFTDIRTY=0,
+    //               or /proc unavailable — both as before)
+    enum class WriteTracker : int8_t { kUnprobed = -1, kSoftDirty, kUffd, kNone, kProtRead };
+    WriteTracker write_tracker_ = WriteTracker::kUnprobed;
+    // The userfaultfd behind kUffd. Static so the remapPages() hook — a plain
+    // function pointer running in fault paths — can reach it.
+    static inline std::atomic<int> s_uffd_fd_{-1};
 
     // Idle-page read tracking (Linux, opt-in, privileged). The only fault-free
     // way to learn whether a page was READ since last tick is the PTE Accessed
@@ -1043,6 +1060,11 @@ public:
         // in the child since PFNs and privilege may differ; reset the cache.
         if (page_idle_fd_ >= 0)  { close(page_idle_fd_);  page_idle_fd_ = -1; }
         idle_read_ok_ = -1;
+        // The child inherits the userfaultfd but not the registration (no
+        // UFFD_FEATURE_EVENT_FORK), so it must choose and register afresh.
+        if (int ufd = s_uffd_fd_.exchange(-1); ufd >= 0) close(ufd);
+        vm::g_after_remap_track_hook = nullptr;
+        write_tracker_ = WriteTracker::kUnprobed;
         // Spill file: the child inherited the parent's MAP_SHARED mapping of the
         // (unlinked) parent spill file plus the in-memory SpillStore offsets/
         // free-list, which are process-local. Continuing to use them would
@@ -3746,6 +3768,178 @@ private:
 #endif
     }
 
+    // Does soft-dirty WORK? Opening /proc/self/{clear_refs,pagemap} proves
+    // nothing: a kernel built without CONFIG_MEM_SOFT_DIRTY — every arm64
+    // kernel — accepts the "4" clear as a no-op and reports bit 55 as 0
+    // forever. smash then saw every page as never written, skipped Phase 3
+    // (soft-dirty replaces it), and paid a whole-process page-table walk each
+    // tick for nothing. So: write a scratch page, clear, the bit must read 0;
+    // write again, it must read 1.
+    bool softDirtyWorks() {
+#ifdef __linux__
+        if (!ensureSoftDirtyFds()) return false;
+        const size_t ps = runtimePageSize();
+        void* m = reinterpret_cast<void*>(syscall(SYS_mmap, nullptr, ps,
+            PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+        if (m == MAP_FAILED) return false;
+        auto bit = [&]() -> int {
+            uint64_t e = 0;
+            const off_t off = static_cast<off_t>(reinterpret_cast<uintptr_t>(m) / ps * sizeof(e));
+            if (pread(pagemap_fd_, &e, sizeof(e), off) != (ssize_t)sizeof(e)) return -1;
+            return static_cast<int>((e >> 55) & 1);
+        };
+        volatile char* p = static_cast<volatile char*>(m);
+        p[0] = 1;
+        clearSoftDirty();
+        const int after_clear = bit();
+        p[0] = 2;
+        const int after_write = bit();
+        syscall(SYS_munmap, m, ps);
+        return after_clear == 0 && after_write == 1;
+#else
+        return false;
+#endif
+    }
+
+#ifdef __linux__
+    static bool uffdRegisterWp(int fd, void* addr, size_t len) {
+        uffdio_register r{};
+        r.range.start = reinterpret_cast<uintptr_t>(addr);
+        r.range.len = len;
+        r.mode = UFFDIO_REGISTER_MODE_WP;
+        return syscall(SYS_ioctl, fd, UFFDIO_REGISTER, &r) == 0;
+    }
+
+    // vm::g_after_remap_track_hook: a MAP_FIXED remap dropped the range's
+    // registration; restore it. Async-signal-safe (one ioctl).
+    static void uffdReregisterAfterRemap(void* addr, size_t size) {
+        const int fd = s_uffd_fd_.load(std::memory_order_acquire);
+        if (fd >= 0) (void)uffdRegisterWp(fd, addr, size);
+    }
+
+    // One PAGEMAP_SCAN pass over [start, end): calls on_written(addr) for
+    // every written page and, with rearm, write-protects them again in the
+    // same call — the userfaultfd equivalent of reading pagemap bit 55 and
+    // then writing "4" to clear_refs. Returns false if the ioctl fails.
+    template <typename F>
+    bool uffdScan(uintptr_t start, uintptr_t end, bool rearm, F&& on_written) {
+        uffd::PageRegion regs[256];
+        uffd::PmScanArg a{};
+        a.size = sizeof(a);
+        a.flags = rearm ? uffd::kScanWpMatching : 0;
+        a.start = start;
+        a.end = end;
+        a.vec = reinterpret_cast<uintptr_t>(regs);
+        a.vec_len = sizeof(regs) / sizeof(regs[0]);
+        a.category_mask = uffd::kPageIsWritten;
+        a.return_mask = uffd::kPageIsWritten;
+        while (a.start < a.end) {
+            const long n = syscall(SYS_ioctl, pagemap_fd_, uffd::kPagemapScan, &a);
+            if (n < 0) return false;
+            for (long k = 0; k < n; ++k)
+                for (uintptr_t x = regs[k].start; x < regs[k].end; x += kPageSize)
+                    on_written(x);
+            if (a.walk_end <= a.start || a.walk_end >= a.end) break;
+            a.start = a.walk_end;
+        }
+        return true;
+    }
+
+    // Set up async userfaultfd write-protect tracking over the whole arena.
+    // Needs Linux 6.7 (UFFD_FEATURE_WP_ASYNC, PAGEMAP_SCAN). UFFD_USER_MODE_ONLY
+    // is what an unprivileged process may open when
+    // vm.unprivileged_userfaultfd=0 (the usual default); async write-protect
+    // is resolved in the kernel either way, with no signal. A scratch page is
+    // checked end to end before the arena is trusted to it.
+    bool setupUffd() {
+        if (!vm_ || vm_->contigPages() == 0 || !ensureSoftDirtyFds()) return false;
+        int fd = static_cast<int>(syscall(__NR_userfaultfd,
+                                          O_CLOEXEC | O_NONBLOCK | UFFD_USER_MODE_ONLY));
+        if (fd < 0) fd = static_cast<int>(syscall(__NR_userfaultfd, O_CLOEXEC | O_NONBLOCK));
+        if (fd < 0) return false;
+        uffdio_api api{};
+        api.api = UFFD_API;
+        api.features = UFFD_FEATURE_WP_ASYNC | UFFD_FEATURE_WP_UNPOPULATED;
+        if (syscall(SYS_ioctl, fd, UFFDIO_API, &api) != 0) { close(fd); return false; }
+
+        const size_t ps = runtimePageSize();
+        void* m = reinterpret_cast<void*>(syscall(SYS_mmap, nullptr, ps,
+            PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+        bool ok = m != MAP_FAILED && uffdRegisterWp(fd, m, ps);
+        if (ok) {
+            const auto lo = reinterpret_cast<uintptr_t>(m), hi = lo + ps;
+            int seen = 0;
+            auto count = [&](uintptr_t) { ++seen; };
+            ok = uffdScan(lo, hi, true, count);                    // arm
+            seen = 0;
+            ok = ok && uffdScan(lo, hi, false, count) && seen == 0;  // clean
+            static_cast<volatile char*>(m)[0] = 1;
+            ok = ok && uffdScan(lo, hi, false, count) && seen == 1;  // write seen
+        }
+        if (m != MAP_FAILED) syscall(SYS_munmap, m, ps);
+        if (!ok || !uffdRegisterWp(fd, vm_->base(), vm_->contigPages() * kPageSize)) {
+            close(fd);
+            return false;
+        }
+        s_uffd_fd_.store(fd, std::memory_order_release);
+        vm::g_after_remap_track_hook = &uffdReregisterAfterRemap;
+        return true;
+    }
+#endif
+
+    // Read and re-arm the userfaultfd write bits for the arena pages in
+    // [start, end) into accessed_. External pages are the application's own
+    // mappings and are not registered, so they get no write signal here.
+    void readUffdWritten(size_t start, size_t end) {
+#ifdef __linux__
+        if (!vm_ || pagemap_fd_ < 0) return;
+        if (end > vm_->contigPages()) end = vm_->contigPages();
+        if (start >= end) return;
+        const auto base = reinterpret_cast<uintptr_t>(vm_->base());
+        (void)uffdScan(base + start * kPageSize, base + end * kPageSize, true,
+                       [&](uintptr_t x) {
+                           accessed_[(x - base) / kPageSize].store(true, std::memory_order_relaxed);
+                       });
+#else
+        (void)start; (void)end;
+#endif
+    }
+
+    WriteTracker selectWriteTracker() {
+#ifdef __linux__
+        // SMASH_SOFTDIRTY=0, and /proc being unavailable, keep their old
+        // meaning: Phase 3 PROT_READ monitoring.
+        if (!isSoftDirtyEnabled() || !ensureSoftDirtyFds()) return WriteTracker::kProtRead;
+        // SMASH_WRITE_TRACK=auto|softdirty|uffd|none (default auto: the first
+        // of soft-dirty, userfaultfd that actually works).
+        const char* v = std::getenv("SMASH_WRITE_TRACK");
+        const bool any = !v || std::strcmp(v, "auto") == 0;
+        if (v && std::strcmp(v, "none") == 0) return WriteTracker::kNone;
+        if ((any || std::strcmp(v, "softdirty") == 0) && softDirtyWorks())
+            return WriteTracker::kSoftDirty;
+        if ((any || std::strcmp(v, "uffd") == 0) && setupUffd())
+            return WriteTracker::kUffd;
+        return WriteTracker::kNone;
+#else
+        return WriteTracker::kProtRead;
+#endif
+    }
+
+    WriteTracker writeTracker() {
+        if (write_tracker_ == WriteTracker::kUnprobed) write_tracker_ = selectWriteTracker();
+        return write_tracker_;
+    }
+
+    static const char* writeTrackerName(WriteTracker t) {
+        switch (t) {
+            case WriteTracker::kSoftDirty: return "softdirty";
+            case WriteTracker::kUffd:      return "uffd";
+            case WriteTracker::kNone:      return "none";
+            case WriteTracker::kProtRead:  return "protread";
+            default:                       return "unprobed";
+        }
+    }
+
     // Probe for usable idle-page read tracking. Requires (1) the sysfs bitmap
     // openable O_RDWR (kernel built with CONFIG_IDLE_PAGE_TRACKING + root), and
     // (2) /proc/self/pagemap exposing a real PFN (non-zero) for a resident page
@@ -4690,12 +4884,16 @@ private:
         assignNodeChunks(committed);
 #endif
 
-        // Soft-dirty: bulk-read kernel-tracked write bits into accessed_
-        // BEFORE Phase 1 consumes them, then clear for the next tick.
-        bool softdirty = isSoftDirtyEnabled() && ensureSoftDirtyFds();
-        if (softdirty) {
+        // Kernel write tracking: bulk-read which pages were written into
+        // accessed_ BEFORE Phase 1 consumes them (and re-arm for next tick).
+        const WriteTracker tracker = writeTracker();
+        if (tracker == WriteTracker::kSoftDirty) {
             readSoftDirty(0, committed);
+        } else if (tracker == WriteTracker::kUffd) {
+            readUffdWritten(0, committed);
         }
+        // Every tracker but PROT_READ monitoring replaces Phase 3.
+        const bool softdirty = tracker != WriteTracker::kProtRead;
 #ifdef __linux__
         // Probe idle-page read tracking once (cached). No-op + fallback when the
         // kernel lacks CONFIG_IDLE_PAGE_TRACKING or we lack CAP_SYS_ADMIN (the
@@ -4758,9 +4956,10 @@ private:
         if (!no_monitor && !defer_phases && !skip_phase3 && !softdirty) {
             dispatch(3);  // Phase 3: monitoring
         }
-        if (softdirty) {
+        if (tracker == WriteTracker::kSoftDirty) {
             // End-of-tick clear so app writes during the next tick get
-            // freshly tracked. One syscall, no per-page cost.
+            // freshly tracked. One syscall, no per-page cost. (kUffd re-arms
+            // inside its scan; kNone has nothing to clear.)
             clearSoftDirty();
         }
 
@@ -5677,7 +5876,7 @@ public:
             "[smash stats] [%s] pid=%d committed=%zu  active=%zu  monitor=%zu"
             "  compressing=%zu  compressed=%zu  shadow=%zu  empty=%zu"
             "  tier_up=%llu/%llu  spilled=%zu  zero=%llu  bump=%zu"
-            "  reheat=%llu\n",
+            "  reheat=%llu  track=%s\n",
             ts, (int)getpid(), total, active, monitor, compressing, compressed,
             shadow, empty,
             (unsigned long long)tier_success,
@@ -5685,7 +5884,8 @@ public:
             spilled,
             (unsigned long long)self->zero_pages_.load(std::memory_order_relaxed),
             raw_bump,
-            (unsigned long long)g_reheat_events.load(std::memory_order_relaxed));
+            (unsigned long long)g_reheat_events.load(std::memory_order_relaxed),
+            writeTrackerName(self->write_tracker_));
         // Cast to void to silence -Wunused-result on glibc (write is
         // marked __wur there). We're inside a signal handler — there's
         // no useful recovery if write() short-returns.

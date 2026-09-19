@@ -660,3 +660,13 @@ add_smash_mode_test(test_static_tls_threads_full static_tls_threads_test 0 60
   "SMASH_COLD_TIMEOUT_SEC=1")
 add_smash_mode_test(test_static_tls_threads_large_only static_tls_threads_test 1 60
   "SMASH_COLD_TIMEOUT_SEC=1")
+
+# userfaultfd write tracking: where soft-dirty does not exist (arm64), smash
+# tracks writes with async uffd write-protect + PAGEMAP_SCAN. Forced to uffd
+# here so it runs on any Linux 6.7+ host; skips on older kernels.
+add_executable(test_uffd_write_tracking uffd_write_tracking_test.cpp ${printf_SOURCE_DIR}/printf.cpp)
+target_include_directories(test_uffd_write_tracking PRIVATE ${SMASH_TEST_INCLUDE_DIRS})
+target_link_libraries(test_uffd_write_tracking PRIVATE alloc8::headers lz4_static libzstd_static)
+add_test(NAME test_uffd_write_tracking COMMAND test_uffd_write_tracking)
+set_tests_properties(test_uffd_write_tracking PROPERTIES
+  ENVIRONMENT "SMASH_WRITE_TRACK=uffd;SMASH_COLD_TICKS=2;SMASH_FIXAV=0")

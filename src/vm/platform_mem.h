@@ -310,6 +310,14 @@ inline bool protectPages(void* addr, size_t size, bool read, bool write) {
 // exists, like g_external_page_check.
 inline void (*g_after_remap_hook)(void* addr, size_t size) = nullptr;
 
+// Also called by remapPages() after it replaces a range, for write tracking:
+// a MAP_FIXED mapping is a new VMA that is no longer registered with smash's
+// userfaultfd, so writes to it would go unseen (verified: after a MAP_FIXED
+// remap a write is not reported until the range is registered again). Set by
+// CompressorThread when the userfaultfd write tracker is active. Must be
+// async-signal-safe, like g_after_remap_hook.
+inline void (*g_after_remap_track_hook)(void* addr, size_t size) = nullptr;
+
 // Replace pages with a fresh anonymous mapping at the same address.
 // Returns true on success. Used to collapse the per-page VMA fragmentation
 // that mprotect-PROT_NONE creates so we don't hit vm.max_map_count.
@@ -346,6 +354,7 @@ inline bool remapPages(void* addr, size_t size, bool read, bool write) {
                       MAP_PRIVATE | MAP_ANON | MAP_FIXED);
     if (p != addr) return false;
     if (g_after_remap_hook) g_after_remap_hook(addr, size);
+    if (g_after_remap_track_hook) g_after_remap_track_hook(addr, size);
     return true;
 #endif
 }
