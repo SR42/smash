@@ -189,9 +189,14 @@ add_test(NAME test_fault_cycle COMMAND test_fault_cycle)
 # SMASH_COLD_TIMEOUT_SEC=1 sets cold_ticks_overridden, which bypasses the
 # CPU-pressure floor multiplier (see compressor_thread.h::phase2Range).
 set_tests_properties(test_fault_cycle PROPERTIES
-  ENVIRONMENT "SMASH_RECOMPRESS_BACKOFF=0;SMASH_COLD_TIMEOUT_SEC=1;SMASH_FIXAV=0"
-  LABELS "known_issue"
-  DISABLED TRUE)  # Signal-delivery timing varies across CI environments
+  ENVIRONMENT "SMASH_RECOMPRESS_BACKOFF=0;SMASH_COLD_TIMEOUT_SEC=1;SMASH_FIXAV=0")
+# Same body with eager (non-deferred) reclaim, where a COMPRESSED page stays
+# readable until the deferred-madvise sweeper protects it. This mode is what
+# failed 20/20 in June and got the test disabled as "signal-delivery timing";
+# the test now waits for the page to be truly inaccessible in both modes.
+add_test(NAME test_fault_cycle_eager_reclaim COMMAND test_fault_cycle)
+set_tests_properties(test_fault_cycle_eager_reclaim PROPERTIES
+  ENVIRONMENT "SMASH_RECOMPRESS_BACKOFF=0;SMASH_COLD_TIMEOUT_SEC=1;SMASH_FIXAV=0;SMASH_DEFERRED_RECLAIM=0")
 
 # Interposition test: built without alloc8 linkage, run under DYLD_INSERT
 add_executable(interpose_test interpose_test.cpp)
@@ -592,21 +597,16 @@ add_smash_mode_test(test_hugepage_mmap hugepage_mmap_test 0 120
   "SMASH_TRACE_MPROTECT_FAIL=1")
 
 # Same binary, but SMASH_TEST_STRICT_HUGEPAGE=1 promotes the wasted-work
-# finding from a WARN to a failure: smash retries the rejected page operations
-# on every compressor tick forever (~8192 failing mprotect calls in a few
-# seconds for a 16 MiB mapping) and the slices permanently occupy VmRegion's
-# 128 Ki-page external budget while being permanently uncompressible.
-# Registered DISABLED with the known_issue label — the same treatment
-# test_fault_cycle gets — because it documents a real defect that is not fixed
-# yet. Enable it once the mmap interposer skips MAP_HUGETLB.
+# finding from a WARN to a failure. Before the mmap interposer skipped
+# MAP_HUGETLB, smash retried the rejected page operations on every compressor
+# tick forever (8192 failing page operations in 6 s for a 16 MiB mapping) and
+# the slices permanently held VmRegion's 128 Ki-page external budget while
+# being permanently uncompressible. This is the regression guard for that skip.
 add_smash_mode_test(test_hugepage_no_mprotect_storm hugepage_mmap_test 0 120
   "SMASH_TRACK_EXTERNAL=1"
   "SMASH_COLD_TIMEOUT_SEC=1"
   "SMASH_TRACE_MPROTECT_FAIL=1"
   "SMASH_TEST_STRICT_HUGEPAGE=1")
-set_tests_properties(test_hugepage_no_mprotect_storm PROPERTIES
-  LABELS "known_issue"
-  DISABLED TRUE)  # registerLinuxExternalRange has no MAP_HUGETLB carve-out
 
 # VMA pressure: crossing vm.max_map_count makes mmap return ENOMEM, which makes
 # malloc return nullptr, which makes operator new throw std::bad_alloc. smash

@@ -1,24 +1,17 @@
 // Application hugepage mappings under smash's mmap interposer.
 //
 // smash's Linux mmap interposer registers application-direct mappings so the
-// compressor can see them (src/linux_syscall_wrappers.cpp). The filter is:
-//
-//     bool anon = (flags & MAP_ANONYMOUS) != 0;
-//     bool writable = (prot & PROT_WRITE) != 0;
-//     if (!anon || !writable || len == 0) return ret;
-//     if (vm) registerLinuxExternalRange(vm, ret, len);
-//
-// There is no MAP_HUGETLB carve-out, and registerLinuxExternalRange walks the
-// mapping in kPageSize (4 KiB) strides. So an application that allocates
-// hugepages with
+// compressor can see them (src/linux_syscall_wrappers.cpp, SMASH_TRACK_EXTERNAL=1).
+// Its filter, isTrackableMapping(), takes anonymous writable mappings and skips
+// MAP_HUGETLB. It did not always skip MAP_HUGETLB, and registerLinuxExternalRange
+// walks a mapping in kPageSize (4 KiB) strides, so an application that allocated
 //
 //     mmap(NULL, n, PROT_READ|PROT_WRITE,
 //          MAP_PRIVATE|MAP_ANONYMOUS|MAP_HUGETLB, -1, 0)
 //
-// has every 4 KiB slice of its huge mapping registered as a separate
-// "external page" and marked ACTIVE. The compressor then manages them like
-// ordinary pages — but the kernel requires huge-page-aligned addresses and
-// lengths for hugetlb VMAs, so every operation smash performs on them fails:
+// had every 4 KiB slice of its huge mapping registered as a separate "external
+// page" and marked ACTIVE. The kernel requires huge-page-aligned addresses and
+// lengths for hugetlb VMAs, so every operation smash then performed failed:
 //
 //     mprotect(hugetlb + 4096, 4096, ...)              -> EINVAL
 //     madvise(hugetlb + 4096, 4096, MADV_DONTNEED)     -> EINVAL
@@ -26,28 +19,24 @@
 //
 // (all three verified directly on a host with hugepages reserved).
 //
-// Three consequences this test pins down:
+// Three properties this test pins down:
 //
 //   1. Correctness — the application's data must survive. smash's restore
 //      paths use remapPages(), which is MAP_FIXED|MAP_ANON over the target;
-//      on a hugetlb VMA a partial replacement would shred the mapping. The
-//      kernel refuses it, but nothing in smash relies on that refusal, so the
-//      integrity check is the guard.
+//      on a hugetlb VMA a partial replacement would shred the mapping.
 //
-//   2. Wasted work — smash retries the failing page operations on every
-//      compressor tick, forever, because nothing records that the page is
-//      unmanageable. A 16 MiB hugetlb mapping produces ~8192 failing
-//      mprotect calls in a few seconds and keeps going.
+//   2. No wasted work — nothing records that a page is unmanageable, so a
+//      registered hugetlb slice is retried every compressor tick, forever.
+//      Before the skip, one 16 MiB mapping produced 8192 failing page
+//      operations in 6 s; now it must produce none.
 //
-//   3. Slot starvation — VmRegion's external-page budget is
-//      kTrackMaxPages = 128 Ki pages, which at 4 KiB is 512 MiB. Hugepages
-//      registered here consume that budget permanently while being
-//      permanently uncompressible, so genuinely compressible app mappings
-//      are silently dropped once it fills.
+//   3. No slot starvation — VmRegion's external-page budget is
+//      kTrackMaxPages = 128 Ki pages (512 MiB at 4 KiB). Registered hugetlb
+//      slices held that budget permanently while being uncompressible.
 //
-// Consequence 2 is asserted only when SMASH_TEST_STRICT_HUGEPAGE=1 (see the
-// second ctest registration); by default it is reported as a WARN so the
-// suite stays green while the defect is documented.
+// Property 2 is a failure only under SMASH_TEST_STRICT_HUGEPAGE=1
+// (test_hugepage_no_mprotect_storm, the regression guard for the skip); the
+// default registration reports it as a WARN.
 //
 // Skips cleanly when the host has no hugepages reserved
 // (/proc/meminfo HugePages_Free == 0), which is the case on CI runners —
@@ -219,6 +208,31 @@ int main() {
     for (size_t i = 0; i < maps.size(); ++i)
         std::memset(maps[i], static_cast<int>(0x40 + i), huge);
 
+    // Move the last mapping with mremap. mremap's flags cannot say MAP_HUGETLB,
+    // so the interposer tracks a moved range only if its source was tracked;
+    // without that, this move alone re-registered the destination and brought
+    // the failing-operation storm straight back (4096 in 6 s for an 8 MiB move).
+    // Same size to a huge-aligned destination: growing a hugetlb mapping is
+    // EINVAL, and some kernels refuse the move too — then this is skipped.
+    if (!maps.empty()) {
+        void* resv = mmap(nullptr, 2 * huge, PROT_NONE,
+                          MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+        if (resv != MAP_FAILED) {
+            auto dst = (reinterpret_cast<uintptr_t>(resv) + huge - 1) & ~(uintptr_t{huge} - 1);
+            void* moved = mremap(maps.back(), huge, huge, MREMAP_MAYMOVE | MREMAP_FIXED,
+                                 reinterpret_cast<void*>(dst));
+            if (moved != MAP_FAILED) {
+                maps.back() = moved;
+                ranges.back() = {reinterpret_cast<uintptr_t>(moved),
+                                 reinterpret_cast<uintptr_t>(moved) + huge};
+                printf("moved one hugetlb mapping with mremap\n");
+            } else {
+                printf("NOTE: kernel refused mremap of a hugetlb mapping (errno=%d); "
+                       "the mremap path is not exercised\n", errno);
+            }
+        }
+    }
+
     // Give the compressor something ordinary to work on too, so it is
     // genuinely running its phases rather than idling.
     void* ballast = std::malloc(32u << 20);
@@ -275,7 +289,9 @@ int main() {
     // ── 5. The failing-page-operation storm ─────────────────────────────────
     // Only observable when SMASH_TRACE_MPROTECT_FAIL=1 is set (the ctest
     // registration sets it). smash has no record that a page is unmanageable,
-    // so it retries every tick and the count grows without bound.
+    // so if these mappings were ever registered it would retry every tick and
+    // the count would grow without bound — 8192 in 6 s before the mmap
+    // interposer learned to skip MAP_HUGETLB.
     if (!capturing) {
         printf("NOTE: could not capture stderr; skipping the page-operation "
                "storm check\n");
@@ -283,7 +299,7 @@ int main() {
         size_t fails = countFailsInRanges(log, ranges);
         size_t pages = (maps.size() * huge) / 4096;
         printf("failing page operations on hugetlb pages over %d s: %zu "
-               "(%zu 4 KiB slices registered)\n", kTicksToWait, fails, pages);
+               "(the mappings span %zu 4 KiB slices)\n", kTicksToWait, fails, pages);
 
         if (fails == 0) {
             printf("hugepage page operations: none attempted (mappings are "
@@ -293,10 +309,10 @@ int main() {
                     "FAIL: smash attempted %zu page operations on hugetlb "
                     "pages, all of which the kernel must reject (hugetlb VMAs "
                     "require huge-page-aligned addresses and lengths).\n"
-                    "      registerLinuxExternalRange() in "
-                    "src/linux_syscall_wrappers.cpp has no MAP_HUGETLB "
-                    "carve-out, so it registers each 4 KiB slice of an "
-                    "application hugepage mapping as an external page. Nothing "
+                    "      The mmap interposer in src/linux_syscall_wrappers.cpp "
+                    "(isTrackableMapping) must skip MAP_HUGETLB; this means "
+                    "each 4 KiB slice of an application hugepage mapping was "
+                    "registered as an external page again. Nothing "
                     "records the failure, so the compressor retries every tick "
                     "forever, and the slices permanently occupy VmRegion's "
                     "128 Ki-page external budget while being permanently "
@@ -307,8 +323,9 @@ int main() {
         } else {
             printf("WARN: smash attempted %zu page operations on hugetlb "
                    "pages, all necessarily rejected by the kernel. "
-                   "registerLinuxExternalRange() has no MAP_HUGETLB carve-out; "
-                   "the retries repeat every tick and the slices consume "
+                   "The MAP_HUGETLB skip in the mmap interposer "
+                   "(isTrackableMapping) has regressed; the retries repeat "
+                   "every tick and the slices consume "
                    "VmRegion's external slot budget. Run with "
                    "SMASH_TEST_STRICT_HUGEPAGE=1 to make this a failure.\n",
                    fails);

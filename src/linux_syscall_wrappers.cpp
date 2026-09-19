@@ -1563,6 +1563,24 @@ inline void deregisterLinuxExternalRange(smash::VmRegion* vm, void* base, size_t
     }
 }
 
+// Which application mmaps are compression candidates. Anonymous and writable
+// only (see above), and never MAP_HUGETLB: a hugetlb VMA only accepts
+// huge-page-aligned addresses and lengths, so every 4 KiB mprotect / madvise /
+// MAP_FIXED smash would issue on a registered slice is rejected with EINVAL or
+// ENOMEM. Nothing records that a page is unmanageable, so the compressor used
+// to retry every tick forever — 8192 failing page operations in 6 s for one
+// 16 MiB mapping — while the slices permanently held external slots
+// (test_hugepage_no_mprotect_storm).
+inline bool isTrackableMapping(int prot, int flags, size_t len) {
+    if (len == 0) return false;
+    if (!(flags & MAP_ANONYMOUS)) return false;
+    if (!(prot & PROT_WRITE)) return false;
+#ifdef MAP_HUGETLB
+    if (flags & MAP_HUGETLB) return false;
+#endif
+    return true;
+}
+
 }  // namespace
 
 SMASH_VISIBLE void* mmap(void* addr, size_t len, int prot, int flags, int fd, off_t offset) {
@@ -1571,9 +1589,7 @@ SMASH_VISIBLE void* mmap(void* addr, size_t len, int prot, int flags, int fd, of
     if (!real_mmap) return MAP_FAILED;
     void* ret = real_mmap(addr, len, prot, flags, fd, offset);
     if (ret == MAP_FAILED) return ret;
-    bool anon = (flags & MAP_ANONYMOUS) != 0;
-    bool writable = (prot & PROT_WRITE) != 0;
-    if (!anon || !writable || len == 0) return ret;
+    if (!isTrackableMapping(prot, flags, len)) return ret;
     auto* vm = smash::g_smash_vm_region;
     if (vm) registerLinuxExternalRange(vm, ret, len);
     return ret;
@@ -1595,9 +1611,7 @@ SMASH_VISIBLE void* mmap64(void* addr, size_t len, int prot, int flags, int fd, 
     if (!real_mmap64) return MAP_FAILED;
     void* ret = real_mmap64(addr, len, prot, flags, fd, offset);
     if (ret == MAP_FAILED) return ret;
-    bool anon = (flags & MAP_ANONYMOUS) != 0;
-    bool writable = (prot & PROT_WRITE) != 0;
-    if (!anon || !writable || len == 0) return ret;
+    if (!isTrackableMapping(prot, flags, len)) return ret;
     auto* vm = smash::g_smash_vm_region;
     if (vm) registerLinuxExternalRange(vm, ret, len);
     return ret;
@@ -1627,7 +1641,12 @@ SMASH_VISIBLE void* mremap(void* old_addr, size_t old_size, size_t new_size, int
     if (ret == MAP_FAILED) return ret;
 
     auto* vm = smash::g_smash_vm_region;
-    if (vm && externalTrackingEnabledLinux()) {
+    // mremap's flags say nothing about the mapping's type, so a moved or grown
+    // range is tracked only if its source was: that keeps the mmap filter's
+    // verdict (MAP_HUGETLB, file-backed, read-only are never tracked) instead
+    // of registering whatever the application remaps.
+    if (vm && externalTrackingEnabledLinux() &&
+        vm->contains(reinterpret_cast<uintptr_t>(old_addr))) {
         // If mapping moved (ret != old_addr), untrack old and track new
         if (ret != old_addr) {
             deregisterLinuxExternalRange(vm, old_addr, old_size);
