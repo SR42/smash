@@ -563,6 +563,13 @@ class SmashHeap {
 
     Slab& slab(uint8_t arena, uint8_t sc) { return slabs_[arena * kNumClasses + sc]; }
 
+    // VmRegion's exhausted hook: return every slab's empty spans to the
+    // arena (see Slab::reclaimEmptySpans) so it reuses its own memory before
+    // spilling into uncompressed direct mappings.
+    static void reclaimEmptySpansHook(void* ctx) {
+        for (Slab& s : static_cast<SmashHeap*>(ctx)->slabs_) s.reclaimEmptySpans();
+    }
+
     uint8_t callsiteArena(uint8_t sc, uintptr_t ra) {
 #ifdef SMASH_ABLATION_NO_CALLSITE_ARENA
         (void)ra;
@@ -1140,6 +1147,7 @@ public:
                 }
             }
             log_time("slabs_init");
+            if (!compress_only) vm_region_.setExhaustedHook(&reclaimEmptySpansHook, this);
             compression_inited_ = true;
             g_smash_vm_region = &vm_region_;
             g_smash_page_states_for_external = &page_states_;
@@ -1814,6 +1822,14 @@ public:
         }
         if (!span) return -1;
         return static_cast<int>(span->arena_id);
+    }
+
+    // Diagnostic / test hook behind smash_in_arena(): is this address in the
+    // compressible VmRegion arena (as opposed to a direct-mmap fallback,
+    // BootstrapAlloc, or foreign memory)? Measures whether freed memory is
+    // actually reused by the arena rather than spilling past it.
+    bool inArena(const void* ptr) const {
+        return ptr && vm_region_.inContigArena(reinterpret_cast<uintptr_t>(ptr));
     }
 
     // Back the diagnostic exports smash_numa_compressor_info() and

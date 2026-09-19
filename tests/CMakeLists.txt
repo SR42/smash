@@ -69,6 +69,9 @@ smash_add_test(test_slab test_slab.cpp)
 # VM region test (no LZ4 dependency)
 smash_add_test(test_vm_region test_vm_region.cpp)
 
+# PageRunMap (coalescing free page runs) against a trivially correct model.
+smash_add_test(test_page_run_map test_page_run_map.cpp)
+
 # test_numa_arena: VmRegion's per-node arenas behind malloc_numa, direct-linked
 # so every step is deterministic. Checks grid-aligned chunks bound to the node,
 # freed pages reused only by the same node, no node pages in the shared free
@@ -679,3 +682,11 @@ add_executable(small_arena_exhaustion_test small_arena_exhaustion_test.cpp)
 set_target_properties(small_arena_exhaustion_test PROPERTIES CXX_STANDARD 20)
 add_smash_mode_test(test_small_arena_exhaustion small_arena_exhaustion_test 0 300
   "SMASH_VM_GIB=1")
+
+# Freed memory must be reused by the compressible arena across size classes
+# and sizes: empty slab spans returned, freed page runs coalesced. 1 GiB arena,
+# phases of ~70% each; every phase must land >= 95% inside the arena.
+add_executable(arena_reuse_test arena_reuse_test.cpp)
+set_target_properties(arena_reuse_test PROPERTIES CXX_STANDARD 20)
+target_link_libraries(arena_reuse_test PRIVATE ${CMAKE_DL_LIBS})
+add_smash_mode_test(test_arena_reuse arena_reuse_test 0 600 "SMASH_VM_GIB=1")

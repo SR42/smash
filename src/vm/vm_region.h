@@ -16,6 +16,7 @@
 #include <unistd.h>
 #include "smash/config.h"
 #include "platform_mem.h"
+#include "page_run_map.h"
 #include "page_state.h"
 #include "../core/bootstrap_alloc.h"
 #include "../util/spinlock.h"
@@ -60,12 +61,6 @@ class VmRegion {
     std::atomic<size_t> committed_pages_{0};
     Spinlock commit_lock_;
 
-    struct FreeRun {
-        size_t page_index;
-        size_t page_count;
-        FreeRun* next;
-    };
-
     // Pages committed per watermark advance (see committed_pages_).
     //
     // DEFAULT 0 = OFF (commit exactly the requested pages, per-call). Chunked
@@ -78,45 +73,19 @@ class VmRegion {
     // it ships off. Opt in per-workload via SMASH_COMMIT_CHUNK_KIB=N.
     static constexpr size_t kCommitChunkPages = 0;
 
-    // Sharded free lists to reduce contention under high thread counts.
-    // 64 shards = one per typical cache line, threads hash by ID.
-    static constexpr size_t kNumFreeShards = 64;
-    static constexpr size_t kFreeShardMask = kNumFreeShards - 1;
-
-    struct alignas(64) FreeShard {  // cache-line aligned
-        Spinlock lock;
-        // free_list AND free_pool are the two singly-linked stacks a shard
-        // owns; BOTH must only ever be touched while `lock` is held. An
-        // unlocked pop of free_pool from the decommit thread (vs a locked push
-        // from allocatePages) once corrupted the stack into a cycle → spin-
-        // livelock (fixed 2026-06-25, model/SmashFreePoolRace). GUARDED_BY lets
-        // clang -Wthread-safety re-prove that invariant at compile time so the
-        // regression can't silently return.
-        FreeRun* free_list SMASH_GUARDED_BY(lock) = nullptr;
-        FreeRun* free_pool SMASH_GUARDED_BY(lock) = nullptr;
-    };
-    FreeShard shards_[kNumFreeShards];
-
-    static size_t getShardIdx() {
-        // Hash thread ID to shard. Cache per-thread for speed.
-        thread_local size_t idx = std::hash<std::thread::id>{}(
-            std::this_thread::get_id()) & kFreeShardMask;
-        return idx;
-    }
-
-    FreeRun* newFreeRun(FreeShard& shard) SMASH_REQUIRES(shard.lock) {
-        if (shard.free_pool) {
-            FreeRun* r = shard.free_pool;
-            shard.free_pool = r->next;
-            return r;
-        }
-        return static_cast<FreeRun*>(
-            BootstrapAlloc::instance().allocate(sizeof(FreeRun), alignof(FreeRun)));
-    }
-
-    void recycleFreeRun(FreeRun* r, FreeShard& shard) SMASH_REQUIRES(shard.lock) {
-        r->next = shard.free_pool;
-        shard.free_pool = r;
+    // Free arena pages: a coalescing map of runs (see page_run_map.h). It
+    // replaced 64 per-thread lists of FreeRun nodes that never merged — a run
+    // could only serve a request no larger than itself, so memory freed at one
+    // size could not be reused at a larger one, and a program moving between
+    // sizes spilled out of the compressible arena for good. Owner 0 is the
+    // shared arena, node + 1 a NUMA node arena; runs of different owners never
+    // merge.
+    PageRunMap free_map_;
+    void (*exhausted_hook_)(void*) = nullptr;
+    void* exhausted_ctx_ = nullptr;
+    static constexpr uint32_t kSharedOwner = 0;
+    static uint32_t ownerOfNode(int node) {
+        return node >= 0 ? static_cast<uint32_t>(node) + 1 : kSharedOwner;
     }
 
     // ── Background decommit thread ──────────────────────────────────────────
@@ -127,7 +96,6 @@ class VmRegion {
         void* addr;
         size_t num_pages;
         size_t page_index;
-        size_t shard_idx;
         int node;  // owning NUMA node arena, or -1 for the shared free lists
         DecommitEntry* next;
     };
@@ -155,13 +123,11 @@ class VmRegion {
         decommit_pool_ = e;
     }
 
-    void queueForDecommit(void* addr, size_t num_pages, size_t page_index,
-                          size_t shard_idx, int node) {
+    void queueForDecommit(void* addr, size_t num_pages, size_t page_index, int node) {
         DecommitEntry* e = newDecommitEntry();
         e->addr = addr;
         e->num_pages = num_pages;
         e->page_index = page_index;
-        e->shard_idx = shard_idx;
         e->node = node;
         // Lock-free push to MPSC queue
         DecommitEntry* head = decommit_head_.load(std::memory_order_relaxed);
@@ -187,27 +153,10 @@ class VmRegion {
         // Decommit the pages (release physical backing).
         vm::decommitPages(e->addr, e->num_pages * kPageSize);
 
-        // NOW add to free list (safe - pages are decommitted and PROT_RW).
-        // CRITICAL: newFreeRun() POPS shard.free_pool (the FreeRun recycle
-        // stack), which is guarded by shard.lock — the SAME lock that guards
-        // free_list and that recycleFreeRun (called from allocatePages) holds
-        // when it PUSHES free_pool. This runs on the decommit thread; before
-        // 2026-06-25 newFreeRun was called OUTSIDE the lock here, so the
-        // decommit-thread pop raced the app-thread locked push on free_pool,
-        // corrupting that singly-linked stack into a cycle → newFreeRun /
-        // allocatePages free-list walks spun forever (full-mode LargeAlloc
-        // spin-livelock). All free_pool/free_list mutations for a shard MUST
-        // hold shard.lock. Proven by model/SmashFreePoolRace.{lean,tla}.
-        // Deadlock-safe: newFreeRun's only nested lock is BootstrapAlloc's
-        // expand_lock_ (taken after, never before, shard.lock) — no inversion.
-        // A node arena's pages go back to that arena only (see NodeArena).
-        FreeShard& shard = (e->node >= 0)
-            ? node_arenas_.load(std::memory_order_acquire)[e->node].free
-            : shards_[e->shard_idx];
-        {
-            LockGuard guard(shard.lock);
-            pushFreeRun(shard, e->page_index, e->num_pages);
-        }
+        // NOW add to the free map (safe - pages are decommitted and PROT_RW),
+        // merging with free neighbours of the same owner. A node arena's pages
+        // go back to that arena only (see NodeArena).
+        free_map_.insert(e->page_index, e->num_pages, ownerOfNode(e->node));
     }
 
     static void* decommitThreadEntry(void* arg) {
@@ -400,6 +349,7 @@ public:
             contig_pages_ = region_size / kPageSize;
             total_pages_ = contig_pages_ + kTrackMaxPages;
             vm::setVmBounds(base_, region_size);
+            if (!free_map_.init(contig_pages_)) return false;
         } else {
             // Compress-only mode: contiguous arena is unused; tracked pages
             // get indices 1..kTrackMaxPages-1 (index 0 reserved as sentinel).
@@ -466,59 +416,26 @@ public:
     void* allocatePages(size_t num_pages) {
         if (tracking_mode_) return nullptr;
 
-        // Try this thread's shard first (low contention path)
-        size_t my_shard = getShardIdx();
-        FreeShard& shard = shards_[my_shard];
-        {
-            LockGuard guard(shard.lock);
-            FreeRun** prev = &shard.free_list;
-            FreeRun* run = shard.free_list;
-            while (run) {
-                if (run->page_count >= num_pages) {
-                    size_t page_idx = run->page_index;
-                    if (run->page_count == num_pages) {
-                        *prev = run->next;
-                        recycleFreeRun(run, shard);
-                    } else {
-                        run->page_index += num_pages;
-                        run->page_count -= num_pages;
-                    }
-                    return base_ + page_idx * kPageSize;
-                }
-                prev = &run->next;
-                run = run->next;
-            }
-        }
-
-        // Try other shards round-robin
-        for (size_t i = 1; i < kNumFreeShards; ++i) {
-            FreeShard& other = shards_[(my_shard + i) & kFreeShardMask];
-            if (!other.lock.tryLock()) continue;  // skip contended shards
-            FreeRun** prev = &other.free_list;
-            FreeRun* run = other.free_list;
-            while (run) {
-                if (run->page_count >= num_pages) {
-                    size_t page_idx = run->page_index;
-                    if (run->page_count == num_pages) {
-                        *prev = run->next;
-                        recycleFreeRun(run, other);
-                    } else {
-                        run->page_index += num_pages;
-                        run->page_count -= num_pages;
-                    }
-                    other.lock.unlock();
-                    return base_ + page_idx * kPageSize;
-                }
-                prev = &run->next;
-                run = run->next;
-            }
-            other.lock.unlock();
+        // Reuse freed pages first: the smallest free run that fits, carved
+        // from its low end.
+        if (const size_t idx = free_map_.take(num_pages, kSharedOwner);
+            idx != PageRunMap::kNone) {
+            return base_ + idx * kPageSize;
         }
 
         // Bump allocate from fresh pages (lock-free)
         size_t start = next_page_.fetch_add(num_pages, std::memory_order_release);
         if (start + num_pages > contig_pages_) {
             next_page_.fetch_sub(num_pages, std::memory_order_relaxed);
+            // Arena exhausted: let the heap return empty slab spans, which
+            // then coalesce in the free map, and try once more.
+            if (exhausted_hook_) {
+                exhausted_hook_(exhausted_ctx_);
+                if (const size_t idx = free_map_.take(num_pages, kSharedOwner);
+                    idx != PageRunMap::kNone) {
+                    return base_ + idx * kPageSize;
+                }
+            }
             return nullptr;
         }
         void* addr = base_ + start * kPageSize;
@@ -601,11 +518,7 @@ public:
         // freed contents intact: this distinguishes "smash decommit causes
         // crash" (landmines pass) from "app UAF" (landmines crash, with
         // si_addr inside a logged range).
-        static const bool landmines = []{
-            const char* v = std::getenv("SMASH_LANDMINES");
-            return v && v[0] == '1';
-        }();
-        if (landmines) {
+        if (landminesEnabled()) {
             (void)::mprotect(addr, num_pages * kPageSize, PROT_NONE);
             char buf[96];
             int n = smash::safe_snprintf(buf, sizeof(buf),
@@ -624,11 +537,7 @@ public:
         // walrus has a UAF that reads pre-free data. If it passes, the
         // problem is something else in the madvise/reuse path (e.g. TLB
         // shootdown timing, freelist coherency).
-        static const bool zero_free = []{
-            const char* v = std::getenv("SMASH_ZERO_FREE");
-            return v && v[0] == '1';
-        }();
-        if (zero_free) {
+        if (zeroFreeEnabled()) {
             __builtin_memset(addr, 0, num_pages * kPageSize);
             // fall through to normal queue+decommit+reuse path
         }
@@ -641,8 +550,52 @@ public:
         // thread will decommit them and THEN add to free list. This ensures
         // pages can't be reallocated before decommit completes.
         size_t page_idx = pageIndex(reinterpret_cast<uintptr_t>(addr));
-        size_t shard_idx = getShardIdx();
-        queueForDecommit(addr, num_pages, page_idx, shard_idx, nodeOfPage(page_idx));
+        queueForDecommit(addr, num_pages, page_idx, nodeOfPage(page_idx));
+    }
+
+    static bool landminesEnabled() {
+        static const bool v = []{
+            const char* e = std::getenv("SMASH_LANDMINES");
+            return e && e[0] == '1';
+        }();
+        return v;
+    }
+    static bool zeroFreeEnabled() {
+        static const bool v = []{
+            const char* e = std::getenv("SMASH_ZERO_FREE");
+            return e && e[0] == '1';
+        }();
+        return v;
+    }
+
+    // releasePages(), but synchronous: decommit now and put the run in the
+    // free map before returning, instead of queueing it for the decommit
+    // thread. For the arena-exhausted reclaim, whose caller retries the
+    // allocation immediately and could not see a queued run. The same order
+    // (commit RW, decommit, then free) keeps a run from being reused before it
+    // is decommitted. Debug modes and non-arena addresses take the normal path.
+    void releasePagesNow(void* addr, size_t num_pages) {
+        if (tracking_mode_ || !inContigArena(reinterpret_cast<uintptr_t>(addr)) ||
+            landminesEnabled() || zeroFreeEnabled()) {
+            releasePages(addr, num_pages);
+            return;
+        }
+        DecommitEntry e{};
+        e.addr = addr;
+        e.num_pages = num_pages;
+        e.page_index = pageIndex(reinterpret_cast<uintptr_t>(addr));
+        e.node = nodeOfPage(e.page_index);
+        processDecommitEntry(&e);
+    }
+
+    // Called by allocatePages() when neither the free map nor the bump pointer
+    // can serve a request, before it gives up. The heap uses it to return
+    // empty slab spans (Slab::reclaimEmptySpans) so the arena reuses its own
+    // memory before anything spills into uncompressed direct mappings. Must
+    // not call allocatePages().
+    void setExhaustedHook(void (*fn)(void*), void* ctx) {
+        exhausted_ctx_ = ctx;
+        exhausted_hook_ = fn;
     }
 
     // ── Page tracking (compress-only mode) ──────────────────────────────────
@@ -971,19 +924,10 @@ public:
             return nullptr;
         }
         NodeArena& na = arenas[node];
-        LockGuard guard(na.free.lock);
+        LockGuard guard(na.lock);
 
-        FreeRun** prev = &na.free.free_list;
-        for (FreeRun* run = na.free.free_list; run; prev = &run->next, run = run->next) {
-            if (run->page_count < num_pages) continue;
-            size_t idx = run->page_index;
-            if (run->page_count == num_pages) {
-                *prev = run->next;
-                recycleFreeRun(run, na.free);
-            } else {
-                run->page_index += num_pages;
-                run->page_count -= num_pages;
-            }
+        if (const size_t idx = free_map_.take(num_pages, ownerOfNode(static_cast<int>(node)));
+            idx != PageRunMap::kNone) {
             return base_ + idx * kPageSize;
         }
 
@@ -1010,7 +954,8 @@ public:
             for (size_t c = start / kNodeChunkPages;
                  c < (start + chunk_pages) / kNodeChunkPages; ++c)
                 table[c].store(static_cast<uint16_t>(node + 1), std::memory_order_release);
-            if (na.end > na.cur) pushFreeRun(na.free, na.cur, na.end - na.cur);
+            if (na.end > na.cur)
+                free_map_.insert(na.cur, na.end - na.cur, ownerOfNode(static_cast<int>(node)));
             na.cur = start;
             na.end = start + chunk_pages;
         }
@@ -1022,9 +967,9 @@ public:
 
 private:
     struct NodeArena {
-        FreeShard free;  // free_list + FreeRun pool, guarded by free.lock
+        Spinlock lock;   // guards cur/end; freed pages live in free_map_
         size_t cur = 0;  // unused tail of the newest chunk, [cur, end);
-        size_t end = 0;  // guarded by free.lock
+        size_t end = 0;  // guarded by lock
     };
     static constexpr size_t kNoChunk = ~size_t{0};
 
@@ -1036,15 +981,6 @@ private:
     Spinlock numa_init_lock_;
     // Region that vm::g_after_remap_hook binds pages again for.
     static inline std::atomic<VmRegion*> numa_region_{nullptr};
-
-    void pushFreeRun(FreeShard& shard, size_t page_index, size_t page_count)
-        SMASH_REQUIRES(shard.lock) {
-        FreeRun* run = newFreeRun(shard);
-        run->page_index = page_index;
-        run->page_count = page_count;
-        run->next = shard.free_list;
-        shard.free_list = run;
-    }
 
 #if defined(__linux__)
     NodeArena* ensureNodeArenas() {
@@ -1089,9 +1025,7 @@ private:
     }
 
     void donateToShared(size_t page_index, size_t page_count) {
-        FreeShard& shard = shards_[getShardIdx()];
-        LockGuard guard(shard.lock);
-        pushFreeRun(shard, page_index, page_count);
+        free_map_.insert(page_index, page_count, kSharedOwner);
     }
 
     // vm::g_after_remap_hook. remapPages() just replaced [addr, addr+size)

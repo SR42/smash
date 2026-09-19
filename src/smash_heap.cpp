@@ -1418,6 +1418,15 @@ int smash_arena_for(const void* ptr) {
     return heap ? heap->arenaFor(ptr) : -1;
 }
 
+// Exported diagnostic / test hook, same visibility scheme as smash_arena_for:
+// 1 if `ptr` is in the compressible VmRegion arena, 0 otherwise (a
+// direct-mmap fallback once the arena is exhausted, or not smash memory).
+extern "C" __attribute__((visibility("default")))
+int smash_in_arena(const void* ptr) {
+    auto* heap = SmashRedirect::getHeap();
+    return heap && heap->inArena(ptr) ? 1 : 0;
+}
+
 // Public NUMA allocation API, declared in smash/smash.h. Exported the same way
 // as smash_arena_for: default visibility plus a version-script entry.
 extern "C" __attribute__((visibility("default")))

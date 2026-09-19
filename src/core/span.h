@@ -9,6 +9,7 @@
 #include "size_classes.h"
 #include "../util/bitops.h"
 #include "../util/double_free.h"
+#include "../util/spinlock.h"
 #include "../vm/page_state.h"
 
 #include <atomic>
@@ -25,6 +26,11 @@ namespace smash {
 // span-level (not just slot-level) placement would pay off. Reported as
 // reheat= in the SIGUSR2 stats line.
 inline std::atomic<uint64_t> g_reheat_events{0};
+
+// Words in the largest slab-span bitmap: kMaxSpanPages pages of the smallest
+// (16-byte) class.
+inline constexpr size_t kMaxSpanBitmapWords =
+    (static_cast<size_t>(kMaxSpanPages) * kPageSize / kMinAlignment + 63) / 64;
 
 struct Span {
     void* base;                 // start of data pages
@@ -70,6 +76,13 @@ struct Span {
     // so phase2 doesn't compress pages that are still being filled.
     uint8_t*        cold_counts;
 
+    // Bitmap storage that stays with the descriptor across recycling.
+    // Slab spans are now returned to the arena when empty and their
+    // descriptors reused (Slab::trimEmptySpans), so a fresh bitmap per init
+    // would leak BootstrapAlloc memory on every span churn. Always sized for
+    // the largest span (kMaxSpanBitmapWords), so any size class fits.
+    uint64_t*       bitmap_store;
+
     // Initialize a slab span for the given size class.
     //
     // When max_slots_per_page > 0 and object_size < kPageSize, only the first
@@ -103,8 +116,11 @@ struct Span {
         cold_counts = nullptr;
 
         size_t num_words = (full_capacity + 63) / 64;
-        bitmap = static_cast<uint64_t*>(
-            BootstrapAlloc::instance().allocate(num_words * sizeof(uint64_t), alignof(uint64_t)));
+        if (!bitmap_store) {
+            bitmap_store = static_cast<uint64_t*>(BootstrapAlloc::instance().allocate(
+                kMaxSpanBitmapWords * sizeof(uint64_t), alignof(uint64_t)));
+        }
+        bitmap = bitmap_store;
 
         const bool cap_active = max_slots_per_page > 0 && object_size < kPageSize;
 
@@ -456,37 +472,45 @@ struct Span {
     }
 };
 
-// Lock-free Span descriptor cache. Recycles large-alloc Span descriptors
-// to avoid unbounded BootstrapAlloc growth under alloc/free churn.
-inline std::atomic<Span*>& spanFreeList() {
-    static std::atomic<Span*> head{nullptr};
-    return head;
+// Span descriptor cache: recycled descriptors, reused before BootstrapAlloc.
+// Both large spans and (since empty slab spans are returned to the arena)
+// slab spans pass through it. It was a lock-free Treiber stack whose pop read
+// s->next_free and then CASed the head — the textbook ABA race: between the
+// read and the CAS another thread can pop `s`, pop its successor, and push `s`
+// back, and the CAS then installs a successor that is in use. A spinlock costs
+// one uncontended atomic per span creation, which is rare next to object
+// allocation.
+struct SpanFreeList {
+    Spinlock lock;
+    Span* head = nullptr;
+};
+inline SpanFreeList& spanFreeList() {
+    static SpanFreeList list;
+    return list;
 }
 
 inline Span* newSpanDescriptor() {
-    // Try recycled descriptor first (Treiber stack pop)
-    Span* s = spanFreeList().load(std::memory_order_acquire);
-    while (s) {
-        Span* next = s->next_free;
-        if (spanFreeList().compare_exchange_weak(s, next,
-                std::memory_order_acq_rel, std::memory_order_acquire)) {
-            __builtin_memset(s, 0, sizeof(Span));
-            return s;
-        }
+    SpanFreeList& fl = spanFreeList();
+    Span* s = nullptr;
+    {
+        LockGuard guard(fl.lock);
+        s = fl.head;
+        if (s) fl.head = s->next_free;
     }
-    auto* p = static_cast<Span*>(
+    if (!s) s = static_cast<Span*>(
         BootstrapAlloc::instance().allocate(sizeof(Span), alignof(Span)));
-    __builtin_memset(p, 0, sizeof(Span));
-    return p;
+    // Keep the bitmap storage across the reset (see Span::bitmap_store).
+    uint64_t* store = s->bitmap_store;
+    __builtin_memset(s, 0, sizeof(Span));
+    s->bitmap_store = store;
+    return s;
 }
 
 inline void recycleSpanDescriptor(Span* s) {
-    // Treiber stack push
-    Span* head = spanFreeList().load(std::memory_order_relaxed);
-    do {
-        s->next_free = head;
-    } while (!spanFreeList().compare_exchange_weak(head, s,
-                std::memory_order_release, std::memory_order_relaxed));
+    SpanFreeList& fl = spanFreeList();
+    LockGuard guard(fl.lock);
+    s->next_free = fl.head;
+    fl.head = s;
 }
 
 } // namespace smash

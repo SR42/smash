@@ -76,6 +76,7 @@
     # the arena a smash-managed pointer routed to; test_arena_routing uses it
     # to guard the call-site-arena invariant.
     smash_arena_for;
+    smash_in_arena;
 
     # Public NUMA allocation API (include/smash/smash.h).
     malloc_numa;

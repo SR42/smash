@@ -281,14 +281,38 @@ class Slab {
         return span;
     }
 
-    void releaseSpan(Span* span) {
+    // Release every empty span straight back to the arena. Called only when
+    // the arena is exhausted (VmRegion's exhausted hook), not on every free:
+    // returning spans eagerly made mi-stress ~70% slower (16.9 s -> 28.7 s),
+    // because spans oscillating between empty and in use paid a release, a
+    // decommit and zero-fill faults on every round trip. Keeping empties is
+    // free until the arena runs out; then they are exactly the memory to reuse.
+    // tryLock: the caller may hold another slab's lock (allocateNewSpan), so
+    // blocking here could deadlock; a busy slab is simply skipped.
+public:
+    size_t reclaimEmptySpans() {
+        if (!lock_.tryLock()) return 0;
+        drainPending();
+        size_t n = 0;
+        while (Span* span = empty_.popFront()) {
+            releaseSpan(span, /*sync=*/true);
+            recycleSpanDescriptor(span);
+            ++n;
+        }
+        lock_.unlock();
+        return n;
+    }
+
+private:
+    void releaseSpan(Span* span, bool sync = false) {
         page_map_->clearRange(reinterpret_cast<uintptr_t>(span->base), span->page_count);
         if (inRegion(span)) {
             if (release_hook_) {
                 size_t idx = vm_region_->pageIndex(reinterpret_cast<uintptr_t>(span->base));
                 release_hook_(idx, span->page_count, release_ctx_);
             }
-            vm_region_->releasePages(span->base, span->page_count);
+            if (sync) vm_region_->releasePagesNow(span->base, span->page_count);
+            else vm_region_->releasePages(span->base, span->page_count);
         } else {
             vm::unmapPages(span->base, span->page_count * kPageSize);
         }
