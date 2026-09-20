@@ -275,6 +275,80 @@ Measured after the fix, worker outliving main: full mode 218 ms and large-only 2
 
 **Verified as a real discriminator:** with `SMASH_NO_EXIT_GUARD=1` the repro hangs again and has to be SIGKILLed, and the test itself fails on its 30 s child timeout; with the guard on, the same test passes in 220 ms. The isolation run that first identified the cause is the same switch in reverse — `SMASH_NO_COMPRESSOR=1` made the pre-fix binary exit 0, which pinned the hang on smash's threads rather than on anything else the library does.
 
+### Memory must still work after the compressor shuts down
+
+`CompressorThread::stop()` drains compressed pages and then **uninstalls the
+SIGSEGV/SIGBUS handler**, deliberately, so a real application heap bug surfaces
+normally. Everything that runs after it — atexit handlers, static destructors,
+anything that allocates during exit — still uses smash's heap with no handler
+behind it.
+
+The drain restores `COMPRESSED`, `COMPRESSED_SHADOW` and `ACTIVE_MONITORING`,
+and **trusts `ACTIVE`**. That was the hole: *a page's state is not proof of its
+protection*. The fault handler repairs ACTIVE-but-still-protected pages on
+purpose (Phase 3's batched mprotect can overwrite a per-page PROT_RW
+restoration) — a race smash tolerates precisely because the handler is there.
+Once it is gone, the same page kills the process on the next touch:
+**SEGV_ACCERR, no message, exit 139, long after the workload finished**. One
+mprotect over the contiguous arena at the end of the drain closes it; it only
+widens permissions, so a page mid-restore cannot lose.
+
+Found by running the suite against a **coverage-instrumented build**, where
+gcov's exit-time dump is the late allocator: `test_span_descriptor_race_full`
+segfaulted after printing PASS. Worth keeping as a technique — an instrumented
+build is a cheap way to get a realistic "something allocates during exit" load
+that the suite otherwise never applies. The evidence chain, in order: the
+`SMASH_SHUTDOWN_TRACE=1` output ran to `stop() complete` *before* the crash; a
+SIGSEGV handler preloaded **ahead of** libsmash (so smash's teardown restores
+it) caught `si_code=2` at an address `smash_in_arena()` confirmed was in the
+arena; the page index was inside the range the drain had just walked;
+instrumenting `handleFault` showed the post-drain fault arriving on a page in
+state ACTIVE; and leaving the handler installed through exit made it disappear
+2/2. Verified, same test binary: pre-fix library 3/3 segfault, fixed 5/5 clean,
+and the coverage suite went 57/58 → 58/58.
+
+**No regression test, deliberately.** A synthetic workload with a late atexit
+handler allocating and writing 8 MiB — including one registered from a library
+preloaded ahead of libsmash, so it runs after libsmash's destructor — did not
+reproduce the skew in 11 runs across two pre-fix libraries. Registering it would
+have added a test that passes with and without the fix.
+
+### Coverage: the diagnostics are the least-tested code
+
+Measured 2026-09-20 with `gcovr` over a `--coverage -O1` build running the full
+suite: **66% of lines under `src/`**, and **72% of the lines added that day**.
+The gaps are not random — they are almost entirely the *things-have-gone-wrong*
+paths, which is exactly the code that runs while diagnosing a crash:
+
+| new code | line coverage |
+|---|---|
+| `describeFaultAddress()` (`smash_heap.h`) | 9% |
+| `[smash FATAL]` print (`fault_handler.h`) | 0% |
+| `warnArenaExhausted()` + `arenaFreePages()` / `arenaLongestFreeRun()` | 0–16% |
+| `BootstrapAlloc::reportExhausted` | 0% |
+| metadata-exhaustion null guards (`large_alloc.h`, `slab.h`) | 25–28% |
+| Round 6 syscall wrappers (`linux_syscall_wrappers.cpp`) | 86% |
+| `walkPathForFault` / `walkUnsizedForFault` (`syscall_compat.h`) | 100% |
+
+Whole-file lows worth knowing: `compression_roi.h` 44%, `src/compress_only/`
+0% (compress-only mode has no test), `util/alloc_failure.h` 0%,
+`fault_handler.h` 56%.
+
+The fault diagnostics were verified by hand instead (a program that faults at
+a null address, at an unmapped address, and past its own block), and all three
+classify correctly — including `page N of M, state S` for the arena case. Note
+`si_code` in that line: **1 = SEGV_MAPERR** (nothing mapped — a wild pointer),
+**2 = SEGV_ACCERR** (mapped, wrong permissions — smash's own protection). On a
+SIGBUS the same field separates `BUS_ADRALN` (1, misaligned — an unaligned
+atomic, which faults on aarch64 and does not on x86-64) from `BUS_ADRERR` (2,
+past the end of a file mapping).
+
+A **latent SIGBUS** worth knowing about, though it is opt-in and off by
+default: `SMASH_SPILL=1` pre-`fallocate`s its file precisely so ENOSPC cannot
+become a SIGBUS through the MAP_SHARED mapping — but a drained region is
+hole-punched (`FALLOC_FL_PUNCH_HOLE`) and then reused, and the write that
+refills it needs fresh blocks. On a full filesystem that write is a SIGBUS.
+
 ### Idle-page read tracking (root only)
 
 `test_idle_read_tracking` (`idle_read_tracking_test.cpp`, in-process, `SMASH_COLD_TICKS=2 SMASH_SOFTDIRTY=0`) guards the one read-detection path that only exists as root. With `CAP_SYS_ADMIN`, `/proc/self/pagemap` exposes real PFNs, so `ensureIdleReadFds()` turns on idle-page tracking: at escalation a monitored page is marked idle through `/sys/kernel/mm/page_idle/bitmap` instead of being armed PROT_NONE, and phase 1 treats "no longer idle" as "read", with no fault paid. Unprivileged, the PFN is redacted and the path never activates — so the whole suite, and CI, had never run it.
