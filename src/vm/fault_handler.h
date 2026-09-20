@@ -205,6 +205,14 @@ class FaultHandler {
     // getenv → signalHandler → __restore_rt → getenv … backtrace.) Read these
     // once in start()/ensureInstalled() and consult the cached bools only.
     static inline bool sigtrace_enabled_ = false;
+
+public:
+    // Set by SmashHeap. Fills `buf` with a short description of `addr` (arena
+    // page and state, smash metadata, tracked external page, foreign memory).
+    // Must be async-signal-safe: it runs in a signal handler, in a process
+    // that is about to die.
+    static inline void (*describe_hook_)(const void* addr, char* buf, size_t len) = nullptr;
+private:
     static inline bool dump_crash_bt_enabled_ = false;
 
     // Detect signals that were synthesized by user-space (raise(),
@@ -344,6 +352,23 @@ class FaultHandler {
                 sig, info->si_code, info->si_addr, kind,
                 (unsigned)old->sa_flags);
             if (n > 0) (void)!write(2, buf, (size_t)n);
+        }
+
+        // A fault smash did not handle, with SIG_DFL behind us, kills the
+        // process. Say so: an application whose only symptom is "it died with
+        // no message" cannot tell a smash bug from its own, and the faulting
+        // address plus what smash thinks that address is settles it.
+        if (old->sa_handler == SIG_DFL && !(old->sa_flags & SA_SIGINFO)) {
+            char what[160];
+            what[0] = '\0';
+            if (describe_hook_) describe_hook_(info->si_addr, what, sizeof(what));
+            char buf[288];
+            const int n = smash::safe_snprintf(buf, sizeof(buf),
+                "[smash FATAL] unhandled sig=%d si_code=%d at addr=%p — the process is "
+                "about to die. %s\n",
+                sig, info->si_code, info->si_addr,
+                what[0] ? what : "address not classified");
+            if (n > 0) (void)!write(2, buf, static_cast<size_t>(n));
         }
 
         // For non-kernel-synchronous faults (raise/kill/etc.) that we

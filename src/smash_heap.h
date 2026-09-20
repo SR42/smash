@@ -563,6 +563,40 @@ class SmashHeap {
 
     Slab& slab(uint8_t arena, uint8_t sc) { return slabs_[arena * kNumClasses + sc]; }
 
+    static inline SmashHeap* s_fault_heap_ = nullptr;
+
+    // FaultHandler::describe_hook_: what does smash think this address is?
+    // Async-signal-safe: pointer arithmetic, atomic loads, no allocation.
+    static void describeFaultAddress(const void* addr, char* buf, size_t len) {
+        // The heap that registered the hook; never constructed from here,
+        // which would not be signal-safe.
+        SmashHeap* heap = s_fault_heap_;
+        const auto a = reinterpret_cast<uintptr_t>(addr);
+        if (!heap) { smash::safe_snprintf(buf, len, "smash heap not initialised."); return; }
+        if (BootstrapAlloc::instance().owns(addr)) {
+            smash::safe_snprintf(buf, len, "Inside smash's own metadata (BootstrapAlloc).");
+            return;
+        }
+        if (heap->vm_region_.inContigArena(a)) {
+            const size_t idx = heap->vm_region_.contigPageIndex(a);
+            const int st = static_cast<int>(heap->page_states_.get(idx));
+            smash::safe_snprintf(buf, len,
+                "Inside the compressible arena: page %zu of %zu, state %d "
+                "(1=ACTIVE 2=COMPRESSED 4=MONITORING 5=SHADOW). A fault here that smash "
+                "did not handle is a smash bug — please report this line.",
+                idx, heap->vm_region_.contigPages(), st);
+            return;
+        }
+        if (heap->vm_region_.contains(a)) {
+            smash::safe_snprintf(buf, len, "A page smash tracks outside its arena "
+                                           "(SMASH_TRACK_EXTERNAL).");
+            return;
+        }
+        smash::safe_snprintf(buf, len,
+            "Not smash memory (application, libc or stack) — smash did not manage this "
+            "address, so the fault came from elsewhere.");
+    }
+
     // VmRegion's exhausted hook: return every slab's empty spans to the
     // arena (see Slab::reclaimEmptySpans) so it reuses its own memory before
     // spilling into uncompressed direct mappings.
@@ -1148,6 +1182,8 @@ public:
             }
             log_time("slabs_init");
             if (!compress_only) vm_region_.setExhaustedHook(&reclaimEmptySpansHook, this);
+            s_fault_heap_ = this;
+            vm::FaultHandler::describe_hook_ = &describeFaultAddress;
             compression_inited_ = true;
             g_smash_vm_region = &vm_region_;
             g_smash_page_states_for_external = &page_states_;
