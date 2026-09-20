@@ -286,12 +286,30 @@ is rejected with EINVAL, and before the filter existed a 16 MiB mapping produced
 8192 failing page operations in six seconds (`test_hugepage_no_mprotect_storm`).
 smash never allocates hugetlb memory itself.
 
-**THP: smash's arena gets it when the kernel offers it, and compression
-survives — but a decompressed page comes back 4 KiB.** smash issues no
-`MADV_HUGEPAGE`/`MADV_NOHUGEPAGE` anywhere, so on a `THP=madvise` host (the
-Ubuntu default) the arena gets no huge pages at all, exactly like glibc's
-malloc — measured 0% for both. On a `THP=always` host, touching 512 MiB of
-malloc'd memory:
+**THP: available, opt-in via `SMASH_THP=1`, and destroyed by compression.**
+By default smash issues no `MADV_HUGEPAGE`, so on a `THP=madvise` host (the
+Ubuntu default) the arena gets no huge pages, exactly like glibc's malloc —
+measured 0% for both. `SMASH_THP=1` madvises the arena and it becomes
+huge-page backed (510 MiB of a 512 MiB block). Whether that is worth having
+depends entirely on the access pattern, and the two directions were measured:
+
+| workload | no hint | `SMASH_THP=1` |
+|---|---|---|
+| 256 MiB hot (rewritten) + 256 MiB cold | RSS 284 MiB, AHP 0 | RSS 286 MiB, **AHP 256 MiB** |
+| sparse: one 4 KiB page per 2 MiB over 512 MiB | RSS 24 MiB | RSS **534 MiB** |
+
+So a dense hot set keeps huge-page coverage while the cold set still compresses
+(2 MiB of extra RSS), and a sparse one inflates RSS 22× because every touched
+page drags in a whole huge page. That is the opposite of what this allocator is
+for, which is why it is off by default. `test_thp_arena_{off,on}` guard it and
+skip unless the host policy is `[madvise]`, the only setting where the two
+cases can be told apart; verified as a real discriminator (the on-case fails
+against a library without the knob).
+
+**Compression dismantles huge pages either way.** The compressor protects and
+reclaims 4 KiB at a time, which splits a huge page, and the restore path is a
+per-page `MAP_FIXED` remap that never rebuilds one. On a `THP=always` host,
+touching 512 MiB of malloc'd memory:
 
 | | glibc | smash (full mode, compressor active) |
 |---|---|---|
@@ -299,14 +317,16 @@ malloc'd memory:
 | after cold wait | unchanged | RSS **99 MiB**, AnonHugePages 92, 110 VMAs |
 | after reading it all back | unchanged | RSS 594 MiB, AnonHugePages **74 (12%)**, 114 VMAs |
 
-So compression works fine on THP-backed memory (592 → 99 MiB here), and the VMA
-count stays flat — no splitting storm. What is lost is the huge-page backing
-itself: the restore path is a per-page `remapPages()` (`MAP_FIXED|MAP_ANON`), so
-a workload that faults its whole live set back ends up at ~12% AnonHugePages
-instead of ~99%, and only khugepaged can re-collapse it. For a TLB-sensitive
-workload on a `THP=always` host, that is the trade to weigh. RSS before
-compression is also slightly higher under smash (592 vs 513 MiB) because the
-arena's huge pages round up.
+So compression works on THP-backed memory (592 → 99 MiB here) and the VMA count
+stays flat — no splitting storm. What is lost is the huge-page backing: a
+workload that faults its whole live set back ends up at ~12% AnonHugePages
+instead of ~99%, and only khugepaged can re-collapse it. RSS before compression
+is also higher under smash (592 vs 513 MiB) because the arena's huge pages
+round up. **hugetlb is a different matter and is not possible here at all**: a
+hugetlb VMA rejects every sub-2 MiB `mprotect`, `madvise` and `MAP_FIXED`
+smash's page management depends on (measured directly — EINVAL, EINVAL,
+ENOMEM), so backing the arena with `MAP_HUGETLB` would require the compressor
+to work in 2 MiB units end to end.
 
 ### Which allocation sizes are actually compressed
 
@@ -780,6 +800,7 @@ Runtime environment variables:
 - `SMASH_WRITE_TRACK=auto|softdirty|uffd|none`: How writes are detected (default `auto`, chosen by testing each mechanism; see "Write tracking"). `SMASH_SOFTDIRTY=0` still selects Phase 3 PROT_READ monitoring
 - `SMASH_NO_MONITOR=1`: Disable Phase 3 (PROT_READ access tracking) entirely. Trades cold-detection accuracy for compatibility with code paths that synchronously check page protection
 - `SMASH_VM_GIB=N`: Size of the compressible arena, default 16, ceiling 1 TiB (`kVmMaxBytes`). The arena is a PROT_NONE `MAP_NORESERVE` reservation and its per-page metadata is demand-paged, so an unused arena costs address space, not memory (measured: 16, 64 and 1024 GiB all start at 23.3 MB RSS). If the reservation fails — a 39-bit-VA arm64 kernel, `ulimit -v` — `VmRegion::init` halves the request down to 256 MiB and says so, instead of silently running without compression as it used to (measured: with a 48 GiB address-space limit, `SMASH_VM_GIB=1024` gets a 32 GiB arena and compresses; before, compression was off). The old 64 GiB ceiling was an estimate of metadata cost, not a limit; page indices are 32-bit, so the hard bound is 16 TiB
+- `SMASH_THP=1`: `madvise(MADV_HUGEPAGE)` the arena. Off by default: it keeps a dense hot set on huge pages (TLB coverage) while the cold set still compresses, but inflates RSS 22× on a sparse touch pattern. See "Hugepages and THP"
 - `SMASH_LARGE_ALLOC_VM_THRESHOLD=N`: Bytes at or above which a large allocation is placed in the compressible VmRegion instead of a direct mapping (default `kLargeAllocVmThreshold` = 1 MiB; rounded up to a page). **This decides what can be compressed at all** — a block below it is never walked by the compressor and stays resident however cold it gets. Lower it for a workload whose footprint is mid-sized blocks; see "Which allocation sizes are actually compressed"
 - `SMASH_COLD_TIMEOUT_SEC=N`: Override cold timeout at runtime
 - `SMASH_DOUBLE_FREE=off|warn|abort`: Double-free detection, **default `off`**. `warn` reports to stderr (rate-limited, via `safe_snprintf` + `write(2)` — never `fprintf`, which can call malloc and reenter) and drops the second free; `abort` reports then traps. A double free is UB, so this is a debugging aid rather than a safety guarantee: it is not a promise that a detected double free was harmless, only that this one was dropped. No measurable cost when enabled (see `test_double_free_full`)

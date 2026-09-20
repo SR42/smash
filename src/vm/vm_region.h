@@ -361,6 +361,34 @@ public:
             }
             contig_pages_ = region_size / kPageSize;
             total_pages_ = contig_pages_ + kTrackMaxPages;
+#if defined(__linux__) && defined(MADV_HUGEPAGE)
+            // SMASH_THP=1: ask for transparent hugepages over the arena.
+            // Opt-in, because the trade is sharp in both directions and only
+            // the caller knows which side its workload is on. Measured on a
+            // THP=madvise host, 256 MiB hot + 256 MiB cold:
+            //
+            //   hint off  RSS 284 MiB, AnonHugePages   0
+            //   hint on   RSS 286 MiB, AnonHugePages 256 MiB
+            //
+            // i.e. the hot set stays huge-page backed (TLB coverage) while the
+            // cold set still compresses, for 2 MiB. But with a sparse touch
+            // pattern -- one 4 KiB page per 2 MiB across 512 MiB -- the same
+            // hint takes RSS from 24 MiB to 534 MiB, because every touched
+            // page drags in a whole huge page. That is the opposite of what
+            // this allocator is for, so it stays off unless asked for.
+            //
+            // Compression itself dismantles them: the compressor protects and
+            // reclaims 4 KiB at a time, which splits a huge page, and the
+            // restore path (per-page MAP_FIXED remap) never rebuilds one.
+            // Measured: a 512 MiB block is 510 MiB huge-backed after touch and
+            // 0 after one compress/read-back cycle. The hint is therefore
+            // worth something only for pages that stay hot.
+            {
+                const char* v = std::getenv("SMASH_THP");
+                if (v && v[0] == '1')
+                    (void)::madvise(base_, region_size, MADV_HUGEPAGE);
+            }
+#endif
             vm::setVmBounds(base_, region_size);
             if (!free_map_.init(contig_pages_)) return false;
         } else {

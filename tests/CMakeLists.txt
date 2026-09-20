@@ -260,6 +260,21 @@ set_tests_properties(test_external_mapping PROPERTIES
 # (>= 1 MiB, smash-managed -> compressible VmRegion in BOTH modes) and small
 # (<= 16 KiB, slab in full / system-passthrough in large-only) compressible
 # chunks, asserts compressed>0 via SIGUSR2 stats, then verifies a byte-exact
+# ── Transparent hugepages for the arena (Linux) ─────────────────────────────
+# SMASH_THP=1 madvises the arena MADV_HUGEPAGE. One body, two registrations;
+# skips unless the host policy is [madvise], where the two cases differ.
+if(NOT APPLE)
+  add_executable(thp_arena_test thp_arena_test.cpp)
+  set_target_properties(thp_arena_test PROPERTIES CXX_STANDARD 20)
+  add_test(NAME test_thp_arena_off COMMAND ${CMAKE_COMMAND} -E env
+    "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=0"
+    $<TARGET_FILE:thp_arena_test>)
+  add_test(NAME test_thp_arena_on COMMAND ${CMAKE_COMMAND} -E env
+    "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=0" "SMASH_THP=1"
+    $<TARGET_FILE:thp_arena_test>)
+  set_tests_properties(test_thp_arena_off test_thp_arena_on PROPERTIES TIMEOUT 120)
+endif()
+
 # ── Runtime large-alloc threshold ───────────────────────────────────────────
 # SMASH_LARGE_ALLOC_VM_THRESHOLD decides which allocations reach the compressor
 # at all. One body, two registrations: the expectation is derived from the env
