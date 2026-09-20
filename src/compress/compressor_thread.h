@@ -6072,6 +6072,23 @@ public:
             }
             locks_->unlock(i);
         }
+        // A page's STATE is not proof of its protection. The fault handler
+        // deliberately repairs ACTIVE pages that are still protected — Phase
+        // 3's batched mprotect can overwrite a per-page PROT_RW restoration,
+        // so ACTIVE-but-not-writable is a race smash tolerates *because the
+        // handler is there*. stop() is about to uninstall that handler, after
+        // which the same skew kills the process: SIGSEGV/SEGV_ACCERR with no
+        // message, in whatever runs later (an atexit handler, a static
+        // destructor, anything that allocates during exit).
+        //
+        // The per-page walk above cannot see the skew, because it trusts the
+        // state. One mprotect over the whole contiguous arena does, and costs
+        // a single syscall on a range that is about to be torn down anyway.
+        // It only widens permissions, so a page mid-restore cannot lose.
+        // External pages (>= contigPages()) are the application's own
+        // mappings and are deliberately left alone.
+        size_t arena_pages = committed < vm_->contigPages() ? committed : vm_->contigPages();
+        if (arena_pages) vm::commitPages(vm_->pageAddress(0), arena_pages * kPageSize);
     }
 
     void stop() {
