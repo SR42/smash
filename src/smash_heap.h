@@ -1734,7 +1734,19 @@ public:
             trackAllocation(ptr, count * size);
             return ptr;
         }
-        size_t total = count * size;
+        // count * size can wrap: calloc(2^60 + 1, 16) would otherwise hand back
+        // a 16-byte block to a caller that believes it owns 2^60 elements.
+        // Today every public entry point (calloc, xxcalloc, macOS
+        // replace_calloc) goes through alloc8's checked wrapper, which returns
+        // null on overflow and then calls SmashHeap::malloc — nothing reaches
+        // this function — so this is defence in depth for the first caller
+        // that does. Verified against glibc on the wrapping shapes, including
+        // products that wrap to 16 and 256 bytes.
+        size_t total = 0;
+        if (__builtin_mul_overflow(count, size, &total)) {
+            errno = ENOMEM;
+            return nullptr;
+        }
         // Large-only: small callocs go to system allocator
         if (isLargeOnlyMode() && total <= largeOnlyThreshold() && g_system_alloc.calloc) {
             return g_system_alloc.calloc(count, size);
