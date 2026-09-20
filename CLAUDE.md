@@ -341,19 +341,29 @@ resident. So a caller that can use `malloc_numa` gets sub-threshold blocks
 compressed today with no rebuild — at the cost of binding that memory to one
 node (`MPOL_BIND`), page granularity, and `realloc` returning an unbound block.
 
-The threshold is **compile-time only**, overridable through the ablation define
-CMake already wires up:
+The threshold is a **runtime** setting, `SMASH_LARGE_ALLOC_VM_THRESHOLD`
+(bytes, rounded up to a page, floored at one page), defaulting to the
+compile-time `kLargeAllocVmThreshold`. The compile-time define still works as
+the default (`cmake .. -DSMASH_LARGE_ALLOC_VM_THRESHOLD=131072`), but no rebuild
+is needed to change it:
 
 ```bash
-cmake .. -DSMASH_LARGE_ALLOC_VM_THRESHOLD=131072    # 128 KiB
+SMASH_LARGE_ALLOC_VM_THRESHOLD=262144 LD_PRELOAD=libsmash.so ./app   # 256 KiB
 ```
 
-Verified at 128 KiB: 320 KB, 512 KB and 768 KB blocks all land in the arena and
-compress to 0% resident, the 320 KB churn cost drops from 9.7 µs to 6.5 µs per
-malloc/free cycle (the arena path beats mmap/munmap), and the suite is 59/59.
-What is *not* verified is the decompression-storm risk the comment warns about,
-which depends on how hot those buffers are in the target application — measure
-before shipping a lowered threshold.
+Verified: with the default, 320/512/768 KB blocks are 0/8 in the arena and 100%
+resident after a cold wait; at 262144 they are 8/8 in the arena and 0%
+resident. At a 128 KiB threshold the 320 KB churn cost also drops from 9.7 µs
+to 6.5 µs per malloc/free cycle, since the arena path beats mmap/munmap.
+`test_large_alloc_threshold_{default,lowered}` guard it — one body, with the
+expectation derived from the env var so the two runs assert the same invariant.
+**Verified as a real discriminator:** the lowered registration fails 3 checks
+against a library without the runtime knob, while the default registration
+passes against both (so the default behaviour is unchanged).
+
+What is *not* verified is the decompression-storm risk the comment on the
+constant warns about, which depends on how hot those buffers are in the target
+application — watch `reheat=` on the SIGUSR2 stats line after lowering it.
 
 ### Every malloc/free cycle over 16 KiB costs ~10 µs (open defect)
 
@@ -770,6 +780,7 @@ Runtime environment variables:
 - `SMASH_WRITE_TRACK=auto|softdirty|uffd|none`: How writes are detected (default `auto`, chosen by testing each mechanism; see "Write tracking"). `SMASH_SOFTDIRTY=0` still selects Phase 3 PROT_READ monitoring
 - `SMASH_NO_MONITOR=1`: Disable Phase 3 (PROT_READ access tracking) entirely. Trades cold-detection accuracy for compatibility with code paths that synchronously check page protection
 - `SMASH_VM_GIB=N`: Size of the compressible arena, default 16, ceiling 1 TiB (`kVmMaxBytes`). The arena is a PROT_NONE `MAP_NORESERVE` reservation and its per-page metadata is demand-paged, so an unused arena costs address space, not memory (measured: 16, 64 and 1024 GiB all start at 23.3 MB RSS). If the reservation fails — a 39-bit-VA arm64 kernel, `ulimit -v` — `VmRegion::init` halves the request down to 256 MiB and says so, instead of silently running without compression as it used to (measured: with a 48 GiB address-space limit, `SMASH_VM_GIB=1024` gets a 32 GiB arena and compresses; before, compression was off). The old 64 GiB ceiling was an estimate of metadata cost, not a limit; page indices are 32-bit, so the hard bound is 16 TiB
+- `SMASH_LARGE_ALLOC_VM_THRESHOLD=N`: Bytes at or above which a large allocation is placed in the compressible VmRegion instead of a direct mapping (default `kLargeAllocVmThreshold` = 1 MiB; rounded up to a page). **This decides what can be compressed at all** — a block below it is never walked by the compressor and stays resident however cold it gets. Lower it for a workload whose footprint is mid-sized blocks; see "Which allocation sizes are actually compressed"
 - `SMASH_COLD_TIMEOUT_SEC=N`: Override cold timeout at runtime
 - `SMASH_DOUBLE_FREE=off|warn|abort`: Double-free detection, **default `off`**. `warn` reports to stderr (rate-limited, via `safe_snprintf` + `write(2)` — never `fprintf`, which can call malloc and reenter) and drops the second free; `abort` reports then traps. A double free is UB, so this is a debugging aid rather than a safety guarantee: it is not a promise that a detected double free was harmless, only that this one was dropped. No measurable cost when enabled (see `test_double_free_full`)
 - `SMASH_NO_EXIT_GUARD=1`: Disable the process-exit guard, so smash's background threads keep the process alive after the application's last thread exits (the pre-fix behaviour — see "Process exit after `pthread_exit()` from main"). Escape hatch for an application that genuinely relies on a library's threads outliving its own

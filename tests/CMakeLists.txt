@@ -260,6 +260,29 @@ set_tests_properties(test_external_mapping PROPERTIES
 # (>= 1 MiB, smash-managed -> compressible VmRegion in BOTH modes) and small
 # (<= 16 KiB, slab in full / system-passthrough in large-only) compressible
 # chunks, asserts compressed>0 via SIGUSR2 stats, then verifies a byte-exact
+# ── Runtime large-alloc threshold ───────────────────────────────────────────
+# SMASH_LARGE_ALLOC_VM_THRESHOLD decides which allocations reach the compressor
+# at all. One body, two registrations: the expectation is derived from the env
+# var, so the default run and the lowered run assert the same invariant.
+add_executable(large_alloc_threshold_test large_alloc_threshold_test.cpp)
+set_target_properties(large_alloc_threshold_test PROPERTIES CXX_STANDARD 20)
+function(add_large_alloc_threshold_test test_name)
+  if(APPLE)
+    add_test(NAME ${test_name} COMMAND ${CMAKE_COMMAND} -E env
+      "DYLD_INSERT_LIBRARIES=$<TARGET_FILE:smash>" "DYLD_FORCE_FLAT_NAMESPACE=1"
+      "MallocNanoZone=0" "SMASH_LARGE_ONLY=1" ${ARGN}
+      $<TARGET_FILE:large_alloc_threshold_test>)
+  else()
+    add_test(NAME ${test_name} COMMAND ${CMAKE_COMMAND} -E env
+      "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=1" ${ARGN}
+      $<TARGET_FILE:large_alloc_threshold_test>)
+  endif()
+  set_tests_properties(${test_name} PROPERTIES TIMEOUT 120)
+endfunction()
+add_large_alloc_threshold_test(test_large_alloc_threshold_default)
+add_large_alloc_threshold_test(test_large_alloc_threshold_lowered
+                               "SMASH_LARGE_ALLOC_VM_THRESHOLD=262144")
+
 # ── Buffered reads after compression (Linux) ────────────────────────────────
 # glibc allocates a FILE's buffer lazily, inside the first read, so under smash
 # it can land on a page the compressor already owns. The kernel returns EFAULT

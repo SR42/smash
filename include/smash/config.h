@@ -610,6 +610,42 @@ inline constexpr size_t kLargeAllocVmThreshold = 1024 * 1024;  // 1 MB
 inline constexpr size_t kLargeAllocVmThreshold = SMASH_LARGE_ALLOC_VM_THRESHOLD;
 #endif
 
+// Runtime override: SMASH_LARGE_ALLOC_VM_THRESHOLD, defaulting to the constant
+// above. This decides whether an allocation is compressible at all, and the
+// effect is absolute — a block below it goes to a direct mapping the
+// compressor never walks, so it stays 100% resident for the life of the
+// process no matter how cold it gets. Measured with the default: 320 KB and
+// 768 KB blocks sit at 100% resident after a cold wait, 1 MiB blocks at 0%.
+//
+// The default is deliberately high (see the comment above): blocks in the
+// 16 KiB–1 MiB band are often hot engine buffers, and compressing those trades
+// RSS for decompression storms. Lower it when a workload's footprint is
+// dominated by mid-sized blocks that really do go cold — and measure `reheat=`
+// on the SIGUSR2 stats line afterwards, because that is where a storm shows up.
+//
+// The value is rounded up to a page and floored at one page. Only consulted
+// from LargeAlloc::allocate (never the small-object fast path), and cached
+// after the first call.
+inline size_t largeAllocVmThreshold() {
+    static std::atomic<size_t> cached{0};   // 0 = unset
+    size_t v = cached.load(std::memory_order_relaxed);
+    if (v == 0) [[unlikely]] {
+        size_t result = kLargeAllocVmThreshold;
+        const char* env = getenv("SMASH_LARGE_ALLOC_VM_THRESHOLD");
+        if (env && *env) {
+            long long parsed = atoll(env);
+            if (parsed > 0) result = static_cast<size_t>(parsed);
+        }
+        // Round up to a whole page; a sub-page threshold would compare against
+        // a page-rounded allocation size and never mean what it says.
+        result = (result + kPageSize - 1) & ~(kPageSize - 1);
+        if (result < kPageSize) result = kPageSize;
+        cached.store(result, std::memory_order_relaxed);
+        return result;
+    }
+    return v;
+}
+
 // ── Virtual memory region ────────────────────────────────────────────────────
 // Compile-time max. The runtime size is read from SMASH_VM_GIB at startup
 // and clamped to [256 MiB, kVmMaxPages*kPageSize]. We bump the compile-time

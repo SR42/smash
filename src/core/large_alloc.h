@@ -49,7 +49,7 @@ public:
         void* mem = nullptr;
 
         // Route large-enough allocations through VmRegion for compression
-        if (vm_region_ && alignment <= kPageSize && alloc_size >= kLargeAllocVmThreshold) {
+        if (vm_region_ && alignment <= kPageSize && alloc_size >= largeAllocVmThreshold()) {
             mem = vm_region_->allocatePages(num_pages);
             if (mem && page_states_) {
                 size_t idx = vm_region_->pageIndex(reinterpret_cast<uintptr_t>(mem));
