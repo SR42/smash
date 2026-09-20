@@ -275,6 +275,59 @@ Measured after the fix, worker outliving main: full mode 218 ms and large-only 2
 
 **Verified as a real discriminator:** with `SMASH_NO_EXIT_GUARD=1` the repro hangs again and has to be SIGKILLed, and the test itself fails on its 30 s child timeout; with the guard on, the same test passes in 220 ms. The isolation run that first identified the cause is the same switch in reverse — `SMASH_NO_COMPRESSOR=1` made the pre-fix binary exit 0, which pinned the hang on smash's threads rather than on anything else the library does.
 
+### Every malloc/free cycle over 16 KiB costs ~10 µs (open defect)
+
+Measured 2026-09-20 while chasing a report of ~1.6% CPU in `xxfree`. A block
+larger than `kMaxSmallSize` that is freed and reallocated goes to the kernel
+**every time**, in both modes. One block, allocated and freed in a loop
+(`-fno-builtin-malloc`, so nothing is elided):
+
+| size | glibc | smash large-only | ratio |
+|---|---|---|---|
+| 32 KiB | 17.2 ns | 9,664 ns | **562×** |
+| 256 KiB | 17.6 ns | 9,684 ns | **550×** |
+| 2 MiB | 16.1 ns | 12,773 ns | **793×** |
+
+The cliff is at 16 KiB, not at `kLargeAllocVmThreshold`: 16 KiB costs 26 ns
+(system passthrough), 17 KiB costs 11,125 ns. Two mechanisms, same effect —
+`strace -c` over 20 k pairs shows **20,115 munmap + 20,198 mmap** for 32 KiB
+blocks (below the 1 MiB threshold, so `LargeAlloc` maps each one directly), and
+**19,063 mprotect + 10,836 madvise** for 2 MiB blocks (arena path: commit on
+allocate, decommit on free). glibc avoids both by caching freed blocks and by
+raising its mmap threshold dynamically once it sees mmap'd blocks being freed.
+
+Nothing in the current configuration space mitigates it: `SMASH_NO_DECOMMIT=1`
+(11.9 → 11.3 µs, and *worse* at 2 MiB), `SMASH_NO_COMPRESSOR=1` (9.7 → 8.2 µs),
+`SMASH_VM_GIB=1` and full mode (10.0 µs) all land in the same range. The fix is
+a **warm cache of freed large blocks** — keep a bounded set mapped and committed
+for reuse instead of returning them to the kernel on every free, the way
+jemalloc's decay-based purging and glibc's dynamic mmap threshold do. The
+`PageRunMap` already recycles the *pages*; what costs is the syscall and fault
+work around them.
+
+**What this does NOT explain is small-allocation overhead**, which is modest and
+was measured separately: a 64-byte malloc+free pair costs 6.7–7.2 ns under
+glibc, 18.6 ns in large-only mode and 15.1 ns in full mode. Note the ordering —
+large-only is *slower* than full mode for small blocks, because it pays smash's
+dispatch and then the system allocator's work.
+
+**Two micro-optimisations of the free path were tried and measured worse**;
+neither is in the tree:
+- Moving the `SMASH_COUNT_FREE` / `SMASH_TRACE_FOREIGN_FREE` diagnostics out of
+  `freeSlow` into cold helpers. Their `char[64]`/`char[160]`+`Dl_info` locals
+  give `freeSlow` a 208-byte frame and a `-fstack-protector-strong` canary, and
+  `perf annotate` attributed ~18% of the function to the canary instructions.
+  Removing it changed nothing: interleaved A/B gave 18.6 ns before, 19.0 ns
+  after. The perf attribution was skid — samples landing on the instruction
+  after a stalled load.
+- A `largeOnlyPassthroughFree()` fast path in `free()`, rejecting non-smash
+  pointers with a range compare so they never enter the cold `freeSlow`, gated
+  on a counter of live non-arena `LargeAlloc` blocks. Measured **3.5 ns slower**
+  (18.6 → 22.2 ns), consistently, interleaved.
+
+The lesson for the next attempt: on this path, `perf` attribution and A/B timing
+disagree, and only the timing is load-bearing.
+
 ### Memory must still work after the compressor shuts down
 
 `CompressorThread::stop()` drains compressed pages and then **uninstalls the
