@@ -308,6 +308,42 @@ workload on a `THP=always` host, that is the trade to weigh. RSS before
 compression is also slightly higher under smash (592 vs 513 MiB) because the
 arena's huge pages round up.
 
+### Which allocation sizes are actually compressed
+
+`kLargeAllocVmThreshold` (1 MiB) decides this, and the effect is absolute:
+**an allocation below it never enters the compressible arena and is never
+compressed**, in either mode. Measured with the exported `smash_in_arena()`
+plus `mincore` after a cold wait, 8 blocks per size, filled with highly
+compressible data:
+
+| size | in arena | resident after cold wait |
+|---|---|---|
+| 320 KB / 512 KB / 768 KB | 0/8 | **100%** — untouched by the compressor |
+| 1 MiB and above | 8/8 | 0% |
+
+Same result in full mode and large-only. So a workload whose memory sits in
+16 KiB–1 MiB blocks pays all of smash's overhead — including the ~10 µs
+malloc/free cycle in the section below — and gets **zero** RSS reduction on
+that memory. The comment on the constant explains the policy ("typically
+internal engine buffers accessed frequently; compressing them causes
+decompression storms"), which is a real risk, but it is a blanket rule rather
+than a cold/hot decision, and smash's own cold detection already exists to make
+that call.
+
+The threshold is **compile-time only**, overridable through the ablation define
+CMake already wires up:
+
+```bash
+cmake .. -DSMASH_LARGE_ALLOC_VM_THRESHOLD=131072    # 128 KiB
+```
+
+Verified at 128 KiB: 320 KB, 512 KB and 768 KB blocks all land in the arena and
+compress to 0% resident, the 320 KB churn cost drops from 9.7 µs to 6.5 µs per
+malloc/free cycle (the arena path beats mmap/munmap), and the suite is 59/59.
+What is *not* verified is the decompression-storm risk the comment warns about,
+which depends on how hot those buffers are in the target application — measure
+before shipping a lowered threshold.
+
 ### Every malloc/free cycle over 16 KiB costs ~10 µs (open defect)
 
 Measured 2026-09-20 while chasing a report of ~1.6% CPU in `xxfree`. A block
