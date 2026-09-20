@@ -40,7 +40,7 @@ library: ASan replaces malloc, which is exactly what smash exists to do, so the
 two fight over the same job. Use it to instrument a single direct-linked test
 binary, not libsmash.
 
-**The suite is clean under UBSan: 42/42 with 0 findings.** Getting there took two
+**The suite is clean under UBSan: 58/58 with 0 findings** (re-run 2026-09-20, after the Round 6 syscall wrappers; the `log_path` mechanism itself was confirmed by a deliberate-UB self-test, since "no report files" and "reports never enabled" look identical). Getting there took two
 real fixes, both found *because* UBSan changed what the compiler could prove:
 
 - `test_syscall_efault` failed under UBSan while passing in the normal build.
