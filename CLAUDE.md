@@ -40,7 +40,32 @@ library: ASan replaces malloc, which is exactly what smash exists to do, so the
 two fight over the same job. Use it to instrument a single direct-linked test
 binary, not libsmash.
 
-**The suite is clean under UBSan: 58/58 with 0 findings** (re-run 2026-09-20, after the Round 6 syscall wrappers; the `log_path` mechanism itself was confirmed by a deliberate-UB self-test, since "no report files" and "reports never enabled" look identical). Getting there took two
+**The suite is clean under UBSan: 58/58 with 0 findings**, unprivileged *and* as root
+(re-run 2026-09-20, after the Round 6 syscall wrappers). Two things are worth
+repeating on any future sanitizer round:
+
+- **Confirm the reporting mechanism before believing the silence.** "No report
+  files" and "reports were never enabled" look identical. A deliberate-UB
+  program built and run with the same flags and `UBSAN_OPTIONS` must produce a
+  `log_path` file; it does.
+- **Run it as root somewhere.** Unprivileged, `test_idle_read_tracking` prints
+  `SKIP: idle-page read tracking needs root` and the whole idle-bitmap path
+  stays uninstrumented — it was the one test body the local sanitized run never
+  executed. As root it runs (`all checks passed`), as do the three
+  `SMASH_SOFTDIRTY=0` tests that historically broke only as root. The remaining
+  skip anywhere in the suite is dictionary *training*, which is off by design
+  (`kDictTrainSamples = 0`).
+
+A sanitized **stress** round found nothing either, over mi-stress (both modes),
+64-thread aligned-`new` churn, 64 threads of 17–81 KiB blocks with cross-thread
+frees (both modes — the 64-byte version is vacuous in large-only, where small
+aligned requests pass through to the system allocator), a 1 GiB arena driven
+into the exhausted hook, and a cold-set workload that compresses and faults
+back in under concurrent allocation: 30–32 k pages compressed per mode,
+262144 byte checks, 0 mismatches, 0 nulls, 0 findings. Note that a
+churn-only stress proves little about the compressor — `compressed=0` and
+`shadow=0` while blocks are freed too fast to go cold — so a stress meant to
+cover the compressor has to hold a live set idle. Getting there took two
 real fixes, both found *because* UBSan changed what the compiler could prove:
 
 - `test_syscall_efault` failed under UBSan while passing in the normal build.
