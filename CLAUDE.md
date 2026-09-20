@@ -56,6 +56,17 @@ repeating on any future sanitizer round:
   skip anywhere in the suite is dictionary *training*, which is off by design
   (`kDictTrainSamples = 0`).
 
+The **benchmarks** are sanitized too, and were not before: `-DSMASH_BUILD_BENCH=ON`
+in the UBSan build dir instruments every bench that links smash internals.
+`run_quick_ci.py` passes (bench_rss 67%, bench_sqlite 56.2%) and all 16 built
+benches exit 0, with **0 findings** — including the compression-internals ones
+(`bench_compression`, `bench_algo_compare`, `bench_dict_experiment`,
+`bench_heap_compress` across its four app profiles), which is where codec UB
+would surface. Do **not** read those RSS percentages as performance: UBSan slows
+everything down, so pages have longer to go cold and the reduction comes out
+above the ~46%/~13% unsanitized baselines. The run is a UB check, not a
+measurement.
+
 A sanitized **stress** round found nothing either, over mi-stress (both modes),
 64-thread aligned-`new` churn, 64 threads of 17–81 KiB blocks with cross-thread
 frees (both modes — the 64-byte version is vacuous in large-only, where small

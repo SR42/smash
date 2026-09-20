@@ -105,7 +105,13 @@ set(SMASH_BENCH_INCLUDE_DIRS
 
 # Helper to add a benchmark executable (linked against smash internals)
 function(smash_add_bench name source)
-  add_executable(${name} ${source})
+  # The vendored printf.cpp defines vsnprintf_, which smash's allocation-free
+  # safe_* formatters call. Without it these targets fail to link with
+  # "undefined reference to vsnprintf_" -- in every configuration, sanitized or
+  # not, which is why bench_compression, bench_dict_experiment and
+  # bench_algo_compare could not be built at all. The other two bench helpers
+  # already add it.
+  add_executable(${name} ${source} ${printf_SOURCE_DIR}/printf.cpp)
   target_include_directories(${name} PRIVATE ${SMASH_BENCH_INCLUDE_DIRS})
   target_link_libraries(${name} PRIVATE alloc8::headers lz4_static libzstd_static ${CMAKE_DL_LIBS})
   if(APPLE)
