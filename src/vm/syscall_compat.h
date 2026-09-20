@@ -71,6 +71,21 @@ inline void walkPagesForFault(const void* buf, size_t len, VmRegion* vm) {
     warmPages(buf, len, vm);
 }
 
+// Warm a buffer whose length the caller does not know (ioctl's legacy request
+// numbers). Walks at most `max_pages` pages and stops at the first page that
+// is not a committed arena page: above the commit watermark the arena is a
+// PROT_NONE reservation, and a fault there is not one smash can resolve.
+inline void walkUnsizedForFault(const void* buf, size_t max_pages, VmRegion* vm) {
+    if (!buf || !vm) return;
+    auto p = reinterpret_cast<uintptr_t>(buf) & ~(static_cast<uintptr_t>(kPageSize) - 1);
+    for (size_t i = 0; i < max_pages; ++i, p += kPageSize) {
+        if (!vm->contains(p) || vm->pageIndex(p) >= vm->committedPages()) return;
+        volatile char* vp = reinterpret_cast<volatile char*>(p);
+        char c = *vp;
+        *vp = c;
+    }
+}
+
 inline void walkIovecForFault(const struct iovec* iov, int iovcnt, VmRegion* vm) {
     for (int i = 0; i < iovcnt; ++i) {
         if (iov[i].iov_base && iov[i].iov_len)

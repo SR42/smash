@@ -26,6 +26,7 @@ For these paths the EFAULT-retry model does not help — those syscalls happen i
 - macOS (`smash_heap.cpp`): `read`, `write`, `pread`, `pwrite`, `readv`, `writev`, `recv`, `send`, `recvfrom`, `sendto`, `recvmsg`, `sendmsg`, `poll`, `kevent`, `kevent64`, `mach_msg`, `mach_msg_overwrite`, `mach_msg2_internal`, plus the buffered-I/O carve-out above.
 - Linux (`linux_syscall_wrappers.cpp`): everything macOS has minus the Mach trio plus `ppoll`, `select`, `pselect`, `accept`, `accept4`, `recvmmsg`, `sendmmsg`, `getsockopt`, `getsockname`, `getpeername`, `getrandom`, `epoll_wait`, `epoll_pwait`, `sched_setaffinity`, `sched_getaffinity`, `pthread_setaffinity_np`, `pthread_getaffinity_np`, plus the `stat`/`statx`, xattr, `statvfs`/`getrusage`/`prlimit64`, `getdents64`/`readlink` and `preadv`/`pwritev` families and `getcwd` (see the file for the full set).
   - Plus the fortified `__*_chk` aliases of the EFAULT-retry family (`__read_chk`, `__pread_chk`, `__pread64_chk`, `__recv_chk`, `__recvfrom_chk`, `__poll_chk`, `__ppoll_chk`, `__readlink_chk`, `__readlinkat_chk`) — see "_FORTIFY_SOURCE and the `__*_chk` aliases" below for why the plain names alone are not enough.
+  - Plus the Round 6 set below: `epoll_ctl`, `ioctl`, `bind`, `setsockopt`, `sendfile`/`sendfile64`, `process_vm_readv`/`process_vm_writev`, `mincore`, `uname`, `sysinfo`, `statfs`/`statfs64`, `getrlimit`/`setrlimit`, `getgroups` (and `__getgroups_chk`), `getcpu`, `prctl`, `sigprocmask`, `pthread_sigmask`, `nanosleep`, `clock_nanosleep`, `utimensat`, `pipe`/`pipe2`, `socketpair`.
   - The affinity four are wrapped because a thread pool keeps one `cpu_set_t` per worker on the heap. `pthread_{set,get}affinity_np` need wrappers of their own: glibc reaches the kernel through an internal `__sched_setaffinity`, so interposing `sched_setaffinity` does not cover them, and they report failure by return value rather than through `errno`, so they warm the mask up front instead of relying only on the EFAULT retry.
 
 ## Platform-specific interposition patterns
@@ -70,20 +71,88 @@ That failure is hard to see with the usual tools, so use the right ones: `.rela.
 
 Resolve the real `__*_chk` functions **eagerly**, in a constructor, not with a call-site `dlsym`: smash reads `/proc/self/pagemap` with `read()`, fortify turns that into `__read_chk`, and `-Bsymbolic` binds it to our own wrapper — so a first-call `dlsym` lands on the compressor's tick path. An earlier lazy version stopped the instrumented build compressing at all.
 
-## Audit: syscalls that still break on a compressed buffer (2026-09-16, Linux)
+## Audit: syscalls that break on a compressed buffer (2026-09-16, Linux)
 
-`retryWithDecompress` only helps for the syscalls smash interposes; everything else hands the application the kernel's EFAULT. Measured with a scratch probe (not in the tree): a 16 MiB heap block, each syscall called twice — once warm, once with `mincore` confirming its page had left RSS — in full mode with `SMASH_COLD_TIMEOUT_SEC=1`. **21 of 31 probes still fail.**
+`retryWithDecompress` only helps for the syscalls smash interposes; everything
+else hands the application the kernel's EFAULT. Measured with a scratch probe
+(not in the tree): a 16 MiB heap block, each syscall called twice — once warm,
+once with `mincore` confirming its page had left RSS — in full mode with
+`SMASH_COLD_TIMEOUT_SEC=1`. **21 of 31 probes failed.**
 
 Not exposed:
 - interposed syscalls (`read`, `writev`, `fstat` controls — all recovered);
 - vDSO calls such as `clock_gettime`: they run in userspace, so a compressed page faults normally and the handler decompresses it;
 - libc functions that bounce through a stack buffer and copy in userspace: `gethostname`, `sigaction`'s `oldact`, `times`.
 
-Still exposed, ordered by how often the buffer is a heap object:
+The 21 that failed, in the audit's risk order — how often the buffer is a heap
+object:
 
 | Risk | Syscalls |
 | --- | --- |
 | Heap buffers are idiomatic | `epoll_ctl` (event structs in heap arrays), `ioctl` (arbitrary app structs), `futex` (a `pthread_mutex_t`/`pthread_cond_t` embedded in a heap object), `bind`, `setsockopt`, `sendfile` (offset), `process_vm_readv`, `mincore` |
 | Usually stack, occasionally heap | `uname`, `sysinfo`, `statfs`, `getrlimit`, `getgroups`, `getcpu`, `prctl(PR_GET_NAME)`, `sigprocmask` (oldset), `nanosleep`, `utimensat`, `pipe2`, `socketpair` |
 
-A syscall only breaks when the application passes a *smash-managed heap* buffer; stack and static buffers are never compressed, which is why this class rarely surfaces. Affinity surfaced because thread pools keep their masks on the heap.
+A syscall only breaks when the application passes a *smash-managed heap*
+buffer; stack and static buffers are never compressed, which is why this class
+rarely surfaces. Affinity surfaced because thread pools keep their masks on the
+heap.
+
+### Round 6 (2026-09-20): all but `futex` are now wrapped
+
+Every entry in both tiers now has a wrapper, plus `sendfile64`,
+`process_vm_writev`, `statfs64`, `setrlimit`, `pthread_sigmask`,
+`clock_nanosleep` and `pipe`, which are the same shape. They follow the
+existing pattern exactly — `retryWith1Buf` / `retryWith2Bufs` / a hand-written
+walk — and all honour `SMASH_NO_SYSCALL_WRAP=1`.
+
+**`futex` is the one that is not wrapped, and cannot be:** glibc has no
+`futex` symbol to interpose, so there is nothing for `LD_PRELOAD` to replace.
+It is also the least exposed item on the list in practice — every pthread
+primitive reads its futex word from userspace before it makes the syscall, and
+that read faults through smash's handler and decompresses the page. Only a
+program issuing a raw `syscall(SYS_futex, ...)` against a heap word it has not
+touched is at risk.
+
+Three things the wrappers had to get right that the existing ones did not:
+
+- **An unsized buffer.** `ioctl`'s argument has no length in its signature.
+  `_IOC_DIR(request) != _IOC_NONE` means the size is encoded in the request
+  number (`_IOC_SIZE`); the legacy numbers (`FIONREAD`, `TIOCGWINSZ`) encode
+  nothing, so the walk falls back to the single page the argument points into,
+  through `walkUnsizedForFault`, which stops at the arena's commit watermark.
+  **Walking past a buffer's end inside the arena is not safe**: above the
+  watermark the arena is a PROT_NONE reservation, and a fault there is not one
+  smash can resolve. The same reasoning makes `walkPathForFault` read a path
+  string byte by byte and stop at the terminator instead of walking a fixed
+  `PATH_MAX`.
+- **A return value that is not `-1`/`errno`.** `clock_nanosleep` returns the
+  error code directly and leaves `errno` alone, so it carries its own retry
+  loop keyed on `ret == EFAULT`. `pthread_sigmask` reports the same way and
+  cannot be retried usefully at all, so it warms up front, like
+  `pthread_setaffinity_np`.
+- **`_FORTIFY_SOURCE`, again.** `getgroups` is the one syscall in this set
+  glibc fortifies, and the audit probe caught it: plain `gcc -O2` rewrote
+  `getgroups(64, list)` into `__getgroups_chk(64, list, 256)` for a `malloc`'d
+  list — `__builtin_object_size` knows how much of the block is left — so the
+  plain wrapper never ran and the call still returned EFAULT. `__getgroups_chk`
+  is now wrapped too, resolved eagerly in the constructor with the rest, and
+  exported only as the `_24` alias.
+
+**Verified as a real discriminator.** The audit probe calls each syscall twice
+on two separate compressed pages: once through the raw kernel entry
+(`syscall(SYS_x, ...)`, which no wrapper can see) and once through the libc
+entry point. Under the fixed library: **22 of 22 raw calls return EFAULT, and
+22 of 22 libc calls succeed.** `getgroups` was 21/22 until `__getgroups_chk`
+was wrapped, which is how that gap was found. `test_syscall_efault`'s phase 19
+is the in-tree version: one compression wait, then one probe per syscall
+against its own page, each checked non-resident with `mincore` immediately
+before the call. Every buffer and descriptor is prepared *before* the wait —
+filling a buffer is a write, and a write is exactly what keeps a page out of
+the compressor's reach, so preparing afterwards would make every probe pass
+vacuously.
+
+**Cost** (300 k iterations of `ioctl` + `uname`, which are as close to a pure
+syscall loop as this gets): 419–438 ns per syscall with no preload, 453 ns
+passing through (`SMASH_NO_SYSCALL_WRAP=1`) and 458–462 ns wrapped. So
+interposition itself costs ~15 ns per syscall and the retry logic ~5 ns on top
+— about 1% of a syscall, paid only by the syscalls listed above.

@@ -154,6 +154,21 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   else()
     set(SMASH_GLIBC_BASE_VERSION "GLIBC_2.2.5")
   endif()
+  # clock_nanosleep@GLIBC_2.17 needs its own version node on x86-64, but on
+  # aarch64 GLIBC_2.17 *is* the base version: defining it twice would both fail
+  # to link and, if it linked, export clock_nanosleep at one version as the
+  # default and as an alias — the self-jump trap documented in the map.
+  if(SMASH_GLIBC_BASE_VERSION STREQUAL "GLIBC_2.17")
+    set(SMASH_GLIBC_217_NODE "")
+  else()
+    set(SMASH_GLIBC_217_NODE
+"GLIBC_2.17 {
+  global:
+    clock_nanosleep;
+    clock_nanosleep_217;
+} ${SMASH_GLIBC_BASE_VERSION};")
+  endif()
+
   configure_file(
     ${CMAKE_CURRENT_SOURCE_DIR}/src/smash_version_script.map.in
     ${CMAKE_CURRENT_BINARY_DIR}/smash_version_script.map

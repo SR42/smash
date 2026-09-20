@@ -126,6 +126,35 @@
     epoll_wait;
     epoll_pwait;
 
+    # Round 6: the syscalls the 2026-09-16 audit found still returning the
+    # kernel's EFAULT to the application (agents/syscall-compat.md).
+    epoll_ctl;
+    ioctl;
+    bind;
+    setsockopt;
+    sendfile;
+    sendfile64;
+    process_vm_readv;
+    process_vm_writev;
+    mincore;
+    uname;
+    sysinfo;
+    statfs;
+    statfs64;
+    getrlimit;
+    setrlimit;
+    getgroups;
+    getcpu;
+    prctl;
+    sigprocmask;
+    pthread_sigmask;
+    nanosleep;
+    clock_nanosleep;
+    utimensat;
+    pipe;
+    pipe2;
+    socketpair;
+
     # mmap/munmap interposition for SMASH_TRACK_EXTERNAL
     mmap;
     mmap64;
@@ -283,6 +312,7 @@ GLIBC_2.4 {
     __recv_chk_24;
     __recvfrom_chk_24;
     __readlink_chk_24;
+    __getgroups_chk_24;
 } @SMASH_GLIBC_BASE_VERSION@;
 
 GLIBC_2.5 {
@@ -302,9 +332,53 @@ GLIBC_2.3.2 {
   global:
     epoll_wait;
     epoll_pwait;
+    epoll_ctl;
     epoll_wait_232;
     epoll_pwait_232;
+    epoll_ctl_232;
 } @SMASH_GLIBC_BASE_VERSION@;
+
+# The rest of the Round 6 wrappers whose glibc version is above the base one.
+# Same rule as everywhere else here: a wrapper only wins if it is exported at
+# the version the caller binds, and x86-64 glibc versions these above
+# GLIBC_2.2.5. On aarch64 every one of them sits at the base GLIBC_2.17, which
+# the bare names above already cover.
+GLIBC_2.3 {
+  global:
+    sendfile64;
+    sendfile64_23;
+} @SMASH_GLIBC_BASE_VERSION@;
+
+GLIBC_2.6 {
+  global:
+    utimensat;
+    utimensat_26;
+} GLIBC_2.3;
+
+GLIBC_2.9 {
+  global:
+    pipe2;
+    pipe2_29;
+} GLIBC_2.6;
+
+GLIBC_2.15 {
+  global:
+    process_vm_readv;
+    process_vm_writev;
+    process_vm_readv_215;
+    process_vm_writev_215;
+} GLIBC_2.9;
+
+GLIBC_2.29 {
+  global:
+    getcpu;
+    getcpu_229;
+} GLIBC_2.15;
+
+# clock_nanosleep is the one case where the version x86-64 glibc uses is also
+# aarch64's base version, so the node would be defined twice there. CMake
+# leaves this empty on aarch64, where the base node already carries the name.
+@SMASH_GLIBC_217_NODE@
 
 # glibc 2.34 re-versioned fstat / fstat64 to GLIBC_2.33 for y2038-safe
 # struct stat. C++ binaries built against modern glibc reference
@@ -376,6 +450,8 @@ GLIBC_2.32 {
   global:
     pthread_getaffinity_np;
     pthread_getaffinity_np_232;
+    pthread_sigmask;
+    pthread_sigmask_232;
 } @SMASH_GLIBC_BASE_VERSION@;
 
 GLIBC_2.34 {

@@ -39,6 +39,12 @@
 #include <sys/wait.h>
 #include <sys/resource.h>
 #include <sys/xattr.h>
+#include <sys/sysinfo.h>
+#include <sys/utsname.h>
+#include <sys/sendfile.h>
+#include <sys/prctl.h>
+#include <sys/statfs.h>
+#include <sys/sysmacros.h>
 #include <sys/mman.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -156,6 +162,7 @@ static int (*g_real_ppoll_chk)(struct pollfd*, nfds_t, const struct timespec*,
                                const sigset_t*, size_t) = nullptr;
 static ssize_t (*g_real_readlink_chk)(const char*, char*, size_t, size_t) = nullptr;
 static ssize_t (*g_real_readlinkat_chk)(int, const char*, char*, size_t, size_t) = nullptr;
+static int (*g_real_getgroups_chk)(int, gid_t*, size_t) = nullptr;
 
 // Resolve one fortified alias, refusing any pointer that lands back inside
 // libsmash. RTLD_NEXT is NOT trustworthy here: resolved from a constructor it
@@ -195,6 +202,7 @@ static void smash_resolve_fortified_syscalls() {
     g_real_ppoll_chk = reinterpret_cast<decltype(g_real_ppoll_chk)>(resolveFortified(libc, "__ppoll_chk", self_base));
     g_real_readlink_chk = reinterpret_cast<decltype(g_real_readlink_chk)>(resolveFortified(libc, "__readlink_chk", self_base));
     g_real_readlinkat_chk = reinterpret_cast<decltype(g_real_readlinkat_chk)>(resolveFortified(libc, "__readlinkat_chk", self_base));
+    g_real_getgroups_chk = reinterpret_cast<decltype(g_real_getgroups_chk)>(resolveFortified(libc, "__getgroups_chk", self_base));
     // Intentionally no dlclose: the handle is RTLD_NOLOAD on a library that is
     // never unloaded, and dropping the refcount buys nothing.
     g_resolving_syscalls.store(false, std::memory_order_relaxed);
@@ -1187,6 +1195,478 @@ SMASH_VISIBLE int pthread_getaffinity_np_232(pthread_t thread, size_t cpusetsize
     return pthread_getaffinity_np(thread, cpusetsize, mask);
 }
 __asm__(".symver pthread_getaffinity_np_232,pthread_getaffinity_np@GLIBC_2.32");
+
+// ── Round 6: the syscalls the 2026-09-16 audit found still exposed ──────────
+// The audit (agents/syscall-compat.md) called 31 syscalls twice under a live
+// compressor — once warm, once with mincore confirming the buffer's page had
+// left RSS — and 21 of them still handed the application the kernel's EFAULT.
+// Everything below is one of those 21, in the audit's own risk order: the
+// buffers that are idiomatically heap objects first.
+//
+// Two of the 21 are not here:
+//  - futex has no libc wrapper to interpose (glibc reaches it through inlined
+//    internal code), so there is no symbol to define. It is also the least
+//    exposed of the list in practice: every pthread primitive touches its
+//    futex word from userspace before it ever makes the syscall, and that
+//    touch faults through our handler and decompresses the page. Only a
+//    program issuing raw syscall(SYS_futex, ...) on a heap word it has not
+//    touched is at risk.
+//  - ioctl's argument has no length in its signature. The wrapper below warms
+//    what _IOC_SIZE gives it, and one page otherwise.
+
+// A path argument can itself be a heap string on a compressed page. Reading
+// it byte by byte IS the decompression (the read faults, the handler restores
+// the page); stopping at the terminator matters, because walking a fixed
+// PATH_MAX past the end could touch an arena page above the commit watermark,
+// which is a PROT_NONE reservation and a fault smash cannot resolve.
+static inline void walkPathForFault(const char* path, smash::VmRegion* vm) {
+    if (!vm || !path) return;
+    if (!vm->contains(reinterpret_cast<uintptr_t>(path))) return;
+    for (size_t i = 0; i < PATH_MAX; ++i) {
+        volatile const char* vp = path + i;
+        if (*vp == '\0') break;
+    }
+}
+
+// ── epoll_ctl ───────────────────────────────────────────────────────────────
+// epoll_wait's event array was already wrapped; epoll_ctl's single event
+// struct was not, and event-loop libraries keep per-fd epoll_event structs in
+// heap arrays alongside their connection objects.
+SMASH_VISIBLE int epoll_ctl(int epfd, int op, int fd, struct epoll_event* event) {
+    using fn_t = int(*)(int, int, int, struct epoll_event*);
+    SMASH_LAZY_RESOLVE(fn_t, epoll_ctl);
+    if (!real_epoll_ctl) return syscall(SYS_epoll_ctl, epfd, op, fd, event);
+    SMASH_PASSTHROUGH_IF_DISABLED(epoll_ctl, epfd, op, fd, event);
+    return smash::vm::retryWith1Buf(
+        [&] { return real_epoll_ctl(epfd, op, fd, event); },
+        event, event ? sizeof(struct epoll_event) : 0);
+}
+SMASH_VISIBLE int epoll_ctl_232(int epfd, int op, int fd, struct epoll_event* event) {
+    return epoll_ctl(epfd, op, fd, event);
+}
+__asm__(".symver epoll_ctl_232,epoll_ctl@GLIBC_2.3.2");
+
+// ── ioctl ───────────────────────────────────────────────────────────────────
+// The argument is whatever the driver says it is. _IOC-encoded request numbers
+// carry the struct's size in their top bits; the legacy numbers (FIONREAD,
+// TIOCGWINSZ, ...) encode nothing, so fall back to the single page the
+// argument points into — enough for every fixed-size legacy struct, and the
+// walk stops at the commit watermark either way.
+SMASH_VISIBLE int ioctl(int fd, unsigned long request, ...) __THROW {
+    using fn_t = int(*)(int, unsigned long, void*);
+    SMASH_LAZY_RESOLVE(fn_t, ioctl);
+    va_list ap;
+    va_start(ap, request);
+    void* arg = va_arg(ap, void*);
+    va_end(ap);
+    if (!real_ioctl) return syscall(SYS_ioctl, fd, request, arg);
+    SMASH_PASSTHROUGH_IF_DISABLED(ioctl, fd, request, arg);
+    const size_t encoded = (_IOC_DIR(request) != _IOC_NONE) ? _IOC_SIZE(request) : 0;
+    auto* vm = smash::g_smash_vm_region;
+    return smash::vm::retryWithDecompress(
+        [&] { return real_ioctl(fd, request, arg); },
+        [&] {
+            if (!vm || !arg) return;
+            if (encoded) smash::vm::walkPagesForFault(arg, encoded, vm);
+            else smash::vm::walkUnsizedForFault(arg, 1, vm);
+        });
+}
+
+// ── bind / setsockopt ───────────────────────────────────────────────────────
+// The kernel reads both. A server that keeps its sockaddr or its option value
+// in a per-listener heap object hands over a page the compressor may own.
+SMASH_VISIBLE int bind(int fd, const struct sockaddr* addr, socklen_t len) __THROW {
+    using fn_t = int(*)(int, const struct sockaddr*, socklen_t);
+    SMASH_LAZY_RESOLVE(fn_t, bind);
+    if (!real_bind) return syscall(SYS_bind, fd, addr, len);
+    SMASH_PASSTHROUGH_IF_DISABLED(bind, fd, addr, len);
+    return smash::vm::retryWith1Buf(
+        [&] { return real_bind(fd, addr, len); }, addr, len);
+}
+
+SMASH_VISIBLE int setsockopt(int fd, int level, int optname,
+                             const void* optval, socklen_t optlen) __THROW {
+    using fn_t = int(*)(int, int, int, const void*, socklen_t);
+    SMASH_LAZY_RESOLVE(fn_t, setsockopt);
+    if (!real_setsockopt) return syscall(SYS_setsockopt, fd, level, optname, optval, optlen);
+    SMASH_PASSTHROUGH_IF_DISABLED(setsockopt, fd, level, optname, optval, optlen);
+    return smash::vm::retryWith1Buf(
+        [&] { return real_setsockopt(fd, level, optname, optval, optlen); },
+        optval, optlen);
+}
+
+// ── sendfile / sendfile64 ───────────────────────────────────────────────────
+// The offset is in/out: a file server keeping its cursor in the connection
+// object loses the transfer entirely when that page is compressed.
+SMASH_VISIBLE ssize_t sendfile(int out_fd, int in_fd, off_t* offset, size_t count) {
+    using fn_t = ssize_t(*)(int, int, off_t*, size_t);
+    SMASH_LAZY_RESOLVE(fn_t, sendfile);
+    if (!real_sendfile) return syscall(SYS_sendfile, out_fd, in_fd, offset, count);
+    SMASH_PASSTHROUGH_IF_DISABLED(sendfile, out_fd, in_fd, offset, count);
+    return smash::vm::retryWith1Buf(
+        [&] { return real_sendfile(out_fd, in_fd, offset, count); },
+        offset, offset ? sizeof(off_t) : 0);
+}
+
+SMASH_VISIBLE ssize_t sendfile64(int out_fd, int in_fd, off64_t* offset, size_t count) {
+    using fn_t = ssize_t(*)(int, int, off64_t*, size_t);
+    SMASH_LAZY_RESOLVE(fn_t, sendfile64);
+    if (!real_sendfile64) return syscall(SYS_sendfile, out_fd, in_fd, offset, count);
+    SMASH_PASSTHROUGH_IF_DISABLED(sendfile64, out_fd, in_fd, offset, count);
+    return smash::vm::retryWith1Buf(
+        [&] { return real_sendfile64(out_fd, in_fd, offset, count); },
+        offset, offset ? sizeof(off64_t) : 0);
+}
+SMASH_VISIBLE ssize_t sendfile64_23(int out_fd, int in_fd, off64_t* offset, size_t count) {
+    return sendfile64(out_fd, in_fd, offset, count);
+}
+__asm__(".symver sendfile64_23,sendfile64@GLIBC_2.3");
+
+// ── process_vm_readv / process_vm_writev ────────────────────────────────────
+// The kernel reads both iovec arrays out of our address space and then copies
+// through the local buffers, so all three can be compressed pages.
+static inline void walkProcessVmArgs(const struct iovec* lvec, unsigned long liovcnt,
+                                     const struct iovec* rvec, unsigned long riovcnt,
+                                     smash::VmRegion* vm) {
+    if (!vm) return;
+    if (lvec && liovcnt) {
+        smash::vm::walkPagesForFault(lvec, liovcnt * sizeof(struct iovec), vm);
+        smash::vm::walkIovecForFault(lvec, static_cast<int>(liovcnt), vm);
+    }
+    if (rvec && riovcnt)
+        smash::vm::walkPagesForFault(rvec, riovcnt * sizeof(struct iovec), vm);
+}
+
+SMASH_VISIBLE ssize_t process_vm_readv(pid_t pid,
+                                       const struct iovec* lvec, unsigned long liovcnt,
+                                       const struct iovec* rvec, unsigned long riovcnt,
+                                       unsigned long flags) __THROW {
+    using fn_t = ssize_t(*)(pid_t, const struct iovec*, unsigned long,
+                            const struct iovec*, unsigned long, unsigned long);
+    SMASH_LAZY_RESOLVE(fn_t, process_vm_readv);
+    if (!real_process_vm_readv)
+        return syscall(SYS_process_vm_readv, pid, lvec, liovcnt, rvec, riovcnt, flags);
+    SMASH_PASSTHROUGH_IF_DISABLED(process_vm_readv, pid, lvec, liovcnt, rvec, riovcnt, flags);
+    auto* vm = smash::g_smash_vm_region;
+    return smash::vm::retryWithDecompress(
+        [&] { return real_process_vm_readv(pid, lvec, liovcnt, rvec, riovcnt, flags); },
+        [&] { walkProcessVmArgs(lvec, liovcnt, rvec, riovcnt, vm); });
+}
+SMASH_VISIBLE ssize_t process_vm_readv_215(pid_t pid,
+                                           const struct iovec* lvec, unsigned long liovcnt,
+                                           const struct iovec* rvec, unsigned long riovcnt,
+                                           unsigned long flags) {
+    return process_vm_readv(pid, lvec, liovcnt, rvec, riovcnt, flags);
+}
+__asm__(".symver process_vm_readv_215,process_vm_readv@GLIBC_2.15");
+
+SMASH_VISIBLE ssize_t process_vm_writev(pid_t pid,
+                                        const struct iovec* lvec, unsigned long liovcnt,
+                                        const struct iovec* rvec, unsigned long riovcnt,
+                                        unsigned long flags) __THROW {
+    using fn_t = ssize_t(*)(pid_t, const struct iovec*, unsigned long,
+                            const struct iovec*, unsigned long, unsigned long);
+    SMASH_LAZY_RESOLVE(fn_t, process_vm_writev);
+    if (!real_process_vm_writev)
+        return syscall(SYS_process_vm_writev, pid, lvec, liovcnt, rvec, riovcnt, flags);
+    SMASH_PASSTHROUGH_IF_DISABLED(process_vm_writev, pid, lvec, liovcnt, rvec, riovcnt, flags);
+    auto* vm = smash::g_smash_vm_region;
+    return smash::vm::retryWithDecompress(
+        [&] { return real_process_vm_writev(pid, lvec, liovcnt, rvec, riovcnt, flags); },
+        [&] { walkProcessVmArgs(lvec, liovcnt, rvec, riovcnt, vm); });
+}
+SMASH_VISIBLE ssize_t process_vm_writev_215(pid_t pid,
+                                            const struct iovec* lvec, unsigned long liovcnt,
+                                            const struct iovec* rvec, unsigned long riovcnt,
+                                            unsigned long flags) {
+    return process_vm_writev(pid, lvec, liovcnt, rvec, riovcnt, flags);
+}
+__asm__(".symver process_vm_writev_215,process_vm_writev@GLIBC_2.15");
+
+// ── mincore ─────────────────────────────────────────────────────────────────
+// One byte of output per page of the queried range, and a program querying a
+// large mapping sizes that vector with malloc. (smash's own residency checks
+// use it too, but through its internal call, not this wrapper.)
+SMASH_VISIBLE int mincore(void* start, size_t len, unsigned char* vec) __THROW {
+    using fn_t = int(*)(void*, size_t, unsigned char*);
+    SMASH_LAZY_RESOLVE(fn_t, mincore);
+    if (!real_mincore) return syscall(SYS_mincore, start, len, vec);
+    SMASH_PASSTHROUGH_IF_DISABLED(mincore, start, len, vec);
+    const size_t ps = static_cast<size_t>(smash::kPageSize);
+    return smash::vm::retryWith1Buf(
+        [&] { return real_mincore(start, len, vec); },
+        vec, vec ? (len + ps - 1) / ps : 0);
+}
+
+// ── The "usually stack, occasionally heap" tier ─────────────────────────────
+// Each of these writes a fixed-size struct the caller owns. They are rarer on
+// the heap than the group above, but the failure is the same: EFAULT handed
+// straight to an application that has no idea its buffer is compressed.
+
+SMASH_VISIBLE int uname(struct utsname* name) __THROW {
+    using fn_t = int(*)(struct utsname*);
+    SMASH_LAZY_RESOLVE(fn_t, uname);
+    if (!real_uname) return syscall(SYS_uname, name);
+    SMASH_PASSTHROUGH_IF_DISABLED(uname, name);
+    return smash::vm::retryWith1Buf([&] { return real_uname(name); },
+                                    name, sizeof(struct utsname));
+}
+
+SMASH_VISIBLE int sysinfo(struct sysinfo* info) __THROW {
+    using fn_t = int(*)(struct sysinfo*);
+    SMASH_LAZY_RESOLVE(fn_t, sysinfo);
+    if (!real_sysinfo) return syscall(SYS_sysinfo, info);
+    SMASH_PASSTHROUGH_IF_DISABLED(sysinfo, info);
+    return smash::vm::retryWith1Buf([&] { return real_sysinfo(info); },
+                                    info, sizeof(struct sysinfo));
+}
+
+SMASH_VISIBLE int statfs(const char* path, struct statfs* buf) __THROW {
+    using fn_t = int(*)(const char*, struct statfs*);
+    SMASH_LAZY_RESOLVE(fn_t, statfs);
+    if (!real_statfs) return syscall(SYS_statfs, path, buf);
+    SMASH_PASSTHROUGH_IF_DISABLED(statfs, path, buf);
+    auto* vm = smash::g_smash_vm_region;
+    return smash::vm::retryWithDecompress(
+        [&] { return real_statfs(path, buf); },
+        [&] {
+            walkPathForFault(path, vm);
+            if (vm && buf) smash::vm::walkPagesForFault(buf, sizeof(struct statfs), vm);
+        });
+}
+
+SMASH_VISIBLE int statfs64(const char* path, struct statfs64* buf) __THROW {
+    using fn_t = int(*)(const char*, struct statfs64*);
+    SMASH_LAZY_RESOLVE(fn_t, statfs64);
+    if (!real_statfs64) return syscall(SYS_statfs, path, buf);
+    SMASH_PASSTHROUGH_IF_DISABLED(statfs64, path, buf);
+    auto* vm = smash::g_smash_vm_region;
+    return smash::vm::retryWithDecompress(
+        [&] { return real_statfs64(path, buf); },
+        [&] {
+            walkPathForFault(path, vm);
+            if (vm && buf) smash::vm::walkPagesForFault(buf, sizeof(struct statfs64), vm);
+        });
+}
+
+SMASH_VISIBLE int getrlimit(__rlimit_resource_t resource, struct rlimit* rlim) __THROW {
+    using fn_t = int(*)(__rlimit_resource_t, struct rlimit*);
+    SMASH_LAZY_RESOLVE(fn_t, getrlimit);
+    if (!real_getrlimit) return syscall(SYS_prlimit64, 0, resource, nullptr, rlim);
+    SMASH_PASSTHROUGH_IF_DISABLED(getrlimit, resource, rlim);
+    return smash::vm::retryWith1Buf([&] { return real_getrlimit(resource, rlim); },
+                                    rlim, sizeof(struct rlimit));
+}
+
+SMASH_VISIBLE int setrlimit(__rlimit_resource_t resource, const struct rlimit* rlim) __THROW {
+    using fn_t = int(*)(__rlimit_resource_t, const struct rlimit*);
+    SMASH_LAZY_RESOLVE(fn_t, setrlimit);
+    if (!real_setrlimit) return syscall(SYS_prlimit64, 0, resource, rlim, nullptr);
+    SMASH_PASSTHROUGH_IF_DISABLED(setrlimit, resource, rlim);
+    return smash::vm::retryWith1Buf([&] { return real_setrlimit(resource, rlim); },
+                                    rlim, sizeof(struct rlimit));
+}
+
+SMASH_VISIBLE int getgroups(int size, gid_t* list) __THROW {
+    using fn_t = int(*)(int, gid_t*);
+    SMASH_LAZY_RESOLVE(fn_t, getgroups);
+    if (!real_getgroups) return syscall(SYS_getgroups, size, list);
+    SMASH_PASSTHROUGH_IF_DISABLED(getgroups, size, list);
+    return smash::vm::retryWith1Buf(
+        [&] { return real_getgroups(size, list); },
+        list, size > 0 ? static_cast<size_t>(size) * sizeof(gid_t) : 0);
+}
+
+// getgroups is the one Round 6 syscall glibc fortifies, and the rewrite is not
+// hypothetical: plain gcc -O2 turned getgroups(64, list) into
+// __getgroups_chk(64, list, 256) for a malloc'd list, because
+// __builtin_object_size knows how much of the block is left. The audit probe
+// caught it — the plain wrapper below was never called and the call still
+// returned EFAULT. Resolved eagerly in the constructor, like the rest.
+SMASH_VISIBLE int __getgroups_chk(int size, gid_t* list, size_t listlen) {
+    if (!g_real_getgroups_chk) return getgroups(size, list);
+    if (g_syscall_wrap_disabled) return g_real_getgroups_chk(size, list, listlen);
+    return smash::vm::retryWith1Buf(
+        [&] { return g_real_getgroups_chk(size, list, listlen); },
+        list, size > 0 ? static_cast<size_t>(size) * sizeof(gid_t) : 0);
+}
+SMASH_VISIBLE int __getgroups_chk_24(int size, gid_t* list, size_t listlen) {
+    return __getgroups_chk(size, list, listlen);
+}
+__asm__(".symver __getgroups_chk_24,__getgroups_chk@GLIBC_2.4");
+
+SMASH_VISIBLE int getcpu(unsigned int* cpu, unsigned int* node) __THROW {
+    using fn_t = int(*)(unsigned int*, unsigned int*);
+    SMASH_LAZY_RESOLVE(fn_t, getcpu);
+    if (!real_getcpu) return syscall(SYS_getcpu, cpu, node, nullptr);
+    SMASH_PASSTHROUGH_IF_DISABLED(getcpu, cpu, node);
+    return smash::vm::retryWith2Bufs(
+        [&] { return real_getcpu(cpu, node); },
+        cpu, cpu ? sizeof(unsigned int) : 0,
+        node, node ? sizeof(unsigned int) : 0);
+}
+SMASH_VISIBLE int getcpu_229(unsigned int* cpu, unsigned int* node) {
+    return getcpu(cpu, node);
+}
+__asm__(".symver getcpu_229,getcpu@GLIBC_2.29");
+
+// prctl is variadic and most options pass no pointer at all. Only the options
+// that hand the kernel a buffer are warmed; the rest just retry, which costs
+// nothing because they never EFAULT.
+SMASH_VISIBLE int prctl(int option, ...) __THROW {
+    using fn_t = int(*)(int, unsigned long, unsigned long, unsigned long, unsigned long);
+    SMASH_LAZY_RESOLVE(fn_t, prctl);
+    va_list ap;
+    va_start(ap, option);
+    unsigned long a2 = va_arg(ap, unsigned long);
+    unsigned long a3 = va_arg(ap, unsigned long);
+    unsigned long a4 = va_arg(ap, unsigned long);
+    unsigned long a5 = va_arg(ap, unsigned long);
+    va_end(ap);
+    if (!real_prctl) return syscall(SYS_prctl, option, a2, a3, a4, a5);
+    SMASH_PASSTHROUGH_IF_DISABLED(prctl, option, a2, a3, a4, a5);
+    size_t len = 0;
+    switch (option) {
+        case PR_GET_NAME: case PR_SET_NAME: len = 16; break;           // TASK_COMM_LEN
+#ifdef PR_GET_PDEATHSIG
+        case PR_GET_PDEATHSIG: len = sizeof(int); break;
+#endif
+#ifdef PR_GET_CHILD_SUBREAPER
+        case PR_GET_CHILD_SUBREAPER: len = sizeof(int); break;
+#endif
+#ifdef PR_GET_TID_ADDRESS
+        case PR_GET_TID_ADDRESS: len = sizeof(void*); break;
+#endif
+        default: break;
+    }
+    auto* vm = smash::g_smash_vm_region;
+    void* arg = reinterpret_cast<void*>(a2);
+    return smash::vm::retryWithDecompress(
+        [&] { return real_prctl(option, a2, a3, a4, a5); },
+        [&] { if (vm && len && arg) smash::vm::walkPagesForFault(arg, len, vm); });
+}
+
+SMASH_VISIBLE int sigprocmask(int how, const sigset_t* set, sigset_t* oldset) __THROW {
+    using fn_t = int(*)(int, const sigset_t*, sigset_t*);
+    SMASH_LAZY_RESOLVE(fn_t, sigprocmask);
+    if (!real_sigprocmask) return syscall(SYS_rt_sigprocmask, how, set, oldset, _NSIG / 8);
+    SMASH_PASSTHROUGH_IF_DISABLED(sigprocmask, how, set, oldset);
+    return smash::vm::retryWith2Bufs(
+        [&] { return real_sigprocmask(how, set, oldset); },
+        set, set ? sizeof(sigset_t) : 0,
+        oldset, oldset ? sizeof(sigset_t) : 0);
+}
+
+// pthread_sigmask reports through its return value, not errno, so the retry
+// predicate cannot see its failure: warm up front instead, like the
+// pthread_*affinity_np pair.
+SMASH_VISIBLE int pthread_sigmask(int how, const sigset_t* set, sigset_t* oldset) __THROW {
+    using fn_t = int(*)(int, const sigset_t*, sigset_t*);
+    SMASH_LAZY_RESOLVE(fn_t, pthread_sigmask);
+    if (!real_pthread_sigmask) return syscall(SYS_rt_sigprocmask, how, set, oldset, _NSIG / 8);
+    SMASH_PASSTHROUGH_IF_DISABLED(pthread_sigmask, how, set, oldset);
+    auto* vm = smash::g_smash_vm_region;
+    if (vm) {
+        if (set) smash::vm::warmPages(set, sizeof(sigset_t), vm);
+        if (oldset) smash::vm::warmPages(oldset, sizeof(sigset_t), vm);
+    }
+    return real_pthread_sigmask(how, set, oldset);
+}
+SMASH_VISIBLE int pthread_sigmask_232(int how, const sigset_t* set, sigset_t* oldset) {
+    return pthread_sigmask(how, set, oldset);
+}
+__asm__(".symver pthread_sigmask_232,pthread_sigmask@GLIBC_2.32");
+
+// nanosleep's own retry loop reaches this wrapper (retryWithDecompress sleeps
+// through it), but with a stack timespec that never EFAULTs, so the nesting is
+// one level deep and terminates.
+SMASH_VISIBLE int nanosleep(const struct timespec* req, struct timespec* rem) {
+    using fn_t = int(*)(const struct timespec*, struct timespec*);
+    SMASH_LAZY_RESOLVE(fn_t, nanosleep);
+    if (!real_nanosleep) return syscall(SYS_nanosleep, req, rem);
+    SMASH_PASSTHROUGH_IF_DISABLED(nanosleep, req, rem);
+    return smash::vm::retryWith2Bufs(
+        [&] { return real_nanosleep(req, rem); },
+        req, req ? sizeof(struct timespec) : 0,
+        rem, rem ? sizeof(struct timespec) : 0);
+}
+
+SMASH_VISIBLE int clock_nanosleep(clockid_t clock_id, int flags,
+                                  const struct timespec* req, struct timespec* rem) {
+    using fn_t = int(*)(clockid_t, int, const struct timespec*, struct timespec*);
+    SMASH_LAZY_RESOLVE(fn_t, clock_nanosleep);
+    if (!real_clock_nanosleep) return syscall(SYS_clock_nanosleep, clock_id, flags, req, rem);
+    SMASH_PASSTHROUGH_IF_DISABLED(clock_nanosleep, clock_id, flags, req, rem);
+    // clock_nanosleep returns the error code directly and leaves errno alone,
+    // so the EFAULT retry has to key on the return value.
+    auto* vm = smash::g_smash_vm_region;
+    int ret = real_clock_nanosleep(clock_id, flags, req, rem);
+    for (int attempt = 0; ret == EFAULT && attempt < 8; ++attempt) {
+        if (vm) {
+            if (req) smash::vm::walkPagesForFault(req, sizeof(struct timespec), vm);
+            if (rem) smash::vm::walkPagesForFault(rem, sizeof(struct timespec), vm);
+        }
+        ret = real_clock_nanosleep(clock_id, flags, req, rem);
+    }
+    return ret;
+}
+SMASH_VISIBLE int clock_nanosleep_217(clockid_t clock_id, int flags,
+                                      const struct timespec* req, struct timespec* rem) {
+    return clock_nanosleep(clock_id, flags, req, rem);
+}
+#if !defined(__aarch64__)   // there GLIBC_2.17 is the base version already
+__asm__(".symver clock_nanosleep_217,clock_nanosleep@GLIBC_2.17");
+#endif
+
+SMASH_VISIBLE int utimensat(int dirfd, const char* path,
+                            const struct timespec times[2], int flags) __THROW {
+    using fn_t = int(*)(int, const char*, const struct timespec*, int);
+    SMASH_LAZY_RESOLVE(fn_t, utimensat);
+    if (!real_utimensat) return syscall(SYS_utimensat, dirfd, path, times, flags);
+    SMASH_PASSTHROUGH_IF_DISABLED(utimensat, dirfd, path, times, flags);
+    auto* vm = smash::g_smash_vm_region;
+    return smash::vm::retryWithDecompress(
+        [&] { return real_utimensat(dirfd, path, times, flags); },
+        [&] {
+            walkPathForFault(path, vm);
+            if (vm && times) smash::vm::walkPagesForFault(times, 2 * sizeof(struct timespec), vm);
+        });
+}
+SMASH_VISIBLE int utimensat_26(int dirfd, const char* path,
+                               const struct timespec times[2], int flags) {
+    return utimensat(dirfd, path, times, flags);
+}
+__asm__(".symver utimensat_26,utimensat@GLIBC_2.6");
+
+SMASH_VISIBLE int pipe(int pipefd[2]) __THROW {
+    using fn_t = int(*)(int*);
+    SMASH_LAZY_RESOLVE(fn_t, pipe);
+    if (!real_pipe) return syscall(SYS_pipe2, pipefd, 0);
+    SMASH_PASSTHROUGH_IF_DISABLED(pipe, pipefd);
+    return smash::vm::retryWith1Buf([&] { return real_pipe(pipefd); },
+                                    pipefd, 2 * sizeof(int));
+}
+
+SMASH_VISIBLE int pipe2(int pipefd[2], int flags) __THROW {
+    using fn_t = int(*)(int*, int);
+    SMASH_LAZY_RESOLVE(fn_t, pipe2);
+    if (!real_pipe2) return syscall(SYS_pipe2, pipefd, flags);
+    SMASH_PASSTHROUGH_IF_DISABLED(pipe2, pipefd, flags);
+    return smash::vm::retryWith1Buf([&] { return real_pipe2(pipefd, flags); },
+                                    pipefd, 2 * sizeof(int));
+}
+SMASH_VISIBLE int pipe2_29(int pipefd[2], int flags) { return pipe2(pipefd, flags); }
+__asm__(".symver pipe2_29,pipe2@GLIBC_2.9");
+
+SMASH_VISIBLE int socketpair(int domain, int type, int protocol, int sv[2]) __THROW {
+    using fn_t = int(*)(int, int, int, int*);
+    SMASH_LAZY_RESOLVE(fn_t, socketpair);
+    if (!real_socketpair) return syscall(SYS_socketpair, domain, type, protocol, sv);
+    SMASH_PASSTHROUGH_IF_DISABLED(socketpair, domain, type, protocol, sv);
+    return smash::vm::retryWith1Buf(
+        [&] { return real_socketpair(domain, type, protocol, sv); },
+        sv, 2 * sizeof(int));
+}
 
 // ── pthread_create / pthread_exit at the version modern glibc uses ──────────
 // alloc8 exports pthread_create/pthread_exit (linux_threads.cpp) to wrap every

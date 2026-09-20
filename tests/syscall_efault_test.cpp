@@ -56,9 +56,23 @@
 #endif
 
 #ifdef __linux__
+#include <grp.h>
+#if defined(__GLIBC__)
+extern "C" int __getgroups_chk(int size, gid_t* list, size_t listlen);
+#endif
 #include <pthread.h>
 #include <sched.h>
+#include <stddef.h>
+#include <sys/epoll.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/prctl.h>
+#include <sys/sendfile.h>
+#include <sys/sysinfo.h>
+#include <sys/un.h>
+#include <sys/utsname.h>
+#include <sys/vfs.h>
+#include <time.h>
 #endif
 
 namespace {
@@ -148,17 +162,17 @@ bool waitForCompression(const char* phase) {
 // does hand the kernel a protected page. waitForCompression only proves that
 // *some* page compressed; a phase whose own buffer stayed resident would pass
 // without exercising the EFAULT path at all.
-bool waitPageNonResident(const void* p, const char* phase) {
+bool waitPageNonResident(const void* p, const char* phase, int tries = 120) {
     const size_t ps = static_cast<size_t>(sysconf(_SC_PAGESIZE));
     void* page = reinterpret_cast<void*>(
         reinterpret_cast<uintptr_t>(p) & ~(static_cast<uintptr_t>(ps) - 1));
-    for (int i = 0; i < 120; ++i) {
+    for (int i = 0; i < tries; ++i) {
         unsigned char resident = 1;
         if (mincore(page, ps, &resident) == 0 && !(resident & 1)) return true;
         usleep(250 * 1000);
     }
-    fprintf(stderr, "FAIL: [%s] the buffer page never left RSS within 30s, so the "
-            "EFAULT path was never exercised\n", phase);
+    fprintf(stderr, "FAIL: [%s] the buffer page never left RSS within %ds, so the "
+            "EFAULT path was never exercised\n", phase, tries / 4);
     return false;
 }
 #endif
@@ -804,6 +818,278 @@ int main() {
         return 1;
     }
     fprintf(stderr, "syscall_efault_test: pthread_setaffinity_np() with heap cpu_set_t PASSED\n");
+
+    // ── Phase 19: the syscalls the 2026-09-16 audit found still exposed ────
+    // 21 of 31 probed syscalls used to hand the application the kernel's
+    // EFAULT; these are the ones that now have wrappers. Each probe gets its
+    // own page, 64 KiB apart, so ONE compression wait covers all of them: a
+    // probe only decompresses the page it touches and the rest stay
+    // compressed until their turn.
+    //
+    // Every buffer and every file descriptor is prepared BEFORE the wait.
+    // Filling a buffer is a write, and a write is exactly what keeps a page
+    // out of the compressor's reach — preparing after the wait would leave
+    // each probe testing a live page and passing vacuously.
+    {
+        auto* probe_block = static_cast<unsigned char*>(std::malloc(kBufBytes));
+        if (!probe_block) { fprintf(stderr, "FAIL: malloc probe_block\n"); return 1; }
+        fillCompressible(probe_block, kBufBytes, 0x7E);
+        constexpr size_t kStride = 64 * 1024;
+        int slot = 0;
+        auto page = [&]() -> unsigned char* { return probe_block + (slot++) * kStride; };
+
+        auto* ev       = reinterpret_cast<struct epoll_event*>(page());
+        auto* fionread = reinterpret_cast<int*>(page());
+        auto* sun      = reinterpret_cast<struct sockaddr_un*>(page());
+        auto* optval   = reinterpret_cast<int*>(page());
+        auto* sf_off   = reinterpret_cast<off_t*>(page());
+        auto* pvm      = page();
+        auto* mc_vec   = page();
+        auto* uts      = reinterpret_cast<struct utsname*>(page());
+        auto* si       = reinterpret_cast<struct sysinfo*>(page());
+        auto* sfs      = reinterpret_cast<struct statfs*>(page());
+        auto* sfs_path = reinterpret_cast<char*>(page());
+        auto* rl_get   = reinterpret_cast<struct rlimit*>(page());
+        auto* rl_set   = reinterpret_cast<struct rlimit*>(page());
+        auto* grps     = reinterpret_cast<gid_t*>(page());
+        auto* grps_chk = reinterpret_cast<gid_t*>(page());
+        auto* cpu_out  = reinterpret_cast<unsigned int*>(page());
+        auto* comm     = reinterpret_cast<char*>(page());
+        auto* oldset   = reinterpret_cast<sigset_t*>(page());
+        auto* oldset2  = reinterpret_cast<sigset_t*>(page());
+        auto* sleep_req = reinterpret_cast<struct timespec*>(page());
+        auto* sleep_rem = reinterpret_cast<struct timespec*>(page());
+        auto* csleep_req = reinterpret_cast<struct timespec*>(page());
+        auto* utimes   = reinterpret_cast<struct timespec*>(page());
+        auto* pipefds  = reinterpret_cast<int*>(page());
+        auto* spfds    = reinterpret_cast<int*>(page());
+
+        // --- descriptors and buffer contents, all before the wait ----------
+        int epfd = epoll_create1(0);
+        int ep_pipe[2] = {-1, -1};
+        if (epfd < 0 || pipe(ep_pipe) != 0) {
+            fprintf(stderr, "FAIL: epoll_create1/pipe setup errno=%d\n", errno);
+            return 1;
+        }
+        ev->events = EPOLLIN;
+        ev->data.fd = ep_pipe[0];
+
+        int io_pipe[2] = {-1, -1};
+        if (pipe(io_pipe) != 0) { fprintf(stderr, "FAIL: pipe setup errno=%d\n", errno); return 1; }
+        if (write(io_pipe[1], "1234", 4) != 4) { fprintf(stderr, "FAIL: pipe write\n"); return 1; }
+        *fionread = -1;
+
+        // Abstract-namespace socket: nothing to unlink afterwards.
+        int bind_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+        std::memset(sun, 0, sizeof(*sun));
+        sun->sun_family = AF_UNIX;
+        std::snprintf(sun->sun_path + 1, sizeof(sun->sun_path) - 1,
+                      "smash-efault-%d", static_cast<int>(getpid()));
+        const socklen_t sun_len = static_cast<socklen_t>(
+            offsetof(struct sockaddr_un, sun_path) + 1 + std::strlen(sun->sun_path + 1));
+
+        int opt_fd = socket(AF_INET, SOCK_STREAM, 0);
+        *optval = 1;
+
+        char sf_path[] = "/tmp/smash-efault-sendfile-XXXXXX";
+        int sf_in = mkstemp(sf_path);
+        if (sf_in < 0) { fprintf(stderr, "FAIL: mkstemp sendfile\n"); return 1; }
+        unlink(sf_path);
+        {
+            char zeros[4096];
+            std::memset(zeros, 0x5A, sizeof(zeros));
+            if (write(sf_in, zeros, sizeof(zeros)) != static_cast<ssize_t>(sizeof(zeros))) {
+                fprintf(stderr, "FAIL: write sendfile source\n");
+                return 1;
+            }
+        }
+        int devnull = open("/dev/null", O_WRONLY);
+        *sf_off = 0;
+
+        // process_vm_readv: both iovec arrays and the destination share one
+        // page; the source is static, so only our side can be compressed.
+        static unsigned char pvm_src[128];
+        for (size_t i = 0; i < sizeof(pvm_src); ++i) pvm_src[i] = static_cast<unsigned char>(i);
+        auto* pvm_local  = reinterpret_cast<struct iovec*>(pvm);
+        auto* pvm_remote = reinterpret_cast<struct iovec*>(pvm + 256);
+        unsigned char* pvm_dst = pvm + 2048;
+        std::memset(pvm_dst, 0, sizeof(pvm_src));
+        pvm_local->iov_base = pvm_dst;
+        pvm_local->iov_len = sizeof(pvm_src);
+        pvm_remote->iov_base = pvm_src;
+        pvm_remote->iov_len = sizeof(pvm_src);
+
+        *mc_vec = 0;
+        std::memset(uts, 0, sizeof(*uts));
+        std::memset(si, 0, sizeof(*si));
+        std::memset(sfs, 0, sizeof(*sfs));
+        std::strcpy(sfs_path, "/");
+        std::memset(rl_get, 0, sizeof(*rl_get));
+        if (getrlimit(RLIMIT_NOFILE, rl_set) != 0) {
+            fprintf(stderr, "FAIL: getrlimit setup errno=%d\n", errno);
+            return 1;
+        }
+        std::memset(grps, 0, 64 * sizeof(gid_t));
+        std::memset(grps_chk, 0, 64 * sizeof(gid_t));
+        cpu_out[0] = cpu_out[1] = 0xFFFFFFFFu;
+        std::memset(comm, 0, 16);
+        std::memset(oldset, 0, sizeof(*oldset));
+        std::memset(oldset2, 0, sizeof(*oldset2));
+        sleep_req->tv_sec = 0;  sleep_req->tv_nsec = 1000;
+        sleep_rem->tv_sec = 0;  sleep_rem->tv_nsec = 0;
+        csleep_req->tv_sec = 0; csleep_req->tv_nsec = 1000;
+        utimes[0].tv_sec = 1000000; utimes[0].tv_nsec = 0;
+        utimes[1] = utimes[0];
+        char ut_path[] = "/tmp/smash-efault-utimensat-XXXXXX";
+        int ut_fd = mkstemp(ut_path);
+        if (ut_fd < 0) { fprintf(stderr, "FAIL: mkstemp utimensat\n"); return 1; }
+        pipefds[0] = pipefds[1] = -1;
+        spfds[0] = spfds[1] = -1;
+
+        // --- one wait, then every probe against its own compressed page ----
+        if (!waitForCompression("pre-round6")) return 1;
+
+        int fails = 0;
+        auto ready = [&](const void* p, const char* name) {
+            if (waitPageNonResident(p, name, 40)) return true;
+            ++fails;
+            return false;
+        };
+        auto check = [&](bool ok, const char* name, long ret) {
+            if (ok) {
+                fprintf(stderr, "syscall_efault_test: %s on a compressed page PASSED\n", name);
+                return;
+            }
+            fprintf(stderr, "FAIL: %s returned %ld errno=%d (%s) with its buffer on a "
+                    "compressed page\n", name, ret, errno, std::strerror(errno));
+            ++fails;
+        };
+
+        if (ready(ev, "epoll_ctl")) {
+            int r = epoll_ctl(epfd, EPOLL_CTL_ADD, ep_pipe[0], ev);
+            check(r == 0, "epoll_ctl", r);
+        }
+        if (ready(fionread, "ioctl")) {
+            int r = ioctl(io_pipe[0], FIONREAD, fionread);
+            check(r == 0 && *fionread == 4, "ioctl(FIONREAD)", r);
+        }
+        if (ready(sun, "bind")) {
+            int r = bind(bind_fd, reinterpret_cast<struct sockaddr*>(sun), sun_len);
+            check(r == 0, "bind", r);
+        }
+        if (ready(optval, "setsockopt")) {
+            int r = setsockopt(opt_fd, SOL_SOCKET, SO_REUSEADDR, optval, sizeof(int));
+            check(r == 0, "setsockopt", r);
+        }
+        if (ready(sf_off, "sendfile")) {
+            ssize_t r = sendfile(devnull, sf_in, sf_off, 4096);
+            check(r == 4096 && *sf_off == 4096, "sendfile", r);
+        }
+        if (ready(pvm, "process_vm_readv")) {
+            ssize_t r = process_vm_readv(getpid(), pvm_local, 1, pvm_remote, 1, 0);
+            if (r < 0 && errno == EPERM) {
+                fprintf(stderr, "syscall_efault_test: process_vm_readv SKIPPED (EPERM, "
+                        "ptrace_scope)\n");
+            } else {
+                check(r == static_cast<ssize_t>(sizeof(pvm_src)) &&
+                      std::memcmp(pvm_dst, pvm_src, sizeof(pvm_src)) == 0,
+                      "process_vm_readv", r);
+            }
+        }
+        if (ready(mc_vec, "mincore")) {
+            int r = mincore(probe_block, static_cast<size_t>(sysconf(_SC_PAGESIZE)), mc_vec);
+            check(r == 0, "mincore", r);
+        }
+        if (ready(uts, "uname")) {
+            int r = uname(uts);
+            check(r == 0 && uts->sysname[0] != '\0', "uname", r);
+        }
+        if (ready(si, "sysinfo")) {
+            int r = sysinfo(si);
+            check(r == 0 && si->uptime > 0, "sysinfo", r);
+        }
+        if (ready(sfs, "statfs")) {
+            int r = statfs("/", sfs);
+            check(r == 0 && sfs->f_bsize > 0, "statfs (heap struct)", r);
+        }
+        if (ready(sfs_path, "statfs path")) {
+            struct statfs stack_sfs;
+            int r = statfs(sfs_path, &stack_sfs);
+            check(r == 0 && stack_sfs.f_bsize > 0, "statfs (heap path string)", r);
+        }
+        if (ready(rl_get, "getrlimit")) {
+            int r = getrlimit(RLIMIT_NOFILE, rl_get);
+            check(r == 0 && rl_get->rlim_cur > 0, "getrlimit", r);
+        }
+        if (ready(rl_set, "setrlimit")) {
+            int r = setrlimit(RLIMIT_NOFILE, rl_set);
+            check(r == 0, "setrlimit", r);
+        }
+        if (ready(grps, "getgroups")) {
+            int r = getgroups(64, grps);
+            check(r >= 0, "getgroups", r);
+        }
+#if defined(__GLIBC__)
+        // getgroups is the one syscall in this group glibc fortifies, and the
+        // rewrite is not hypothetical: plain gcc -O2 turns getgroups(64, list)
+        // into __getgroups_chk(64, list, 256) whenever it can see how much of
+        // the block is left. Call the fortified entry point by name so the
+        // wrapper is guarded whatever this file happens to compile to.
+        if (ready(grps_chk, "__getgroups_chk")) {
+            int r = __getgroups_chk(64, grps_chk, 64 * sizeof(gid_t));
+            check(r >= 0, "__getgroups_chk", r);
+        }
+#endif
+        if (ready(cpu_out, "getcpu")) {
+            int r = getcpu(&cpu_out[0], &cpu_out[1]);
+            check(r == 0 && cpu_out[0] != 0xFFFFFFFFu, "getcpu", r);
+        }
+        if (ready(comm, "prctl")) {
+            int r = prctl(PR_GET_NAME, reinterpret_cast<unsigned long>(comm), 0ul, 0ul, 0ul);
+            check(r == 0 && comm[0] != '\0', "prctl(PR_GET_NAME)", r);
+        }
+        if (ready(oldset, "sigprocmask")) {
+            int r = sigprocmask(SIG_BLOCK, nullptr, oldset);
+            check(r == 0, "sigprocmask", r);
+        }
+        if (ready(oldset2, "pthread_sigmask")) {
+            int r = pthread_sigmask(SIG_BLOCK, nullptr, oldset2);
+            check(r == 0, "pthread_sigmask", r);
+        }
+        if (ready(sleep_req, "nanosleep") && ready(sleep_rem, "nanosleep rem")) {
+            int r = nanosleep(sleep_req, sleep_rem);
+            check(r == 0, "nanosleep", r);
+        }
+        if (ready(csleep_req, "clock_nanosleep")) {
+            int r = clock_nanosleep(CLOCK_MONOTONIC, 0, csleep_req, nullptr);
+            check(r == 0, "clock_nanosleep", r);
+        }
+        if (ready(utimes, "utimensat")) {
+            int r = utimensat(AT_FDCWD, ut_path, utimes, 0);
+            check(r == 0, "utimensat", r);
+        }
+        if (ready(pipefds, "pipe2")) {
+            int r = pipe2(pipefds, 0);
+            check(r == 0 && pipefds[0] >= 0 && pipefds[1] >= 0, "pipe2", r);
+            if (r == 0) { close(pipefds[0]); close(pipefds[1]); }
+        }
+        if (ready(spfds, "socketpair")) {
+            int r = socketpair(AF_UNIX, SOCK_STREAM, 0, spfds);
+            check(r == 0 && spfds[0] >= 0 && spfds[1] >= 0, "socketpair", r);
+            if (r == 0) { close(spfds[0]); close(spfds[1]); }
+        }
+
+        close(epfd); close(ep_pipe[0]); close(ep_pipe[1]);
+        close(io_pipe[0]); close(io_pipe[1]);
+        close(bind_fd); close(opt_fd); close(sf_in); close(devnull);
+        close(ut_fd); unlink(ut_path);
+        std::free(probe_block);
+        if (fails) {
+            fprintf(stderr, "FAIL: %d of the Round 6 syscalls failed on a compressed "
+                    "buffer\n", fails);
+            return 1;
+        }
+    }
 #endif
 
     std::free(recv_buf);

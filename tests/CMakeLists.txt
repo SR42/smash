@@ -370,7 +370,7 @@ else()
       $<TARGET_FILE:syscall_efault_test>
   )
 endif()
-set_tests_properties(test_syscall_efault PROPERTIES TIMEOUT 180)
+set_tests_properties(test_syscall_efault PROPERTIES TIMEOUT 420)
 
 # ── Allocation-contract tests (run under interposition, both modes) ──────────
 # Registered through a shared helper because each one, like
