@@ -260,6 +260,28 @@ set_tests_properties(test_external_mapping PROPERTIES
 # (>= 1 MiB, smash-managed -> compressible VmRegion in BOTH modes) and small
 # (<= 16 KiB, slab in full / system-passthrough in large-only) compressible
 # chunks, asserts compressed>0 via SIGUSR2 stats, then verifies a byte-exact
+# ── Buffered reads after compression (Linux) ────────────────────────────────
+# glibc allocates a FILE's buffer lazily, inside the first read, so under smash
+# it can land on a page the compressor already owns. The kernel returns EFAULT
+# from copy_to_user, and because glibc's internal read is intra-libc the read()
+# wrapper never sees it — the error reaches the application. Measured before
+# the fix: fgets over /proc/self/maps returned 0 lines with ferror set and
+# errno EFAULT, while a raw read(2) into a heap buffer worked.
+if(NOT APPLE)
+  add_executable(stdio_after_compression_test stdio_after_compression_test.cpp)
+  set_target_properties(stdio_after_compression_test PROPERTIES CXX_STANDARD 20)
+  add_test(
+    NAME test_stdio_after_compression
+    COMMAND ${CMAKE_COMMAND} -E env
+      "LD_PRELOAD=$<TARGET_FILE:smash>"
+      "SMASH_LARGE_ONLY=0"
+      "SMASH_DEFER_PHASES_MS=0"
+      "SMASH_COLD_TIMEOUT_SEC=1"
+      $<TARGET_FILE:stdio_after_compression_test>
+  )
+  set_tests_properties(test_stdio_after_compression PROPERTIES TIMEOUT 180)
+endif()
+
 # read-back of BOTH classes. The mode is read from the env at runtime, never a
 # compile flag — that's what guarantees the assertions are identical.
 add_executable(mode_compression_test mode_compression_test.cpp)

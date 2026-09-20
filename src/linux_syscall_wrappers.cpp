@@ -108,6 +108,55 @@ static inline bool iovecInHeap(const struct iovec* iov, int iovcnt, smash::VmReg
 // Use explicit visibility attribute - pragma doesn't work with -fvisibility=hidden
 #define SMASH_VISIBLE __attribute__((visibility("default")))
 
+// ── Buffered-I/O helpers ────────────────────────────────────────────────────
+// Defined outside the extern "C" block below: a template cannot have C
+// linkage, and both of these are file-scope statics used only from the
+// wrappers.
+static inline void warmGlibcFileBuffer(FILE* stream, smash::VmRegion* vm) {
+    if (!stream || !vm) return;
+    char* base = stream->_IO_buf_base;
+    char* end  = stream->_IO_buf_end;
+    if (base && end > base) {
+        size_t sz = static_cast<size_t>(end - base);
+        if (bufferInHeap(base, sz, vm)) {
+            smash::vm::warmPages(base, sz, vm);
+        }
+    }
+}
+
+// A freshly opened FILE has no buffer yet: glibc allocates it lazily, inside
+// the first read, with malloc -- so under smash it can land on a page the
+// compressor already owns. Warming before delegating cannot help, because
+// _IO_buf_base is still null at that point, and glibc's internal read is
+// intra-libc, so the read() wrapper never sees the kernel's EFAULT either. The
+// error reaches the application as a failed stream.
+//
+// Measured before this existed: fgets over /proc/self/maps returned 0 lines
+// with ferror set and errno EFAULT once the compressor had run, while a raw
+// read(2) into a heap buffer of the same size succeeded -- that asymmetry is
+// the whole bug, since raw read goes through the EFAULT retry and stdio does
+// not (test_stdio_after_compression).
+//
+// After the failed call the buffer DOES exist, so warm it and retry. Only a
+// call that made no progress is retried: a read that returned EFAULT consumed
+// nothing, but a partial write cannot be safely repeated.
+template <typename Op, typename NoProgress>
+static inline auto retryStdioOnEfault(FILE* stream, Op op, NoProgress no_progress)
+    -> decltype(op()) {
+    auto ret = op();
+    auto* vm = smash::g_smash_vm_region;
+    if (!vm || !stream) return ret;
+    for (int attempt = 0;
+         attempt < 8 && no_progress(ret) && ferror(stream) && errno == EFAULT;
+         ++attempt) {
+        warmGlibcFileBuffer(stream, vm);
+        clearerr(stream);
+        errno = 0;
+        ret = op();
+    }
+    return ret;
+}
+
 extern "C" {
 
 SMASH_VISIBLE ssize_t read(int fd, void* buf, size_t count) {
@@ -1768,17 +1817,6 @@ SMASH_VISIBLE char* getcwd(char* buf, size_t size) {
 //
 // glibc FILE struct: _IO_buf_base .. _IO_buf_end is the reserve area.
 
-static inline void warmGlibcFileBuffer(FILE* stream, smash::VmRegion* vm) {
-    if (!stream || !vm) return;
-    char* base = stream->_IO_buf_base;
-    char* end  = stream->_IO_buf_end;
-    if (base && end > base) {
-        size_t sz = static_cast<size_t>(end - base);
-        if (bufferInHeap(base, sz, vm)) {
-            smash::vm::warmPages(base, sz, vm);
-        }
-    }
-}
 
 SMASH_VISIBLE size_t fread(void* ptr, size_t size, size_t nmemb, FILE* stream) {
     using fn_t = size_t(*)(void*, size_t, size_t, FILE*);
@@ -1789,7 +1827,9 @@ SMASH_VISIBLE size_t fread(void* ptr, size_t size, size_t nmemb, FILE* stream) {
     bool pin_buf = total && bufferInHeap(ptr, total, vm);
     if (pin_buf) smash::vm::warmPages(ptr, total, vm);
     warmGlibcFileBuffer(stream, vm);
-    size_t ret = real_fread(ptr, size, nmemb, stream);
+    size_t ret = retryStdioOnEfault(stream,
+        [&] { return real_fread(ptr, size, nmemb, stream); },
+        [](size_t r) { return r == 0; });
     return ret;
 }
 
@@ -1801,7 +1841,9 @@ SMASH_VISIBLE char* fgets(char* s, int size, FILE* stream) {
     bool pin_s = (s && size > 0) && bufferInHeap(s, static_cast<size_t>(size), vm);
     if (pin_s) smash::vm::warmPages(s, size, vm);
     warmGlibcFileBuffer(stream, vm);
-    char* ret = real_fgets(s, size, stream);
+    char* ret = retryStdioOnEfault(stream,
+        [&] { return real_fgets(s, size, stream); },
+        [](char* r) { return r == nullptr; });
     return ret;
 }
 
@@ -1811,7 +1853,9 @@ SMASH_VISIBLE int fgetc(FILE* stream) {
     if (!real_fgetc) return EOF;
     auto* vm = smash::g_smash_vm_region;
     warmGlibcFileBuffer(stream, vm);
-    int ret = real_fgetc(stream);
+    int ret = retryStdioOnEfault(stream,
+        [&] { return real_fgetc(stream); },
+        [](int r) { return r == EOF; });
     return ret;
 }
 
@@ -1829,7 +1873,9 @@ SMASH_VISIBLE size_t fwrite(const void* ptr, size_t size, size_t nmemb, FILE* st
     if (total && bufferInHeap(ptr, total, vm))
         smash::vm::warmPages(const_cast<void*>(ptr), total, vm);
     warmGlibcFileBuffer(stream, vm);
-    size_t ret = real_fwrite(ptr, size, nmemb, stream);
+    size_t ret = retryStdioOnEfault(stream,
+        [&] { return real_fwrite(ptr, size, nmemb, stream); },
+        [](size_t r) { return r == 0; });   // a partial write must not repeat
     return ret;
 }
 
