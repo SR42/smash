@@ -166,8 +166,12 @@ class Slab {
     }
 
     // Push a resolved batch onto the pending stack (lock-free, MP producers).
-    void pushPending(void** ptrs, Span** spans, size_t count) {
+    // Returns false if no node could be had (the metadata arena is exhausted,
+    // which it reports itself); the caller then frees the batch directly
+    // instead of writing through a null node.
+    bool pushPending(void** ptrs, Span** spans, size_t count) {
         PendingNode* n = acquirePendingNode();
+        if (!n) return false;
         __builtin_memcpy(n->ptrs, ptrs, count * sizeof(void*));
         __builtin_memcpy(n->spans, spans, count * sizeof(Span*));
         n->count = static_cast<uint32_t>(count);
@@ -177,6 +181,7 @@ class Slab {
         } while (!pending_head_.compare_exchange_weak(
             head, n, std::memory_order_release, std::memory_order_relaxed));
         pending_depth_.fetch_add(1, std::memory_order_relaxed);
+        return true;
     }
 
     // Apply all queued deferred frees. CALLER MUST HOLD lock_ (single consumer).
@@ -280,7 +285,15 @@ class Slab {
         }
 
         Span* span = newSpanDescriptor();
-        span->init(mem, info.pages, size_class_, arena_id_, currentCap());
+        // Both can fail once the metadata arena is exhausted (it reports that
+        // itself). Give the pages back and fail the allocation: mallocSlow
+        // reports it, rather than dereferencing null.
+        if (!span || !span->init(mem, info.pages, size_class_, arena_id_, currentCap())) {
+            if (span) recycleSpanDescriptor(span);
+            if (from_region) vm_region_->releasePages(mem, info.pages);
+            else vm::unmapPages(mem, span_bytes);
+            return nullptr;
+        }
         // Plumb the page-state lookup so Span::allocate() can avoid handing
         // out chunks on COMPRESSED pages (would fault on first user access),
         // and the cold-count array so allocate() can reset coldness on the
@@ -612,9 +625,9 @@ public:
                 lock_.unlock();
                 return;
             }
-            // Contended → defer without blocking.
-            pushPending(ptrs, spans, count);
-            return;
+            // Contended → defer without blocking, unless no node is
+            // available; then block and free directly rather than drop it.
+            if (pushPending(ptrs, spans, count)) return;
         }
         // Back-pressure: queue too deep, block to drain it and apply directly.
         LockGuard guard(lock_);

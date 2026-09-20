@@ -239,6 +239,11 @@ inline constexpr int kMaxSpanPages = 8;
 inline constexpr size_t kBootstrapInitialSize = 64 * 1024 * 1024;   // 64 MB
 inline constexpr size_t kBootstrapExpandSize = 16 * 1024 * 1024;    // 16 MB
 inline constexpr int kBootstrapMaxRegions = 64;
+// Regions grow geometrically from kBootstrapExpandSize to this cap, so the
+// metadata arena scales with the heap: 64 regions reach ~15 GiB instead of
+// the 1.07 GiB that fixed 16 MiB expansions allowed (which a ~169 GB heap
+// exhausted, then died dereferencing null).
+inline constexpr size_t kBootstrapMaxExpandSize = 256 * 1024 * 1024;
 
 // ── Thread cache ─────────────────────────────────────────────────────────────
 // Doubled to 256/128 to halve slab-lock acquisitions on TBB-heavy

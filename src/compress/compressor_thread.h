@@ -5871,12 +5871,16 @@ public:
         uint64_t tier_success = self->tier_upgrade_success_.load(
             std::memory_order_relaxed);
         size_t spilled = self->spilled_count_.load(std::memory_order_relaxed);
-        char buf[416];
+        // Metadata arena: every slab span costs a descriptor and a bitmap
+        // there, and it is what runs out on a very large heap.
+        size_t boot_used = 0, boot_cap = 0, boot_regions = 0;
+        BootstrapAlloc::instance().usage(&boot_used, &boot_cap, &boot_regions);
+        char buf[480];
         int n = smash::safe_snprintf(buf, sizeof(buf),
             "[smash stats] [%s] pid=%d committed=%zu  active=%zu  monitor=%zu"
             "  compressing=%zu  compressed=%zu  shadow=%zu  empty=%zu"
             "  tier_up=%llu/%llu  spilled=%zu  zero=%llu  bump=%zu"
-            "  reheat=%llu  track=%s\n",
+            "  reheat=%llu  track=%s  boot=%zu/%zuMiB(%zu regions)\n",
             ts, (int)getpid(), total, active, monitor, compressing, compressed,
             shadow, empty,
             (unsigned long long)tier_success,
@@ -5885,7 +5889,8 @@ public:
             (unsigned long long)self->zero_pages_.load(std::memory_order_relaxed),
             raw_bump,
             (unsigned long long)g_reheat_events.load(std::memory_order_relaxed),
-            writeTrackerName(self->write_tracker_));
+            writeTrackerName(self->write_tracker_),
+            boot_used >> 20, boot_cap >> 20, boot_regions);
         // Cast to void to silence -Wunused-result on glibc (write is
         // marked __wur there). We're inside a signal handler — there's
         // no useful recovery if write() short-returns.

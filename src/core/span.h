@@ -76,12 +76,15 @@ struct Span {
     // so phase2 doesn't compress pages that are still being filled.
     uint8_t*        cold_counts;
 
-    // Bitmap storage that stays with the descriptor across recycling.
-    // Slab spans are now returned to the arena when empty and their
-    // descriptors reused (Slab::trimEmptySpans), so a fresh bitmap per init
-    // would leak BootstrapAlloc memory on every span churn. Always sized for
-    // the largest span (kMaxSpanBitmapWords), so any size class fits.
+    // Bitmap storage that stays with the descriptor across recycling: empty
+    // slab spans go back to the arena and their descriptors are reused, so a
+    // fresh bitmap per init would leak metadata on every span churn. Sized to
+    // the class that first used this descriptor and grown only when a later
+    // class needs more — sizing every bitmap for the largest span instead
+    // wasted 248 bytes on a 16 KiB class and cut the heap the metadata arena
+    // can cover by 3x (329 GB -> 102 GB).
     uint64_t*       bitmap_store;
+    uint32_t        bitmap_store_words;
 
     // Initialize a slab span for the given size class.
     //
@@ -95,7 +98,7 @@ struct Span {
     // The bitmap remains sized for the full capacity (1 bit per potential
     // slot); disallowed slots are simply marked allocated (0) so the
     // allocator skips them.
-    void init(void* base_, uint32_t pages, uint8_t sc, uint8_t arena = 0,
+    bool init(void* base_, uint32_t pages, uint8_t sc, uint8_t arena = 0,
               uint32_t max_slots_per_page = 0) {
         base = base_;
         page_count = pages;
@@ -116,11 +119,13 @@ struct Span {
         cold_counts = nullptr;
 
         size_t num_words = (full_capacity + 63) / 64;
-        if (!bitmap_store) {
+        if (bitmap_store_words < num_words) {
             bitmap_store = static_cast<uint64_t*>(BootstrapAlloc::instance().allocate(
-                kMaxSpanBitmapWords * sizeof(uint64_t), alignof(uint64_t)));
+                num_words * sizeof(uint64_t), alignof(uint64_t)));
+            bitmap_store_words = bitmap_store ? static_cast<uint32_t>(num_words) : 0;
         }
         bitmap = bitmap_store;
+        if (!bitmap) return false;   // metadata arena exhausted; caller bails
 
         const bool cap_active = max_slots_per_page > 0 && object_size < kPageSize;
 
@@ -134,7 +139,7 @@ struct Span {
                     bitmap[num_words - 1] = (1ULL << valid_bits) - 1;
                 }
             }
-            return;
+            return true;
         }
 
         // Per-page cap path: build sparse bitmap.
@@ -158,6 +163,7 @@ struct Span {
             live = 1;
         }
         object_count = static_cast<uint16_t>(live);
+        return true;
     }
 
     // Widen (or remove) the per-page cap on an already-initialized span.
@@ -499,10 +505,13 @@ inline Span* newSpanDescriptor() {
     }
     if (!s) s = static_cast<Span*>(
         BootstrapAlloc::instance().allocate(sizeof(Span), alignof(Span)));
+    if (!s) return nullptr;   // metadata arena exhausted (it reports that)
     // Keep the bitmap storage across the reset (see Span::bitmap_store).
     uint64_t* store = s->bitmap_store;
+    const uint32_t words = s->bitmap_store_words;
     __builtin_memset(s, 0, sizeof(Span));
     s->bitmap_store = store;
+    s->bitmap_store_words = words;
     return s;
 }
 

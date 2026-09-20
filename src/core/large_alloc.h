@@ -83,6 +83,12 @@ public:
         if (!mem) return nullptr;
 
         Span* span = newSpanDescriptor();
+        if (!span) {   // metadata arena exhausted (it reports that itself)
+            if (vm_region_ && vm_region_->inContigArena(reinterpret_cast<uintptr_t>(mem)))
+                vm_region_->releasePages(mem, num_pages);
+            else vm::unmapPages(mem, alloc_size);
+            return nullptr;
+        }
         span->initLarge(mem, size, num_pages, arena_id);
 
         // O(1) registration: only register the first page. The Span contains
@@ -132,6 +138,10 @@ public:
         // Arena 0: call-site arenas group slab pages by allocation site, and a
         // whole-page NUMA block has no slab.
         Span* span = newSpanDescriptor();
+        if (!span) {   // metadata arena exhausted (it reports that itself)
+            vm::unmapPages(mem, alloc_size);
+            return nullptr;
+        }
         span->initLarge(mem, size, num_pages);
         page_map_->set(reinterpret_cast<uintptr_t>(mem), span);
         return mem;

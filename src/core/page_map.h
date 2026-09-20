@@ -57,7 +57,9 @@ class PageMap {
         tbl = static_cast<L2Table>(
             BootstrapAlloc::instance().allocateZeroed(
                 kPageMapL2Size * sizeof(L2Entry), alignof(L2Entry)));
-        level1_[l1_idx].store(tbl, std::memory_order_release);
+        // Null when the metadata arena is exhausted; callers must check
+        // rather than store through it (that was a null dereference).
+        if (tbl) level1_[l1_idx].store(tbl, std::memory_order_release);
         return tbl;
     }
 
@@ -95,6 +97,7 @@ public:
         const auto l1 = page_idx >> kPageMapL2Bits;
         const auto l2 = page_idx & (kPageMapL2Size - 1);
         L2Table tbl = ensureL2(l1);
+        if (!tbl) return;   // metadata arena exhausted (reported there)
         tbl[l2].store(span, std::memory_order_release);
         mirrorFlat(addr, span);
         // Teardown of a page→span mapping invalidates any address-keyed span
@@ -136,6 +139,7 @@ public:
             const auto l1 = page >> kPageMapL2Bits;
             const auto l2 = page & (kPageMapL2Size - 1);
             L2Table tbl = ensureL2(l1);
+            if (!tbl) return;   // metadata arena exhausted (reported there)
             // Fill to the end of this L2 table or the end of the run.
             const size_t l2_end = (l2 + (last_page - page) < kPageMapL2Size - 1)
                 ? l2 + (last_page - page)

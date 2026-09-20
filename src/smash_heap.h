@@ -573,6 +573,12 @@ class SmashHeap {
         SmashHeap* heap = s_fault_heap_;
         const auto a = reinterpret_cast<uintptr_t>(addr);
         if (!heap) { smash::safe_snprintf(buf, len, "smash heap not initialised."); return; }
+        if (a < 4096) {
+            smash::safe_snprintf(buf, len,
+                "A null or near-null dereference. If smash printed "
+                "\"internal metadata arena exhausted\" above, that is the cause.");
+            return;
+        }
         if (BootstrapAlloc::instance().owns(addr)) {
             smash::safe_snprintf(buf, len, "Inside smash's own metadata (BootstrapAlloc).");
             return;

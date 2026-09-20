@@ -42,6 +42,23 @@ class BootstrapAlloc {
     std::atomic<uintptr_t> bounds_lo_{UINTPTR_MAX};
     std::atomic<uintptr_t> bounds_hi_{0};
 
+    // Said once, when the arena cannot grow. Callers return nullptr from here
+    // on, which surfaces as a failed allocation rather than a null dereference.
+    [[gnu::cold, gnu::noinline]] void reportExhausted(size_t want) {
+        static std::atomic<bool> warned{false};
+        if (warned.exchange(true, std::memory_order_relaxed)) return;
+        size_t total = 0;
+        const size_t n = num_regions_.load(std::memory_order_acquire);
+        for (size_t i = 0; i < n; ++i) total += regions_[i].capacity;
+        char buf[288];
+        const int k = smash::safe_snprintf(buf, sizeof(buf),
+            "[smash FATAL] internal metadata arena exhausted: %zu regions, %zu MiB, "
+            "asking for %zu bytes. Every slab span costs a descriptor and a bitmap "
+            "here. Allocations will now fail; raise kBootstrapMaxRegions or "
+            "kBootstrapMaxExpandSize.\n", n, total >> 20, want);
+        if (k > 0) (void)!::write(2, buf, static_cast<size_t>(k));
+    }
+
     void* tryAllocFrom(Region& r, size_t size, size_t align) {
         size_t off = r.offset.load(std::memory_order_relaxed);
         for (;;) {
@@ -111,9 +128,19 @@ class BootstrapAlloc {
             void* p = tryAllocFrom(regions_[n - 1], size, align);
             if (p) return p;
         }
-        size_t region_size = kBootstrapExpandSize;
+        // Grow geometrically. Fixed 16 MiB expansions capped the arena at
+        // 64 MiB + 63 x 16 MiB = 1.07 GiB, and every slab span costs a
+        // descriptor plus a bitmap here, so a big heap ran the arena dry and
+        // the next span descriptor came back null — a write to address 0 with
+        // no message (reported at ~169 GB RSS). Doubling to a 256 MiB cap
+        // takes the same 64 regions to ~15 GiB, which covers a multi-TB heap.
+        size_t region_size = kBootstrapExpandSize << (n < 5 ? n : 4);
+        if (region_size > kBootstrapMaxExpandSize) region_size = kBootstrapMaxExpandSize;
         if (size + align > region_size) region_size = size + align;
-        if (!addRegion(region_size)) return nullptr;
+        if (!addRegion(region_size)) {
+            reportExhausted(size);
+            return nullptr;
+        }
         n = num_regions_.load(std::memory_order_acquire);
         return tryAllocFrom(regions_[n - 1], size, align);
     }
@@ -191,6 +218,19 @@ public:
     }
 
     [[gnu::always_inline, gnu::hot]]
+    // Diagnostics: bytes handed out, bytes mapped, and region count. Every
+    // slab span costs a descriptor plus a bitmap here, so this is what runs
+    // out on a very large heap (reported on the SIGUSR2 stats line as boot=).
+    void usage(size_t* used, size_t* capacity, size_t* regions) const {
+        const size_t n = num_regions_.load(std::memory_order_acquire);
+        size_t u = 0, c = 0;
+        for (size_t i = 0; i < n; ++i) {
+            u += regions_[i].offset.load(std::memory_order_relaxed);
+            c += regions_[i].capacity;
+        }
+        *used = u; *capacity = c; *regions = n;
+    }
+
     bool owns(const void* ptr) const {
         auto p = reinterpret_cast<uintptr_t>(ptr);
         // Fast-reject: ptr outside any bootstrap region's envelope.

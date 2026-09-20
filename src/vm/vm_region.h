@@ -125,6 +125,19 @@ class VmRegion {
 
     void queueForDecommit(void* addr, size_t num_pages, size_t page_index, int node) {
         DecommitEntry* e = newDecommitEntry();
+        if (!e) {
+            // The metadata arena is exhausted (it reports that itself). Do the
+            // release synchronously on a stack entry instead of dereferencing
+            // null: this path is reached exactly when an allocation has just
+            // failed and is giving its pages back.
+            DecommitEntry local{};
+            local.addr = addr;
+            local.num_pages = num_pages;
+            local.page_index = page_index;
+            local.node = node;
+            processDecommitEntry(&local);
+            return;
+        }
         e->addr = addr;
         e->num_pages = num_pages;
         e->page_index = page_index;

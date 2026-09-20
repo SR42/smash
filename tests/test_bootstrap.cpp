@@ -111,12 +111,36 @@ static void testManyAllocations() {
     }
 }
 
+// The metadata arena must scale with the heap. Every slab span costs a
+// descriptor plus a bitmap here, so its capacity bounds how large a heap smash
+// can manage: when it runs out, allocations fail (and before the null checks,
+// the process died dereferencing null — reported at ~169 GB RSS). Fixed
+// 16 MiB expansions capped it at 64 MiB + 63 x 16 MiB = 1.07 GiB, roughly a
+// 100 GB heap. Regions now double up to kBootstrapMaxExpandSize.
+static void testCapacityScales() {
+    size_t cap = smash::kBootstrapInitialSize;
+    for (int i = 1; i < smash::kBootstrapMaxRegions; ++i) {
+        size_t r = smash::kBootstrapExpandSize << (i - 1 < 4 ? i - 1 : 4);
+        if (r > smash::kBootstrapMaxExpandSize) r = smash::kBootstrapMaxExpandSize;
+        cap += r;
+    }
+    const size_t kWant = size_t{8} << 30;   // 8 GiB of metadata
+    CHECK(cap >= kWant,
+          "metadata arena capacity is only %zu MiB; with ~112 bytes per slab span "
+          "that bounds the heap to roughly %zu GB. Regions must keep growing "
+          "geometrically (kBootstrapMaxExpandSize).",
+          cap >> 20, (cap / 112) * 8 * 4096 / 1000000000);
+    printf("  metadata arena capacity: %zu MiB across %d regions\n",
+           cap >> 20, smash::kBootstrapMaxRegions);
+}
+
 int main() {
     testBasicAlloc();
     testAlignment();
     testManyAllocations();
     // Last: it consumes the initial region on purpose.
     testGrowPastFirstRegion();
+    testCapacityScales();
 
     if (failures == 0) {
         fprintf(stderr, "bootstrap: all tests passed\n");
