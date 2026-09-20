@@ -330,6 +330,17 @@ decompression storms"), which is a real risk, but it is a blanket rule rather
 than a cold/hot decision, and smash's own cold detection already exists to make
 that call.
 
+**`malloc_numa` is the exception: it ignores the threshold at every size.**
+`LargeAlloc::allocateOnNode` has no size test — it always tries
+`VmRegion::allocatePagesOnNode` first, and only falls back to a separate bound
+mapping (never compressed) when there is no VmRegion or it is exhausted.
+Measured on a 4-node host, node 0, after a cold wait: `malloc_numa` blocks of
+4 KB, 64 KB, 320 KB, 768 KB, 1 MB and 4 MB all report `smash_in_arena() == 1`
+and 0% resident, while plain `malloc` of 64 KB / 320 KB / 768 KB is 100%
+resident. So a caller that can use `malloc_numa` gets sub-threshold blocks
+compressed today with no rebuild — at the cost of binding that memory to one
+node (`MPOL_BIND`), page granularity, and `realloc` returning an unbound block.
+
 The threshold is **compile-time only**, overridable through the ablation define
 CMake already wires up:
 
