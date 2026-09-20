@@ -275,6 +275,39 @@ Measured after the fix, worker outliving main: full mode 218 ms and large-only 2
 
 **Verified as a real discriminator:** with `SMASH_NO_EXIT_GUARD=1` the repro hangs again and has to be SIGKILLed, and the test itself fails on its 30 s child timeout; with the guard on, the same test passes in 220 ms. The isolation run that first identified the cause is the same switch in reverse — `SMASH_NO_COMPRESSOR=1` made the pre-fix binary exit 0, which pinned the hang on smash's threads rather than on anything else the library does.
 
+### Hugepages and THP
+
+**Explicit hugepages (`MAP_HUGETLB`): supported by exclusion.** The mmap
+interposer's filter skips them (`isTrackableMapping()`), so an application's
+hugetlb mappings keep working and are never tracked or compressed. That skip is
+load-bearing, not an omission — a hugetlb VMA only accepts huge-page-aligned
+operations, so every `mprotect`/`madvise`/`MAP_FIXED` smash would issue on one
+is rejected with EINVAL, and before the filter existed a 16 MiB mapping produced
+8192 failing page operations in six seconds (`test_hugepage_no_mprotect_storm`).
+smash never allocates hugetlb memory itself.
+
+**THP: smash's arena gets it when the kernel offers it, and compression
+survives — but a decompressed page comes back 4 KiB.** smash issues no
+`MADV_HUGEPAGE`/`MADV_NOHUGEPAGE` anywhere, so on a `THP=madvise` host (the
+Ubuntu default) the arena gets no huge pages at all, exactly like glibc's
+malloc — measured 0% for both. On a `THP=always` host, touching 512 MiB of
+malloc'd memory:
+
+| | glibc | smash (full mode, compressor active) |
+|---|---|---|
+| after touch | RSS 513 MiB, AnonHugePages 512 (100%), 24 VMAs | RSS 592 MiB, AnonHugePages 584 (**99%**), 101 VMAs |
+| after cold wait | unchanged | RSS **99 MiB**, AnonHugePages 92, 110 VMAs |
+| after reading it all back | unchanged | RSS 594 MiB, AnonHugePages **74 (12%)**, 114 VMAs |
+
+So compression works fine on THP-backed memory (592 → 99 MiB here), and the VMA
+count stays flat — no splitting storm. What is lost is the huge-page backing
+itself: the restore path is a per-page `remapPages()` (`MAP_FIXED|MAP_ANON`), so
+a workload that faults its whole live set back ends up at ~12% AnonHugePages
+instead of ~99%, and only khugepaged can re-collapse it. For a TLB-sensitive
+workload on a `THP=always` host, that is the trade to weigh. RSS before
+compression is also slightly higher under smash (592 vs 513 MiB) because the
+arena's huge pages round up.
+
 ### Every malloc/free cycle over 16 KiB costs ~10 µs (open defect)
 
 Measured 2026-09-20 while chasing a report of ~1.6% CPU in `xxfree`. A block
