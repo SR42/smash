@@ -211,14 +211,31 @@ class Slab {
         }
     }
 
-    [[gnu::cold, gnu::noinline]] static void warnArenaExhausted() {
+    // Says WHICH kind of exhaustion this is, because the fix differs: few free
+    // pages means the live set genuinely outgrew the arena (raise
+    // SMASH_VM_GIB), while many free pages with a short longest run means
+    // fragmentation — a bigger arena only postpones it.
+    [[gnu::cold, gnu::noinline]] void warnArenaExhausted(size_t want_pages) {
         static std::atomic<bool> warned{false};
         if (warned.exchange(true, std::memory_order_relaxed)) return;
-        static const char msg[] =
-            "[smash WARN] the compressible VmRegion arena is exhausted; new small-object "
-            "spans now come from direct mmap and are not compressed. Raise SMASH_VM_GIB "
-            "to keep them compressible.\n";
-        (void)!::write(2, msg, sizeof(msg) - 1);
+        const size_t total = vm_region_->contigPages();
+        const size_t bump = vm_region_->rawNextPage();
+        const size_t free_pages = vm_region_->arenaFreePages();
+        const size_t longest = vm_region_->arenaLongestFreeRun();
+        char buf[448];
+        const int n = smash::safe_snprintf(buf, sizeof(buf),
+            "[smash WARN] compressible arena exhausted while asking for %zu pages: "
+            "%zu of %zu MiB handed out, %zu MiB free in %zu-page runs or shorter. "
+            "New small-object spans now come from direct mmap and are NOT compressed. "
+            "%s\n",
+            want_pages, bump * kPageSize >> 20, total * kPageSize >> 20,
+            free_pages * kPageSize >> 20, longest,
+            free_pages * 4 < total
+                ? "The live set outgrew the arena: raise SMASH_VM_GIB (ceiling 1024; "
+                  "an unused arena costs address space, not memory)."
+                : "Most of the arena is free but too fragmented for this request, so a "
+                  "larger SMASH_VM_GIB only postpones it — please report this.");
+        if (n > 0) (void)!::write(2, buf, static_cast<size_t>(n));
     }
 
     // True if the span's pages are in the compressible VmRegion arena. A span
@@ -259,7 +276,7 @@ class Slab {
             // pages are simply not compressed.
             mem = vm::mapPages(span_bytes);
             if (!mem) return nullptr;
-            if (vm_region_) warnArenaExhausted();
+            if (vm_region_) warnArenaExhausted(info.pages);
         }
 
         Span* span = newSpanDescriptor();

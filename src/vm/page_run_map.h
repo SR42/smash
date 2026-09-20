@@ -107,6 +107,23 @@ public:
 
     size_t numPages() const { return num_pages_; }
 
+    // Free pages held by `owner`, and a lower bound on its longest run (the
+    // start of the highest non-empty size bin). Together they separate "the
+    // arena is genuinely full" from "it is fragmented": many free pages but a
+    // short longest run means no single allocation fits.
+    size_t freePages(uint32_t owner) {
+        LockGuard guard(lock_);
+        return bins_[owner].free_pages;
+    }
+    size_t longestRunAtLeast(uint32_t owner) {
+        LockGuard guard(lock_);
+        const OwnerBins& ob = bins_[owner];
+        for (size_t b = kNumBins; b-- > 0;) {
+            if (ob.head[b]) return b < kExactBins ? b + 1 : size_t{1} << (6 + (b - kExactBins));
+        }
+        return 0;
+    }
+
 private:
     struct Tag {             // valid only at a free run's first page
         uint32_t len;        // 0 = not the start of a free run
@@ -119,6 +136,7 @@ private:
     struct OwnerBins {
         uint32_t head[kNumBins];                             // index + 1
         uint64_t nonempty[2];                                // bit per bin
+        size_t free_pages;                                   // for diagnostics
     };
 
     static void* mapZeroed(size_t bytes) {
@@ -159,6 +177,7 @@ private:
         if (t.next) tags_[t.next - 1].prev = static_cast<uint32_t>(s + 1);
         ob.head[b] = static_cast<uint32_t>(s + 1);
         ob.nonempty[b / 64] |= uint64_t{1} << (b % 64);
+        ob.free_pages += len;
         ends_[s + len - 1] = static_cast<uint32_t>(s + 1);
     }
 
@@ -170,6 +189,7 @@ private:
         else ob.head[b] = t.next;
         if (t.next) tags_[t.next - 1].prev = t.prev;
         if (!ob.head[b]) ob.nonempty[b / 64] &= ~(uint64_t{1} << (b % 64));
+        ob.free_pages -= t.len;
         t.len = 0;           // the end tag goes stale; readers re-validate it
         t.next = t.prev = 0;
     }

@@ -279,6 +279,8 @@ Measured with a 1 GiB arena, phases of ~70 % each, everything freed between phas
 
 **Returning spans eagerly is a trap.** The first version released empty spans beyond two per slab on every free; mi-stress went from 16.9 s to 28.7 s, because spans oscillating between empty and in use paid a release, a decommit and zero-fill faults each round trip. Isolated by building the map without trimming (16.3–16.9 s) and trimming without merging (27–30 s). Reclaiming only when the arena is exhausted costs nothing in steady state: mi-stress 16.7–16.9 s against 16.2–16.9 s before; thread churn 83–86 s against 86 s; and 16 threads of 1–4 MiB blocks got faster, 10.2 s against 16.6 s, since the old path walked singly-linked lists across shards. 64 threads with the hook firing constantly (1 GiB arena): 2.56 M allocations, 0 nulls, no deadlock — the hook takes other slabs' locks with `tryLock` only.
 
+When the arena is exhausted the warning says **which kind** of exhaustion it is, because the fix differs: it reports pages handed out, free pages still in the map, and the longest reusable run. Few free pages means the live set genuinely outgrew the arena (raise `SMASH_VM_GIB`); many free pages with a short longest run means fragmentation, which a larger arena only postpones.
+
 **Every full-mode allocation that is about to return nullptr now says why** (`util/alloc_failure.h`, rate-limited, allocation-free): `[smash alloc-fail] <path>: size=… align=… errno=… arena=used/total pages vmas=count/max_map_count`. Before, smash returned null silently and the only symptom was the application's `bad_alloc`.
 
 ### Write tracking: soft-dirty, userfaultfd, or neither

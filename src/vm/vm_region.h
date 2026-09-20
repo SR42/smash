@@ -862,6 +862,10 @@ public:
     }
     size_t rawNextPage() const { return next_page_.load(std::memory_order_acquire); }
 
+    // Arena occupancy, for the exhausted warning and the stats line.
+    size_t arenaFreePages() { return free_map_.freePages(kSharedOwner); }
+    size_t arenaLongestFreeRun() { return free_map_.longestRunAtLeast(kSharedOwner); }
+
     size_t committedPages() const {
         size_t bump = next_page_.load(std::memory_order_acquire);
         if (tracking_mode_) return bump;
