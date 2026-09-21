@@ -27,6 +27,7 @@
 #include "smash/config.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
 #include <sys/ioctl.h>
@@ -58,6 +59,15 @@ static bool isCompressed(PageState s) {
 
 int main() {
     setvbuf(stdout, nullptr, _IONBF, 0);
+    // Pin the tracker config in the test itself, not only in the ctest
+    // registration. selectWriteTracker() checks SMASH_SOFTDIRTY *before* it
+    // looks at SMASH_WRITE_TRACK, so an inherited SMASH_SOFTDIRTY=0 (a whole
+    // suite run forcing Phase 3 PROT_READ monitoring) silently overrides the
+    // forced tracker: Phase 3 then mprotects this test's own pages PROT_READ,
+    // and since the test installs no fault handler, its next write to the hot
+    // page dies with SIGSEGV instead of testing anything.
+    setenv("SMASH_SOFTDIRTY", "1", 1);
+    setenv("SMASH_WRITE_TRACK", "uffd", 1);
     if (!kernelHasAsyncUffdWp()) {
         printf("SKIP: kernel lacks async userfaultfd write-protect (needs Linux 6.7+)\n");
         return 0;

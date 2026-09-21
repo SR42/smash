@@ -766,7 +766,7 @@ target_include_directories(test_uffd_write_tracking PRIVATE ${SMASH_TEST_INCLUDE
 target_link_libraries(test_uffd_write_tracking PRIVATE alloc8::headers lz4_static libzstd_static)
 add_test(NAME test_uffd_write_tracking COMMAND test_uffd_write_tracking)
 set_tests_properties(test_uffd_write_tracking PROPERTIES
-  ENVIRONMENT "SMASH_WRITE_TRACK=uffd;SMASH_COLD_TICKS=2;SMASH_FIXAV=0")
+  ENVIRONMENT "SMASH_WRITE_TRACK=uffd;SMASH_SOFTDIRTY=1;SMASH_COLD_TICKS=2;SMASH_FIXAV=0")
 
 # Small allocations after the VmRegion arena is exhausted: slab spans used to
 # have no fallback, so operator new threw std::bad_alloc (multithreaded apps
