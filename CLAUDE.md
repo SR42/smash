@@ -761,6 +761,48 @@ LargeAlloc's path), `malloc_numa` (unaffected), and sizes between 1 MiB and a
 raised `SMASH_LARGE_ALLOC_VM_THRESHOLD` (no class covers them, so they take the
 direct mapping as before).
 
+### The arena's page allocator has one lock, and it collapses past ~8 threads
+
+`VmRegion::allocatePages()` calls `free_map_.take()` **first on every large
+allocation**, and `PageRunMap` is guarded by a single spinlock ("One lock
+guards the whole map"). Frees reach the same lock through
+`processDecommitEntry` → `insert()`. So every large allocation and every large
+free serialises on one lock, whatever the arena count.
+
+Measured with 2 MiB blocks churned across threads (8 physical cores):
+
+| threads | smash total ops/sec | µs per alloc+free | glibc |
+|---|---|---|---|
+| 1 | 57k | 17.5 | 0.1 µs |
+| 2 | **96k** | 10.4 | 0.2 µs |
+| 4 | 70k | 14.3 | 0.1 µs |
+| 8 | 32k | 31.0 | 0.3 µs |
+| 16 | 22k | 45.7 | 0.3 µs |
+
+Throughput peaks at **two threads** and then goes backwards. The cause is
+smash's lock, not the kernel — forcing the same workload onto the direct-mmap
+path (`SMASH_LARGE_ALLOC_VM_THRESHOLD` above the block size), which skips
+`PageRunMap` entirely but still pays mmap/munmap, stays flat:
+
+| threads | arena path | direct mmap |
+|---|---|---|
+| 1 | 17.5 µs | 19.0 µs |
+| 8 | 20.7 µs | 20.3 µs |
+| 16 | **49.3 µs** | 21.9 µs |
+
+So beyond ~8 concurrent large allocations the compressible path is *slower than
+falling back to uncompressed mappings*. For a workload whose bytes are large
+blocks and which runs a thread per core on a large machine, this is the
+scalability wall, and it is a design property rather than a tuning parameter:
+the slab has per-(arena, class) locks and the mid-size bins are sharded by
+arena, but the page allocator underneath them all has one.
+
+Two directions, neither implemented: shard `PageRunMap` by owner/arena the way
+everything above it is sharded, and cache freed runs per thread so the common
+allocate-free-allocate cycle never reaches the shared map (which would also
+address the ~10 µs churn cost below, since a cached run needs no mprotect and
+no madvise).
+
 ### Every malloc/free cycle over 16 KiB costs ~10 µs (open defect)
 
 Measured 2026-09-20 while chasing a report of ~1.6% CPU in `xxfree`. A block
