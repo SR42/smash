@@ -761,6 +761,53 @@ LargeAlloc's path), `malloc_numa` (unaffected), and sizes between 1 MiB and a
 raised `SMASH_LARGE_ALLOC_VM_THRESHOLD` (no class covers them, so they take the
 direct mapping as before).
 
+### Compression throughput is ~160 MB/s and does not scale with cores
+
+No counter silently caps compression — `SMASH_TIME_BUDGET_PCT`, the one knob
+that marks buckets SKIP, is unset by default and returns -1 (no gating). What
+limits it is the per-page syscall cost, and it gets worse with thread count
+rather than better.
+
+Measured, 16 GiB of compressible data left cold on an 8-core host:
+**162 MB/s**, and 8 GiB gave 161 MB/s — flat. The telling number is the CPU:
+**117%**, with system time (50 s) nearly double user time (28 s). Eight workers
+are available and the machine has eight cores; compression uses barely one of
+them, so it is not CPU-bound and more workers cannot help.
+
+`strace -c -f` over ~485k compressed pages shows why:
+
+| syscall | calls | per page |
+|---|---|---|
+| mprotect | 3,068,894 | **~6.3** |
+| madvise | 485,843 | 1.0 |
+| pwrite64 (clear_refs) | 485,843 | 1.0 |
+| **membarrier** | 485,844 | **1.0** |
+
+Both of the expensive ones scale badly with the application's thread count, not
+with smash's: `mprotect` takes the process-wide `mmap_lock` in write mode, so
+it serialises against every application thread's faults and mappings, and
+`membarrier(MEMBARRIER_CMD_PRIVATE_EXPEDITED)` IPIs **every core running a
+thread of the process** — once per page. The membarrier is load-bearing (it
+drains other threads' store buffers before the page snapshot; without it a
+racing store is lost), so it cannot simply be removed.
+
+Measured effect of the application using its own cores (6 GiB cold, spinner
+threads on an 8-core box): **164 MB/s idle, 93–98 MB/s with 4–7 busy threads**.
+On this host that is confounded with plain CPU competition, so read it as a
+direction, not a coefficient.
+
+**At 200 GB this is the binding constraint**: a full pass takes ~20 minutes at
+160 MB/s, and new cold pages queue behind it. Measured directly — with a live
+cold set, the time for a *fresh* cold block to compress was 8.0 s at 1 GiB
+live, 42.6 s at 8 GiB, and **never within 60 s at 24 GiB**.
+
+Two other fixed sizes matter at that scale, though neither is a silent cap:
+`kFaultSlotCount = 128` bounds concurrent decompressions (a 128-thread app
+faulting in parallel exhausts it exactly, and `acquireFaultSlot()` spins), and
+`kMaxCompressorWorkers = 8` bounds the worker pool — irrelevant while the work
+is syscall-bound, but it would become the next limit if the syscalls were
+fixed.
+
 ### The arena's page allocator has one lock, and it collapses past ~8 threads
 
 `VmRegion::allocatePages()` calls `free_map_.take()` **first on every large
