@@ -491,6 +491,19 @@ request (see the section above).
 
 Suite 65/65 with bins off and with `SMASH_MID_BINS=1` forced across every test.
 
+**The in-tree benchmarks cannot see this feature, which is a gap in them, not
+a null result about it.** Measured with bins off and on, interleaved, on a
+freshly built library: `bench_rss` 71–72% either way (it allocates 1 MiB
+blocks, already above the band), `bench_sqlite --quick` identical in both modes
+(peak 199.3 vs 199.9 MiB large-only, reduction 27.7 vs 27.7, ops within noise),
+and `bench_json`, `bench_kv_store`, `bench_coldhotmix`, `bench_model_serving`
+all unchanged. None of them allocates a meaningful share of its footprint in
+(16 KiB, 1 MiB). That makes them a decent no-regression check and no kind of
+validation — the evidence for the feature is the targeted measurements above
+plus mimalloc's `test-stress`, which is third-party and does span the band:
+7.2 s → 2.8 s in large-only mode and 16.7 s → 10.4 s in full mode, four runs
+interleaved.
+
 **Contention is the thing to watch, and two fixes were needed to get here.**
 The first version kept one lock per class and built new chunks while holding
 it — setting a page state and a page-map entry for every page of a 2 MiB chunk
