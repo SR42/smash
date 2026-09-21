@@ -402,6 +402,24 @@ expectation derived from the env var so the two runs assert the same invariant.
 against a library without the runtime knob, while the default registration
 passes against both (so the default behaviour is unchanged).
 
+**The real reason for the gap is not the one the comment gives: it keeps the
+arena able to serve large contiguous requests.** A big allocation needs an
+unbroken run of pages, and mid-size blocks scattered through the arena are what
+makes such a run impossible. Measured with a 4 GiB arena filled to 3.75 GiB
+with 512 KB blocks, every other one then freed, followed by a 1 GiB request:
+
+| | mid-size blocks in the arena | the later 1 GiB allocation |
+|---|---|---|
+| default threshold | 0 of 7680 | **lands in the arena** (compressible) |
+| threshold 128 KiB | 7680 of 7680 | **falls back to a direct mapping** (never compressed) |
+
+So for a workload that mixes mid-size blocks with multi-hundred-MB or GB
+allocations, lowering the threshold can cost more compression than it gains:
+the mid-size blocks become compressible, and the big ones stop being. The
+arena is also a fixed budget (`SMASH_VM_GIB`), and mid-size blocks consume it.
+Neither point is in the comment on the constant, and both are stronger than the
+one that is.
+
 **The storm the constant's comment warns about did not appear when tested.**
 With the threshold lowered so 512 KB blocks are eligible, 64 continuously
 rewritten buffers stayed **100% resident** while 64 untouched ones went to
