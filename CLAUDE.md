@@ -469,6 +469,56 @@ having it at runtime rather than picking a new constant. A workload in
 large-only mode with cold mid-size blocks wants it lowered on both counts;
 full mode wants measurement first.
 
+### The base small-object path: the thread cache is 4 deep, and that is the cost
+
+An alloc+free pair of 64-byte objects costs **35 ns against glibc's 9 ns** with
+no drains involved, and the reason is `kPerLaneDepth`:
+
+```
+kCacheLanes = 64, kThreadCacheMaxPerClass = 256
+kPerLaneDepth = 256 / 64 = 4
+```
+
+Each (lane, size-class) cache holds **four pointers**, so roughly every fourth
+allocation goes to the slab through `ThreadCache::refill` and every fourth free
+drains through `drainRangeToSlabs`. A `perf` profile of a pure cache-hit
+workload (batch 64, far below the nominal 256 capacity) confirms it:
+`drainRangeToSlabs` 22.3%, `refill` 14.4% — a third of the time in paths that
+should not run at all on a cache hit.
+
+The lanes exist to keep arenas separate, so the depth cannot simply be bought
+by reducing them — that caps segregation. Measured, all on this 8-CPU host
+(16 arenas, 32 with cold-bias doubling):
+
+| lanes | depth | memory/thread | alloc+free | distinct arenas over 32 call sites |
+|---|---|---|---|---|
+| **64 (stock)** | **4** | **72 KB** | **35.5–36.7 ns** | **14** |
+| 32 | 8 | 72 KB | 29.7–30.2 ns | 14 |
+| 8 | 32 | 72 KB | 21.0 ns | **8 — collapsed** |
+| 64 | 16 | 288 KB | 23.4–23.9 ns | 14 |
+| 64 | 64 | 1152 KB | 15.3–17.0 ns | 14 |
+| glibc | | | 9.0 ns | |
+
+Two things follow. **Depth is worth a lot** — 4 → 64 takes the path from 35 ns
+to 15 ns, within 70% of glibc — but buying it with `kThreadCacheMaxPerClass`
+costs 1.15 MB per thread, and per-thread memory is exactly what
+`test_thread_cache_reclaim_*` exists to police. **Cutting lanes is not free
+either**, even though it looks it: at the same 72 KB, 8 lanes give 21 ns but
+collapse 32 call sites from 14 distinct arenas to 8, because the lane count
+caps how many arenas a thread can hold objects for. `bench_arena_segregation`
+does *not* see this (it reports ratios for homogeneous pages only, not how many
+pages stay homogeneous), so the routing test is the instrument that matters.
+
+**The principled fix is to size the lanes to the runtime arena count**, which
+is known at thread-cache creation: `getTotalArenas()` is 32 here and 8 on a
+4-CPU host, against a fixed 64 lanes. That wastes half the cache on this host
+and 87% of it on a small one, and pays for it in depth. Matching them is worth
+**17% here at identical memory with routing untouched** (35.5 → 29.7 ns,
+distinct arenas 14 either way) and considerably more on smaller hosts, where 8
+arenas would give depth 32. It needs ThreadCache to use a runtime stride and a
+runtime per-lane depth instead of the compile-time `void* ptrs[kPerLaneDepth]`,
+so it is a refactor of the hottest path, not a constant change.
+
 ### The thread-cache drain path, and what actually costs in it
 
 `drainRangeToSlabs` (`smash_heap.cpp`) returns a lane's worth of pointers to
