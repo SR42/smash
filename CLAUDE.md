@@ -469,6 +469,33 @@ having it at runtime rather than picking a new constant. A workload in
 large-only mode with cold mid-size blocks wants it lowered on both counts;
 full mode wants measurement first.
 
+### Per-page metadata costs ~1% of the arena, and it is sized for the whole arena
+
+The compressor keeps fifteen per-page arrays (`compressed_`, `cold_count_`,
+`page_tier_`, `shadow_tick_`, the page-state table, the per-page `Span*` table,
+…). Summed, they are **43 bytes per 4 KiB page — 1.05% of whatever the arena
+covers** — and they come from BootstrapAlloc sized for `vm->totalPages()`, not
+for the pages actually used. `MAP_NORESERVE` keeps the untouched part off RSS,
+but the bootstrap *capacity* must cover the whole arena:
+
+| `SMASH_VM_GIB` | metadata capacity needed |
+|---|---|
+| 16 (default) | 0.18 GB |
+| 128 | 1.44 GB |
+| 512 | 5.77 GB |
+| 1024 (ceiling) | 11.54 GB |
+
+Against a capacity of 15.4 GB after the geometric-growth fix, and **1.07 GB
+before it** — which is exactly why a run with `SMASH_VM_GIB=512` died at
+~169 GB RSS with a write to address 0. Raising `SMASH_VM_GIB` is not free: it
+costs ~11 MB of metadata capacity per GiB of arena even if the arena is empty.
+
+For a workload's *resident* cost the same 1% applies to pages actually used, on
+top of the compressed blobs. A 50 GB cold set that compresses 16.7x (measured
+on a real application under zram, LZ4, which compresses page-at-a-time exactly
+as smash does) lands at roughly 3.0 GB of blobs plus 0.56 GB of metadata —
+about **14x effective**, against the codec's 16.7x.
+
 ### The ratio you measure depends entirely on the data you measure it with
 
 `test_compression_ratio` and `bench_compression` both build their page with
