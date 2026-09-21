@@ -469,6 +469,40 @@ having it at runtime rather than picking a new constant. A workload in
 large-only mode with cold mid-size blocks wants it lowered on both counts;
 full mode wants measurement first.
 
+### The compression unit is one page, and bigger is only worth it up to ~64 KiB
+
+A recurring question, and the reason THP degrades under smash (the compressor
+protects and reclaims 4 KiB at a time, which splits a huge page). Measured with
+zstd level 1, the tier smash actually uses, over 64 MiB of two data sets —
+synthetic heap-shaped bytes (pointers, short strings, small ints, zero
+padding) and 64 MiB of real system binaries — compressing the same bytes as
+independent units of each size:
+
+| unit | ratio (heap / real) | decompress per unit | compress per unit |
+|---|---|---|---|
+| **4 KiB** (today) | 3.13x / 2.01x | 7.9 / 7.4 µs | 15.5 / 16.4 µs |
+| 16 KiB | 3.37x / 2.25x | 19.3 / 16.6 µs | 41.5 / 46.7 µs |
+| 64 KiB | 3.36x / 2.32x | 58.4 / 48.0 µs | 145 / 151 µs |
+| 256 KiB | 3.37x / 2.41x | 219 / 175 µs | 551 / 555 µs |
+| 1 MiB | 3.52x / 2.36x | 853 / 675 µs | 2007 / 1953 µs |
+| 2 MiB (THP-sized) | 3.52x / 2.37x | **1684 / 1338 µs** | 3947 / 3852 µs |
+
+Two things follow. **The ratio gain is front-loaded and small**: +8% (heap) to
++12% (real) by 16 KiB, +20% at best anywhere, and it plateaus — real data is
+*worse* at 2 MiB than at 256 KiB. **The latency is linear and unforgiving**: a
+THP-sized unit makes every first touch cost 1.3–1.7 ms, against 8 µs today.
+That is the argument against ever matching the compression unit to a huge page,
+independent of how convenient it would be for THP.
+
+The interesting range is **16–64 KiB**, and there is a second reason to look
+there: the fault path already decompresses `kPrefetchWindow` = 2 pages in each
+direction, so a fault that finds its neighbours compressed already pays up to
+5 x 7.9 = 40 µs. One 16 KiB unit covers 4 pages for 19 µs *and* compresses 8–12%
+better — cheaper than what the prefetch window already does, for a better
+ratio. Nothing is implemented; the compressor is page-indexed in ~120 places,
+`PageState` is per page and the store is keyed by page index, so this is a
+refactor rather than a constant.
+
 ### Mid-size bins (`SMASH_MID_BINS=1`, opt-in)
 
 Serves the (16 KiB, 1 MiB) band from size-binned chunks carved out of the arena
