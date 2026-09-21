@@ -109,6 +109,19 @@ public:
         }
     }
 
+    // Same resolution free() uses on its fast path: one load from the flat
+    // per-page table when the address is inside the contiguous arena, and the
+    // two-level radix walk only for everything else. get() alone always walks
+    // the radix, which costs two dependent loads where one would do — and the
+    // drain path resolves a whole lane of pointers at a time.
+    [[gnu::always_inline]]
+    inline Span* getFast(uintptr_t addr) const {
+        if (vm_region_ && vm_region_->inContigArena(addr) &&
+            vm_region_->hasSpanTable()) [[likely]]
+            return vm_region_->getSpan(vm_region_->contigPageIndex(addr));
+        return get(addr);
+    }
+
     Span* get(uintptr_t addr) const {
         const auto page_idx = addr >> kPageShift;
         const auto l1 = page_idx >> kPageMapL2Bits;

@@ -126,9 +126,15 @@ void drainRangeToSlabs(void** ptrs, size_t start, size_t n,
 
     Span* spans[kThreadCacheMaxPerClass];
     uint8_t arenas[kThreadCacheMaxPerClass];
-    uint32_t counts[kTotalArenas]{};
+    // Zero only the arenas this process actually has. `{}` on the full array
+    // clears kTotalArenas entries — 1 KiB — on every drain, while
+    // getTotalArenas() is typically 8. The rest is never read.
+    uint32_t counts[kTotalArenas];
+    for (int a = 0; a < total_arenas; ++a) counts[a] = 0;
     for (size_t i = 0; i < n; ++i) {
-        Span* span = page_map->get(reinterpret_cast<uintptr_t>(ptrs[start + i]));
+        // getFast: one flat-table load for arena pointers instead of the radix
+        // walk's two dependent loads. A drain resolves up to half a lane.
+        Span* span = page_map->getFast(reinterpret_cast<uintptr_t>(ptrs[start + i]));
         // arena_id is in [0, getTotalArenas()) when cold-arena feedback is on.
         uint8_t arena = (span && !span->is_large) ? span->arena_id : 0;
         if (arena >= total_arenas) arena = 0;  // defensive

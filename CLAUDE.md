@@ -469,6 +469,46 @@ having it at runtime rather than picking a new constant. A workload in
 large-only mode with cold mid-size blocks wants it lowered on both counts;
 full mode wants measurement first.
 
+### The thread-cache drain path, and what actually costs in it
+
+`drainRangeToSlabs` (`smash_heap.cpp`) returns a lane's worth of pointers to
+their arenas' slabs: resolve each pointer's span, counting-sort by arena into
+stack buffers, then one batch per non-empty arena. It runs whenever a free
+finds its lane full (every ~128 frees, draining half a 256-entry lane) and on
+every thread teardown, so it is the cross-thread-free path.
+
+**It is expensive, and worth knowing by how much.** A batch allocate/free loop
+of 64-byte objects, varying the batch across the 256-entry lane capacity so
+drains go from never to constant:
+
+| batch | smash | glibc |
+|---|---|---|
+| 64 (no drain) | 41.5 ns | 8.7 ns |
+| 256 | 84.1 ns | 8.8 ns |
+| 4096 | 117.4 ns | 9.4 ns |
+| 32768 | 118.7 ns | 9.5 ns |
+
+So draining roughly triples the per-operation cost of this pattern.
+
+Two things in it were wasteful, and **the one that mattered was not the one
+that looked like it would**:
+
+- `uint32_t counts[kTotalArenas]{}` zeroed **1 KiB on every drain**
+  (`kTotalArenas` is 256 — `kMaxArenas` 128, doubled for cold-arena feedback)
+  while `getTotalArenas()` is typically 8. Zeroing only the live entries:
+  **119.0 → 110.5 ns, −7.1%** on the hot workload above.
+- The span lookup used `PageMap::get()`, the two-level radix walk, where
+  `free()`'s own fast path uses one load from the flat per-page table. Adding
+  `PageMap::getFast()` and using it here gains **nothing measurable when the
+  tables are hot** (110.5 → 111.4 ns, inside noise) and **−1.1% on a large
+  shuffled working set** where they are not (779.4 ± 5.0 → 770.6 ± 4.5 ns over
+  six runs). Keep both, but do not expect the second one to show up on a
+  microbenchmark that reuses the same pages.
+
+The frame is also ~9.5 KiB of stack buffers per call (`spans`, `arenas`,
+`counts`, `offsets`, `cursor`, `out_ptrs`, `out_spans`, all sized for the
+compile-time maxima). Suite 66/66.
+
 ### Per-page metadata costs ~1% of the arena, and it is sized for the whole arena
 
 The compressor keeps fifteen per-page arrays (`compressed_`, `cold_count_`,
