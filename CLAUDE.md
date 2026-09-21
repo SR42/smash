@@ -469,6 +469,50 @@ having it at runtime rather than picking a new constant. A workload in
 large-only mode with cold mid-size blocks wants it lowered on both counts;
 full mode wants measurement first.
 
+### Mid-size bins (`SMASH_MID_BINS=1`, opt-in)
+
+Serves the (16 KiB, 1 MiB) band from size-binned chunks carved out of the arena
+instead of one direct `mmap` each, which is what makes that band compressible
+at all (`src/core/mid_alloc.h`). 18 classes spaced 1.25x apart, each owning
+chunks of at least 2 MiB sliced into equal blocks tracked by the same `Span`
+bitmap the slab uses. A freed block is reused by its own class, so the arena
+only ever sees whole uniform chunks — which is the point, because individual
+mid-size blocks in the arena are exactly what denies a later large contiguous
+request (see the section above).
+
+| | bins off | bins on |
+|---|---|---|
+| 320 KB block in the arena | no | **yes** |
+| cold 320 KB block after a cold wait | 100% resident | **0% resident** |
+| 320 KB malloc/free cycle | 9,641 ns | **34.7 ns** (glibc: 19.6) |
+| mi-stress, large-only | 7.18 s | **2.85 s** |
+| mi-stress, full mode | 16.19 s | **10.32 s** |
+| 64-thread mid-size churn (bigaba) | 5.59 s | 8.72 s |
+
+Suite 65/65 with bins off and with `SMASH_MID_BINS=1` forced across every test.
+
+**Contention is the thing to watch, and two fixes were needed to get here.**
+The first version kept one lock per class and built new chunks while holding
+it — setting a page state and a page-map entry for every page of a 2 MiB chunk
+inside the critical section. At 64 threads that made the binned path **5.6x
+slower** than the direct-mmap path it replaces (29.3 s against 5.3 s) while
+still being 6x faster at 4 threads. Sharding the classes by arena and building
+the chunk outside the lock took 64 threads to 8.7 s. The remaining gap is real:
+this is an opt-in feature that wins 2.5-5x on ordinary workloads and still
+loses ~1.6x on a benchmark where every allocation is mid-size across 64
+threads.
+
+**Empty chunks return to the arena only under pressure**, through the same
+`VmRegion` exhausted hook the slab uses — handing them back on every free is
+the trap that cost ~70% on mi-stress. Verified: 3 GiB of 512 KB blocks, all
+freed, then a 1 GiB allocation lands in the arena. Without the hook wired the
+chunks would hold the arena forever.
+
+**Not covered in this first version:** aligned allocations (they keep
+LargeAlloc's path), `malloc_numa` (unaffected), and sizes between 1 MiB and a
+raised `SMASH_LARGE_ALLOC_VM_THRESHOLD` (no class covers them, so they take the
+direct mapping as before).
+
 ### Every malloc/free cycle over 16 KiB costs ~10 µs (open defect)
 
 Measured 2026-09-20 while chasing a report of ~1.6% CPU in `xxfree`. A block
@@ -638,7 +682,7 @@ Measured with a 1 GiB arena, phases of ~70 % each, everything freed between phas
 
 ### The metadata arena bounds how large a heap smash can manage
 
-Every slab span costs a `Span` descriptor (104 B) plus its bitmap in BootstrapAlloc, which is never freed, so that arena's capacity bounds the heap. Fixed 16 MiB expansions capped it at 64 MiB + 63 × 16 MiB = **1.07 GiB** ≈ a 100 GB heap of large classes — and when it ran out, `allocate()` returned null into code that did not check it: **a write to address 0, with no message**. Reported as a crash at ~169 GB RSS.
+Every slab span costs a `Span` descriptor (112 B, pinned by a static_assert) plus its bitmap in BootstrapAlloc, which is never freed, so that arena's capacity bounds the heap. Fixed 16 MiB expansions capped it at 64 MiB + 63 × 16 MiB = **1.07 GiB** ≈ a 100 GB heap of large classes — and when it ran out, `allocate()` returned null into code that did not check it: **a write to address 0, with no message**. Reported as a crash at ~169 GB RSS.
 
 - **Regions now grow geometrically** (16 → 32 → … → `kBootstrapMaxExpandSize` = 256 MiB), so 64 regions reach **15.4 GiB**, covering a multi-TB heap. `test_bootstrap`'s `testCapacityScales` fails if that drops below 8 GiB. Measured with the cap cut to 6 regions: flat growth exhausts at 144 MiB and fails the workload, geometric gives 560 MiB and completes.
 - **Bitmaps are sized per class again.** Sizing every bitmap for the largest span (an earlier version of the span-recycling change) wasted 248 B on a 16 KiB class and cut the coverable heap 3× (329 GB → 102 GB). `Span::bitmap_store_words` tracks what the descriptor already owns and grows it only when a larger class needs more.
@@ -884,6 +928,7 @@ Runtime environment variables:
 - `SMASH_WRITE_TRACK=auto|softdirty|uffd|none`: How writes are detected (default `auto`, chosen by testing each mechanism; see "Write tracking"). `SMASH_SOFTDIRTY=0` still selects Phase 3 PROT_READ monitoring
 - `SMASH_NO_MONITOR=1`: Disable Phase 3 (PROT_READ access tracking) entirely. Trades cold-detection accuracy for compatibility with code paths that synchronously check page protection
 - `SMASH_VM_GIB=N`: Size of the compressible arena, default 16, ceiling 1 TiB (`kVmMaxBytes`). The arena is a PROT_NONE `MAP_NORESERVE` reservation and its per-page metadata is demand-paged, so an unused arena costs address space, not memory (measured: 16, 64 and 1024 GiB all start at 23.3 MB RSS). If the reservation fails — a 39-bit-VA arm64 kernel, `ulimit -v` — `VmRegion::init` halves the request down to 256 MiB and says so, instead of silently running without compression as it used to (measured: with a 48 GiB address-space limit, `SMASH_VM_GIB=1024` gets a 32 GiB arena and compresses; before, compression was off). The old 64 GiB ceiling was an estimate of metadata cost, not a limit; page indices are 32-bit, so the hard bound is 16 TiB
+- `SMASH_MID_BINS=1`: Serve the (16 KiB, 1 MiB) band from size-binned chunks in the compressible arena instead of one direct `mmap` each. Off by default: it trades ~10% of the requested bytes to size-class rounding for compressibility and much cheaper churn, which only pays for blocks that go cold. See "Mid-size bins"
 - `SMASH_THP=1`: `madvise(MADV_HUGEPAGE)` the arena. Off by default: it keeps a dense hot set on huge pages (TLB coverage) while the cold set still compresses, but inflates RSS 22× on a sparse touch pattern. See "Hugepages and THP"
 - `SMASH_LARGE_ALLOC_VM_THRESHOLD=N`: Bytes at or above which a large allocation is placed in the compressible VmRegion instead of a direct mapping (default `kLargeAllocVmThreshold` = 1 MiB; rounded up to a page). **This decides what can be compressed at all** — a block below it is never walked by the compressor and stays resident however cold it gets. Lower it for a workload whose footprint is mid-sized blocks; see "Which allocation sizes are actually compressed"
 - `SMASH_COLD_TIMEOUT_SEC=N`: Override cold timeout at runtime

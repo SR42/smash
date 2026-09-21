@@ -610,6 +610,22 @@ inline constexpr size_t kLargeAllocVmThreshold = 1024 * 1024;  // 1 MB
 inline constexpr size_t kLargeAllocVmThreshold = SMASH_LARGE_ALLOC_VM_THRESHOLD;
 #endif
 
+// SMASH_MID_BINS=1: bin allocations in the (16 KiB, 1 MiB) band by size and
+// serve them from chunks carved out of the compressible arena, instead of one
+// direct mmap each. Off by default — it trades ~10% of the requested bytes to
+// size-class rounding for compressibility and much cheaper churn, which is
+// only a good trade for blocks that go cold. See src/core/mid_alloc.h.
+inline bool midBinsEnabled() {
+    static std::atomic<int> cached{-1};
+    int v = cached.load(std::memory_order_relaxed);
+    if (v < 0) [[unlikely]] {
+        const char* env = getenv("SMASH_MID_BINS");
+        v = (env && env[0] == '1') ? 1 : 0;
+        cached.store(v, std::memory_order_relaxed);
+    }
+    return v == 1;
+}
+
 // Runtime override: SMASH_LARGE_ALLOC_VM_THRESHOLD, defaulting to the constant
 // above. This decides whether an allocation is compressible at all, and the
 // effect is absolute — a block below it goes to a direct mapping the

@@ -11,6 +11,11 @@
 // The expectation is computed from the env var, so both registrations run
 // byte-identical assertions and cannot drift: whatever the threshold is,
 // half of it must be outside the arena and twice it must be inside.
+//
+// SMASH_MID_BINS=1 deliberately changes that: it serves the (16 KiB, 1 MiB)
+// band from binned chunks inside the arena, so a sub-threshold size in that
+// band IS arena-backed. The expectation follows both settings rather than
+// failing on the feature.
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -25,6 +30,19 @@ int failures = 0;
 
 constexpr size_t kPage = 4096;
 constexpr size_t kDefaultThreshold = 1024 * 1024;
+constexpr size_t kMaxSmall = 16384;          // kMaxSmallSize
+constexpr size_t kMidBandTop = 1024 * 1024;  // top of the binned band
+
+bool midBinsOn() {
+    const char* v = std::getenv("SMASH_MID_BINS");
+    return v && v[0] == '1';
+}
+
+// True when mid-size bins claim this size, i.e. it is in the band AND below
+// the threshold (at or above it, LargeAlloc takes the block directly).
+bool binnedByMidAlloc(size_t size, size_t threshold) {
+    return midBinsOn() && size > kMaxSmall && size < kMidBandTop && size < threshold;
+}
 
 // Same rounding the library applies: up to a whole page, floored at one page.
 size_t effectiveThreshold() {
@@ -75,13 +93,14 @@ int main() {
 
     // Below: never compressible. At and above: compressible.
     if (t / 2 > 16384)                       // below kMaxSmallSize it would be a slab object
-        check("half the threshold", t / 2, false);
+        check("half the threshold", t / 2, binnedByMidAlloc(t / 2, t));
     check("exactly the threshold", t, true);
     check("twice the threshold", t * 2, true);
 
     // The size the runtime knob exists for: 320 KB is compressible only when
     // the threshold has been lowered to reach it.
-    check("320 KB probe", 320u << 10, (320u << 10) >= t);
+    check("320 KB probe", 320u << 10,
+          (320u << 10) >= t || binnedByMidAlloc(320u << 10, t));
 
     if (failures) { std::printf("large_alloc_threshold_test: %d FAILURES\n", failures); return 1; }
     std::printf("large_alloc_threshold_test: all checks passed\n");

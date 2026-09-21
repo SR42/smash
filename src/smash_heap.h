@@ -8,6 +8,7 @@
 #include "core/page_map.h"
 #include "core/slab.h"
 #include "core/large_alloc.h"
+#include "core/mid_alloc.h"
 #include "core/thread_cache.h"
 #include "util/exit_guard.h"
 #include "util/alloc_failure.h"
@@ -497,6 +498,7 @@ class SmashHeap {
     size_t cohort_pages_len_ = 0;
 
     LargeAlloc large_alloc_;
+    MidAlloc mid_alloc_;
     PageMap page_map_;
 
     // ── ASLR-resilient call-site hash cache ─────────────────────────────────
@@ -607,7 +609,13 @@ class SmashHeap {
     // arena (see Slab::reclaimEmptySpans) so it reuses its own memory before
     // spilling into uncompressed direct mappings.
     static void reclaimEmptySpansHook(void* ctx) {
-        for (Slab& s : static_cast<SmashHeap*>(ctx)->slabs_) s.reclaimEmptySpans();
+        auto* heap = static_cast<SmashHeap*>(ctx);
+        for (Slab& s : heap->slabs_) s.reclaimEmptySpans();
+        // Mid-size chunks hold arena pages the same way, and a workload that
+        // allocates a batch of mid-size blocks and frees them all would
+        // otherwise keep the arena forever while big allocations spill into
+        // uncompressible mappings.
+        if (midBinsEnabled()) heap->mid_alloc_.reclaimEmptyChunks();
     }
 
     uint8_t callsiteArena(uint8_t sc, uintptr_t ra) {
@@ -1248,6 +1256,11 @@ public:
             } else {
                 large_alloc_.init(&page_map_);
             }
+            // Mid-size bins live in the arena, so they need the same wiring as
+            // an arena-backed large block: page states for the compressor and
+            // the page map for free()'s ownership lookup.
+            if (compression_inited_)
+                mid_alloc_.init(&vm_region_, &page_states_, &page_map_);
         }
         log_time("large_alloc_init");
         log_time("TOTAL_CONSTRUCTOR");
@@ -1438,6 +1451,16 @@ public:
         // For large allocations, use the caller's return address for arena routing
         uintptr_t ra_for_arena = caller_ra ? caller_ra : appCallerRA();
         uint8_t arena = callsiteArenaForLarge(ra_for_arena);
+        // SMASH_MID_BINS=1: serve the (16 KiB, 1 MiB) band from size-binned
+        // chunks in the arena so it is compressible at all. Falls through to
+        // LargeAlloc's direct mapping when the band does not apply or the
+        // arena cannot take another chunk.
+        if (midBinsEnabled()) [[unlikely]] {
+            if (void* p = mid_alloc_.allocate(size, arena)) {
+                if (isEagerZeroMode()) __builtin_memset(p, 0, size);
+                return p;
+            }
+        }
         void* ptr = large_alloc_.allocate(size, kMinAlignment, arena);
         if (!ptr) [[unlikely]]
             reportAllocFailure("large (VmRegion and direct mmap)", size, 0,
@@ -1529,6 +1552,7 @@ public:
             }
         }
         if (span->is_large) [[unlikely]] { large_alloc_.deallocate(span); return; }
+        if (span->is_mid) [[unlikely]] { mid_alloc_.deallocate(span, ptr); return; }
         const auto sc = span->size_class;
         const uint8_t arena = span->arena_id;
         ThreadCache* tc = currentThreadCache();
@@ -1648,6 +1672,7 @@ public:
             return;
         }
         if (span->is_large) { large_alloc_.deallocate(span); return; }
+        if (span->is_mid) { mid_alloc_.deallocate(span, ptr); return; }
         uint8_t sc = span->size_class;
         uint8_t arena = span->arena_id;
         ThreadCache* tc = getOrCreateThreadCache();
@@ -1854,6 +1879,11 @@ public:
             return 0;
         }
         if (span->is_large) return span->large_size;
+        // A mid-size chunk's blocks are its object_size, not a slab class:
+        // reporting classSize(size_class) here would hand realloc a wildly
+        // wrong length (size_class on these spans is the large-alloc tracking
+        // bucket, a page count, not a byte size).
+        if (span->is_mid) return span->object_size;
         return classSize(span->size_class);
     }
 

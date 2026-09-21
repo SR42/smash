@@ -47,6 +47,7 @@ struct Span {
     uint16_t allocated_count;
     uint8_t size_class;
     bool is_large;              // true for mmap-backed large allocations
+    bool is_mid;                // true for a MidAlloc chunk (see mid_alloc.h)
     uint8_t arena_id;           // which arena this span belongs to
     uint16_t free_hint_word;    // word index to start bitmap scan from
     // Per-page cap currently encoded in the bitmap.  0 = no cap (dense).
@@ -98,14 +99,19 @@ struct Span {
     // The bitmap remains sized for the full capacity (1 bit per potential
     // slot); disallowed slots are simply marked allocated (0) so the
     // allocator skips them.
+    // `explicit_object_size` is for MidAlloc, whose classes are not in
+    // kSizeClasses: it carves a chunk into equal blocks of its own size and
+    // reuses everything else here unchanged (bitmap, capacity, free hint).
+    // Zero means "take the size from the size class", the slab's behaviour.
     bool init(void* base_, uint32_t pages, uint8_t sc, uint8_t arena = 0,
-              uint32_t max_slots_per_page = 0) {
+              uint32_t max_slots_per_page = 0, uint32_t explicit_object_size = 0) {
         base = base_;
         page_count = pages;
         size_class = sc;
         is_large = false;
+        is_mid = explicit_object_size != 0;
         arena_id = arena;
-        object_size = kSizeClasses[sc].size;
+        object_size = explicit_object_size ? explicit_object_size : kSizeClasses[sc].size;
         full_capacity = (pages * kPageSize) / object_size;
 
         allocated_count = 0;
@@ -233,6 +239,7 @@ struct Span {
         page_count = pages;
         size_class = kNumClasses;
         is_large = true;
+        is_mid = false;
         arena_id = arena;
         object_size = 0;
         full_capacity = 0;
@@ -477,6 +484,13 @@ struct Span {
         return p >= b && p < b + static_cast<size_t>(page_count) * kPageSize;
     }
 };
+
+// Every slab span, mid-size chunk and large block costs one of these in the
+// bootstrap arena, which is never freed — so this size is what bounds the heap
+// smash can cover (see "The metadata arena bounds how large a heap smash can
+// manage"). Pin it so a new field is a decision, not an accident.
+static_assert(sizeof(Span) <= 112,
+              "Span grew: that shrinks the coverable heap proportionally");
 
 // Span descriptor cache: recycled descriptors, reused before BootstrapAlloc.
 // Both large spans and (since empty slab spans are returned to the arena)

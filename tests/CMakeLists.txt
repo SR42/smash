@@ -260,6 +260,25 @@ set_tests_properties(test_external_mapping PROPERTIES
 # (>= 1 MiB, smash-managed -> compressible VmRegion in BOTH modes) and small
 # (<= 16 KiB, slab in full / system-passthrough in large-only) compressible
 # chunks, asserts compressed>0 via SIGUSR2 stats, then verifies a byte-exact
+# ── Mid-size bins (Linux) ───────────────────────────────────────────────────
+# SMASH_MID_BINS=1 serves the (16 KiB, 1 MiB) band from size-binned chunks in
+# the arena instead of one direct mmap each, which is what makes that band
+# compressible at all. One body, two registrations: the off-run asserts the
+# blocks stay out of the arena, the on-run that they enter it and compress.
+if(NOT APPLE)
+  add_executable(mid_bins_test mid_bins_test.cpp)
+  set_target_properties(mid_bins_test PROPERTIES CXX_STANDARD 20)
+  add_test(NAME test_mid_bins_off COMMAND ${CMAKE_COMMAND} -E env
+    "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=1"
+    "SMASH_COLD_TIMEOUT_SEC=1" "SMASH_DEFER_PHASES_MS=0"
+    $<TARGET_FILE:mid_bins_test>)
+  add_test(NAME test_mid_bins_on COMMAND ${CMAKE_COMMAND} -E env
+    "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=1" "SMASH_MID_BINS=1"
+    "SMASH_COLD_TIMEOUT_SEC=1" "SMASH_DEFER_PHASES_MS=0"
+    $<TARGET_FILE:mid_bins_test>)
+  set_tests_properties(test_mid_bins_off test_mid_bins_on PROPERTIES TIMEOUT 180)
+endif()
+
 # ── Transparent hugepages for the arena (Linux) ─────────────────────────────
 # SMASH_THP=1 madvises the arena MADV_HUGEPAGE. One body, two registrations;
 # skips unless the host policy is [madvise], where the two cases differ.
