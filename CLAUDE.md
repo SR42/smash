@@ -509,6 +509,33 @@ caps how many arenas a thread can hold objects for. `bench_arena_segregation`
 does *not* see this (it reports ratios for homogeneous pages only, not how many
 pages stay homogeneous), so the routing test is the instrument that matters.
 
+**All of that is measured at low thread counts, and it does not extrapolate.**
+The same alloc/free workload across threads (8 physical cores, so 128 threads
+is oversubscribed), with one free in eight handed to a peer:
+
+| threads | stock (depth 4) | depth 64 | glibc |
+|---|---|---|---|
+| 1 | 35.3 ns | **16.0** | 12.0 |
+| 8 | 48.8 ns | **31.5** | 20.9 |
+| 32 | 43.3 ns | **35.5** | 21.5 |
+| 128 | **53.5 ns** | 75.3 | 25.6 |
+
+A deeper cache wins by 2x at one thread, by a third at eight, barely at 32, and
+**loses at 128** — 1.15 MB per thread is 147 MB of thread caches across 128
+threads, and that stops fitting anywhere. Whether that crossover is the same on
+a machine with 128 *real* cores is not something an 8-core host can answer;
+treat the last row as a warning that depth is not free at scale, not as a
+measurement of a 128-core box.
+
+**Arena and lane counts scale with CPUs, and the interesting case is 128
+cores**: `getNumArenas()` gives 64 there, so 128 arenas with cold-bias against
+64 lanes — 2:1 collisions. Those collisions are benign by construction:
+`lane = arena & 63` and the cold-bias arena is `base + 64`, so each arena
+collides with exactly its own twin, never with an unrelated call-site group.
+It also means the lane-sizing fix below buys such a machine nothing — its lanes
+are already saturated, and matching lanes to 128 arenas within a fixed budget
+would *halve* the depth to 2.
+
 **The principled fix is to size the lanes to the runtime arena count**, which
 is known at thread-cache creation: `getTotalArenas()` is 32 here and 8 on a
 4-CPU host, against a fixed 64 lanes. That wastes half the cache on this host
