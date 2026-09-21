@@ -139,7 +139,7 @@ real fixes, both found *because* UBSan changed what the compiler could prove:
 cd build && ctest --output-on-failure
 ```
 
-All 66 tests must pass; none are registered `DISABLED`. Run the suite **as root** too when touching the compressor: some paths only exist with root (see "Idle-page read tracking"), and an unprivileged run — which is all CI does — never executes them. CI (`.github/workflows/ci.yml`) runs the full suite on `ubuntu-latest` and `macos-latest` on every push and PR. Twenty-eight of the tests are end-to-end under `DYLD_INSERT_LIBRARIES` / `LD_PRELOAD`:
+All 68 tests must pass; none are registered `DISABLED`. Run the suite **as root** too when touching the compressor: some paths only exist with root (see "Idle-page read tracking"), and an unprivileged run — which is all CI does — never executes them. CI (`.github/workflows/ci.yml`) runs the full suite on `ubuntu-latest` and `macos-latest` on every push and PR. Twenty-eight of the tests are end-to-end under `DYLD_INSERT_LIBRARIES` / `LD_PRELOAD`:
 
 - `test_arena_routing` guards call-site arena routing — the invariant behind the paper's compression-homogeneity claim. Runs a program with 32 distinct noinline allocation sites under interposition and asserts, via the exported `smash_arena_for(ptr)` query, that they do **not** all collapse into one arena. This is the regression guard for the LTO/wrapper return-address bug: under dynamic interposition the return address seen inside the allocator can point into the wrapper library instead of the app, collapsing every call site into one arena (homogeneity 0%). Fast and deterministic (no compressor): full mode routes 256 B allocations through the slab, and `SMASH_CPU_ARENA=0` + default thread-hash-off make the arena a pure function of the return address, so a buggy capture yields exactly 1 distinct arena. Verified as a real discriminator (injecting a constant RA makes it fail with `distinct_arenas=1`). Must run under interposition — a direct-linked call would never exercise the wrapper path where the bug lives.
 
@@ -151,6 +151,12 @@ All 66 tests must pass; none are registered `DISABLED`. Run the suite **as root*
     - routing freed node pages to the shared free lists fails the arena test's shared-list and reuse checks on all 4 nodes. End to end, 0 of 16 frees come back at the same address, and the binding leaks into a later `malloc(256)`;
     - never marking node blocks `ACTIVE` fails the compression check: 0 of 4096 pages leave RSS in 30 s on every node.
   - Skips on `ENOSYS`/`EPERM` from `mbind`. Single-node CI runners cover node 0 only, with no off-node pin.
+
+- `test_malloc_numa_aligned_{full,large_only}` guard `malloc_numa_aligned(node, size, align)` (`include/smash/smash.h`): `malloc_numa` plus an alignment guarantee on the returned address. Sweeps five alignments (one page to 16 MiB) against six sizes across the routing boundaries on every online node, re-checking the whole `malloc_numa` contract on the aligned blocks — binding, physical placement with the writer pinned off-node, byte stability, cold compression and restore — plus `EINVAL` for an alignment that is zero or not a power of two.
+
+  Inside a node arena the alignment is met by over-allocating and returning the unused head and tail to **that node's** free runs, never the shared ones, which would leak the binding into ordinary allocations. The leak check is what guards that: a leak costs `align` per round trip, so at 2 MiB alignment it exhausts the 4 GiB arena the test pins by round trip ~2048, and every allocation after that falls out onto a separate bound mapping smash never compresses. **Verified as a real discriminator by source mutation:** dropping the two `free_map_.insert` calls fails with 1331–2963 of 3000 blocks outside the arena per node, and removing the alignment round-up fails 12,025 checks; restored, 3/3 runs pass.
+
+  Two things the check deliberately does *not* assert, both measured. **Not a stable address:** `PageRunMap::take()` returns the head of the first large-enough bin with no address preference, so the aligned path legitimately cycles — 190 distinct addresses over 256 round trips, against 212 for the unaligned baseline. **Not a larger alignment:** at 16 MiB the request needs a contiguous 16 MiB run inside one node's arena, which four nodes sharing a small arena cannot always produce (47 of 1500 fell out with correct trimming), so that configuration reports fragmentation rather than a leak. `SMASH_VM_GIB=4` in the registration is load-bearing for the same reason — the default 16 GiB would hide a leak, and 1 GiB shared four ways produces false positives.
 
 - `test_numa_compressor_{full,large_only}` guard the per-node compressor groups (`numa_compressor_test.cpp`, both modes, `SMASH_COLD_TIMEOUT_SEC=1`). It leaves a 16 MiB block cold on every node, written from off-node CPUs. Once most of each block has left RSS, it uses the diagnostic exports `smash_numa_compressor_info` and `smash_compressed_blob_for` to check, per node, that:
   - the group's threads have CPU affinity inside the node, and none of their compressions ran on another CPU;
@@ -350,7 +356,8 @@ decompression storms"), which is a real risk, but it is a blanket rule rather
 than a cold/hot decision, and smash's own cold detection already exists to make
 that call.
 
-**`malloc_numa` is the exception: it ignores the threshold at every size.**
+**`malloc_numa` and `malloc_numa_aligned` are the exception: they ignore the
+threshold at every size.**
 `LargeAlloc::allocateOnNode` has no size test — it always tries
 `VmRegion::allocatePagesOnNode` first, and only falls back to a separate bound
 mapping (never compressed) when there is no VmRegion or it is exhausted.
@@ -360,6 +367,10 @@ and 0% resident, while plain `malloc` of 64 KB / 320 KB / 768 KB is 100%
 resident. So a caller that can use `malloc_numa` gets sub-threshold blocks
 compressed today with no rebuild — at the cost of binding that memory to one
 node (`MPOL_BIND`), page granularity, and `realloc` returning an unbound block.
+`malloc_numa_aligned(node, size, align)` is the same deal with an alignment
+guarantee, which is otherwise unavailable on a compressible block: ordinary
+`posix_memalign`/`aligned_alloc` above `kMinAlignment` go to `LargeAlloc`'s
+over-map-and-trim path, which is a direct mapping and is never compressed.
 
 **Above the threshold, size is not a limit.** 2 MiB, 32 MiB, 256 MiB and 1 GiB
 blocks all land in the arena and compress to 0% resident. What bounds them is

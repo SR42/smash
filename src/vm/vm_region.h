@@ -1008,6 +1008,41 @@ public:
         na.cur += num_pages;
         return base_ + idx * kPageSize;
     }
+
+    // Aligned variant: the returned address is a multiple of `alignment`, a
+    // power of two of at least kPageSize. Over-allocates by alignment - one
+    // page and returns the prefix and suffix runs to the *node's* own free
+    // runs, never the shared ones — they are inside a chunk this node's arena
+    // owns and are still bound to it, so handing them to the shared arena
+    // would leak the binding into ordinary allocations (see Key Conventions).
+    // The trimmed pages were never marked ACTIVE and are EMPTY either way:
+    // freshly carved chunk pages start EMPTY, and the release hook resets a
+    // reused run to EMPTY before it reaches the free map.
+    //
+    // Alignment is enforced on the *address*, not the page index. The arena
+    // base is an mmap result and is only page-aligned, so an index aligned to
+    // alignment / kPageSize says nothing about the address.
+    void* allocatePagesOnNodeAligned(size_t num_pages, uint32_t node, size_t alignment) {
+        if (alignment <= kPageSize) return allocatePagesOnNode(num_pages, node);
+        const size_t align_pages = alignment / kPageSize;
+        size_t want = num_pages + align_pages - 1;
+        if (want < num_pages) {            // the addition wrapped
+            errno = ENOMEM;
+            return nullptr;
+        }
+        void* raw = allocatePagesOnNode(want, node);
+        if (!raw) return nullptr;
+
+        const auto addr = reinterpret_cast<uintptr_t>(raw);
+        const auto aligned = (addr + alignment - 1) & ~(alignment - 1);
+        const size_t start = pageIndex(addr);
+        const size_t prefix = (aligned - addr) / kPageSize;
+        const size_t suffix = want - prefix - num_pages;
+        const uint32_t owner = ownerOfNode(static_cast<int>(node));
+        if (prefix) free_map_.insert(start, prefix, owner);
+        if (suffix) free_map_.insert(start + prefix + num_pages, suffix, owner);
+        return reinterpret_cast<void*>(aligned);
+    }
 #endif
 
 private:

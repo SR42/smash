@@ -530,6 +530,25 @@ add_smash_mode_test(test_malloc_numa_full       malloc_numa_test 0 120
 add_smash_mode_test(test_malloc_numa_large_only malloc_numa_test 1 120
                     "SMASH_COLD_TIMEOUT_SEC=1")
 
+# malloc_numa_aligned(node, size, align): malloc_numa plus an alignment
+# guarantee. Sweeps alignments from one page to 16 MiB against sizes across the
+# routing boundaries on every online node, and re-checks the whole malloc_numa
+# contract on the aligned blocks (binding, placement from off-node CPUs, cold
+# compression and restore). The reuse check is the one that fails if the
+# over-allocated head and tail are leaked instead of returned to the node's own
+# free runs.
+add_executable(malloc_numa_aligned_test malloc_numa_aligned_test.cpp)
+set_target_properties(malloc_numa_aligned_test PROPERTIES CXX_STANDARD 20)
+target_link_libraries(malloc_numa_aligned_test PRIVATE ${CMAKE_DL_LIBS})
+# SMASH_VM_GIB=1 is load-bearing, not incidental: it is what makes the leak
+# check bite. A leaked head/tail costs `align` per round trip, so 200 round
+# trips at 16 MiB alignment need 3.2 GiB and fall out of a 1 GiB arena; in the
+# default 16 GiB arena the same leak would pass unnoticed.
+add_smash_mode_test(test_malloc_numa_aligned_full       malloc_numa_aligned_test 0 180
+                    "SMASH_COLD_TIMEOUT_SEC=1;SMASH_VM_GIB=4")
+add_smash_mode_test(test_malloc_numa_aligned_large_only malloc_numa_aligned_test 1 180
+                    "SMASH_COLD_TIMEOUT_SEC=1;SMASH_VM_GIB=4")
+
 # NUMA compressor groups: on a host with two or more memory nodes, each node's
 # malloc_numa pages are compressed by threads pinned to that node, with working
 # memory and compressed blobs on the node. Checks thread affinity, on-node

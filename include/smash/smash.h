@@ -39,6 +39,26 @@ extern "C" {
 // Without NUMA (macOS), node 0 is a plain malloc and any other node is EINVAL.
 void* malloc_numa(uint32_t numa, size_t size);
 
+// malloc_numa() with an alignment guarantee: the returned address is a
+// multiple of `aligned`, which must be a power of two. Everything else — the
+// binding policy, page rounding, compression, free()/realloc() semantics and
+// the error codes — is exactly as for malloc_numa, plus:
+//
+//   EINVAL  `aligned` is zero or not a power of two
+//
+// An alignment below the page size is raised to one page, since node blocks
+// are page-granular either way, so the smallest alignment this can return is
+// the page size and never less than what malloc_numa already gives.
+//
+// Inside the node arena the block is aligned by over-allocating and returning
+// the unused head and tail to that node's own free runs, so the excess stays
+// available to the same node and no binding leaks into ordinary allocations.
+// Cost: up to `aligned` minus one page of arena space held transiently, and
+// fragmentation of the node's arena in the usual way. When the arena cannot
+// serve it, the block is a separate bound mapping trimmed to alignment — and,
+// as with malloc_numa, that fallback is never compressed.
+void* malloc_numa_aligned(uint32_t numa, size_t size, size_t aligned);
+
 // Hint to smash that a region is about to go cold (eligible for compression).
 // No-op in Phase 1.
 void smash_hint_cold(void* ptr, size_t size);

@@ -80,6 +80,7 @@
 
     # Public NUMA allocation API (include/smash/smash.h).
     malloc_numa;
+    malloc_numa_aligned;
 
     # Diagnostic / test hooks for the NUMA compressor groups
     # (test_numa_compressor).

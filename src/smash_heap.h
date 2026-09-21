@@ -1746,6 +1746,30 @@ public:
 #endif
     }
 
+    // malloc_numa_aligned(): mallocNuma() with an alignment guarantee on the
+    // returned address. `alignment` must be a power of two; anything below a
+    // page is raised to one, since a node block is page-granular regardless.
+    void* mallocNumaAligned(uint32_t node, size_t size, size_t alignment) {
+        if (isPassthroughMode() || isCompressOnlyMode()) {
+            errno = ENOTSUP;
+            return nullptr;
+        }
+        if (alignment == 0 || (alignment & (alignment - 1)) != 0) {
+            errno = EINVAL;
+            return nullptr;
+        }
+        if (size == 0) size = 1;
+#if defined(__linux__)
+        return large_alloc_.allocateOnNode(size, node, alignment);
+#else
+        if (node != 0) {
+            errno = EINVAL;
+            return nullptr;
+        }
+        return this->memalign(alignment, size);
+#endif
+    }
+
     void* calloc(size_t count, size_t size) {
         // SMASH_PASSTHROUGH=1: pass calloc to system allocator.
         if (isPassthroughMode()) {

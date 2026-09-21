@@ -1440,6 +1440,11 @@ void* malloc_numa(uint32_t numa, size_t size) {
     return SmashRedirect::getHeap()->mallocNuma(numa, size);
 }
 
+extern "C" __attribute__((visibility("default")))
+void* malloc_numa_aligned(uint32_t numa, size_t size, size_t aligned) {
+    return SmashRedirect::getHeap()->mallocNumaAligned(numa, size, aligned);
+}
+
 // Diagnostic / test hooks for the NUMA compressor groups (not public API).
 // test_numa_compressor declares the same struct; `size` guards the layout.
 struct SmashNumaCompressorInfo {

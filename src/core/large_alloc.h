@@ -147,7 +147,10 @@ public:
     // tracks them like any other large allocation, and deallocate() returns
     // them to that arena. With no VmRegion, or one that is exhausted, the
     // block is a separate bound mapping, which is never compressed.
-    void* allocateOnNode(size_t size, uint32_t node) {
+    // `alignment` is a power of two; anything below a page is raised to one,
+    // since node blocks are page-granular in both paths anyway.
+    void* allocateOnNode(size_t size, uint32_t node, size_t alignment = kPageSize) {
+        if (alignment < kPageSize) alignment = kPageSize;
         size_t alloc_size = roundUp(size, kPageSize);
         if (alloc_size < size || alloc_size / kPageSize > UINT32_MAX) {
             errno = ENOMEM;
@@ -157,7 +160,7 @@ public:
 
         void* mem = nullptr;
         if (vm_region_) {
-            mem = vm_region_->allocatePagesOnNode(num_pages, node);
+            mem = vm_region_->allocatePagesOnNodeAligned(num_pages, node, alignment);
             // Any failure but exhaustion (bad node, mbind refused) would fail
             // the same way on a separate mapping.
             if (!mem && errno != ENOMEM) return nullptr;
@@ -168,8 +171,27 @@ public:
             }
         }
         if (!mem) {
-            mem = vm::mapPages(alloc_size);
-            if (!mem) return nullptr;
+            // Separate bound mapping: never compressed. Over-map and trim for
+            // an alignment the mapping itself does not guarantee, exactly as
+            // the non-NUMA aligned path does, and bind only what is kept —
+            // binding before the trim would mbind pages about to be unmapped.
+            if (alignment <= kPageSize) {
+                mem = vm::mapPages(alloc_size);
+                if (!mem) return nullptr;
+            } else {
+                const size_t map_size = alloc_size + alignment;
+                if (map_size < alloc_size) { errno = ENOMEM; return nullptr; }
+                void* raw = vm::mapPages(map_size);
+                if (!raw) return nullptr;
+                const auto addr = reinterpret_cast<uintptr_t>(raw);
+                const auto aligned = roundUp(addr, alignment);
+                const size_t prefix = aligned - addr;
+                const size_t suffix = map_size - prefix - alloc_size;
+                if (prefix > 0) vm::unmapPages(raw, prefix);
+                if (suffix > 0)
+                    vm::unmapPages(reinterpret_cast<void*>(aligned + alloc_size), suffix);
+                mem = reinterpret_cast<void*>(aligned);
+            }
             if (!vm::bindPagesToNode(mem, alloc_size, node)) {
                 int err = errno;
                 vm::unmapPages(mem, alloc_size);
@@ -182,7 +204,13 @@ public:
         // whole-page NUMA block has no slab.
         Span* span = newSpanDescriptor();
         if (!span) {   // metadata arena exhausted (it reports that itself)
-            vm::unmapPages(mem, alloc_size);
+            // Match deallocate()'s routing: unmapping an arena block would
+            // punch a hole in the region's own reservation.
+            if (vm_region_ &&
+                vm_region_->inContigArena(reinterpret_cast<uintptr_t>(mem)))
+                vm_region_->releasePages(mem, num_pages);
+            else
+                vm::unmapPages(mem, alloc_size);
             return nullptr;
         }
         span->initLarge(mem, size, num_pages);
