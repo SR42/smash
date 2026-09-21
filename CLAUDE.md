@@ -494,6 +494,29 @@ THP-sized unit makes every first touch cost 1.3–1.7 ms, against 8 µs today.
 That is the argument against ever matching the compression unit to a huge page,
 independent of how convenient it would be for THP.
 
+**LZ4 shifts the trade but does not change the conclusion.** Same data, same
+unit sizes, `LZ4_compress_fast` at acceleration 1 against zstd-1:
+
+| unit | zstd-1 ratio | zstd-1 decomp | LZ4 ratio | LZ4 decomp |
+|---|---|---|---|---|
+| 4 KiB | 3.13x / 2.01x | 8.4 / 7.8 µs | 1.86x / 1.59x | **1.8 / 1.2 µs** |
+| 16 KiB | 3.37x / 2.25x | 19.8 / 17.0 µs | 1.91x / 1.74x | 7.0 / 4.1 µs |
+| 64 KiB | 3.36x / 2.32x | 58.8 / 48.8 µs | 1.93x / 1.84x | 27.3 / 15.9 µs |
+| 2 MiB | 3.52x / 2.37x | 1644 / 1394 µs | 1.93x / 1.81x | 857 / 460 µs |
+
+LZ4 decompresses **4–6x faster** and compresses **25–40% worse**, and it gains
+even less from a larger unit than zstd does (1.86x → 1.93x across the whole
+range on heap-shaped data) because it finds no long-range matches to exploit.
+So the unit-size conclusion holds for both codecs: 2 MiB still costs half a
+millisecond per fault under LZ4, which is 60x worse than the 8 µs a zstd-1 page
+costs today.
+
+The choice is therefore between axes, not sizes: **zstd-1 at 16–64 KiB** for
+ratio, **LZ4 at 4 KiB** for fault latency (1.2–1.8 µs). smash already exposes
+the codec as a compile-time ablation (`-DSMASH_USE_LZ4=ON` picks LZ4 as the
+fast tier), and the ROI model chooses fast versus deep tier per page, so the
+tiering to build on is in place.
+
 The interesting range is **16–64 KiB**, and there is a second reason to look
 there: the fault path already decompresses `kPrefetchWindow` = 2 pages in each
 direction, so a fault that finds its neighbours compressed already pays up to
