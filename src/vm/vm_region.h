@@ -443,14 +443,26 @@ public:
     void resetDecommitThreadForFork() {
         // Thread doesn't exist in child - don't try to join it
         decommit_running_.store(false, std::memory_order_relaxed);
-        // Drain pending entries synchronously
+        drainDecommitQueueNow();
+    }
+
+    // Process every queued decommit on the calling thread; returns how many
+    // entries were drained. A freed run reaches the free map only when its
+    // entry is processed, so an allocation that misses the map can call this
+    // to find out whether the pages it wants are merely in flight rather than
+    // gone. Does the mprotect/madvise work inline, so it is for paths that
+    // would otherwise claim fresh region or fail outright, never a fast path.
+    size_t drainDecommitQueueNow() {
         DecommitEntry* batch = decommit_head_.exchange(nullptr, std::memory_order_acquire);
+        size_t drained = 0;
         while (batch) {
             DecommitEntry* next = batch->next;
             processDecommitEntry(batch);
             recycleDecommitEntry(batch);
             batch = next;
+            ++drained;
         }
+        return drained;
     }
 
     // ── Allocation (full mode only) ─────────────────────────────────────────
@@ -940,6 +952,7 @@ public:
     // the page again.
     static constexpr size_t kNodeChunkPages = (64 * 1024 * 1024) / kPageSize;
 
+
     // NUMA node owning contiguous page `idx`, or -1. Lock-free and
     // async-signal-safe.
     int nodeOfPage(size_t idx) const {
@@ -969,18 +982,67 @@ public:
             return nullptr;
         }
         NodeArena& na = arenas[node];
-        LockGuard guard(na.lock);
-
-        if (const size_t idx = free_map_.take(num_pages, ownerOfNode(static_cast<int>(node)));
-            idx != PageRunMap::kNone) {
-            return base_ + idx * kPageSize;
+        const uint32_t owner = ownerOfNode(static_cast<int>(node));
+        // Fast paths, under the arena lock: this node's own free runs, then
+        // the unused tail of its newest chunk.
+        {
+            LockGuard guard(na.lock);
+            if (const size_t idx = free_map_.take(num_pages, owner); idx != PageRunMap::kNone)
+                return base_ + idx * kPageSize;
+            if (na.end - na.cur >= num_pages) {
+                const size_t idx = na.cur;
+                na.cur += num_pages;
+                return base_ + idx * kPageSize;
+            }
         }
+
+        // Both missed, so the next step would claim a whole kNodeChunkPages
+        // chunk (64 MiB) of fresh region for this one request. Before that:
+        // this node's freed pages may simply be in flight. free() queues a run
+        // and it joins the free map only when that entry is processed, so a
+        // miss does not mean the pages are gone. Claiming fresh region instead
+        // is what made a tight allocate/free loop walk the whole arena —
+        // measured, 64 KiB blocks with a 1 GiB arena consumed all 1023.9 MiB
+        // of it and then served 4.5% of allocations from uncompressible direct
+        // mappings, while the same loop with 50 us of slack between iterations
+        // reused a 0.8 MiB window and never fell back.
+        //
+        // Deliberately NOT under na.lock. The drain does an mprotect and an
+        // madvise per queued run, and holding the node's lock across that
+        // serialises every other thread allocating on this node behind the
+        // syscalls: measured at 16 threads over 4 nodes, 15.0 us per
+        // allocate+free against 1.9 us with the lock released here. Nothing in
+        // the drain touches a NodeArena — processDecommitEntry only takes the
+        // free map's own lock — and the state it publishes is exactly what the
+        // retry below reads, so dropping the lock costs only a re-check.
+        drainDecommitQueueNow();
+
+        LockGuard guard(na.lock);
+        if (const size_t idx = free_map_.take(num_pages, owner); idx != PageRunMap::kNone)
+            return base_ + idx * kPageSize;
 
         if (na.end - na.cur < num_pages) {
             const size_t chunk_pages =
                 (num_pages + kNodeChunkPages - 1) / kNodeChunkPages * kNodeChunkPages;
             const size_t start = carveNodeChunk(chunk_pages);
             if (start == kNoChunk) {
+                // The region has no fresh chunk left, so this node's own freed
+                // pages are the only source there is. Drain once more — a run
+                // queued since the drain above can still rescue this — and
+                // only then give up, because the caller's fallback is a
+                // separate mapping that is never compressed. Under the lock
+                // this time: the alternative is returning uncompressible
+                // memory, which is worth more than the contention.
+                //
+                // The shared arena's exhausted hook is deliberately not called
+                // here: it returns empty slab spans, which are shared-owner
+                // pages, and runs of different owners never merge. It cannot
+                // produce a chunk for this node.
+                if (drainDecommitQueueNow()) {
+                    if (const size_t idx = free_map_.take(num_pages, owner);
+                        idx != PageRunMap::kNone)
+                        return base_ + idx * kPageSize;
+                }
                 errno = ENOMEM;
                 return nullptr;
             }
@@ -1000,7 +1062,7 @@ public:
                  c < (start + chunk_pages) / kNodeChunkPages; ++c)
                 table[c].store(static_cast<uint16_t>(node + 1), std::memory_order_release);
             if (na.end > na.cur)
-                free_map_.insert(na.cur, na.end - na.cur, ownerOfNode(static_cast<int>(node)));
+                free_map_.insert(na.cur, na.end - na.cur, owner);
             na.cur = start;
             na.end = start + chunk_pages;
         }

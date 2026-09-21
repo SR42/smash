@@ -530,6 +530,20 @@ add_smash_mode_test(test_malloc_numa_full       malloc_numa_test 0 120
 add_smash_mode_test(test_malloc_numa_large_only malloc_numa_test 1 120
                     "SMASH_COLD_TIMEOUT_SEC=1")
 
+# A malloc_numa churn loop must keep reusing its node arena instead of taking
+# fresh region. A freed run reaches the free map only when its queued decommit
+# is processed, so a tight loop misses the map; the miss used to go straight to
+# a new 64 MiB chunk, which consumed the arena and then served allocations from
+# uncompressible direct mappings. SMASH_VM_GIB=1 is load-bearing: the default
+# 16 GiB never reaches exhaustion and the check would pass vacuously.
+add_executable(numa_arena_churn_test numa_arena_churn_test.cpp)
+set_target_properties(numa_arena_churn_test PROPERTIES CXX_STANDARD 20)
+target_link_libraries(numa_arena_churn_test PRIVATE ${CMAKE_DL_LIBS} Threads::Threads)
+add_smash_mode_test(test_numa_arena_churn_full       numa_arena_churn_test 0 180
+                    "SMASH_VM_GIB=1")
+add_smash_mode_test(test_numa_arena_churn_large_only numa_arena_churn_test 1 180
+                    "SMASH_VM_GIB=1")
+
 # malloc_numa_aligned(node, size, align): malloc_numa plus an alignment
 # guarantee. Sweeps alignments from one page to 16 MiB against sizes across the
 # routing boundaries on every online node, and re-checks the whole malloc_numa
