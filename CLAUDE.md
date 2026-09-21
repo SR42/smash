@@ -761,6 +761,42 @@ LargeAlloc's path), `malloc_numa` (unaffected), and sizes between 1 MiB and a
 raised `SMASH_LARGE_ALLOC_VM_THRESHOLD` (no class covers them, so they take the
 direct mapping as before).
 
+### Coalescing the reclaim syscalls (+41% compression throughput)
+
+`reclaimShadowRange()` — the dominant path in the default deferred-reclaim
+mode — issued **one madvise and one mprotect per reclaimed page**, and under
+FixAv one membarrier per page as well. Its own comment said so ("each reclaimed
+shadow page gets its own mprotect(PROT_NONE) … with no coalescing"), and an
+interposer that counts calls by caller confirmed it: **422,151 madvise calls
+over a 2 GiB cold set, every one of them 4096 bytes**. (The deferred-madvise
+sweeper already coalesced; this path did not. Note that `protectPages` reaches
+the kernel through `syscall(SYS_mprotect, …)`, so an `LD_PRELOAD` shim that
+interposes libc's `mprotect` sees none of them — use `strace` for those and the
+shim for `madvise`.)
+
+Pages are visited in ascending index order within a chunk, and chunks ascend,
+so reclaimable pages are usually adjacent. Accumulating a contiguous run and
+issuing one syscall per run gives, measured on the same workload:
+
+| | per page | coalesced |
+|---|---|---|
+| madvise calls | 422,151 × 4 KiB | **13,386 × 128 KiB** |
+| compression throughput | 142–152 MB/s | **193–222 MB/s** |
+
+**The run cap is 32 pages on purpose.** A page stays locked from the moment it
+joins a run until the flush, so an application thread faulting on it waits for
+the rest of the run's verification work (~10 µs per page). 32 bounds that at a
+few hundred µs while still removing 97% of the syscalls; the sweeper can use
+512 because it holds no page across decompression. Measured cold re-access
+latency is unchanged at 0.2 µs/object.
+
+Correctness rests on the locks being held across the flush: state and
+`shadow_tick_` are set there too, so a fault on any page of a pending run still
+sees `COMPRESSED_SHADOW` and blocks on the lock exactly as before. Every exit
+from the loop flushes, including the VMA-budget breaks and the function's
+return — a missed flush would leave pages locked forever. Suite 66/66 in both
+the default and `SMASH_FIXAV=1` configurations, integrity checks clean in both.
+
 ### Compression throughput is ~160 MB/s and does not scale with cores
 
 No counter silently caps compression — `SMASH_TIME_BUDGET_PCT`, the one knob

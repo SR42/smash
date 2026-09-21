@@ -3596,8 +3596,55 @@ private:
         long reclaimed_since_resync = 0;
         constexpr long kVmaResyncReclaims = 256;
 
+        // Coalesce the reclaim syscalls. Each reclaimed page used to cost its
+        // own madvise + mprotect (and under FixAv its own membarrier, which
+        // IPIs every core running a thread of the process). Measured on a
+        // 2 GiB cold set: 422k madvise calls, every one of them 4096 bytes.
+        // Pages are visited in ascending index order within a chunk and chunks
+        // ascend, so reclaimable pages are usually adjacent; one syscall per
+        // run instead of per page follows directly.
+        //
+        // The run cap is deliberately small. A page stays locked from the
+        // moment it joins a run until the flush, so an application thread
+        // faulting on it blocks for the rest of the run's verification work
+        // (~10 us per page). 32 bounds that at a few hundred us while still
+        // removing most of the syscalls; the deferred sweeper uses 512 because
+        // it holds no page across decompression work.
+        constexpr size_t kReclaimCoalesceMax = 32;
+        size_t rrun[kReclaimCoalesceMax];
+        size_t rrun_n = 0;
+        uintptr_t rrun_expect = 0;
+        auto flushReclaimRun = [&]() {
+            if (rrun_n == 0) return;
+            void* rbase = vm_->pageAddress(rrun[0]);
+            const size_t rbytes = rrun_n * kPageSize;
+            if (rbase) {
+                if (fixavEnabled()) {
+                    vm::protectPages(rbase, rbytes, false, false);   // PROT_NONE
+                    membarrierSyncCore();                            // once per run
+                    vm::decommitPages(rbase, rbytes);
+                } else {
+                    vm::decommitPages(rbase, rbytes);
+                    vm::protectPages(rbase, rbytes, false, false);   // PROT_NONE
+                }
+            }
+            for (size_t k = 0; k < rrun_n; ++k) {
+                shadow_tick_[rrun[k]] = 0;
+                states_->set(rrun[k], PageState::COMPRESSED);
+                locks_->unlock(rrun[k]);
+            }
+            ++vma_now;                       // one PROT_NONE split per run
+            reclaimed_since_resync += static_cast<long>(rrun_n);
+            if (reclaimed_since_resync >= kVmaResyncReclaims) {
+                vma_now = readVmaCount();
+                reclaimed_since_resync = 0;
+            }
+            rrun_n = 0;
+            rrun_expect = 0;
+        };
+
         for (size_t c = 0; c < num_chunks_range; ++c) {
-            if (vma_cap > 0 && vma_now >= vma_cap) break;  // VMA budget exhausted
+            if (vma_cap > 0 && vma_now >= vma_cap) { flushReclaimRun(); break; }
             size_t ci = chunk_base + c;
             if (ci >= num_chunks_) break;
             uint64_t mask = live_chunks_[ci];
@@ -3606,7 +3653,7 @@ private:
             if (ownedByRunningNodeGroup(page_base)) continue;
 
             while (mask) {
-                if (vma_cap > 0 && vma_now >= vma_cap) break;  // VMA budget
+                if (vma_cap > 0 && vma_now >= vma_cap) { flushReclaimRun(); break; }
                 int bit = __builtin_ctzll(mask);
                 mask &= mask - 1;
                 size_t i = page_base + bit;
@@ -3680,33 +3727,25 @@ private:
                 // Content verified under PROT_READ — any write between
                 // the memcmp and now would have faulted (handler discards
                 // blob and sets ACTIVE). Safe to reclaim.
-                if (fixavEnabled()) {
-                    // FixAv: PROT_NONE → membarrier → madvise so a remote
-                    // reader can never observe a DROPPED+RO page (the
-                    // mprotect IPI shoots down the TLB; any post-madvise
-                    // access faults visibly and the handler decompresses).
-                    vm::protectPages(page_addr, kPageSize, false, false);  // PROT_NONE
-                    shadow_tick_[i] = 0;
-                    states_->set(i, PageState::COMPRESSED);
-                    membarrierSyncCore();
-                    vm::decommitPages(page_addr, kPageSize);
-                } else {
-                    vm::decommitPages(page_addr, kPageSize);
-                    vm::protectPages(page_addr, kPageSize, false, false);  // PROT_NONE
-                    shadow_tick_[i] = 0;
-                    states_->set(i, PageState::COMPRESSED);
+                // Join the coalescing run instead of issuing this page's
+                // syscalls now. The lock stays held until the flush, which is
+                // what lets one syscall cover the whole range; state and
+                // shadow_tick are set there too, so a fault on any page of the
+                // run still sees COMPRESSED_SHADOW and blocks on the lock,
+                // exactly as it did when the work was per page.
+                {
+                    const uintptr_t uaddr = reinterpret_cast<uintptr_t>(page_addr);
+                    if (rrun_n > 0 && uaddr != rrun_expect) flushReclaimRun();
+                    rrun[rrun_n++] = i;
+                    rrun_expect = uaddr + kPageSize;
+                    if (rrun_n == kReclaimCoalesceMax) flushReclaimRun();
                 }
-                locks_->unlock(i);
-                // Charge this reclaim against the VMA budget. The PROT_NONE
-                // above splits ~1 VMA; resync to the real count periodically
-                // to absorb merges from concurrent fault-driven decompression.
-                ++vma_now;
-                if (++reclaimed_since_resync >= kVmaResyncReclaims) {
-                    vma_now = readVmaCount();
-                    reclaimed_since_resync = 0;
-                }
+                // The VMA charge and the resync now happen in
+                // flushReclaimRun(): one PROT_NONE split per run, not per page.
             }
         }
+        // Any partial run still holds its pages' locks: flush before returning.
+        flushReclaimRun();
     }
 
     // ── Soft-dirty access tracking (Linux only) ───────────────────────────
