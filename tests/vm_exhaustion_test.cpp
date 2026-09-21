@@ -39,6 +39,7 @@
 #include <cstring>
 #include <dlfcn.h>
 #include <new>
+#include <string>
 #include <unistd.h>
 #include <vector>
 
@@ -163,6 +164,23 @@ int main() {
     std::vector<void*> chunks;
     chunks.reserve(kNumChunks);
 
+    // Capture stderr across phase 1. A large allocation that misses the arena
+    // comes from a direct mmap and is NEVER compressed, however cold it gets,
+    // and nothing else in the process reports that — for a workload of
+    // multi-MB or GB blocks it is the difference between smash working and
+    // smash doing nothing, so the warning is part of the contract. The
+    // redirect is scoped to phase 1 and everything captured is re-emitted, so
+    // a FAIL message can never be swallowed.
+    char warn_path[] = "/tmp/smash-vm-exhaustion-warn-XXXXXX";
+    int warn_fd = mkstemp(warn_path);
+    int saved_stderr = -1;
+    if (warn_fd >= 0) {
+        unlink(warn_path);
+        fflush(stderr);
+        saved_stderr = dup(2);
+        if (saved_stderr >= 0) dup2(warn_fd, 2);
+    }
+
     // ── Phase 1: overflow the arena ─────────────────────────────────────────
     for (size_t i = 0; i < kNumChunks; ++i) {
         void* p = nullptr;
@@ -187,6 +205,24 @@ int main() {
         stamp(p, kChunkBytes, i);
         chunks.push_back(p);
     }
+
+    std::string phase1_stderr;
+    if (saved_stderr >= 0) {
+        fflush(stderr);
+        dup2(saved_stderr, 2);
+        close(saved_stderr);
+        lseek(warn_fd, 0, SEEK_SET);
+        char rb[4096];
+        ssize_t n;
+        while ((n = read(warn_fd, rb, sizeof(rb))) > 0)
+            phase1_stderr.append(rb, static_cast<size_t>(n));
+        close(warn_fd);
+        if (!phase1_stderr.empty())
+            fwrite(phase1_stderr.data(), 1, phase1_stderr.size(), stderr);
+    }
+    CHECK(phase1_stderr.find("did not fit the compressible arena") != std::string::npos,
+          "the arena filled and LargeAlloc fell back to a direct mapping, but "
+          "smash said nothing — that memory is silently never compressed");
 
     printf("phase 1: allocated %zu / %zu chunks (%.2f GiB)\n",
            chunks.size(), kNumChunks,

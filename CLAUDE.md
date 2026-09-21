@@ -361,6 +361,27 @@ resident. So a caller that can use `malloc_numa` gets sub-threshold blocks
 compressed today with no rebuild — at the cost of binding that memory to one
 node (`MPOL_BIND`), page granularity, and `realloc` returning an unbound block.
 
+**Above the threshold, size is not a limit.** 2 MiB, 32 MiB, 256 MiB and 1 GiB
+blocks all land in the arena and compress to 0% resident. What bounds them is
+arena *capacity*, and missing it is silent by default — which for a workload of
+multi-MB or GB blocks is the difference between smash working and smash doing
+nothing. With a 2 GiB arena and four live 1 GiB blocks, the first two compress
+to 0% and the last two sit at 100% resident forever, because `LargeAlloc` fell
+back to a direct mapping the compressor never walks. `LargeAlloc` now says so
+once, with the same capacity-vs-fragmentation split as
+`Slab::warnArenaExhausted`:
+
+```
+[smash WARN] a 1024 MiB allocation did not fit the compressible arena: 2048 of
+2048 MiB handed out, 0 MiB free in 0-page runs or shorter. It came from a
+direct mmap instead and will NEVER be compressed, however cold it gets. …
+```
+
+`test_vm_exhaustion` asserts the warning appears (it already forces the
+fallback); **verified as a real discriminator** — against a library without it
+the test fails with "smash said nothing". So size the arena above the live set:
+`SMASH_VM_GIB` costs address space, not memory.
+
 The threshold is a **runtime** setting, `SMASH_LARGE_ALLOC_VM_THRESHOLD`
 (bytes, rounded up to a page, floored at one page), defaulting to the
 compile-time `kLargeAllocVmThreshold`. The compile-time define still works as

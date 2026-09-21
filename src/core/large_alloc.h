@@ -39,6 +39,32 @@ public:
         release_ctx_ = hook_ctx;
     }
 
+    // One-shot: the arena could not take a block that was meant to be
+    // compressible. Mirrors Slab::warnArenaExhausted, including the
+    // capacity-vs-fragmentation split, because the fix differs.
+    [[gnu::cold, gnu::noinline]] void warnLargeAllocNotCompressible(size_t alloc_size) {
+        static std::atomic<bool> warned{false};
+        if (warned.exchange(true, std::memory_order_relaxed)) return;
+        const size_t total = vm_region_->contigPages();
+        const size_t bump = vm_region_->rawNextPage();
+        const size_t free_pages = vm_region_->arenaFreePages();
+        const size_t longest = vm_region_->arenaLongestFreeRun();
+        char buf[512];
+        const int n = smash::safe_snprintf(buf, sizeof(buf),
+            "[smash WARN] a %zu MiB allocation did not fit the compressible arena: "
+            "%zu of %zu MiB handed out, %zu MiB free in %zu-page runs or shorter. "
+            "It came from a direct mmap instead and will NEVER be compressed, "
+            "however cold it gets. %s\n",
+            alloc_size >> 20, bump * kPageSize >> 20, total * kPageSize >> 20,
+            free_pages * kPageSize >> 20, longest,
+            free_pages * 4 < total
+                ? "The live set outgrew the arena: raise SMASH_VM_GIB (ceiling 1024; "
+                  "an unused arena costs address space, not memory)."
+                : "Most of the arena is free but too fragmented for a run this long, "
+                  "so a larger SMASH_VM_GIB only postpones it — please report this.");
+        if (n > 0) (void)!::write(2, buf, static_cast<size_t>(n));
+    }
+
     void* allocate(size_t size, size_t alignment, uint8_t arena_id = 0) {
         if (alignment < kPageSize) alignment = kPageSize;
 
@@ -58,7 +84,16 @@ public:
             }
         }
 
-        // Fallback to direct mmap
+        // Fallback to direct mmap. When the caller asked for a compressible
+        // block (at or above the threshold) and the arena could not serve it,
+        // say so once: this memory is never walked by the compressor, so it
+        // stays resident for the life of the process however cold it gets,
+        // and nothing else in the process reports that. It is the failure mode
+        // that matters most for a workload of multi-MB or GB blocks, where a
+        // few allocations can exhaust the arena outright.
+        if (!mem && vm_region_ && alignment <= kPageSize &&
+            alloc_size >= largeAllocVmThreshold()) [[unlikely]]
+            warnLargeAllocNotCompressible(alloc_size);
         if (!mem) {
             if (alignment <= kPageSize) {
                 mem = vm::mapPages(alloc_size);
