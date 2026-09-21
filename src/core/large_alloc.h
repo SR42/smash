@@ -49,6 +49,7 @@ public:
         const size_t bump = vm_region_->rawNextPage();
         const size_t free_pages = vm_region_->arenaFreePages();
         const size_t longest = vm_region_->arenaLongestFreeRun();
+        const size_t want_pages = alloc_size / kPageSize;
         char buf[512];
         const int n = smash::safe_snprintf(buf, sizeof(buf),
             "[smash WARN] a %zu MiB allocation did not fit the compressible arena: "
@@ -57,11 +58,18 @@ public:
             "however cold it gets. %s\n",
             alloc_size >> 20, bump * kPageSize >> 20, total * kPageSize >> 20,
             free_pages * kPageSize >> 20, longest,
-            free_pages * 4 < total
-                ? "The live set outgrew the arena: raise SMASH_VM_GIB (ceiling 1024; "
-                  "an unused arena costs address space, not memory)."
-                : "Most of the arena is free but too fragmented for a run this long, "
-                  "so a larger SMASH_VM_GIB only postpones it — please report this.");
+            // Exact, not a guess: it is fragmentation precisely when enough
+            // pages are free but no single run is long enough. A ratio of free
+            // to total cannot tell those apart — measured, an arena with 1021
+            // of 4096 MiB free in 512 KB runs is 24.9% free and was reported as
+            // "the live set outgrew the arena", which is the opposite of the
+            // truth and sends the reader to raise SMASH_VM_GIB for nothing.
+            (free_pages >= want_pages && longest < want_pages)
+                ? "A run that long is not available though the space is: the arena is "
+                  "fragmented, so a larger SMASH_VM_GIB only postpones this. Blocks "
+                  "of very different sizes sharing the arena is the usual cause."
+                : "The live set outgrew the arena: raise SMASH_VM_GIB (ceiling 1024; "
+                  "an unused arena costs address space, not memory).");
         if (n > 0) (void)!::write(2, buf, static_cast<size_t>(n));
     }
 

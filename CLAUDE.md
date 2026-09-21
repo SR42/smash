@@ -420,6 +420,25 @@ arena is also a fixed budget (`SMASH_VM_GIB`), and mid-size blocks consume it.
 Neither point is in the comment on the constant, and both are stronger than the
 one that is.
 
+**Small objects are not exempt, they fail differently.** The same shape with
+64-byte objects also denies the 1 GiB request, but for the opposite reason:
+freeing every other object of 31 million returned **0 MiB**, because objects
+share pages and a page comes back only when every object on it is free. So
+small objects produce *occupancy* (raise `SMASH_VM_GIB` and it helps) while
+mid-size blocks produce *holes* (a larger arena only postpones it). Telling the
+two apart is what the warning is for, and getting that test right matters:
+"free-to-total ratio" is not the distinction — an arena 24.9% free in 512 KB
+runs was reported as "the live set outgrew the arena" when the truth was
+fragmentation. The test is now exact: enough free pages but no run long enough.
+
+**Freed arena memory is not immediately reusable.** Frees go through the
+deferred decommit queue before returning to the free map, so a burst of frees
+followed straight away by a large allocation sees only part of it: measured
+1004 MiB free immediately after freeing 1919 MiB worth, and the full 1919 MiB
+three seconds later. A program that frees a lot and then asks for one big block
+can therefore miss the arena and land on an uncompressible direct mapping,
+purely on timing.
+
 **The storm the constant's comment warns about did not appear when tested.**
 With the threshold lowered so 512 KB blocks are eligible, 64 continuously
 rewritten buffers stayed **100% resident** while 64 untouched ones went to

@@ -235,11 +235,13 @@ class Slab {
             "%s\n",
             want_pages, bump * kPageSize >> 20, total * kPageSize >> 20,
             free_pages * kPageSize >> 20, longest,
-            free_pages * 4 < total
-                ? "The live set outgrew the arena: raise SMASH_VM_GIB (ceiling 1024; "
-                  "an unused arena costs address space, not memory)."
-                : "Most of the arena is free but too fragmented for this request, so a "
-                  "larger SMASH_VM_GIB only postpones it — please report this.");
+            // Fragmentation is exactly "enough free pages, no long-enough run";
+            // a free-to-total ratio cannot distinguish the two cases.
+            (free_pages >= want_pages && longest < want_pages)
+                ? "A run that long is not available though the space is: the arena is "
+                  "fragmented, so a larger SMASH_VM_GIB only postpones this."
+                : "The live set outgrew the arena: raise SMASH_VM_GIB (ceiling 1024; "
+                  "an unused arena costs address space, not memory).");
         if (n > 0) (void)!::write(2, buf, static_cast<size_t>(n));
     }
 
