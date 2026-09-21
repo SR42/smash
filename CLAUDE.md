@@ -469,6 +469,35 @@ having it at runtime rather than picking a new constant. A workload in
 large-only mode with cold mid-size blocks wants it lowered on both counts;
 full mode wants measurement first.
 
+### The ratio you measure depends entirely on the data you measure it with
+
+`test_compression_ratio` and `bench_compression` both build their page with
+`fillCompressiblePage()`: a fixed record header, a zeroed middle and a tail of
+`(off + i) & 0xFF`. The comment rightly rejects an all-one-byte page as
+degenerate, but the replacement is still **periodic** — the pattern repeats
+with a period of at most 256 bytes — and periodicity is exactly what a
+compressor is best at. Measured consequences, same codecs, same machine:
+
+| data | zstd-1 at 4 KiB | zstd-1 at 2 MiB |
+|---|---|---|
+| smash's generator | 25–26x | **6043x** |
+| synthetic heap-shaped (pointers, strings, ints, padding) | 3.13x | 3.52x |
+| 64 MiB of real system binaries | 2.01x | 2.37x |
+
+A 6000x ratio is not a compression result, it is a statement that the input
+repeats. Two things follow. The **25–26x the in-tree test reports is an upper
+bound**, not what an application should expect — the paper's own RQ2 figures
+(LZ4 4.7–12.3x, zstd-1 8.8–20.4x) sit well below it. And **that data must
+never be used to reason about unit size**: it says a 2 MiB unit is 240x better,
+where realistic data says 8–20%. The test is still a good regression guard for
+"did the codec break", which is what it claims to be; it is not a model of a
+heap.
+
+The same caveat applies to the codec choice. On smash's generator LZ4 gives up
+only 4% of zstd's ratio (25.3x against 26.3x), which would make LZ4 look nearly
+free; on realistic data it gives up 25–40%. Which of those an application sees
+depends on its own bytes.
+
 ### The compression unit is one page, and bigger is only worth it up to ~64 KiB
 
 A recurring question, and the reason THP degrades under smash (the compressor
@@ -493,6 +522,11 @@ Two things follow. **The ratio gain is front-loaded and small**: +8% (heap) to
 THP-sized unit makes every first touch cost 1.3–1.7 ms, against 8 µs today.
 That is the argument against ever matching the compression unit to a huge page,
 independent of how convenient it would be for THP.
+
+(Numbers below are with compression contexts reused, as smash does —
+`ZSTD_compressCCtx` / `ZSTD_decompressDCtx` and `LZ4_compress_fast_extState`.
+Using the one-shot APIs instead inflates the 4 KiB rows by ~25% and leaves the
+large ones unchanged, which flatters big units.)
 
 **LZ4 shifts the trade but does not change the conclusion.** Same data, same
 unit sizes, `LZ4_compress_fast` at acceleration 1 against zstd-1:
