@@ -402,9 +402,35 @@ expectation derived from the env var so the two runs assert the same invariant.
 against a library without the runtime knob, while the default registration
 passes against both (so the default behaviour is unchanged).
 
-What is *not* verified is the decompression-storm risk the comment on the
-constant warns about, which depends on how hot those buffers are in the target
-application — watch `reheat=` on the SIGUSR2 stats line after lowering it.
+**The storm the constant's comment warns about did not appear when tested.**
+With the threshold lowered so 512 KB blocks are eligible, 64 continuously
+rewritten buffers stayed **100% resident** while 64 untouched ones went to
+**0%** — cold detection made exactly the distinction the size gate is a proxy
+for. That is the argument against the gate as a *compressibility* rule: smash
+already answers "is this hot?" per page, from observed access, and the size
+gate answers it by proxy while also excluding genuinely cold mid-size memory.
+
+**But the gate also decides arena placement, and that part cuts differently in
+the two modes.** Below the threshold a block is a direct mmap (a syscall pair
+per allocation); above it, it comes from the arena. Measured with mi-stress
+(32 threads, default args) and a 320 KB churn loop:
+
+| | large-only | full mode |
+|---|---|---|
+| mi-stress, default 1 MiB | 7.10 / 7.23 s | 16.24 / 17.26 s |
+| mi-stress, threshold 16 KiB | **4.64 / 4.59 s** | 18.19 / 18.87 s |
+| 320 KB malloc/free cycle | 9.85 µs → **7.59 µs** | — |
+
+In large-only the arena is much cheaper than the syscalls it replaces (35%
+faster); in full mode the same change is ~12% *slower*, because small objects
+already come from the arena there and mid-size blocks add contention rather
+than removing syscalls. `bench_sqlite --quick` is unchanged either way (54.1 /
+53.8% reduction at the default, 52.0 / 54.1% at 16 KiB; ops/sec within noise).
+
+So the knob is genuinely workload- and mode-dependent, which is the case for
+having it at runtime rather than picking a new constant. A workload in
+large-only mode with cold mid-size blocks wants it lowered on both counts;
+full mode wants measurement first.
 
 ### Every malloc/free cycle over 16 KiB costs ~10 µs (open defect)
 
