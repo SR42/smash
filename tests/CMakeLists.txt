@@ -260,6 +260,21 @@ set_tests_properties(test_external_mapping PROPERTIES
 # (>= 1 MiB, smash-managed -> compressible VmRegion in BOTH modes) and small
 # (<= 16 KiB, slab in full / system-passthrough in large-only) compressible
 # chunks, asserts compressed>0 via SIGUSR2 stats, then verifies a byte-exact
+# ── Fortified-wrapper interposition (Linux) ─────────────────────────────────
+# A __*_chk wrapper only runs if it is exported at the version the caller
+# binds, and that version differs per architecture (GLIBC_2.4/2.5/2.16 on
+# x86-64, GLIBC_2.17 on aarch64). Taking each function's address emits the
+# same versioned reference a call would, so dladdr says who won.
+if(NOT APPLE)
+  add_executable(chk_interposition_test chk_interposition_test.cpp)
+  set_target_properties(chk_interposition_test PROPERTIES CXX_STANDARD 20)
+  target_compile_options(chk_interposition_test PRIVATE -O1 -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=2)
+  target_link_libraries(chk_interposition_test PRIVATE ${CMAKE_DL_LIBS})
+  add_test(NAME test_chk_interposition COMMAND ${CMAKE_COMMAND} -E env
+    "LD_PRELOAD=$<TARGET_FILE:smash>" $<TARGET_FILE:chk_interposition_test>)
+  set_tests_properties(test_chk_interposition PROPERTIES TIMEOUT 60)
+endif()
+
 # ── Mid-size bins (Linux) ───────────────────────────────────────────────────
 # SMASH_MID_BINS=1 serves the (16 KiB, 1 MiB) band from size-binned chunks in
 # the arena instead of one direct mmap each, which is what makes that band

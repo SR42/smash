@@ -154,6 +154,36 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   else()
     set(SMASH_GLIBC_BASE_VERSION "GLIBC_2.2.5")
   endif()
+  # _FORTIFY_SOURCE's __*_chk symbols are versioned GLIBC_2.4 / 2.5 / 2.16 on
+  # x86-64, and the map exports the wrappers at exactly those versions. On
+  # aarch64 the whole port starts at GLIBC_2.17, so every one of them is
+  # __*_chk@@GLIBC_2.17 there (verified against an aarch64 libc) and NONE of
+  # those exports matched: the entire fortify carve-out was inert on aarch64,
+  # so any fortified read into a heap buffer bypassed the EFAULT retry.
+  # Reported as test_syscall_efault failing with "__getgroups_chk returned -1
+  # errno=14" — that test is simply the first to call a __*_chk by name.
+  #
+  # Where the base version IS 2.17, exporting the bare names in the base node
+  # is what the callers bind. It is emitted only there: on x86-64 the bare
+  # names must stay local, because exporting a bare __*_chk alongside its own
+  # _NN alias at the SAME version is the self-jump that pinned a process at
+  # 100% CPU (see the map's comment).
+  if(SMASH_GLIBC_BASE_VERSION STREQUAL "GLIBC_2.17")
+    set(SMASH_CHK_BASE_EXPORTS
+"    __read_chk;
+    __pread_chk;
+    __pread64_chk;
+    __recv_chk;
+    __recvfrom_chk;
+    __poll_chk;
+    __ppoll_chk;
+    __readlink_chk;
+    __readlinkat_chk;
+    __getgroups_chk;")
+  else()
+    set(SMASH_CHK_BASE_EXPORTS "")
+  endif()
+
   # clock_nanosleep@GLIBC_2.17 needs its own version node on x86-64, but on
   # aarch64 GLIBC_2.17 *is* the base version: defining it twice would both fail
   # to link and, if it linked, export clock_nanosleep at one version as the

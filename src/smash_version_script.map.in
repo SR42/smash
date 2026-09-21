@@ -126,6 +126,12 @@
     epoll_wait;
     epoll_pwait;
 
+    # The __*_chk wrappers, but only where the base version is the one their
+    # callers bind (aarch64, where all of glibc is GLIBC_2.17). Empty on
+    # x86-64, where they are exported by the GLIBC_2.4 / 2.5 / 2.16 nodes
+    # below and the bare names must stay local.
+@SMASH_CHK_BASE_EXPORTS@
+
     # Round 6: the syscalls the 2026-09-16 audit found still returning the
     # kernel's EFAULT to the application (agents/syscall-compat.md).
     epoll_ctl;
