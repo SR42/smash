@@ -139,7 +139,7 @@ real fixes, both found *because* UBSan changed what the compiler could prove:
 cd build && ctest --output-on-failure
 ```
 
-All 58 tests must pass; none are registered `DISABLED`. Run the suite **as root** too when touching the compressor: some paths only exist with root (see "Idle-page read tracking"), and an unprivileged run — which is all CI does — never executes them. CI (`.github/workflows/ci.yml`) runs the full suite on `ubuntu-latest` and `macos-latest` on every push and PR. Twenty-eight of the tests are end-to-end under `DYLD_INSERT_LIBRARIES` / `LD_PRELOAD`:
+All 66 tests must pass; none are registered `DISABLED`. Run the suite **as root** too when touching the compressor: some paths only exist with root (see "Idle-page read tracking"), and an unprivileged run — which is all CI does — never executes them. CI (`.github/workflows/ci.yml`) runs the full suite on `ubuntu-latest` and `macos-latest` on every push and PR. Twenty-eight of the tests are end-to-end under `DYLD_INSERT_LIBRARIES` / `LD_PRELOAD`:
 
 - `test_arena_routing` guards call-site arena routing — the invariant behind the paper's compression-homogeneity claim. Runs a program with 32 distinct noinline allocation sites under interposition and asserts, via the exported `smash_arena_for(ptr)` query, that they do **not** all collapse into one arena. This is the regression guard for the LTO/wrapper return-address bug: under dynamic interposition the return address seen inside the allocator can point into the wrapper library instead of the app, collapsing every call site into one arena (homogeneity 0%). Fast and deterministic (no compressor): full mode routes 256 B allocations through the slab, and `SMASH_CPU_ARENA=0` + default thread-hash-off make the arena a pure function of the return address, so a buggy capture yields exactly 1 distinct arena. Verified as a real discriminator (injecting a constant RA makes it fail with `distinct_arenas=1`). Must run under interposition — a direct-linked call would never exercise the wrapper path where the bug lives.
 
@@ -797,7 +797,52 @@ from the loop flushes, including the VMA-budget breaks and the function's
 return — a missed flush would leave pages locked forever. Suite 66/66 in both
 the default and `SMASH_FIXAV=1` configurations, integrity checks clean in both.
 
-### Compression throughput is ~160 MB/s and does not scale with cores
+### Batching the PROT_READ arm (+60% on top of that)
+
+Coalescing the reclaim tail left **one** per-page mprotect in
+`reclaimShadowRange()`: the `PROT_READ` arm that precedes the content check.
+It was invisible to the counting interposer for the reason noted above —
+`protectPages` goes through `syscall(SYS_mprotect, …)` — so it was attributed
+with a temporary return-address counter compiled into `protectPages` itself.
+Over a 1 GiB cold set it was **254,803 of the 794,668 remaining calls**, and
+`compressPage`'s defensive `PROT_RW` was the other 539,865.
+
+A look-ahead now arms a whole contiguous run in one call and remembers the
+window (`armed_hi`), so the per-page path re-arms nothing. The run stops at the
+chunk edge, at 32 pages, at the first page that is not `COMPRESSED_SHADOW` or
+not yet past the delay, and at any address discontinuity.
+
+**The look-ahead takes no locks on the pages it arms**, and that is safe for a
+specific reason: arming only *tightens* protection, which this path already has
+to tolerate racing with. Every page re-checks its state under its own lock
+immediately afterwards, and a write that lands first faults, the handler drops
+the blob and restores `PROT_RW`, and the loop then skips the page. A page armed
+but never reached — the chunk ends, the VMA budget trips — costs one spurious
+fault and heals the same way. Locking the look-ahead window instead would
+reintroduce exactly the hold time the 32-page cap exists to bound.
+
+Measured on a 1 GiB cold set (`strace -f -c`), all three stages:
+
+| | per page | reclaim tail | + arm |
+|---|---|---|---|
+| mprotect | 1,048,620 | 794,668 | **540,716** |
+| madvise | 262,168 | 8,216 | **8,216** |
+| membarrier | 262,145 | 8,193 | **8,193** |
+| MB/s (4 GiB, no strace) | 145–153 | ~208 | **237–260** |
+
+The ~2.1 mprotect per page that remain are `compressPage`'s defensive
+`PROT_RW`, one per page. Batching those needs per-page protection tracking —
+the call exists to repair a page whose protection may have been changed by
+another path — so it is left alone.
+
+### Compression throughput is ~250 MB/s and does not scale with cores
+
+**The numbers in this section were measured before the syscall batching above**
+and are kept because the *shape* of the limit is unchanged — only the constant
+moved. Re-measured on the identical 16 GiB workload after batching:
+**254 MB/s** (was 162), CPU 122%, system 66.8 s against user 49.7 s. It is
+still system-heavy, still nowhere near using the eight available cores, and
+still a full pass over 200 GB in **~13 minutes** rather than ~21.
 
 No counter silently caps compression — `SMASH_TIME_BUDGET_PCT`, the one knob
 that marks buckets SKIP, is unset by default and returns -1 (no gating). What
@@ -810,7 +855,8 @@ Measured, 16 GiB of compressible data left cold on an 8-core host:
 are available and the machine has eight cores; compression uses barely one of
 them, so it is not CPU-bound and more workers cannot help.
 
-`strace -c -f` over ~485k compressed pages shows why:
+`strace -c -f` over ~485k compressed pages shows why (pre-batching counts;
+mprotect is now ~2.1 per page and madvise and membarrier ~0.03):
 
 | syscall | calls | per page |
 |---|---|---|
@@ -832,8 +878,9 @@ threads on an 8-core box): **164 MB/s idle, 93–98 MB/s with 4–7 busy threads
 On this host that is confounded with plain CPU competition, so read it as a
 direction, not a coefficient.
 
-**At 200 GB this is the binding constraint**: a full pass takes ~20 minutes at
-160 MB/s, and new cold pages queue behind it. Measured directly — with a live
+**At 200 GB this is still the binding constraint**: a full pass takes ~13
+minutes at 254 MB/s (~21 at the pre-batching 160), and new cold pages queue
+behind it. Measured directly — with a live
 cold set, the time for a *fresh* cold block to compress was 8.0 s at 1 GiB
 live, 42.6 s at 8 GiB, and **never within 60 s at 24 GiB**.
 
