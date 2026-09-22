@@ -46,6 +46,10 @@ using arena_fn = int (*)(const void*);
 // and is >= 0 for a direct-mmap block too, so it cannot tell "in the
 // compressible arena" from "fell out of it", which is the whole leak check.
 using in_arena_fn = int (*)(const void*);
+// smash_numa_arena_info(node, &carved, &free): pages this node's arena has
+// taken from the region and how many are free. carved - free is exactly what
+// its live blocks cost.
+using arena_info_fn = int (*)(uint32_t, size_t*, size_t*);
 
 static constexpr size_t kMiB = 1024 * 1024;
 static int g_failures = 0;
@@ -173,6 +177,63 @@ static void checkNoArenaLeak(aligned_fn numa_aligned, in_arena_fn in_arena, int 
              node, iters, align);
 }
 
+// An aligned block must not cost the arena more than its own pages. The first
+// implementation always took `num_pages + align_pages - 1` and handed the head
+// and tail back, which costs a constant `alignment - one page` per *live*
+// block: the returned fragments are by construction too short to host the next
+// request of the same shape, so a workload allocating one shape can never
+// reuse them. Measured at 64 KiB alignment: +60 KiB per block whatever its
+// size — 1.19x on 320 KiB blocks, 1.94x on 64 KiB ones. The free-run search is
+// alignment-aware now and the chunk cursor is rounded up instead, so a size
+// that is a multiple of the alignment costs exactly its own pages.
+//
+// Measured with smash_numa_arena_info, not with the blocks' address span. A
+// span equals what the blocks cost only while the node's free runs are one
+// contiguous stretch; once the arena has any history the same blocks scatter
+// across existing runs and the span reads 3.5x with nothing wasted. That
+// mistake is easy to make and the numbers look like a real defect.
+//
+// Only sizes that are multiples of the alignment are checked: anything else
+// leaves a gap by arithmetic, not by implementation (a 320 KiB block cannot
+// tile a 128 KiB grid), and those gaps are ordinary free runs — verified
+// separately that 63 of 63 are taken by the next allocation that fits.
+static void checkFootprint(aligned_fn numa_aligned, arena_info_fn arena_info, int node,
+                           size_t size, size_t align, int count) {
+    const size_t ps = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    const size_t block_pages = (size + ps - 1) / ps * ps / ps;
+    size_t carved0 = 0, free0 = 0, carved1 = 0, free1 = 0;
+
+    // Warm the node's arena first so the "before" reading exists even on the
+    // very first use of this node.
+    void* warm = numa_aligned(static_cast<uint32_t>(node), ps, ps);
+    if (arena_info(static_cast<uint32_t>(node), &carved0, &free0) != 0) {
+        fail("node %d: smash_numa_arena_info failed", node);
+        free(warm);
+        return;
+    }
+    std::vector<void*> live;
+    for (int i = 0; i < count; ++i) {
+        void* p = numa_aligned(static_cast<uint32_t>(node), size, align);
+        if (!p) { fail("node %d: footprint probe hit NULL at block %d", node, i); break; }
+        live.push_back(p);
+    }
+    if (live.size() == static_cast<size_t>(count) &&
+        arena_info(static_cast<uint32_t>(node), &carved1, &free1) == 0) {
+        const long used = static_cast<long>(carved1 - free1) -
+                          static_cast<long>(carved0 - free0);
+        const long want = static_cast<long>(block_pages) * count;
+        // One alignment gap can be charged where the run in use had to be
+        // skipped past; anything more is per-block waste, which is the defect.
+        const long slack = static_cast<long>(align / ps);
+        if (used > want + slack)
+            fail("node %d: %d live %zu-byte blocks at %zu alignment cost the arena %ld "
+                 "pages, want %ld (+%ld slack) — an aligned block is being charged the "
+                 "alignment gap", node, count, size, align, used, want, slack);
+    }
+    for (void* p : live) free(p);
+    free(warm);
+}
+
 // Cold aligned blocks are compressed and restored on their node, exactly like
 // unaligned ones: the trim must not disturb the ACTIVE marking of the range
 // that is handed out.
@@ -242,7 +303,8 @@ static void checkCompressedAndRestored(aligned_fn numa_aligned,
     printf("compression wait: %d ms\n", waited_ms);
 }
 
-static void runLinux(aligned_fn numa_aligned, arena_fn arena_for, in_arena_fn in_arena) {
+static void runLinux(aligned_fn numa_aligned, arena_fn arena_for, in_arena_fn in_arena,
+                     arena_info_fn arena_info) {
     const size_t ps = static_cast<size_t>(sysconf(_SC_PAGESIZE));
 
     // Probe once: a kernel or seccomp filter that refuses mbind fails every
@@ -261,7 +323,15 @@ static void runLinux(aligned_fn numa_aligned, arena_fn arena_for, in_arena_fn in
     const cpu_set_t* pin = have_affinity ? &allowed : nullptr;
 
     const std::vector<int> nodes = memoryNodes();
-    const size_t aligns[] = {ps, 2 * ps, 64 * 1024, 2 * kMiB, 16 * kMiB};
+
+    for (int node : nodes) {
+        checkFootprint(numa_aligned, arena_info, node, 64 * 1024, 64 * 1024, 64);
+        checkFootprint(numa_aligned, arena_info, node, 320 * 1024, 64 * 1024, 64);
+        checkFootprint(numa_aligned, arena_info, node, 128 * 1024, 128 * 1024, 64);
+        checkFootprint(numa_aligned, arena_info, node, kMiB, 128 * 1024, 32);
+    }
+
+    const size_t aligns[] = {ps, 2 * ps, 64 * 1024, 128 * 1024, 2 * kMiB, 16 * kMiB};
     const size_t sizes[] = {1, ps - 1, ps, 320 * 1024, kMiB, 5 * kMiB + 1};
 
     for (int node : nodes)
@@ -339,13 +409,15 @@ int main() {
         reinterpret_cast<aligned_fn>(dlsym(RTLD_DEFAULT, "malloc_numa_aligned"));
     auto arena_for = reinterpret_cast<arena_fn>(dlsym(RTLD_DEFAULT, "smash_arena_for"));
     auto in_arena = reinterpret_cast<in_arena_fn>(dlsym(RTLD_DEFAULT, "smash_in_arena"));
-    if (!numa_aligned || !arena_for || !in_arena) {
+    auto arena_info =
+        reinterpret_cast<arena_info_fn>(dlsym(RTLD_DEFAULT, "smash_numa_arena_info"));
+    if (!numa_aligned || !arena_for || !in_arena || !arena_info) {
         printf("SKIP: malloc_numa_aligned not found (not running under libsmash)\n");
         return 0;
     }
 
 #if defined(__linux__)
-    runLinux(numa_aligned, arena_for, in_arena);
+    runLinux(numa_aligned, arena_for, in_arena, arena_info);
 #else
     runSingleNode(numa_aligned, arena_for);
 #endif

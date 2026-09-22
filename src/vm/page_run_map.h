@@ -105,6 +105,53 @@ public:
         return s;
     }
 
+    // Take `len` pages from a free run of `owner` starting at an index with
+    // ((index + phase) % align_pages) == 0, where align_pages is a power of
+    // two. kNone if no run can host one; the caller then falls back to fresh
+    // region, so a bounded search is fine.
+    //
+    // It carves only what is needed: the part of the chosen run before the
+    // aligned start and the part after the request both stay free. The
+    // alternative — take len + align_pages - 1 and hand the ends back — costs
+    // align_pages - 1 pages per *live* block in a workload that allocates one
+    // shape, because the returned fragments are by construction too short to
+    // host the next request of that same shape. Measured at 64 KiB alignment:
+    // a constant 60 KiB per live block whatever its size, so 1.19x on 320 KiB
+    // blocks and 1.94x on 64 KiB ones.
+    size_t takeAligned(size_t len, uint32_t owner, size_t align_pages, size_t phase) {
+        if (align_pages <= 1) return take(len, owner);
+        if (len == 0 || len > 0xFFFFFFFFu) return kNone;
+        LockGuard guard(lock_);
+        OwnerBins& ob = bins_[owner];
+        // A run this long hosts the request at any phase, so any bin above the
+        // one holding it is an unconditional hit and the scan stays bounded.
+        const size_t fits_anywhere = len + align_pages - 1;
+        const size_t stop_bin = binOf(fits_anywhere);
+        size_t s = kNone, off = 0;
+        for (size_t b = binOf(len); b < kNumBins && s == kNone; ++b) {
+            if (!((ob.nonempty[b / 64] >> (b % 64)) & 1)) continue;
+            if (b > stop_bin) {
+                s = ob.head[b] - 1;
+                off = alignOffset(s, align_pages, phase);
+                break;
+            }
+            size_t scanned = 0;
+            for (uint32_t i = ob.head[b]; i && scanned < kAlignScan;
+                 i = tags_[i - 1].next, ++scanned) {
+                const size_t c = i - 1;
+                const size_t o = alignOffset(c, align_pages, phase);
+                if (o + len <= tags_[c].len) { s = c; off = o; break; }
+            }
+        }
+        if (s == kNone) return kNone;
+        const size_t have = tags_[s].len;
+        if (off + len > have) return kNone;   // the stop_bin shortcut rules this out
+        unlink(s);
+        if (off) link(s, off, owner);
+        if (const size_t tail = have - off - len; tail) link(s + off + len, tail, owner);
+        return s + off;
+    }
+
     size_t numPages() const { return num_pages_; }
 
     // Free pages held by `owner`, and a lower bound on its longest run (the
@@ -143,6 +190,18 @@ private:
         void* p = ::mmap(nullptr, bytes, PROT_READ | PROT_WRITE,
                          MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
         return p == MAP_FAILED ? nullptr : p;
+    }
+
+    // Free runs examined per size bin before giving up on the alignment. A
+    // miss only means the caller takes fresh region, so this trades a rare
+    // extra chunk for a bounded hold of the map's single lock.
+    static constexpr size_t kAlignScan = 8;
+
+    // Pages from `s` to the next index satisfying the alignment. align_pages
+    // is a power of two, so the modulo is a mask.
+    static size_t alignOffset(size_t s, size_t align_pages, size_t phase) {
+        const size_t m = (s + phase) & (align_pages - 1);
+        return m ? align_pages - m : 0;
     }
 
     static size_t binOf(size_t len) {

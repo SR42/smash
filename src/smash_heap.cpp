@@ -1440,6 +1440,17 @@ void* malloc_numa(uint32_t numa, size_t size) {
     return SmashRedirect::getHeap()->mallocNuma(numa, size);
 }
 
+// Diagnostic / test hook (not public API): pages node `numa`'s arena has taken
+// from the compressible region, and how many are free. carved - free is what
+// that node's live blocks actually cost. 0 on success, -1 if the node has no
+// arena yet or the id is out of range.
+extern "C" __attribute__((visibility("default")))
+int smash_numa_arena_info(uint32_t numa, size_t* carved_pages, size_t* free_pages) {
+    if (!carved_pages || !free_pages) return -1;
+    auto* heap = SmashRedirect::getHeap();
+    return heap && heap->numaArenaInfo(numa, carved_pages, free_pages) ? 0 : -1;
+}
+
 extern "C" __attribute__((visibility("default")))
 void* malloc_numa_aligned(uint32_t numa, size_t size, size_t aligned) {
     return SmashRedirect::getHeap()->mallocNumaAligned(numa, size, aligned);

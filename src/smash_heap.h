@@ -1770,6 +1770,10 @@ public:
 #endif
     }
 
+    bool numaArenaInfo(uint32_t node, size_t* carved, size_t* free_pages) {
+        return vm_region_.nodeArenaInfo(node, carved, free_pages);
+    }
+
     void* calloc(size_t count, size_t size) {
         // SMASH_PASSTHROUGH=1: pass calloc to system allocator.
         if (isPassthroughMode()) {

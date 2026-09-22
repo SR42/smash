@@ -917,6 +917,23 @@ public:
 
     // Arena occupancy, for the exhausted warning and the stats line.
     size_t arenaFreePages() { return free_map_.freePages(kSharedOwner); }
+
+    // Diagnostic: pages `node`'s arena has taken from the region, and how many
+    // of them are currently free. The difference is exactly what the node's
+    // live blocks cost, which an address span cannot tell you once the arena
+    // has any history — blocks legitimately scatter across existing free runs.
+    // False if this region has no node arenas (none has been used yet).
+    bool nodeArenaInfo(uint32_t node, size_t* carved, size_t* free_pages) {
+        if (node >= vm::kMaxNumaNodes) return false;
+        NodeArena* arenas = node_arenas_.load(std::memory_order_acquire);
+        if (!arenas) return false;
+        {
+            LockGuard guard(arenas[node].lock);
+            *carved = arenas[node].carved;
+        }
+        *free_pages = free_map_.freePages(ownerOfNode(static_cast<int>(node)));
+        return true;
+    }
     size_t arenaLongestFreeRun() { return free_map_.longestRunAtLeast(kSharedOwner); }
 
     size_t committedPages() const {
@@ -963,11 +980,41 @@ public:
     }
 
 #if defined(__linux__)
-    // Allocate `num_pages` from `node`'s arena: its free list first, then the
-    // unused tail of its newest chunk, then a newly carved and bound chunk.
+    // Allocate `num_pages` from `node`'s arena: its own free runs first, then
+    // the unused tail of its newest chunk, then a newly carved and bound
+    // chunk. `align_pages` (a power of two) constrains the returned ADDRESS,
+    // not the page index: the arena base is an mmap result and only page
+    // aligned, so the base's own residue is folded in as `phase`.
     // Returns nullptr with errno EINVAL (bad node, from mbind), EPERM/ENOSYS
     // (mbind refused), or ENOMEM (region exhausted).
     void* allocatePagesOnNode(size_t num_pages, uint32_t node) {
+        return allocatePagesOnNodeImpl(num_pages, node, 1);
+    }
+
+    // Aligned variant: the returned address is a multiple of `alignment`, a
+    // power of two. Nothing extra is allocated for it — the free-run search is
+    // alignment-aware and the chunk cursor is rounded up, with only the pages
+    // actually skipped donated to this node's free runs.
+    void* allocatePagesOnNodeAligned(size_t num_pages, uint32_t node, size_t alignment) {
+        const size_t align_pages = alignment > kPageSize ? alignment / kPageSize : 1;
+        return allocatePagesOnNodeImpl(num_pages, node, align_pages);
+    }
+
+private:
+    // Pages from index `idx` to the next index whose address is aligned.
+    size_t alignGap(size_t idx, size_t align_pages, size_t phase) const {
+        if (align_pages <= 1) return 0;
+        const size_t m = (idx + phase) & (align_pages - 1);
+        return m ? align_pages - m : 0;
+    }
+
+    // The arena base's own offset within an alignment window, in pages.
+    size_t basePhase(size_t align_pages) const {
+        if (align_pages <= 1) return 0;
+        return (reinterpret_cast<uintptr_t>(base_) / kPageSize) & (align_pages - 1);
+    }
+
+    void* allocatePagesOnNodeImpl(size_t num_pages, uint32_t node, size_t align_pages) {
         if (tracking_mode_ || !base_ || num_pages == 0 || num_pages > contig_pages_) {
             errno = ENOMEM;
             return nullptr;
@@ -983,17 +1030,26 @@ public:
         }
         NodeArena& na = arenas[node];
         const uint32_t owner = ownerOfNode(static_cast<int>(node));
-        // Fast paths, under the arena lock: this node's own free runs, then
-        // the unused tail of its newest chunk.
+        const size_t phase = basePhase(align_pages);
+
+        // Serve from the unused tail of this node's newest chunk, rounding the
+        // cursor up to the alignment and donating only the pages skipped — so
+        // an aligned block costs the alignment gap once, not on every block.
+        // Caller must hold na.lock.
+        auto fromTail = [&]() -> void* {
+            const size_t start = na.cur + alignGap(na.cur, align_pages, phase);
+            if (start < na.cur || start + num_pages > na.end) return nullptr;
+            if (start > na.cur) free_map_.insert(na.cur, start - na.cur, owner);
+            na.cur = start + num_pages;
+            return base_ + start * kPageSize;
+        };
+
         {
             LockGuard guard(na.lock);
-            if (const size_t idx = free_map_.take(num_pages, owner); idx != PageRunMap::kNone)
+            if (const size_t idx = free_map_.takeAligned(num_pages, owner, align_pages, phase);
+                idx != PageRunMap::kNone)
                 return base_ + idx * kPageSize;
-            if (na.end - na.cur >= num_pages) {
-                const size_t idx = na.cur;
-                na.cur += num_pages;
-                return base_ + idx * kPageSize;
-            }
+            if (void* p = fromTail()) return p;
         }
 
         // Both missed, so the next step would claim a whole kNodeChunkPages
@@ -1018,100 +1074,75 @@ public:
         drainDecommitQueueNow();
 
         LockGuard guard(na.lock);
-        if (const size_t idx = free_map_.take(num_pages, owner); idx != PageRunMap::kNone)
+        if (const size_t idx = free_map_.takeAligned(num_pages, owner, align_pages, phase);
+            idx != PageRunMap::kNone)
             return base_ + idx * kPageSize;
+        if (void* p = fromTail()) return p;
 
-        if (na.end - na.cur < num_pages) {
-            const size_t chunk_pages =
-                (num_pages + kNodeChunkPages - 1) / kNodeChunkPages * kNodeChunkPages;
-            const size_t start = carveNodeChunk(chunk_pages);
-            if (start == kNoChunk) {
-                // The region has no fresh chunk left, so this node's own freed
-                // pages are the only source there is. Drain once more — a run
-                // queued since the drain above can still rescue this — and
-                // only then give up, because the caller's fallback is a
-                // separate mapping that is never compressed. Under the lock
-                // this time: the alternative is returning uncompressible
-                // memory, which is worth more than the contention.
-                //
-                // The shared arena's exhausted hook is deliberately not called
-                // here: it returns empty slab spans, which are shared-owner
-                // pages, and runs of different owners never merge. It cannot
-                // produce a chunk for this node.
-                if (drainDecommitQueueNow()) {
-                    if (const size_t idx = free_map_.take(num_pages, owner);
-                        idx != PageRunMap::kNone)
-                        return base_ + idx * kPageSize;
-                }
-                errno = ENOMEM;
-                return nullptr;
+        // A chunk has to cover the request plus the worst-case alignment gap
+        // inside it, since the grid is in page indices and the alignment is on
+        // addresses.
+        const size_t need = num_pages + (align_pages > 1 ? align_pages - 1 : 0);
+        const size_t chunk_pages =
+            (need + kNodeChunkPages - 1) / kNodeChunkPages * kNodeChunkPages;
+        const size_t start = carveNodeChunk(chunk_pages);
+        if (start == kNoChunk) {
+            // The region has no fresh chunk left, so this node's own freed
+            // pages are the only source there is. Drain once more — a run
+            // queued since the drain above can still rescue this — and only
+            // then give up, because the caller's fallback is a separate
+            // mapping that is never compressed. Under the lock this time: the
+            // alternative is returning uncompressible memory, which is worth
+            // more than the contention.
+            //
+            // The shared arena's exhausted hook is deliberately not called
+            // here: it returns empty slab spans, which are shared-owner pages,
+            // and runs of different owners never merge. It cannot produce a
+            // chunk for this node.
+            if (drainDecommitQueueNow()) {
+                if (const size_t idx =
+                        free_map_.takeAligned(num_pages, owner, align_pages, phase);
+                    idx != PageRunMap::kNone)
+                    return base_ + idx * kPageSize;
             }
-            void* chunk = base_ + start * kPageSize;
-            // Freshly carved, so nothing in the chunk has been touched: no
-            // pages to move.
-            if (!vm::bindPagesToNode(chunk, chunk_pages * kPageSize, node)) {
-                const int err = errno;
-                // mbind can fail after binding part of the range.
-                vm::unbindPages(chunk, chunk_pages * kPageSize);
-                donateToShared(start, chunk_pages);
-                errno = err;
-                return nullptr;
-            }
-            auto* table = node_of_chunk_.load(std::memory_order_acquire);
-            for (size_t c = start / kNodeChunkPages;
-                 c < (start + chunk_pages) / kNodeChunkPages; ++c)
-                table[c].store(static_cast<uint16_t>(node + 1), std::memory_order_release);
-            if (na.end > na.cur)
-                free_map_.insert(na.cur, na.end - na.cur, owner);
-            na.cur = start;
-            na.end = start + chunk_pages;
-        }
-        const size_t idx = na.cur;
-        na.cur += num_pages;
-        return base_ + idx * kPageSize;
-    }
-
-    // Aligned variant: the returned address is a multiple of `alignment`, a
-    // power of two of at least kPageSize. Over-allocates by alignment - one
-    // page and returns the prefix and suffix runs to the *node's* own free
-    // runs, never the shared ones — they are inside a chunk this node's arena
-    // owns and are still bound to it, so handing them to the shared arena
-    // would leak the binding into ordinary allocations (see Key Conventions).
-    // The trimmed pages were never marked ACTIVE and are EMPTY either way:
-    // freshly carved chunk pages start EMPTY, and the release hook resets a
-    // reused run to EMPTY before it reaches the free map.
-    //
-    // Alignment is enforced on the *address*, not the page index. The arena
-    // base is an mmap result and is only page-aligned, so an index aligned to
-    // alignment / kPageSize says nothing about the address.
-    void* allocatePagesOnNodeAligned(size_t num_pages, uint32_t node, size_t alignment) {
-        if (alignment <= kPageSize) return allocatePagesOnNode(num_pages, node);
-        const size_t align_pages = alignment / kPageSize;
-        size_t want = num_pages + align_pages - 1;
-        if (want < num_pages) {            // the addition wrapped
             errno = ENOMEM;
             return nullptr;
         }
-        void* raw = allocatePagesOnNode(want, node);
-        if (!raw) return nullptr;
-
-        const auto addr = reinterpret_cast<uintptr_t>(raw);
-        const auto aligned = (addr + alignment - 1) & ~(alignment - 1);
-        const size_t start = pageIndex(addr);
-        const size_t prefix = (aligned - addr) / kPageSize;
-        const size_t suffix = want - prefix - num_pages;
-        const uint32_t owner = ownerOfNode(static_cast<int>(node));
-        if (prefix) free_map_.insert(start, prefix, owner);
-        if (suffix) free_map_.insert(start + prefix + num_pages, suffix, owner);
-        return reinterpret_cast<void*>(aligned);
+        void* chunk = base_ + start * kPageSize;
+        // Freshly carved, so nothing in the chunk has been touched: no pages
+        // to move.
+        if (!vm::bindPagesToNode(chunk, chunk_pages * kPageSize, node)) {
+            const int err = errno;
+            // mbind can fail after binding part of the range.
+            vm::unbindPages(chunk, chunk_pages * kPageSize);
+            donateToShared(start, chunk_pages);
+            errno = err;
+            return nullptr;
+        }
+        auto* table = node_of_chunk_.load(std::memory_order_acquire);
+        for (size_t c = start / kNodeChunkPages;
+             c < (start + chunk_pages) / kNodeChunkPages; ++c)
+            table[c].store(static_cast<uint16_t>(node + 1), std::memory_order_release);
+        if (na.end > na.cur)
+            free_map_.insert(na.cur, na.end - na.cur, owner);
+        na.cur = start;
+        na.end = start + chunk_pages;
+        na.carved += chunk_pages;
+        if (void* p = fromTail()) return p;
+        errno = ENOMEM;   // chunk_pages covers `need`, so this is unreachable
+        return nullptr;
     }
+
+public:
 #endif
 
 private:
     struct NodeArena {
-        Spinlock lock;   // guards cur/end; freed pages live in free_map_
-        size_t cur = 0;  // unused tail of the newest chunk, [cur, end);
-        size_t end = 0;  // guarded by lock
+        Spinlock lock;      // guards cur/end/carved; freed pages live in free_map_
+        size_t cur = 0;     // unused tail of the newest chunk, [cur, end);
+        size_t end = 0;     // guarded by lock
+        size_t carved = 0;  // total pages this node's arena has taken from the
+                            // region, for the diagnostic below
     };
     static constexpr size_t kNoChunk = ~size_t{0};
 
