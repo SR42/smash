@@ -222,7 +222,7 @@ The root risk is that `kPageSize` is a **compile-time** constant (`ALLOC8_PAGE_S
 - `test_page_size` (unit, no preload) — the constants. Asserts `1 << kPageShift == kPageSize` (config.h derives the shift with a ternary that only knows 4 KiB and 16 KiB, so a 64 KiB build silently gets shift 12), `kPageSize == sysconf(_SC_PAGESIZE)`, that this machine's addresses fit the hard-coded `kAddressBits = 48` `PageMap` L1 table (which is indexed with no bounds check), and that every size class still has a valid span geometry — a class whose span holds zero objects makes `Slab::allocate()` return nullptr forever. Verified as a real discriminator: rebuilding it against a patched `ALLOC8_PAGE_SIZE` of 65536 fails on both the shift and the kernel mismatch, 16384 fails on the mismatch alone.
 - `test_vm_granularity` (unit, no preload) — the same mismatch at the syscall level. Issues the exact reserve → commit → protect → decommit sequence `VmRegion` and the compressor depend on, at `kPageSize` offsets 0/1/2/3/7/15/31/63 into a reservation. Verified as a real discriminator: built with `ALLOC8_PAGE_SIZE=1024` on this 4 KiB-page host (the same smaller-than-kernel relationship as a 4 KiB build on a 64 KiB kernel) every non-zero offset fails with `errno=22 EINVAL`.
 - `test_alloc_contract_{full,large_only}` — the direct regression test for the reported symptom. One executable (`alloc_contract_test.cpp`) run twice, differing only in `SMASH_LARGE_ONLY`, same one-body-two-modes contract as `mode_compression_test`. Sweeps 163 sizes across every routing boundary (size-class edges ±1, `kMaxSmallSize`, `kLargeAllocVmThreshold`, page multiples for 4/16/64 KiB pages) through `malloc`, `operator new`/`new[]`/nothrow/`align_val_t`, `posix_memalign`, `aligned_alloc`, `calloc`, `realloc` grow/shrink chains, and sustained mixed churn — asserting none ever yields nullptr or throws, and that every block is correctly aligned, fully writable, and byte-stable.
-- `test_aligned_alloc_footprint_{full,large_only}` — footprint, not correctness. `SmashHeap::memalign()` routes **every** allocation with alignment > `kMinAlignment` (16 B) to `LargeAlloc`, which rounds up to a whole page, so an ordinary `alignas(64)` 64-byte object costs a full kernel page. Two-tier like `test_compression_ratio`: a hard 384 MiB RSS budget that 4 KiB (47 MiB measured) and 16 KiB pages clear with ~2× headroom but a 64 KiB-page kernel exceeds ~2×, plus a WARN documenting the amplification (65× in full mode here; large-only measures 2.1×, since it passes small aligned requests to the system allocator).
+- `test_aligned_alloc_footprint_{full,large_only}` — footprint, not correctness. **`SmashHeap::memalign()` used to route every allocation with alignment > `kMinAlignment` (16 B) to `LargeAlloc`**, which rounds up to a whole page, so an ordinary `alignas(64)` 64-byte object cost a full kernel page — 66× amplification and an mmap/munmap pair per object. Fixed; see "Aligned small allocations come from the slab" below. The test now asserts a 4× per-object ceiling under interposition, which the old routing fails at 66×, in addition to the original 384 MiB hard budget and WARN. The budget alone could never catch this: 66× passed it comfortably on a 4 KiB-page host and only failed on a 64 KiB-page kernel, which is how the cost stayed in the tree documented rather than fixed.
 - `test_vm_exhaustion` — `SMASH_VM_GIB=1` caps the contiguous arena at 1 GiB and the test allocates 1.5 GiB of live 4 MiB chunks, forcing `LargeAlloc`'s direct-mmap fallback; config.h names this failure by name ("exhaust the region and trigger malloc=NULL → std::bad_alloc"). Also covers the mixed arena/fallback free routing (issue #84's class) by freeing everything and reallocating. Self-evidencing: phase 1 sorts the chunk addresses and requires at least one discontinuity, since arena chunks are bump-allocated adjacent — with `SMASH_VM_GIB=16` it reports 0 discontinuities and correctly fails rather than passing on coverage it never exercised.
 
 Only the first and last page of each chunk is touched in `test_vm_exhaustion`, so reserving 1.5 GiB costs a few MiB of RSS.
@@ -732,6 +732,46 @@ better — cheaper than what the prefetch window already does, for a better
 ratio. Nothing is implemented; the compressor is page-indexed in ~120 places,
 `PageState` is per page and the store is keyed by page index, so this is a
 refactor rather than a constant.
+
+### Aligned small allocations come from the slab
+
+`memalign()` sent every alignment above `kMinAlignment` (16 B) to `LargeAlloc`,
+so an `alignas(64)` 64-byte object cost a whole page **and** an mmap/munmap
+pair. No new "aligned slab" is needed to fix that, because the existing classes
+already provide the alignment: an object's address is
+`span->base + slot * object_size`, and a span's base is always page-aligned, so
+for a power-of-two alignment no larger than a page **every object of a class
+whose size is a multiple of that alignment is aligned**. `alignedSizeClass()`
+picks the smallest such class and `memalign()` then requests exactly
+`classSize()` bytes — `sizeToClass(classSize(c)) == c`, so this reuses the
+ordinary small path and produces an ordinary object that `free()`, `getSize()`
+and the thread cache already handle, with no new state anywhere.
+
+The table's 16-byte steps are what make this cheap: for 64-byte alignment only
+the 16/32/48/80/96/112/160/224 classes are not multiples, so a request rounds
+up to the next class rather than to a page.
+
+Measured under interposition, 200 k live objects, full mode:
+
+| request | before | after |
+|---|---|---|
+| 64 B @ 64 B align | 4226 B/object | **76 B/object** |
+| 100 B @ 64 B align | 4226 | 140 |
+| 128 B @ 128 B align | 4225 | 140 |
+| 200 B @ 256 B align | 4226 | 269 |
+| 4096 B @ 4096 B align | 4225 | 4139 (the object *is* a page) |
+| alloc+free latency | **9755 ns** | **20 ns** (glibc: 10 ns) |
+
+`test_aligned_alloc_footprint_full` goes from 66× to **1.2×**. Correctness swept
+over `posix_memalign`, `aligned_alloc` and `operator new(align_val_t)` for
+alignments 32 B–8 KiB against 21 sizes from 1 B to 64 KiB: 4536 allocations per
+configuration, checked for alignment, usable size and byte stability, 0
+failures in all four of {full, large-only} × {routing on, off}.
+
+`SMASH_ALIGN_SLAB=0` restores the old routing. Alignments above a page, and
+sizes above `kMaxSmallSize`, still go to `LargeAlloc` — as does everything in
+large-only mode, where small aligned requests pass through to the system
+allocator (2.1×).
 
 ### Mid-size bins (`SMASH_MID_BINS=1`, opt-in)
 
@@ -1409,6 +1449,7 @@ Runtime environment variables:
 - `SMASH_WRITE_TRACK=auto|softdirty|uffd|none`: How writes are detected (default `auto`, chosen by testing each mechanism; see "Write tracking"). `SMASH_SOFTDIRTY=0` still selects Phase 3 PROT_READ monitoring
 - `SMASH_NO_MONITOR=1`: Disable Phase 3 (PROT_READ access tracking) entirely. Trades cold-detection accuracy for compatibility with code paths that synchronously check page protection
 - `SMASH_VM_GIB=N`: Size of the compressible arena, default 16, ceiling 1 TiB (`kVmMaxBytes`). The arena is a PROT_NONE `MAP_NORESERVE` reservation and its per-page metadata is demand-paged, so an unused arena costs address space, not memory (measured: 16, 64 and 1024 GiB all start at 23.3 MB RSS). If the reservation fails — a 39-bit-VA arm64 kernel, `ulimit -v` — `VmRegion::init` halves the request down to 256 MiB and says so, instead of silently running without compression as it used to (measured: with a 48 GiB address-space limit, `SMASH_VM_GIB=1024` gets a 32 GiB arena and compresses; before, compression was off). The old 64 GiB ceiling was an estimate of metadata cost, not a limit; page indices are 32-bit, so the hard bound is 16 TiB
+- `SMASH_ALIGN_SLAB=0`: Restore the old aligned-allocation routing, where any alignment above 16 B goes to `LargeAlloc` and costs a whole page per object. Default ON (slab-served); see "Aligned small allocations come from the slab"
 - `SMASH_MID_BINS=1`: Serve the (16 KiB, 1 MiB) band from size-binned chunks in the compressible arena instead of one direct `mmap` each. Off by default: it trades ~10% of the requested bytes to size-class rounding for compressibility and much cheaper churn, which only pays for blocks that go cold. See "Mid-size bins"
 - `SMASH_THP=1`: `madvise(MADV_HUGEPAGE)` the arena. Off by default: it keeps a dense hot set on huge pages (TLB coverage) while the cold set still compresses, but inflates RSS 22× on a sparse touch pattern. See "Hugepages and THP"
 - `SMASH_LARGE_ALLOC_VM_THRESHOLD=N`: Bytes at or above which a large allocation is placed in the compressible VmRegion instead of a direct mapping (default `kLargeAllocVmThreshold` = 1 MiB; rounded up to a page). **This decides what can be compressed at all** — a block below it is never walked by the compressor and stays resident however cold it gets. Lower it for a workload whose footprint is mid-sized blocks; see "Which allocation sizes are actually compressed"

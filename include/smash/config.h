@@ -20,6 +20,18 @@ inline constexpr size_t kMaxSmallSize = 16384;
 inline constexpr int kNumClasses = 36;
 inline constexpr size_t kMinAlignment = 16;
 
+// SMASH_ALIGN_SLAB: serve an aligned small allocation from the slab class
+// whose size is a multiple of the alignment, instead of sending every
+// alignment above kMinAlignment to LargeAlloc and a whole page. Default ON;
+// set to 0 for the old behaviour. See alignedSizeClass().
+inline bool alignSlabEnabled() {
+    static const bool on = [] {
+        const char* v = getenv("SMASH_ALIGN_SLAB");
+        return !v || v[0] != '0';
+    }();
+    return on;
+}
+
 // ── Large-allocation pseudo size-classes (compression-tracking only) ─────────
 // Slab pages hold many heterogeneous small objects, so per-bucket compression
 // signal is noisy. Large allocations are one slice of one buffer from one

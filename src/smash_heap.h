@@ -1715,6 +1715,25 @@ public:
             // If system posix_memalign not available, fall through to smash's allocator
         }
         if (alignment <= kMinAlignment) return this->malloc(size);
+
+        // An alignment that some size class already satisfies costs nothing
+        // extra: allocate the smallest such class and the object is aligned by
+        // construction (see alignedSizeClass). Routing it to LargeAlloc
+        // instead rounds it up to a whole page — measured 65x amplification in
+        // full mode for alignas(64) objects, which is what
+        // test_aligned_alloc_footprint_full documents.
+        //
+        // Requesting classSize() bytes rather than adding a by-class entry
+        // point is deliberate: sizeToClass(classSize(c)) == c, so this reuses
+        // the ordinary small path exactly, and the result is an ordinary
+        // object of an ordinary class that free(), getSize() and the thread
+        // cache already handle. appCallerRA() reads alloc8's TLS hint, so
+        // arena routing still sees the application's call site, not this one.
+        if (alignSlabEnabled()) {
+            const uint8_t acls = alignedSizeClass(size, alignment);
+            if (acls < kNumClasses) return this->malloc(classSize(acls));
+        }
+
         uintptr_t caller_ra = appCallerRA();
         uint8_t arena = callsiteArenaForLarge(caller_ra);
         void* ptr = large_alloc_.allocate(size, alignment, arena);

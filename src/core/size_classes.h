@@ -106,4 +106,30 @@ inline uint32_t classSize(uint8_t sc) {
     return kSizeClasses[sc].size;
 }
 
+// Smallest class that holds `size` AND whose objects are all `alignment`-
+// aligned; kNumClasses if there is none.
+//
+// No special "aligned slab" is needed for this. An object's address is
+// span->base + slot * object_size, and a span's base is always page-aligned
+// (it comes from VmRegion::allocatePages or vm::mapPages). So for a power-of-
+// two alignment no larger than a page, alignment divides the base, and every
+// object in the span is aligned exactly when alignment divides the class size.
+// Picking such a class is the whole mechanism: the object is an ordinary
+// object of an ordinary class, so free(), getSize() and the thread cache need
+// no knowledge of it.
+//
+// Most alignments are nearly free here, because the table is built from
+// 16-byte steps: for alignment 64 only 16/32/48/80/96/112/160/224 are not
+// multiples, so a request rounds up at most to the next class rather than to
+// a whole page.
+inline uint8_t alignedSizeClass(size_t size, size_t alignment) {
+    if (size == 0) size = 1;
+    if (size > kMaxSmallSize || alignment == 0 || alignment > kPageSize)
+        return static_cast<uint8_t>(kNumClasses);
+    if (alignment & (alignment - 1)) return static_cast<uint8_t>(kNumClasses);
+    for (uint8_t c = sizeToClass(size); c < kNumClasses; ++c)
+        if ((kSizeClasses[c].size & (alignment - 1)) == 0) return c;
+    return static_cast<uint8_t>(kNumClasses);
+}
+
 } // namespace smash

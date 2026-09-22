@@ -76,6 +76,12 @@ constexpr size_t kObjectAlign = 64;
 // third.
 constexpr size_t kHardBudgetBytes = 384ull * 1024 * 1024;
 
+// Per-object RSS ceiling as a multiple of the requested bytes, checked only
+// under interposition. 4x leaves room for the slab's own span rounding and for
+// large-only's system-allocator path (136 B for a 64-byte object = 2.1x)
+// while failing hard on the page-per-object routing this replaced (66x).
+constexpr double kAmplificationMax = 4.0;
+
 // Advisory ratio: cost per object relative to the bytes actually requested.
 constexpr size_t kWarnRatio = 16;
 
@@ -202,6 +208,25 @@ int main() {
                 objects, kObjectSize, grew / (1024.0 * 1024.0),
                 kHardBudgetBytes / (1024.0 * 1024.0), per_object, kObjectSize,
                 page);
+        ++failures;
+    } else if (smashInterposed() && ratio > kAmplificationMax) {
+        // The real assertion now that memalign serves an alignment some size
+        // class already satisfies from the slab (alignedSizeClass()): a
+        // 64-byte object at 64-byte alignment costs a slot in a 64-byte class,
+        // not a whole page. Measured under interposition on a 4 KiB-page host:
+        // 74 B/object (1.2x) in full mode with the routing on, against
+        // 4224 B/object (66x) with SMASH_ALIGN_SLAB=0, and 136 B/object in
+        // large-only where small aligned requests pass through to the system
+        // allocator. The old hard budget (384 MiB) cannot catch a regression
+        // here — 66x amplification passed it comfortably on this host and only
+        // failed on a 64 KiB-page kernel, which is what let this cost sit in
+        // the tree documented rather than fixed.
+        fprintf(stderr,
+                "FAIL: %.1fx amplification (%.0f B of RSS per %zu-byte object), "
+                "over the %.1fx ceiling. An alignment that a size class already "
+                "satisfies must come from the slab — check alignedSizeClass() "
+                "and SMASH_ALIGN_SLAB.\n",
+                ratio, per_object, kObjectSize, kAmplificationMax);
         ++failures;
     } else if (ratio > double(kWarnRatio)) {
         printf("WARN: %.1fx amplification (%.0f B of RSS per %zu-byte object). "
