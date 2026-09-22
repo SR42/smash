@@ -768,6 +768,39 @@ alignments 32 B–8 KiB against 21 sizes from 1 B to 64 KiB: 4536 allocations pe
 configuration, checked for alignment, usable size and byte stability, 0
 failures in all four of {full, large-only} × {routing on, off}.
 
+**The other approach — searching a normal slab for aligned slots — is built
+but off by default (`SMASH_ALIGN_SLOT_SEARCH=1`), because it usually loses.**
+It keeps the request in its *natural* class and takes a slot whose index is a
+multiple of `alignment / gcd(class_size, alignment)`. The slots it steps over
+are stranded unless something else allocates them, so its cost is
+`class_size x stride` = `lcm(class_size, alignment)`. Computed over all 131072
+(size, alignment) pairs, that **never beats promotion** when the workload
+allocates only aligned objects: equal in 110928 cases, worse in 20144, worst
+**7.0x** (97 B at 128-byte alignment — natural class 112 B x stride 8 = 896 B
+against a promoted 128 B). Measured, 200 k live 48-byte objects at 64-byte
+alignment: 76 B/object promoted, **202 B/object** searched.
+
+It wins only when ordinary allocations of the same class fill those slots, and
+**call-site arena routing normally prevents exactly that**: `callsiteArena()`
+sends a `posix_memalign` call site and a `malloc` call site to different
+arenas, hence different slabs, so the plain allocations never reach the skipped
+slots. Measured with 200 k aligned 48-byte objects interleaved with 600 k plain
+ones — 62 B/object promoted, **94 B/object searched** with default arenas, i.e.
+worse, and 61 B/object once `SMASH_NUM_ARENAS=1 SMASH_CPU_ARENA=0` forces them
+to share.
+
+Where it does pay is a large alignment on a small object, with traffic to fill
+the gaps. 50 k objects at 4096-byte alignment and 64 bytes each, interleaved
+with 3.2 M plain 64-byte allocations, single arena: **137 -> 74 bytes per
+object, 444.5 MiB -> 241.3 MiB**. Promotion has to round those to the 4096-byte
+class; the search leaves them in the 64-byte class.
+
+So enable it only with evidence that the aligned and plain allocations of a
+class share an arena — which in practice means collapsing arenas — and that the
+alignment is far larger than the object. The suite passes 70/70 with it forced
+on, and the aligned-API sweep (4536 allocations per configuration) is clean in
+both modes with it on.
+
 `SMASH_ALIGN_SLAB=0` restores the old routing. Alignments above a page, and
 sizes above `kMaxSmallSize`, still go to `LargeAlloc` — as does everything in
 large-only mode, where small aligned requests pass through to the system
@@ -1449,6 +1482,7 @@ Runtime environment variables:
 - `SMASH_WRITE_TRACK=auto|softdirty|uffd|none`: How writes are detected (default `auto`, chosen by testing each mechanism; see "Write tracking"). `SMASH_SOFTDIRTY=0` still selects Phase 3 PROT_READ monitoring
 - `SMASH_NO_MONITOR=1`: Disable Phase 3 (PROT_READ access tracking) entirely. Trades cold-detection accuracy for compatibility with code paths that synchronously check page protection
 - `SMASH_VM_GIB=N`: Size of the compressible arena, default 16, ceiling 1 TiB (`kVmMaxBytes`). The arena is a PROT_NONE `MAP_NORESERVE` reservation and its per-page metadata is demand-paged, so an unused arena costs address space, not memory (measured: 16, 64 and 1024 GiB all start at 23.3 MB RSS). If the reservation fails — a 39-bit-VA arm64 kernel, `ulimit -v` — `VmRegion::init` halves the request down to 256 MiB and says so, instead of silently running without compression as it used to (measured: with a 48 GiB address-space limit, `SMASH_VM_GIB=1024` gets a 32 GiB arena and compresses; before, compression was off). The old 64 GiB ceiling was an estimate of metadata cost, not a limit; page indices are 32-bit, so the hard bound is 16 TiB
+- `SMASH_ALIGN_SLOT_SEARCH=1`: Keep an aligned small allocation in its natural size class and search that class's bitmap for an aligned slot, instead of promoting it to a class that is a multiple of the alignment. **Off by default and usually a loss** — the stranded slots make it up to 7× worse, and call-site arena routing keeps plain allocations from filling them. See "Aligned small allocations come from the slab"
 - `SMASH_ALIGN_SLAB=0`: Restore the old aligned-allocation routing, where any alignment above 16 B goes to `LargeAlloc` and costs a whole page per object. Default ON (slab-served); see "Aligned small allocations come from the slab"
 - `SMASH_MID_BINS=1`: Serve the (16 KiB, 1 MiB) band from size-binned chunks in the compressible arena instead of one direct `mmap` each. Off by default: it trades ~10% of the requested bytes to size-class rounding for compressibility and much cheaper churn, which only pays for blocks that go cold. See "Mid-size bins"
 - `SMASH_THP=1`: `madvise(MADV_HUGEPAGE)` the arena. Off by default: it keeps a dense hot set on huge pages (TLB coverage) while the cold set still compresses, but inflates RSS 22× on a sparse touch pattern. See "Hugepages and THP"

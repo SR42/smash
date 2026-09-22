@@ -432,6 +432,51 @@ public:
     }
 
     // Allocate one object from this size class. Caller must hold no locks.
+    // Allocate an object whose slot index is a multiple of `stride`, so its
+    // address carries that much extra alignment. nullptr when no span of this
+    // class can host one — the caller then falls back to promoting the request
+    // to a size class that is itself a multiple of the alignment.
+    // SMASH_ALIGN_SLOT_SEARCH only.
+    //
+    // Only existing spans are searched, and a new one is created just as
+    // allocate() would. What this deliberately does NOT do is keep looking
+    // past the first partial span: an aligned request that misses there is
+    // cheaper to serve by promotion than by walking every span of the class.
+    void* allocateAligned(uint32_t stride) {
+        LockGuard guard(lock_);
+        drainPending();
+
+        if (Span* span = partial_.front()) {
+            maybeWiden(span);
+            if (void* ptr = span->allocateAligned(stride)) {
+                if (span->full()) {
+                    partial_.remove(span);
+                    full_.pushFront(span);
+                }
+                return ptr;
+            }
+        }
+
+        Span* span = empty_.popFront();
+        if (!span) {
+            span = allocateNewSpan();
+            if (!span) return nullptr;
+        } else {
+            recommitEmptySpan(span);
+        }
+        void* ptr = span->allocateAligned(stride);
+        if (!ptr) {
+            // A fresh span always has slot 0 free, so this cannot happen for a
+            // stride the span can host; if it ever does, keep the span on the
+            // empty list rather than leaking it.
+            empty_.pushFront(span);
+            return nullptr;
+        }
+        if (span->full()) full_.pushFront(span);
+        else partial_.pushFront(span);
+        return ptr;
+    }
+
     void* allocate() {
         LockGuard guard(lock_);
         drainPending();  // apply any deferred cross-thread frees first

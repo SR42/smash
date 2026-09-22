@@ -407,6 +407,39 @@ struct Span {
         return nullptr;  // no warm slot; fb holds any fallbacks
     }
 
+    // Allocate a slot whose index is a multiple of `stride` (a power of two),
+    // so the object's address is aligned to `stride * object_size` on top of
+    // the span's page-aligned base. nullptr when the span holds no such free
+    // slot. SMASH_ALIGN_SLOT_SEARCH only.
+    //
+    // Deliberately ignores the warm/cooling slot preference that
+    // allocateWarm() applies: the aligned slots are a fixed sub-lattice of the
+    // bitmap, so there is no freedom to prefer one page over another without
+    // giving up the alignment that is the entire point of the call.
+    void* allocateAligned(uint32_t stride) {
+        if (stride <= 1) return allocate();
+        const size_t num_words = (full_capacity + 63) / 64;
+        const int telem_ticks = cold_counts ? coolingCloseDefaultTicks() : 0;
+        if (stride >= 64) {
+            // Only slot 0 of every (stride/64)-th word qualifies.
+            const size_t wstep = stride / 64;
+            for (size_t i = 0; i < num_words; i += wstep)
+                if (bitmap[i] & 1ULL)
+                    return takeSlot(static_cast<int>(i), 0, true, telem_ticks);
+            return nullptr;
+        }
+        // stride divides 64, so word*64 is a multiple of it and the test
+        // reduces to the bit index within the word.
+        uint64_t mask = 0;
+        for (uint32_t b = 0; b < 64; b += stride) mask |= (uint64_t{1} << b);
+        for (size_t i = 0; i < num_words; ++i) {
+            const uint64_t w = bitmap[i] & mask;
+            if (!w) continue;
+            return takeSlot(static_cast<int>(i), ctz(w), true, telem_ticks);
+        }
+        return nullptr;
+    }
+
     // Consume a fallback recorded by allocateWarm(): cooling first (streak
     // reset counts as a re-heat, but no fault), then compressed (the user's
     // first access will fault and decompress; cold_counts untouched — the

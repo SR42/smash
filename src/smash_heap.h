@@ -22,6 +22,7 @@
 #include "util/safe_printf.h"  // allocation-free snprintf for malloc-path diagnostics
 #include <alloc8/alloc8.h>     // alloc8_caller_ra: app allocation site captured at wrapper entry
 #include <cstddef>
+#include <numeric>
 #include <cstdint>
 #include <atomic>
 #include <dlfcn.h>
@@ -1729,6 +1730,32 @@ public:
         // object of an ordinary class that free(), getSize() and the thread
         // cache already handle. appCallerRA() reads alloc8's TLS hint, so
         // arena routing still sees the application's call site, not this one.
+        // SMASH_ALIGN_SLOT_SEARCH: try the natural class first, taking a slot
+        // whose index is a multiple of the stride that makes it aligned. This
+        // avoids promoting the request, but only pays when ordinary
+        // allocations of that class consume the slots it steps over — see the
+        // note on alignSlotSearchEnabled(). Falls through to promotion when
+        // the class has no aligned slot free.
+        if (alignSlotSearchEnabled() && alignment <= kPageSize &&
+            size <= kMaxSmallSize) {
+            const uint8_t nc = sizeToClass(size);
+            if (nc < kNumClasses) {
+                const size_t csz = classSize(nc);
+                const size_t g = std::gcd(csz, alignment);
+                const size_t stride = alignment / g;
+                if (stride == 1) {
+                    // Every slot of this class is already aligned.
+                    return this->malloc(size);
+                }
+                const uint8_t arena = callsiteArena(nc, appCallerRA());
+                // Bypasses the thread cache on purpose: a cached pointer is an
+                // arbitrary slot of the class and cannot be assumed aligned.
+                if (void* p = slab(arena, nc).allocateAligned(
+                        static_cast<uint32_t>(stride)))
+                    return p;
+            }
+        }
+
         if (alignSlabEnabled()) {
             const uint8_t acls = alignedSizeClass(size, alignment);
             if (acls < kNumClasses) return this->malloc(classSize(acls));
