@@ -517,6 +517,26 @@ public:
                     return base_ + idx * kPageSize;
                 }
             }
+            // Then the same thing the node arenas do: a run that has been
+            // freed but is still queued for decommit is not gone, it is in
+            // flight, and giving up on it hands the caller a direct mapping
+            // that is never compressed. Measured with a 1 GiB arena and 2 MiB
+            // blocks before this: 1728 of 40000 blocks fell out at 4 threads,
+            // 46263 of 160000 at 8, 93726 at 16 and 144241 at 64 — while a
+            // single thread, whose decommit thread keeps up, lost none.
+            //
+            // drainInFlight() covers both a queued run and one another thread
+            // is already processing, so this only stops retrying when there is
+            // genuinely nothing left to come back.
+            for (int attempt = 0; attempt < kDrainWaitAttempts; ++attempt) {
+                drainDecommitQueueNow();
+                if (const size_t idx = free_map_.take(num_pages, kSharedOwner);
+                    idx != PageRunMap::kNone) {
+                    return base_ + idx * kPageSize;
+                }
+                if (!drainInFlight()) break;
+                sched_yield();
+            }
             return nullptr;
         }
         void* addr = base_ + start * kPageSize;

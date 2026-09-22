@@ -530,6 +530,26 @@ add_smash_mode_test(test_malloc_numa_full       malloc_numa_test 0 120
 add_smash_mode_test(test_malloc_numa_large_only malloc_numa_test 1 120
                     "SMASH_COLD_TIMEOUT_SEC=1")
 
+# The shared arena (every ordinary large allocation) must reuse freed pages
+# rather than spill onto uncompressible direct mappings. SMASH_VM_GIB=1 is
+# load-bearing: with the default 16 GiB neither phase reaches exhaustion and
+# both pass without exercising anything.
+add_executable(shared_arena_churn_test shared_arena_churn_test.cpp)
+set_target_properties(shared_arena_churn_test PROPERTIES CXX_STANDARD 20)
+target_link_libraries(shared_arena_churn_test PRIVATE ${CMAKE_DL_LIBS} Threads::Threads)
+# Phase A (in-flight frees) and phase B (reclaiming empty slab spans) are
+# separate registrations, not two phases of one run: each leaves the arena in a
+# state that makes the other fail for the wrong reason, and forking to separate
+# them inherits a slab lock held by a smash background thread at fork time,
+# which crippled reclaimEmptySpans()'s tryLock in the child and reproduced the
+# very symptom phase B hunts. Separate processes, one phase each.
+add_smash_mode_test(test_shared_arena_churn_full       shared_arena_churn_test 0 600
+                    "SMASH_VM_GIB=1;SMASH_TEST_PHASE=A")
+add_smash_mode_test(test_shared_arena_churn_large_only shared_arena_churn_test 1 600
+                    "SMASH_VM_GIB=1;SMASH_TEST_PHASE=A")
+add_smash_mode_test(test_arena_reclaim_concurrent      shared_arena_churn_test 0 600
+                    "SMASH_VM_GIB=1;SMASH_TEST_PHASE=B")
+
 # A malloc_numa churn loop must keep reusing its node arena instead of taking
 # fresh region. A freed run reaches the free map only when its queued decommit
 # is processed, so a tight loop misses the map; the miss used to go straight to
