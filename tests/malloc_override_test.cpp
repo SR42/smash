@@ -27,9 +27,12 @@
 // Verified as a real discriminator: inverting the full-mode sense makes it
 // fail (exit 1), and `smash_arena_for()` returns -1 for stack addresses, raw
 // mmap results and NULL, while returning a real arena id for malloc'd memory.
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <malloc.h>
+#include <new>
 #include <dlfcn.h>
 
 namespace {
@@ -107,6 +110,46 @@ int main() {
     if (static_cast<unsigned char*>(large)[big - 1] != 0x5a)
         return fail("2 MiB block not writable to its last byte");
     free(large);
+
+    // ── every aligned entry point must be interposed, not just malloc ──────
+    // A wrapper only wins when it is exported at the version the caller binds.
+    // aligned_alloc is versioned GLIBC_2.16 by glibc while smash's map put it
+    // in the GLIBC_2.2.5 base node, so every aligned_alloc block came from
+    // libc: smash never tracked or compressed it, and nothing said so. The
+    // same class of bug as the pthread_create@GLIBC_2.34 leak. Alignment and
+    // usability prove nothing here — libc's own aligned_alloc satisfies both —
+    // so the check has to be ownership.
+    //
+    // A 2 MiB request keeps this mode-independent: it is smash-managed in
+    // large-only too, where small allocations pass through by design.
+    {
+        const size_t asz = 2u << 20;
+        struct { const char* name; void* p; } probes[4];
+        void* pm = nullptr;
+        if (posix_memalign(&pm, 64, asz) != 0) pm = nullptr;
+        probes[0] = {"posix_memalign", pm};
+        probes[1] = {"aligned_alloc", aligned_alloc(64, asz)};
+        probes[2] = {"memalign", memalign(64, asz)};
+        probes[3] = {"operator new(align_val_t)",
+                     ::operator new(asz, std::align_val_t(64))};
+        for (auto& pr : probes) {
+            if (!pr.p) return fail(pr.name);
+            if (reinterpret_cast<uintptr_t>(pr.p) % 64)
+                return fail("aligned entry point returned a misaligned block");
+            if (!owned(pr.p)) {
+                std::fprintf(stderr,
+                    "FAIL: %s returned a block smash does not own — the wrapper "
+                    "is not being bound (check its symbol version against "
+                    "glibc's in smash_version_script.map)\n", pr.name);
+                return 1;
+            }
+            std::memset(pr.p, 0x33, asz);
+        }
+        free(probes[0].p);
+        free(probes[1].p);
+        free(probes[2].p);
+        ::operator delete(probes[3].p, std::align_val_t(64));
+    }
 
     std::printf("PASS: %s\n",
                 large_only ? "large-only — small bypassed, large owned"

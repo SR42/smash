@@ -15,7 +15,7 @@
     realloc;
     memalign;
     posix_memalign;
-    aligned_alloc;
+@SMASH_ALIGNED_ALLOC_IN_BASE@
     free_sized;
     free_aligned_sized;
     malloc_usable_size;
@@ -332,6 +332,15 @@ GLIBC_2.16 {
   global:
     __poll_chk_216;
     __ppoll_chk_216;
+    # glibc versions aligned_alloc at GLIBC_2.16, so a caller binds
+    # aligned_alloc@GLIBC_2.16 and a base-node-only export never runs — ld.so
+    # silently uses libc's, and the block is never tracked or compressed
+    # (measured: smash_arena_for() said NO for aligned_alloc while
+    # posix_memalign, memalign and valloc were all smash-owned). Substituted
+    # empty where the arch's ABI baseline is already >= 2.16 (aarch64,
+    # GLIBC_2.17), because there the bare name in the base node is what
+    # callers bind and exporting it twice is the self-jump trap below.
+@SMASH_ALIGNED_ALLOC_IN_216@
 } GLIBC_2.5;
 
 # libevent requests epoll_wait@GLIBC_2.3.2

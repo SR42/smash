@@ -184,6 +184,31 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     set(SMASH_CHK_BASE_EXPORTS "")
   endif()
 
+  # aligned_alloc appeared in glibc 2.16, so a caller binds
+  # aligned_alloc@GLIBC_2.16 (or @GLIBC_2.17 on aarch64, whose ABI baseline is
+  # higher). Exporting it only in a GLIBC_2.2.5 base node leaves that reference
+  # unbound and ld.so silently uses libc's aligned_alloc instead: measured,
+  # smash_arena_for() said NO for every aligned_alloc block while
+  # posix_memalign, memalign and valloc were all smash-owned. The blocks then
+  # come back to smash's free(), which forwards them to libc — correct, but the
+  # memory is never tracked or compressed.
+  #
+  # A version node can never precede the arch's ABI baseline, so emit the 2.16
+  # node only when the base is below it; where the base is already >= 2.16
+  # (aarch64, GLIBC_2.17) the bare name in the base node is what callers bind,
+  # and a second node of the same name would be a duplicate definition.
+  string(REPLACE "GLIBC_" "" _smash_base_ver "${SMASH_GLIBC_BASE_VERSION}")
+  # The map already has a GLIBC_2.16 node (the __*_chk_216 aliases), so
+  # aligned_alloc joins that one — a second node of the same version name is a
+  # link error.
+  if(_smash_base_ver VERSION_GREATER_EQUAL "2.16")
+    set(SMASH_ALIGNED_ALLOC_IN_BASE "    aligned_alloc;")
+    set(SMASH_ALIGNED_ALLOC_IN_216 "")
+  else()
+    set(SMASH_ALIGNED_ALLOC_IN_BASE "")
+    set(SMASH_ALIGNED_ALLOC_IN_216 "    aligned_alloc;")
+  endif()
+
   # clock_nanosleep@GLIBC_2.17 needs its own version node on x86-64, but on
   # aarch64 GLIBC_2.17 *is* the base version: defining it twice would both fail
   # to link and, if it linked, export clock_nanosleep at one version as the
