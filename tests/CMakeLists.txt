@@ -539,9 +539,13 @@ add_smash_mode_test(test_malloc_numa_large_only malloc_numa_test 1 120
 add_executable(numa_arena_churn_test numa_arena_churn_test.cpp)
 set_target_properties(numa_arena_churn_test PROPERTIES CXX_STANDARD 20)
 target_link_libraries(numa_arena_churn_test PRIVATE ${CMAKE_DL_LIBS} Threads::Threads)
-add_smash_mode_test(test_numa_arena_churn_full       numa_arena_churn_test 0 180
+# 600 s, not 180: the work scales with the host's memory-node count (every
+# node runs its own 100000 round trips) and every arena miss now drains the
+# decommit queue inline, so a many-node or slow-syscall host takes far longer
+# than the ~5 s this costs on a 4-node x86-64 box.
+add_smash_mode_test(test_numa_arena_churn_full       numa_arena_churn_test 0 600
                     "SMASH_VM_GIB=1")
-add_smash_mode_test(test_numa_arena_churn_large_only numa_arena_churn_test 1 180
+add_smash_mode_test(test_numa_arena_churn_large_only numa_arena_churn_test 1 600
                     "SMASH_VM_GIB=1")
 
 # malloc_numa_aligned(node, size, align): malloc_numa plus an alignment

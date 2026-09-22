@@ -31,7 +31,14 @@
 #include <cstring>
 #include <dlfcn.h>
 #include <thread>
+#include <time.h>
 #include <vector>
+
+static double nowSec() {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return t.tv_sec + t.tv_nsec * 1e-9;
+}
 
 #if defined(__linux__)
 #include <unistd.h>
@@ -73,12 +80,32 @@ static void runLinux() {
 
     const std::vector<int> nodes = numa_test::memoryNodes();
 
+    // Host context, printed before any assertion: this test is sensitive to
+    // node count (every node's arena carves its own 64 MiB chunks out of one
+    // SMASH_VM_GIB arena) and to the kernel page size (smash's kPageSize is a
+    // compile-time 4096; an aarch64 kernel with 16 or 64 KiB pages makes every
+    // mprotect and madvise sub-page-aligned — see test_page_size). A failure
+    // report is hard to act on without these.
+    const char* vm_gib = getenv("SMASH_VM_GIB");
+    printf("host: %zu memory node(s), %ld online CPU(s), kernel page %ld B, "
+           "SMASH_VM_GIB=%s\n",
+           nodes.size(), sysconf(_SC_NPROCESSORS_ONLN), ps,
+           vm_gib ? vm_gib : "(default)");
+    if (ps != 4096)
+        printf("NOTE: kernel page is %ld B, not 4096 — smash is built with a "
+               "compile-time 4096-byte page, so this test's arena arithmetic "
+               "and smash's own page operations disagree with the kernel.\n", ps);
+
     // Single-threaded, per node. 100k round trips of 64 KiB is 6.25 GiB of
     // allocation through a 1 GiB arena, so it cannot be satisfied without
     // reuse: before the fix this exhausted the arena at round trip ~55000.
     for (int node : nodes) {
         long nulls = 0;
+        const double t0 = nowSec();
         const long out = churn(static_cast<uint32_t>(node), 64 * 1024, 100000, &nulls);
+        const double dt = nowSec() - t0;
+        if (dt > 20.0)
+            printf("  node %d: 100000 round trips took %.1f s\n", node, dt);
         if (out || nulls) {
             fprintf(stderr, "FAIL: node %d: 100000 single-threaded round trips gave "
                     "%ld block(s) outside the compressible arena and %ld NULL — the "
