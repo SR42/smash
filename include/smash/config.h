@@ -28,7 +28,7 @@ inline constexpr size_t kMinAlignment = 16;
 // size class and search that class's bitmap for a slot whose index is a
 // multiple of alignment/gcd(class_size, alignment), instead of promoting the
 // request to a class that is itself a multiple of the alignment. Off by
-// default, and see "Aligned small allocations" in CLAUDE.md before enabling:
+// default; read "Aligned small allocations" (agents/allocation-paths.md):
 // measured over all 131072 (size, alignment) pairs, it never beats promotion
 // when the workload allocates only aligned objects — the slots it steps over
 // are stranded — and is up to 7x worse. It wins only when ordinary

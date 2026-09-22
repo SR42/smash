@@ -111,7 +111,7 @@ extern __attribute__((tls_model("initial-exec")))
 // computation in between (`mov %fs:0`, `lea`) writes no flags. The result is a
 // spurious "load of null pointer of type 'int'" on every call, over a load
 // that is in fact correct. Reproduced on gcc 13.3 and 14.2 at -O2 and above;
-// clang 18 is clean. See CLAUDE.md, "Sanitizers".
+// clang 18 is clean. See agents/sanitizers.md.
 extern __attribute__((tls_model("initial-exec")))
     constinit thread_local int g_full_mode_cached;  // -1 = unknown, 0 = bypass, 1 = full
 

@@ -1,0 +1,463 @@
+# Performance: measured costs and limits
+
+Measured costs of the hot paths, compression throughput and its limits, codec and unit-size trade-offs, and the open performance defects. Moved from CLAUDE.md.
+
+## The base small-object path: the thread cache is 4 deep, and that is the cost
+
+An alloc+free pair of 64-byte objects costs **35 ns against glibc's 9 ns** with
+no drains involved, and the reason is `kPerLaneDepth`:
+
+```
+kCacheLanes = 64, kThreadCacheMaxPerClass = 256
+kPerLaneDepth = 256 / 64 = 4
+```
+
+Each (lane, size-class) cache holds **four pointers**, so roughly every fourth
+allocation goes to the slab through `ThreadCache::refill` and every fourth free
+drains through `drainRangeToSlabs`. A `perf` profile of a pure cache-hit
+workload (batch 64, far below the nominal 256 capacity) confirms it:
+`drainRangeToSlabs` 22.3%, `refill` 14.4% — a third of the time in paths that
+should not run at all on a cache hit.
+
+The lanes exist to keep arenas separate, so the depth cannot simply be bought
+by reducing them — that caps segregation. Measured, all on this 8-CPU host
+(16 arenas, 32 with cold-bias doubling):
+
+| lanes | depth | memory/thread | alloc+free | distinct arenas over 32 call sites |
+|---|---|---|---|---|
+| **64 (stock)** | **4** | **72 KB** | **35.5–36.7 ns** | **14** |
+| 32 | 8 | 72 KB | 29.7–30.2 ns | 14 |
+| 8 | 32 | 72 KB | 21.0 ns | **8 — collapsed** |
+| 64 | 16 | 288 KB | 23.4–23.9 ns | 14 |
+| 64 | 64 | 1152 KB | 15.3–17.0 ns | 14 |
+| glibc | | | 9.0 ns | |
+
+Two things follow. **Depth is worth a lot** — 4 → 64 takes the path from 35 ns
+to 15 ns, within 70% of glibc — but buying it with `kThreadCacheMaxPerClass`
+costs 1.15 MB per thread, and per-thread memory is exactly what
+`test_thread_cache_reclaim_*` exists to police. **Cutting lanes is not free
+either**, even though it looks it: at the same 72 KB, 8 lanes give 21 ns but
+collapse 32 call sites from 14 distinct arenas to 8, because the lane count
+caps how many arenas a thread can hold objects for. `bench_arena_segregation`
+does *not* see this (it reports ratios for homogeneous pages only, not how many
+pages stay homogeneous), so the routing test is the instrument that matters.
+
+**All of that is measured at low thread counts, and it does not extrapolate.**
+The same alloc/free workload across threads (8 physical cores, so 128 threads
+is oversubscribed), with one free in eight handed to a peer:
+
+| threads | stock (depth 4) | depth 64 | glibc |
+|---|---|---|---|
+| 1 | 35.3 ns | **16.0** | 12.0 |
+| 8 | 48.8 ns | **31.5** | 20.9 |
+| 32 | 43.3 ns | **35.5** | 21.5 |
+| 128 | **53.5 ns** | 75.3 | 25.6 |
+
+A deeper cache wins by 2x at one thread, by a third at eight, barely at 32, and
+**loses at 128** — 1.15 MB per thread is 147 MB of thread caches across 128
+threads, and that stops fitting anywhere. Whether that crossover is the same on
+a machine with 128 *real* cores is not something an 8-core host can answer;
+treat the last row as a warning that depth is not free at scale, not as a
+measurement of a 128-core box.
+
+**Arena and lane counts scale with CPUs, and the interesting case is 128
+cores**: `getNumArenas()` gives 64 there, so 128 arenas with cold-bias against
+64 lanes — 2:1 collisions. Those collisions are benign by construction:
+`lane = arena & 63` and the cold-bias arena is `base + 64`, so each arena
+collides with exactly its own twin, never with an unrelated call-site group.
+It also means the lane-sizing fix below buys such a machine nothing — its lanes
+are already saturated, and matching lanes to 128 arenas within a fixed budget
+would *halve* the depth to 2.
+
+**The principled fix is to size the lanes to the runtime arena count**, which
+is known at thread-cache creation: `getTotalArenas()` is 32 here and 8 on a
+4-CPU host, against a fixed 64 lanes. That wastes half the cache on this host
+and 87% of it on a small one, and pays for it in depth. Matching them is worth
+**17% here at identical memory with routing untouched** (35.5 → 29.7 ns,
+distinct arenas 14 either way) and considerably more on smaller hosts, where 8
+arenas would give depth 32. It needs ThreadCache to use a runtime stride and a
+runtime per-lane depth instead of the compile-time `void* ptrs[kPerLaneDepth]`,
+so it is a refactor of the hottest path, not a constant change.
+
+## The thread-cache drain path, and what actually costs in it
+
+`drainRangeToSlabs` (`smash_heap.cpp`) returns a lane's worth of pointers to
+their arenas' slabs: resolve each pointer's span, counting-sort by arena into
+stack buffers, then one batch per non-empty arena. It runs whenever a free
+finds its lane full (every ~128 frees, draining half a 256-entry lane) and on
+every thread teardown, so it is the cross-thread-free path.
+
+**It is expensive, and worth knowing by how much.** A batch allocate/free loop
+of 64-byte objects, varying the batch across the 256-entry lane capacity so
+drains go from never to constant:
+
+| batch | smash | glibc |
+|---|---|---|
+| 64 (no drain) | 41.5 ns | 8.7 ns |
+| 256 | 84.1 ns | 8.8 ns |
+| 4096 | 117.4 ns | 9.4 ns |
+| 32768 | 118.7 ns | 9.5 ns |
+
+So draining roughly triples the per-operation cost of this pattern.
+
+Two things in it were wasteful, and **the one that mattered was not the one
+that looked like it would**:
+
+- `uint32_t counts[kTotalArenas]{}` zeroed **1 KiB on every drain**
+  (`kTotalArenas` is 256 — `kMaxArenas` 128, doubled for cold-arena feedback)
+  while `getTotalArenas()` is typically 8. Zeroing only the live entries:
+  **119.0 → 110.5 ns, −7.1%** on the hot workload above.
+- The span lookup used `PageMap::get()`, the two-level radix walk, where
+  `free()`'s own fast path uses one load from the flat per-page table. Adding
+  `PageMap::getFast()` and using it here gains **nothing measurable when the
+  tables are hot** (110.5 → 111.4 ns, inside noise) and **−1.1% on a large
+  shuffled working set** where they are not (779.4 ± 5.0 → 770.6 ± 4.5 ns over
+  six runs). Keep both, but do not expect the second one to show up on a
+  microbenchmark that reuses the same pages.
+
+The frame is also ~9.5 KiB of stack buffers per call (`spans`, `arenas`,
+`counts`, `offsets`, `cursor`, `out_ptrs`, `out_spans`, all sized for the
+compile-time maxima). Suite 66/66.
+
+## Per-page metadata costs ~1% of the arena, and it is sized for the whole arena
+
+The compressor keeps fifteen per-page arrays (`compressed_`, `cold_count_`,
+`page_tier_`, `shadow_tick_`, the page-state table, the per-page `Span*` table,
+…). Summed, they are **43 bytes per 4 KiB page — 1.05% of whatever the arena
+covers** — and they come from BootstrapAlloc sized for `vm->totalPages()`, not
+for the pages actually used. `MAP_NORESERVE` keeps the untouched part off RSS,
+but the bootstrap *capacity* must cover the whole arena:
+
+| `SMASH_VM_GIB` | metadata capacity needed |
+|---|---|
+| 16 (default) | 0.18 GB |
+| 128 | 1.44 GB |
+| 512 | 5.77 GB |
+| 1024 (ceiling) | 11.54 GB |
+
+Against a capacity of 15.4 GB after the geometric-growth fix, and **1.07 GB
+before it** — which is exactly why a run with `SMASH_VM_GIB=512` died at
+~169 GB RSS with a write to address 0. Raising `SMASH_VM_GIB` is not free: it
+costs ~11 MB of metadata capacity per GiB of arena even if the arena is empty.
+
+For a workload's *resident* cost the same 1% applies to pages actually used, on
+top of the compressed blobs. A 50 GB cold set that compresses 16.7x (measured
+on a real application under zram, LZ4, which compresses page-at-a-time exactly
+as smash does) lands at roughly 3.0 GB of blobs plus 0.56 GB of metadata —
+about **14x effective**, against the codec's 16.7x.
+
+## The ratio you measure depends entirely on the data you measure it with
+
+`test_compression_ratio` and `bench_compression` both build their page with
+`fillCompressiblePage()`: a fixed record header, a zeroed middle and a tail of
+`(off + i) & 0xFF`. The comment rightly rejects an all-one-byte page as
+degenerate, but the replacement is still **periodic** — the pattern repeats
+with a period of at most 256 bytes — and periodicity is exactly what a
+compressor is best at. Measured consequences, same codecs, same machine:
+
+| data | zstd-1 at 4 KiB | zstd-1 at 2 MiB |
+|---|---|---|
+| smash's generator | 25–26x | **6043x** |
+| synthetic heap-shaped (pointers, strings, ints, padding) | 3.13x | 3.52x |
+| 64 MiB of real system binaries | 2.01x | 2.37x |
+
+A 6000x ratio is not a compression result, it is a statement that the input
+repeats. Two things follow. The **25–26x the in-tree test reports is an upper
+bound**, not what an application should expect — the paper's own RQ2 figures
+(LZ4 4.7–12.3x, zstd-1 8.8–20.4x) sit well below it. And **that data must
+never be used to reason about unit size**: it says a 2 MiB unit is 240x better,
+where realistic data says 8–20%. The test is still a good regression guard for
+"did the codec break", which is what it claims to be; it is not a model of a
+heap.
+
+The same caveat applies to the codec choice. On smash's generator LZ4 gives up
+only 4% of zstd's ratio (25.3x against 26.3x), which would make LZ4 look nearly
+free; on realistic data it gives up 25–40%. Which of those an application sees
+depends on its own bytes.
+
+## The compression unit is one page, and bigger is only worth it up to ~64 KiB
+
+A recurring question, and the reason THP degrades under smash (the compressor
+protects and reclaims 4 KiB at a time, which splits a huge page). Measured with
+zstd level 1, the tier smash actually uses, over 64 MiB of two data sets —
+synthetic heap-shaped bytes (pointers, short strings, small ints, zero
+padding) and 64 MiB of real system binaries — compressing the same bytes as
+independent units of each size:
+
+| unit | ratio (heap / real) | decompress per unit | compress per unit |
+|---|---|---|---|
+| **4 KiB** (today) | 3.13x / 2.01x | 7.9 / 7.4 µs | 15.5 / 16.4 µs |
+| 16 KiB | 3.37x / 2.25x | 19.3 / 16.6 µs | 41.5 / 46.7 µs |
+| 64 KiB | 3.36x / 2.32x | 58.4 / 48.0 µs | 145 / 151 µs |
+| 256 KiB | 3.37x / 2.41x | 219 / 175 µs | 551 / 555 µs |
+| 1 MiB | 3.52x / 2.36x | 853 / 675 µs | 2007 / 1953 µs |
+| 2 MiB (THP-sized) | 3.52x / 2.37x | **1684 / 1338 µs** | 3947 / 3852 µs |
+
+Two things follow. **The ratio gain is front-loaded and small**: +8% (heap) to
++12% (real) by 16 KiB, +20% at best anywhere, and it plateaus — real data is
+*worse* at 2 MiB than at 256 KiB. **The latency is linear and unforgiving**: a
+THP-sized unit makes every first touch cost 1.3–1.7 ms, against 8 µs today.
+That is the argument against ever matching the compression unit to a huge page,
+independent of how convenient it would be for THP.
+
+(Numbers below are with compression contexts reused, as smash does —
+`ZSTD_compressCCtx` / `ZSTD_decompressDCtx` and `LZ4_compress_fast_extState`.
+Using the one-shot APIs instead inflates the 4 KiB rows by ~25% and leaves the
+large ones unchanged, which flatters big units.)
+
+**LZ4 shifts the trade but does not change the conclusion.** Same data, same
+unit sizes, `LZ4_compress_fast` at acceleration 1 against zstd-1:
+
+| unit | zstd-1 ratio | zstd-1 decomp | LZ4 ratio | LZ4 decomp |
+|---|---|---|---|---|
+| 4 KiB | 3.13x / 2.01x | 8.4 / 7.8 µs | 1.86x / 1.59x | **1.8 / 1.2 µs** |
+| 16 KiB | 3.37x / 2.25x | 19.8 / 17.0 µs | 1.91x / 1.74x | 7.0 / 4.1 µs |
+| 64 KiB | 3.36x / 2.32x | 58.8 / 48.8 µs | 1.93x / 1.84x | 27.3 / 15.9 µs |
+| 2 MiB | 3.52x / 2.37x | 1644 / 1394 µs | 1.93x / 1.81x | 857 / 460 µs |
+
+LZ4 decompresses **4–6x faster** and compresses **25–40% worse**, and it gains
+even less from a larger unit than zstd does (1.86x → 1.93x across the whole
+range on heap-shaped data) because it finds no long-range matches to exploit.
+So the unit-size conclusion holds for both codecs: 2 MiB still costs half a
+millisecond per fault under LZ4, which is 60x worse than the 8 µs a zstd-1 page
+costs today.
+
+The choice is therefore between axes, not sizes: **zstd-1 at 16–64 KiB** for
+ratio, **LZ4 at 4 KiB** for fault latency (1.2–1.8 µs). smash already exposes
+the codec as a compile-time ablation (`-DSMASH_USE_LZ4=ON` picks LZ4 as the
+fast tier), and the ROI model chooses fast versus deep tier per page, so the
+tiering to build on is in place.
+
+The interesting range is **16–64 KiB**, and there is a second reason to look
+there: the fault path already decompresses `kPrefetchWindow` = 2 pages in each
+direction, so a fault that finds its neighbours compressed already pays up to
+5 x 7.9 = 40 µs. One 16 KiB unit covers 4 pages for 19 µs *and* compresses 8–12%
+better — cheaper than what the prefetch window already does, for a better
+ratio. Nothing is implemented; the compressor is page-indexed in ~120 places,
+`PageState` is per page and the store is keyed by page index, so this is a
+refactor rather than a constant.
+
+## Coalescing the reclaim syscalls (+41% compression throughput)
+
+`reclaimShadowRange()` — the dominant path in the default deferred-reclaim
+mode — issued **one madvise and one mprotect per reclaimed page**, and under
+FixAv one membarrier per page as well. Its own comment said so ("each reclaimed
+shadow page gets its own mprotect(PROT_NONE) … with no coalescing"), and an
+interposer that counts calls by caller confirmed it: **422,151 madvise calls
+over a 2 GiB cold set, every one of them 4096 bytes**. (The deferred-madvise
+sweeper already coalesced; this path did not. Note that `protectPages` reaches
+the kernel through `syscall(SYS_mprotect, …)`, so an `LD_PRELOAD` shim that
+interposes libc's `mprotect` sees none of them — use `strace` for those and the
+shim for `madvise`.)
+
+Pages are visited in ascending index order within a chunk, and chunks ascend,
+so reclaimable pages are usually adjacent. Accumulating a contiguous run and
+issuing one syscall per run gives, measured on the same workload:
+
+| | per page | coalesced |
+|---|---|---|
+| madvise calls | 422,151 × 4 KiB | **13,386 × 128 KiB** |
+| compression throughput | 142–152 MB/s | **193–222 MB/s** |
+
+**The run cap is 32 pages on purpose.** A page stays locked from the moment it
+joins a run until the flush, so an application thread faulting on it waits for
+the rest of the run's verification work (~10 µs per page). 32 bounds that at a
+few hundred µs while still removing 97% of the syscalls; the sweeper can use
+512 because it holds no page across decompression. Measured cold re-access
+latency is unchanged at 0.2 µs/object.
+
+Correctness rests on the locks being held across the flush: state and
+`shadow_tick_` are set there too, so a fault on any page of a pending run still
+sees `COMPRESSED_SHADOW` and blocks on the lock exactly as before. Every exit
+from the loop flushes, including the VMA-budget breaks and the function's
+return — a missed flush would leave pages locked forever. Suite 66/66 in both
+the default and `SMASH_FIXAV=1` configurations, integrity checks clean in both.
+
+## Batching the PROT_READ arm (+60% on top of that)
+
+Coalescing the reclaim tail left **one** per-page mprotect in
+`reclaimShadowRange()`: the `PROT_READ` arm that precedes the content check.
+It was invisible to the counting interposer for the reason noted above —
+`protectPages` goes through `syscall(SYS_mprotect, …)` — so it was attributed
+with a temporary return-address counter compiled into `protectPages` itself.
+Over a 1 GiB cold set it was **254,803 of the 794,668 remaining calls**, and
+`compressPage`'s defensive `PROT_RW` was the other 539,865.
+
+A look-ahead now arms a whole contiguous run in one call and remembers the
+window (`armed_hi`), so the per-page path re-arms nothing. The run stops at the
+chunk edge, at 32 pages, at the first page that is not `COMPRESSED_SHADOW` or
+not yet past the delay, and at any address discontinuity.
+
+**The look-ahead takes no locks on the pages it arms**, and that is safe for a
+specific reason: arming only *tightens* protection, which this path already has
+to tolerate racing with. Every page re-checks its state under its own lock
+immediately afterwards, and a write that lands first faults, the handler drops
+the blob and restores `PROT_RW`, and the loop then skips the page. A page armed
+but never reached — the chunk ends, the VMA budget trips — costs one spurious
+fault and heals the same way. Locking the look-ahead window instead would
+reintroduce exactly the hold time the 32-page cap exists to bound.
+
+Measured on a 1 GiB cold set (`strace -f -c`), all three stages:
+
+| | per page | reclaim tail | + arm |
+|---|---|---|---|
+| mprotect | 1,048,620 | 794,668 | **540,716** |
+| madvise | 262,168 | 8,216 | **8,216** |
+| membarrier | 262,145 | 8,193 | **8,193** |
+| MB/s (4 GiB, no strace) | 145–153 | ~208 | **237–260** |
+
+The ~2.1 mprotect per page that remain are `compressPage`'s defensive
+`PROT_RW`, one per page. Batching those needs per-page protection tracking —
+the call exists to repair a page whose protection may have been changed by
+another path — so it is left alone.
+
+## Compression throughput is ~250 MB/s and does not scale with cores
+
+**The numbers in this section were measured before the syscall batching above**
+and are kept because the *shape* of the limit is unchanged — only the constant
+moved. Re-measured on the identical 16 GiB workload after batching:
+**254 MB/s** (was 162), CPU 122%, system 66.8 s against user 49.7 s. It is
+still system-heavy, still nowhere near using the eight available cores, and
+still a full pass over 200 GB in **~13 minutes** rather than ~21.
+
+No counter silently caps compression — `SMASH_TIME_BUDGET_PCT`, the one knob
+that marks buckets SKIP, is unset by default and returns -1 (no gating). What
+limits it is the per-page syscall cost, and it gets worse with thread count
+rather than better.
+
+Measured, 16 GiB of compressible data left cold on an 8-core host:
+**162 MB/s**, and 8 GiB gave 161 MB/s — flat. The telling number is the CPU:
+**117%**, with system time (50 s) nearly double user time (28 s). Eight workers
+are available and the machine has eight cores; compression uses barely one of
+them, so it is not CPU-bound and more workers cannot help.
+
+`strace -c -f` over ~485k compressed pages shows why (pre-batching counts;
+mprotect is now ~2.1 per page and madvise and membarrier ~0.03):
+
+| syscall | calls | per page |
+|---|---|---|
+| mprotect | 3,068,894 | **~6.3** |
+| madvise | 485,843 | 1.0 |
+| pwrite64 (clear_refs) | 485,843 | 1.0 |
+| **membarrier** | 485,844 | **1.0** |
+
+Both of the expensive ones scale badly with the application's thread count, not
+with smash's: `mprotect` takes the process-wide `mmap_lock` in write mode, so
+it serialises against every application thread's faults and mappings, and
+`membarrier(MEMBARRIER_CMD_PRIVATE_EXPEDITED)` IPIs **every core running a
+thread of the process** — once per page. The membarrier is load-bearing (it
+drains other threads' store buffers before the page snapshot; without it a
+racing store is lost), so it cannot simply be removed.
+
+Measured effect of the application using its own cores (6 GiB cold, spinner
+threads on an 8-core box): **164 MB/s idle, 93–98 MB/s with 4–7 busy threads**.
+On this host that is confounded with plain CPU competition, so read it as a
+direction, not a coefficient.
+
+**At 200 GB this is still the binding constraint**: a full pass takes ~13
+minutes at 254 MB/s (~21 at the pre-batching 160), and new cold pages queue
+behind it. Measured directly — with a live
+cold set, the time for a *fresh* cold block to compress was 8.0 s at 1 GiB
+live, 42.6 s at 8 GiB, and **never within 60 s at 24 GiB**.
+
+Two other fixed sizes matter at that scale, though neither is a silent cap:
+`kFaultSlotCount = 128` bounds concurrent decompressions (a 128-thread app
+faulting in parallel exhausts it exactly, and `acquireFaultSlot()` spins), and
+`kMaxCompressorWorkers = 8` bounds the worker pool — irrelevant while the work
+is syscall-bound, but it would become the next limit if the syscalls were
+fixed.
+
+## The arena's page allocator has one lock, and it collapses past ~8 threads
+
+`VmRegion::allocatePages()` calls `free_map_.take()` **first on every large
+allocation**, and `PageRunMap` is guarded by a single spinlock ("One lock
+guards the whole map"). Frees reach the same lock through
+`processDecommitEntry` → `insert()`. So every large allocation and every large
+free serialises on one lock, whatever the arena count.
+
+Measured with 2 MiB blocks churned across threads (8 physical cores):
+
+| threads | smash total ops/sec | µs per alloc+free | glibc |
+|---|---|---|---|
+| 1 | 57k | 17.5 | 0.1 µs |
+| 2 | **96k** | 10.4 | 0.2 µs |
+| 4 | 70k | 14.3 | 0.1 µs |
+| 8 | 32k | 31.0 | 0.3 µs |
+| 16 | 22k | 45.7 | 0.3 µs |
+
+Throughput peaks at **two threads** and then goes backwards. The cause is
+smash's lock, not the kernel — forcing the same workload onto the direct-mmap
+path (`SMASH_LARGE_ALLOC_VM_THRESHOLD` above the block size), which skips
+`PageRunMap` entirely but still pays mmap/munmap, stays flat:
+
+| threads | arena path | direct mmap |
+|---|---|---|
+| 1 | 17.5 µs | 19.0 µs |
+| 8 | 20.7 µs | 20.3 µs |
+| 16 | **49.3 µs** | 21.9 µs |
+
+So beyond ~8 concurrent large allocations the compressible path is *slower than
+falling back to uncompressed mappings*. For a workload whose bytes are large
+blocks and which runs a thread per core on a large machine, this is the
+scalability wall, and it is a design property rather than a tuning parameter:
+the slab has per-(arena, class) locks and the mid-size bins are sharded by
+arena, but the page allocator underneath them all has one.
+
+Two directions, neither implemented: shard `PageRunMap` by owner/arena the way
+everything above it is sharded, and cache freed runs per thread so the common
+allocate-free-allocate cycle never reaches the shared map (which would also
+address the ~10 µs churn cost below, since a cached run needs no mprotect and
+no madvise).
+
+## Every malloc/free cycle over 16 KiB costs ~10 µs (open defect)
+
+Measured 2026-09-20 while chasing a report of ~1.6% CPU in `xxfree`. A block
+larger than `kMaxSmallSize` that is freed and reallocated goes to the kernel
+**every time**, in both modes. One block, allocated and freed in a loop
+(`-fno-builtin-malloc`, so nothing is elided):
+
+| size | glibc | smash large-only | ratio |
+|---|---|---|---|
+| 32 KiB | 17.2 ns | 9,664 ns | **562×** |
+| 256 KiB | 17.6 ns | 9,684 ns | **550×** |
+| 2 MiB | 16.1 ns | 12,773 ns | **793×** |
+
+The cliff is at 16 KiB, not at `kLargeAllocVmThreshold`: 16 KiB costs 26 ns
+(system passthrough), 17 KiB costs 11,125 ns. Two mechanisms, same effect —
+`strace -c` over 20 k pairs shows **20,115 munmap + 20,198 mmap** for 32 KiB
+blocks (below the 1 MiB threshold, so `LargeAlloc` maps each one directly), and
+**19,063 mprotect + 10,836 madvise** for 2 MiB blocks (arena path: commit on
+allocate, decommit on free). glibc avoids both by caching freed blocks and by
+raising its mmap threshold dynamically once it sees mmap'd blocks being freed.
+
+Nothing in the current configuration space mitigates it: `SMASH_NO_DECOMMIT=1`
+(11.9 → 11.3 µs, and *worse* at 2 MiB), `SMASH_NO_COMPRESSOR=1` (9.7 → 8.2 µs),
+`SMASH_VM_GIB=1` and full mode (10.0 µs) all land in the same range. The fix is
+a **warm cache of freed large blocks** — keep a bounded set mapped and committed
+for reuse instead of returning them to the kernel on every free, the way
+jemalloc's decay-based purging and glibc's dynamic mmap threshold do. The
+`PageRunMap` already recycles the *pages*; what costs is the syscall and fault
+work around them.
+
+**What this does NOT explain is small-allocation overhead**, which is modest and
+was measured separately: a 64-byte malloc+free pair costs 6.7–7.2 ns under
+glibc, 18.6 ns in large-only mode and 15.1 ns in full mode. Note the ordering —
+large-only is *slower* than full mode for small blocks, because it pays smash's
+dispatch and then the system allocator's work.
+
+**Two micro-optimisations of the free path were tried and measured worse**;
+neither is in the tree:
+- Moving the `SMASH_COUNT_FREE` / `SMASH_TRACE_FOREIGN_FREE` diagnostics out of
+  `freeSlow` into cold helpers. Their `char[64]`/`char[160]`+`Dl_info` locals
+  give `freeSlow` a 208-byte frame and a `-fstack-protector-strong` canary, and
+  `perf annotate` attributed ~18% of the function to the canary instructions.
+  Removing it changed nothing: interleaved A/B gave 18.6 ns before, 19.0 ns
+  after. The perf attribution was skid — samples landing on the instruction
+  after a stalled load.
+- A `largeOnlyPassthroughFree()` fast path in `free()`, rejecting non-smash
+  pointers with a range compare so they never enter the cold `freeSlow`, gated
+  on a counter of live non-arena `LargeAlloc` blocks. Measured **3.5 ns slower**
+  (18.6 → 22.2 ns), consistently, interleaved.
+
+The lesson for the next attempt: on this path, `perf` attribution and A/B timing
+disagree, and only the timing is load-bearing.

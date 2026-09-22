@@ -1,0 +1,183 @@
+# Fixed defects and their guards
+
+Investigations behind fixed defects: symptom, cause, fix, measurements, and the test that guards each. Moved from CLAUDE.md; the rule each one taught is in Key Conventions there, with the long form in [conventions.md](conventions.md).
+
+## BootstrapAlloc growth (self-deadlock guard)
+
+`test_bootstrap`'s `testGrowPastFirstRegion` allocates 1 MiB at a time until it passes the 64 MiB initial region, forcing `addRegion()`, and touches both ends of every chunk so the new region is proven writable. It is single-threaded and takes milliseconds.
+
+It guards the deadlock described in Key Conventions ([conventions.md](conventions.md)): `expandAndAllocate()` holds `expand_lock_` and calls `tryAllocFrom()`, which used to call `ensureCommitted()`, which took the same non-recursive spinlock to `mprotect` the next pages. The first allocation that had to grow the arena spun forever holding the lock, and every other thread piled up behind it — 25 threads in `R` state at ~730% CPU, 23 of them innermost in `spinRelax`.
+
+Found with mimalloc's `test-stress` built with `USE_STD_MALLOC=1` (the only test in that suite that exercises smash rather than mimalloc's own `mi_*` API), run under a plain `LD_PRELOAD` with no smash environment — i.e. the default, experimental full mode. The trigger is total allocation, not concurrency: a `ThreadCache` is 92 KiB and goes through `allocate()`, so ~728 of them exhaust the initial region. 16 threads × 20 iterations passed; 4 × 250, 8 × 120, 16 × 60 and 32 × 50 all hung, and all four complete in 1–16 s after the fix.
+
+**Verified as a real discriminator:** reverted to the pre-fix `bootstrap_alloc.h`, this test hangs (killed at 45 s); restored, it passes. The RSS-budget tests (`test_aligned_alloc_footprint_{full,large_only}`, `test_vm_exhaustion`, `test_vma_pressure`) all still pass, which is the check that mapping regions read/write up front did not cost footprint — a budget check, not a direct before/after RSS measurement.
+
+## Thread-cache reclaim (symbol-version guard)
+
+`test_thread_cache_reclaim_{full,tls_only,large_only}` — one body (`thread_cache_reclaim_test.cpp`) creating and joining 1500 threads one at a time, asserting RSS grows less than 8 KiB per thread. A `ThreadCache` is 92 KiB, so a leaked one is an order of magnitude over that line.
+
+Reclaiming the cache used to depend entirely on alloc8's `pthread_create` interposer calling `xxthread_cleanup`, and on **glibc ≥ 2.34 that interposer never ran for application threads**: glibc 2.34 merged libpthread into libc and moved the default version of `pthread_create`/`pthread_exit` to `GLIBC_2.34`, while libsmash exported only the base `GLIBC_2.2.5` definition, so every caller bound straight to libc. Measured with atomic counters: of 200 application threads **16 were wrapped, and all 16 were smash's own** compressor threads (whose calls resolve inside libsmash under `-Bsymbolic`). RSS grew **91.2 KiB per thread**, linear over 2000 threads, and 14000 threads segfaulted once `BootstrapAlloc` was exhausted and `newThreadCache()` placement-new'd onto null. Forcing a test binary to request `pthread_create@GLIBC_2.2.5` flipped it to 216 wrapped / 199 pool hits / 0.3 KiB per thread, which is what identified the version as the cause rather than the pool.
+
+Two independent mechanisms now cover it, and the three registrations isolate them: `_full` exercises the versioned alias path, `_tls_only` sets `SMASH_NO_THREAD_HOOKS=1` so `threadInit`/`threadCleanup` are no-ops and only the `pthread_key_t` destructor can reclaim, and `_large_only` is the control where small allocations never create a cache. Measured after the fix: 0.3, 0.2 and 0.2 KiB per thread respectively, with RSS flat from thread 500 to thread 14000.
+
+A separate hang on the same idiom — an application whose *main* thread retires with `pthread_exit(NULL)` — was found while testing this and is fixed by the process-exit guard described in "Process exit after `pthread_exit()` from main" below.
+
+## Compressor shutdown race (node-worker park loop)
+
+`test_shutdown_race_{full,large_only}` spawn 200 very short-lived preloaded
+children and assert every one exits. `CompressorThread::stop()` joins the NUMA
+node-group workers at process exit, and a worker could be asleep on a futex that
+nothing would ever wake again, so the `pthread_join` inside `__cxa_finalize`
+waited forever and the process never exited.
+
+`stopNodeThreads()` stores `numa_exit_`, bumps `numa_work_gen_` and wakes, in
+that order. The worker's park loop sampled the generation once at thread start
+and only consulted `numa_exit_` *after* observing a generation **change**. A
+worker whose first instructions ran after all three stop operations had already
+happened therefore sampled the already-bumped generation into `last`, found
+`gen == last`, and parked forever. The window between the load and the
+`futexWait` is already safe — the value changed, so `FUTEX_WAIT` returns EAGAIN
+— it is the thread-start-after-stop ordering that was not. The fix is to check
+`numa_exit_` **before** parking.
+
+It needs startup and teardown to nearly coincide, so it hit short-lived
+programs. Measured on `arena_routing_test` (0.02 s): **7 hangs in 300 runs
+(2.3%) before the fix, 0 in 300 after**. It first surfaced as an intermittent
+`test_arena_routing` timeout — a poor guard, since that test only catches the
+race by accident, which is why `test_shutdown_race_*` provokes it directly. A
+gdb backtrace of a caught hang showed main in `pthread_join` under
+`__cxa_finalize` → `stop()` → `stopNodeThreads()`, with a node worker asleep in
+`futexWait`. Node groups only exist on hosts with ≥ 2 memory nodes, which is why
+single-node CI runners never saw it.
+
+**Verified as a real discriminator:** rebuilt against the pre-fix park loop,
+`test_shutdown_race_full` and `test_shutdown_race_large_only` both fail (0% of 2
+passed, ~11 s each as they hit a hung child); with the fix restored both pass in
+~3.5 s.
+
+## Process exit after `pthread_exit()` from main
+
+`test_main_pthread_exit_{full,large_only}` — a forked child creates a worker thread and then main retires with `pthread_exit(NULL)`; the parent asserts the child exits **0 within 30 s** *and* that the child's own `atexit` handler ran. The handler is the sharper assertion: a "fix" that ended the process without going through glibc's normal last-thread path would still exit 0 while silently skipping the application's exit handlers.
+
+glibc ends a process when its thread count reaches zero — the last thread to exit calls `exit(0)`, which is why the no-preload control runs `atexit` handlers and exits 0. `pthread_exit()` from main does **not** call `exit()`: it retires main and leaves the process alive until that count drops. Every smash background thread that never exits kept it above zero, so the process hung forever. Measured: a zombie thread-group leader beside 16 sleeping smash threads, needing SIGKILL, with the application's `atexit` handler never running. Neither of smash's existing shutdown hooks helps, because both hang off `exit()` — the `atexit` handler in `compressor_thread.h` and `destructor(101)` in `smash_heap.cpp`.
+
+`src/util/exit_guard.h` fixes it by **removing smash's threads once the application has none left and letting glibc's own last-thread logic run**, so status, `atexit` handlers and static destructors are stock rather than reproduced here. Calling `exit()` from smash would mean choosing a status and running the application's handlers on a compressor thread.
+
+- **Detection is a `/proc/self/task` scan**, not a counter: any task that is not the caller, not a registered smash thread, and not a zombie (the retired main thread lingers as one, and is counted in `Threads:`) is a live application thread. A counter of wrapped threads would inherit the failure mode fixed in the previous section, where interposition silently stopped wrapping application threads.
+- **Triggered from a second `pthread_key_t`** armed for every thread whether or not it allocates, so the trigger works in large-only mode too. Before main retires it costs one relaxed atomic load per thread exit and scans nothing; the compressor re-checks once per tick only after main has retired, covering an application thread smash never saw start.
+- **Every smash-created thread registers** (`exit_guard::ThreadRegistration`, RAII so each return path releases the slot): the compressor coordinator, helpers and node workers, plus VmRegion's lazily started decommit thread. The registry is cleared in the `atfork` child handler, since fork clones only the calling thread.
+- **Shutdown stops threads only** — the compress store stays intact, so `atexit` handlers and static destructors running afterwards still fault in compressed pages normally (decompression runs on the faulting thread and needs no compressor thread). `CompressorThread::stop()` and `stopDecommitThread()` skip joining the calling thread, because the coordinator's fallback path can run the shutdown from inside the coordinator itself.
+
+Measured after the fix, worker outliving main: full mode 218 ms and large-only 219 ms, against a 205 ms no-preload control — both exit 0 with handlers run, where both hung before. The main-retires-alone shape (500 threads, then `pthread_exit` from main) goes from a hang to 59 ms.
+
+**Verified as a real discriminator:** with `SMASH_NO_EXIT_GUARD=1` the repro hangs again and has to be SIGKILLed, and the test itself fails on its 30 s child timeout; with the guard on, the same test passes in 220 ms. The isolation run that first identified the cause is the same switch in reverse — `SMASH_NO_COMPRESSOR=1` made the pre-fix binary exit 0, which pinned the hang on smash's threads rather than on anything else the library does.
+
+## Memory must still work after the compressor shuts down
+
+`CompressorThread::stop()` drains compressed pages and then **uninstalls the
+SIGSEGV/SIGBUS handler**, deliberately, so a real application heap bug surfaces
+normally. Everything that runs after it — atexit handlers, static destructors,
+anything that allocates during exit — still uses smash's heap with no handler
+behind it.
+
+The drain restores `COMPRESSED`, `COMPRESSED_SHADOW` and `ACTIVE_MONITORING`,
+and **trusts `ACTIVE`**. That was the hole: *a page's state is not proof of its
+protection*. The fault handler repairs ACTIVE-but-still-protected pages on
+purpose (Phase 3's batched mprotect can overwrite a per-page PROT_RW
+restoration) — a race smash tolerates precisely because the handler is there.
+Once it is gone, the same page kills the process on the next touch:
+**SEGV_ACCERR, no message, exit 139, long after the workload finished**. One
+mprotect over the contiguous arena at the end of the drain closes it; it only
+widens permissions, so a page mid-restore cannot lose.
+
+Found by running the suite against a **coverage-instrumented build**, where
+gcov's exit-time dump is the late allocator: `test_span_descriptor_race_full`
+segfaulted after printing PASS. Worth keeping as a technique — an instrumented
+build is a cheap way to get a realistic "something allocates during exit" load
+that the suite otherwise never applies. The evidence chain, in order: the
+`SMASH_SHUTDOWN_TRACE=1` output ran to `stop() complete` *before* the crash; a
+SIGSEGV handler preloaded **ahead of** libsmash (so smash's teardown restores
+it) caught `si_code=2` at an address `smash_in_arena()` confirmed was in the
+arena; the page index was inside the range the drain had just walked;
+instrumenting `handleFault` showed the post-drain fault arriving on a page in
+state ACTIVE; and leaving the handler installed through exit made it disappear
+2/2. Verified, same test binary: pre-fix library 3/3 segfault, fixed 5/5 clean,
+and the coverage suite went 57/58 → 58/58.
+
+**No regression test, deliberately.** A synthetic workload with a late atexit
+handler allocating and writing 8 MiB — including one registered from a library
+preloaded ahead of libsmash, so it runs after libsmash's destructor — did not
+reproduce the skew in 11 runs across two pre-fix libraries. Registering it would
+have added a test that passes with and without the fix.
+
+## Idle-page read tracking (root only)
+
+`test_idle_read_tracking` (`idle_read_tracking_test.cpp`, in-process, `SMASH_COLD_TICKS=2 SMASH_SOFTDIRTY=0`) guards the one read-detection path that only exists as root. With `CAP_SYS_ADMIN`, `/proc/self/pagemap` exposes real PFNs, so `ensureIdleReadFds()` turns on idle-page tracking: at escalation a monitored page is marked idle through `/sys/kernel/mm/page_idle/bitmap` instead of being armed PROT_NONE, and phase 1 treats "no longer idle" as "read", with no fault paid. Unprivileged, the PFN is redacted and the path never activates — so the whole suite, and CI, had never run it.
+
+First reported as three aarch64 failures — `test_compression` and `test_prefetch` (`page X should be COMPRESSED, got 4`, i.e. stuck in `ACTIVE_MONITORING`) and `test_syscall_efault` (`the buffer page never left RSS within 30s`). **It is not arch-specific: it is root.** On x86-64 the same three failed with the same messages as root, passed as a normal user, and passed as root with `SMASH_IDLE_READ_TRACK=0`. They are exactly the three tests that pin `SMASH_SOFTDIRTY=0`; with soft-dirty on, pages never enter `ACTIVE_MONITORING`, where the idle check lives. Two defects:
+
+- **The idle bit was trusted for pages that were never marked.** The check was gated on `idle_read_ok_ == 1 && st == ACTIVE_MONITORING`, not on whether this page was armed. An unmarked page reads "not idle", so every monitored page counted as read at its first check, reset its cold count, and never reached escalation — nothing compressed. This was the actual cause of the three failures: even pages already on the LRU never compressed before the fix.
+- **A failed mark was trusted.** The kernel silently ignores an idle mark on a page that is not on the LRU. The shared zero page never is (a page the application has only read), and freshly written pages are not until the per-CPU LRU-add batch drains. Measured on 6.8 as root: 0/8 freshly written pages take the mark, 8/8 after 256 MiB of other faults. Such a page reads "not idle" forever. A read that *was* counted had the same effect: the bit stays clear until the page is armed again, and it was only re-armed at `cold_count == floor`, which it could no longer reach.
+
+The fix is a per-page `idle_armed_` flag, allocated only when the probe succeeds (unprivileged runs pay nothing): escalation marks the page, **reads the bit back**, and sets the flag only if the mark took — otherwise it falls back to the PROT_NONE arm. Phase 1 consults the idle bit only for flagged pages and clears the flag once it reports a read; entering monitoring clears it too.
+
+The test asserts three scenarios: written pages use the idle arm (still PROT_READ, never PROT_NONE) and compress at tick 3; a read after the arm is detected without a fault (nothing compressed at tick 3) and the pages still compress once quiet (tick 6); zero-page-backed pages cannot take the mark, fall back to PROT_NONE, and compress at tick 3. **Verified as a real discriminator:** built with identical flags against the pre-fix compressor it fails 4 checks as root — no page compresses within 16 ticks in any scenario, and the zero page never falls back. It skips when not root or when the kernel lacks `CONFIG_IDLE_PAGE_TRACKING`, so it only guards anything when the suite is run as root. Measured as root after the fix: full suite 47/47.
+
+## Small allocations after the arena is exhausted
+
+`test_small_arena_exhaustion` (full mode, `SMASH_VM_GIB=1`). Reported on aarch64 (4 KiB pages) as `std::bad_alloc` and "terminate called recursively" in full mode only; `SMASH_LARGE_ONLY=1` worked. "terminate called recursively" is libstdc++ reporting a second thread reaching `std::terminate` while the first is in it — several threads getting `bad_alloc` at once.
+
+In full mode small objects live in slab spans carved from the VmRegion arena, and **when the arena ran out, `Slab::allocateNewSpan()` returned nullptr**: large allocations fall back to a direct mapping, small ones had no fallback. The arena runs out without a large live set because an empty span's pages stay with its own (arena, size class) — `Slab::scavenge()` exists but has no callers — so a program that moves between size classes consumes a fresh share for each. Reproduced with a 1 GiB arena: 800 MiB of 64-byte objects, all freed, then 128-byte objects failed after **173 MiB** with the arena at 262143/262144 pages.
+
+Fix: a span falls back to a direct mapping (`vm::mapPages`), and every region-only step in `Slab` — page states, the release hook, cold counts, `releasePages` — is skipped for it (`Slab::inRegion()`). Its pages are not compressed; a one-time warning says so. Emptying such a span uses `vm::decommitOwnMapping()`, because `vm::decommitPages()` deliberately traps on any address outside the arena. **Verified:** three phases of 800 MiB each (64, 128, 256-byte objects) complete with every object's pattern intact; the previous library fails phase B at 173 MiB; 64 threads × 10 rounds with the arena exhausted made 2.56 M allocations with 0 nulls.
+
+**Freed memory is now reused by the arena** (`test_arena_reuse`, `test_page_run_map`). The fallback keeps a long-running program alive, but memory past the arena is never compressed, and two things made such a program drift out of the arena permanently:
+
+- **Empty slab spans were never returned** (`Slab::scavenge()` had no callers), so every page a size class had ever used stayed with it.
+- **Freed page runs were never coalesced.** They sat on 64 per-thread singly-linked lists of `FreeRun` nodes, so a run could only serve a request no larger than itself: 1-page runs freed by the 64-byte class could not hold a 2-page 128-byte span, 1 MiB runs could not hold a 2 MiB block.
+
+Both are fixed. `PageRunMap` (`src/vm/page_run_map.h`) replaces the lists: boundary tags in demand-paged per-page arrays (length/owner/links at a run's first page, start at its last), size bins with a non-empty bitmap, merge with both neighbours on free. Owners keep NUMA node arenas apart (0 shared, n + 1 node n) — runs of different owners never merge. When neither the map nor the bump pointer can serve a request, VmRegion calls an **exhausted hook**: the heap returns every slab's empty spans synchronously (`Slab::reclaimEmptySpans`, `VmRegion::releasePagesNow`), they coalesce, and the allocation is retried before anything falls back to a direct mapping. Span descriptors are recycled with their bitmap (`Span::bitmap_store`), so span churn no longer leaks BootstrapAlloc.
+
+Measured with a 1 GiB arena, phases of ~70 % each, everything freed between phases:
+
+| phase | before | after |
+|---|---|---|
+| small 64 B | 100 % | 100 % |
+| small 128 B / 256 B / 1 KiB | 40 / 6 / 0 % | 100 % |
+| large 1 / 2 / 3 MiB | 0 % | 100 % |
+
+**Verified as real discriminators:** with merging disabled, or with the hook not registered, `test_arena_reuse` fails the same six phases as before the fix; `test_page_run_map` checks the map against a per-page model through 284 k operations (4,919 large takes that only merged runs can serve) and fails 21 checks with merging disabled.
+
+**Returning spans eagerly is a trap.** The first version released empty spans beyond two per slab on every free; mi-stress went from 16.9 s to 28.7 s, because spans oscillating between empty and in use paid a release, a decommit and zero-fill faults each round trip. Isolated by building the map without trimming (16.3–16.9 s) and trimming without merging (27–30 s). Reclaiming only when the arena is exhausted costs nothing in steady state: mi-stress 16.7–16.9 s against 16.2–16.9 s before; thread churn 83–86 s against 86 s; and 16 threads of 1–4 MiB blocks got faster, 10.2 s against 16.6 s, since the old path walked singly-linked lists across shards. 64 threads with the hook firing constantly (1 GiB arena): 2.56 M allocations, 0 nulls, no deadlock — the hook takes other slabs' locks with `tryLock` only.
+
+## The metadata arena bounds how large a heap smash can manage
+
+Every slab span costs a `Span` descriptor (112 B, pinned by a static_assert) plus its bitmap in BootstrapAlloc, which is never freed, so that arena's capacity bounds the heap. Fixed 16 MiB expansions capped it at 64 MiB + 63 × 16 MiB = **1.07 GiB** ≈ a 100 GB heap of large classes — and when it ran out, `allocate()` returned null into code that did not check it: **a write to address 0, with no message**. Reported as a crash at ~169 GB RSS.
+
+- **Regions now grow geometrically** (16 → 32 → … → `kBootstrapMaxExpandSize` = 256 MiB), so 64 regions reach **15.4 GiB**, covering a multi-TB heap. `test_bootstrap`'s `testCapacityScales` fails if that drops below 8 GiB. Measured with the cap cut to 6 regions: flat growth exhausts at 144 MiB and fails the workload, geometric gives 560 MiB and completes.
+- **Bitmaps are sized per class again.** Sizing every bitmap for the largest span (an earlier version of the span-recycling change) wasted 248 B on a 16 KiB class and cut the coverable heap 3× (329 GB → 102 GB). `Span::bitmap_store_words` tracks what the descriptor already owns and grows it only when a larger class needs more.
+- **Exhaustion is loud and survivable.** `BootstrapAlloc::reportExhausted` prints regions, MiB and the failed request once; `newSpanDescriptor`, `Span::init`, `Slab::allocateNewSpan`, `LargeAlloc::allocate`, `PageMap::ensureL2` and `Slab::pushPending` all handle null, and `VmRegion::queueForDecommit` falls back to a synchronous release (its queue entry comes from the same arena). Verified with the arena cut to one 64 MiB region: 4/4 runs fail with `std::bad_alloc` and a message, where the same build crashed at 0x0 before. Each of those null paths was found by a crash, not by reading.
+- **Watch it** on the SIGUSR2 stats line: `boot=<used>/<mapped>MiB(<regions>)`.
+
+A fault smash does not handle, with the default disposition behind it, now prints `[smash FATAL] unhandled sig=… at addr=… — the process is about to die.` plus what smash thinks that address is: its own metadata, a page of the compressible arena (with the page's state — a fault there that smash did not handle is a smash bug), a tracked external page, or memory smash never managed. Silence used to be the only symptom, which left no way to tell a smash bug from an application one. Nothing is printed when the application has its own handler (it may well survive), and a `SIGKILL` — the OOM killer — still prints nothing by definition; check `dmesg`.
+
+When the arena is exhausted the warning says **which kind** of exhaustion it is, because the fix differs: it reports pages handed out, free pages still in the map, and the longest reusable run. Few free pages means the live set genuinely outgrew the arena (raise `SMASH_VM_GIB`); many free pages with a short longest run means fragmentation, which a larger arena only postpones.
+
+**Every full-mode allocation that is about to return nullptr now says why** (`util/alloc_failure.h`, rate-limited, allocation-free): `[smash alloc-fail] <path>: size=… align=… errno=… arena=used/total pages vmas=count/max_map_count`. Before, smash returned null silently and the only symptom was the application's `bad_alloc`.
+
+## Write tracking: soft-dirty, userfaultfd, or neither
+
+The compressor has to know which pages were written since the last tick. `selectWriteTracker()` picks the mechanism once per process **by testing it**, and the choice is on the SIGUSR2 stats line as `track=`:
+
+- `softdirty` — `/proc/self/clear_refs` + `pagemap` bit 55, the default wherever it works.
+- `uffd` — async userfaultfd write-protect (`UFFD_FEATURE_WP_ASYNC` + `WP_UNPOPULATED`) registered over the arena, read and re-armed each tick with the `PAGEMAP_SCAN` ioctl. Linux 6.7+. Opened with `UFFD_USER_MODE_ONLY`, which unprivileged processes may use under the usual `vm.unprivileged_userfaultfd=0`. A scratch page is checked end to end before the arena is registered.
+- `none` — the files open but neither mechanism works: no write signal, only Phase B's content check.
+- `protread` — Phase 3 `mprotect(PROT_READ)` monitoring: `SMASH_SOFTDIRTY=0`, or `/proc` unavailable (both as before).
+
+`SMASH_WRITE_TRACK=auto|softdirty|uffd|none` (default `auto`: soft-dirty if it works, else userfaultfd, else `none`).
+
+**Why the test matters: arm64 has no soft-dirty** — `CONFIG_MEM_SOFT_DIRTY` does not exist there. smash used to decide soft-dirty worked because the two `/proc` files opened; the kernel accepted the clear as a no-op and reported bit 55 as 0 forever, so on arm64 every page looked never written, Phase 3 was skipped (soft-dirty replaces it), and each tick paid a whole-process page-table walk for nothing. Hot pages were compressed anyway and only Phase B's content check discarded them. Measured on x86 with bit 55 masked out to simulate it (hot 32 MiB rewritten every 20 ms, plus cold 32 MiB): real soft-dirty kept the hot set live; the simulated arm64 kernel compressed all 8192 hot pages; with the fix the same simulated kernel selects `uffd` and matches soft-dirty — hot set live, and for a 3-second writer 60 MiB RSS / 10.5 ms per write pass / 8.5 s CPU against soft-dirty's 60 MiB / 10.3 ms / 8.6 s. `SMASH_SOFTDIRTY=0` is **not** a good workaround there: `protread` was the slowest on both workloads (≈45 % more CPU, 7 % fewer write passes at 20 ms).
+
+Two things the userfaultfd path has to handle, both verified with a standalone prototype before wiring it in: a `MAP_FIXED` remap creates a new VMA the userfaultfd no longer covers (writes become invisible), so `remapPages()` re-registers through `vm::g_after_remap_track_hook`; and a forked child inherits the fd but not the registration, so the post-fork reset closes it and the child selects afresh (verified: a forked child that starts a thread reports `track=uffd` with its hot set tracked). External pages (`SMASH_TRACK_EXTERNAL=1`) are the application's own mappings and are deliberately not registered, so they get no write signal under `uffd`.
+
+`test_uffd_write_tracking` (in-process, forced to `uffd`, skips before Linux 6.7) drives `compressTick()` with a page written before every tick, a cold page, and a written page that went through `remapPages()`, and requires that neither written page is compressed at **any** tick. **Verified as a real discriminator:** with `SMASH_WRITE_TRACK=none` both written pages compress at tick 1; with only the remap hook removed, just the remapped page compresses (tick 2). Checking only the final state is not enough — an untracked written page cycles between SHADOW and ACTIVE as Phase B discards its stale blobs, and the last tick can land on ACTIVE. Suite 53/53 in default and forced-`uffd` modes, unprivileged and as root.
