@@ -528,7 +528,8 @@ public:
             // drainInFlight() covers both a queued run and one another thread
             // is already processing, so this only stops retrying when there is
             // genuinely nothing left to come back.
-            for (int attempt = 0; attempt < kDrainWaitAttempts; ++attempt) {
+            for (int attempt = 0; drainWaitEnabled() && attempt < kDrainWaitAttempts;
+                 ++attempt) {
                 drainDecommitQueueNow();
                 if (const size_t idx = free_map_.take(num_pages, kSharedOwner);
                     idx != PageRunMap::kNone) {
@@ -1181,7 +1182,8 @@ exhausted:
         // it returns empty slab spans, which are shared-owner pages, and runs
         // of different owners never merge. It cannot produce a chunk for this
         // node.
-        for (int attempt = 0; attempt < kDrainWaitAttempts; ++attempt) {
+        for (int attempt = 0; drainWaitEnabled() && attempt < kDrainWaitAttempts;
+             ++attempt) {
             // Drained WITHOUT na.lock, as in the common path: holding it
             // across the drain's mprotect/madvise serialises every other
             // thread on this node and was measured at 18.5 s against 2.8 s for

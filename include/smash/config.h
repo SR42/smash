@@ -33,6 +33,20 @@ inline constexpr size_t kMinAlignment = 16;
 // when the workload allocates only aligned objects — the slots it steps over
 // are stranded — and is up to 7x worse. It wins only when ordinary
 // allocations of the same class fill those slots.
+// SMASH_NO_DRAIN_WAIT=1: an allocation that finds no free run gives up
+// immediately instead of waiting for runs that are freed but still queued for
+// decommit. This is the pre-fix behaviour and exists so a test can measure the
+// same workload both ways in one run — an absolute fallback rate is not
+// portable (measured 34-125 of 320000 on an 8-CPU host against 1537 on a
+// 128-CPU one), but the ratio between the two is.
+inline bool drainWaitEnabled() {
+    static const bool on = [] {
+        const char* v = getenv("SMASH_NO_DRAIN_WAIT");
+        return !(v && v[0] != '0');
+    }();
+    return on;
+}
+
 inline bool alignSlotSearchEnabled() {
     static const bool on = [] {
         const char* v = getenv("SMASH_ALIGN_SLOT_SEARCH");

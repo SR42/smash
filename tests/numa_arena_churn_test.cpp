@@ -156,24 +156,27 @@ static void runLinux() {
     // enough concurrency it can expire with pages still in transit. Falling
     // back then is a footprint loss, never a correctness one.
     //
-    // Measured on an 8-CPU host, 1 GiB arena over 4 nodes, 320000 round trips.
-    // The live set here is trivial (256 threads x 64 KiB = 16 MiB), so nothing
-    // in this phase is about capacity; what is left is the bounded wait for
-    // in-flight frees expiring under heavy parallelism. Fixed: 0-8 at 64
-    // threads, 265 at 128, 125 at 256. Before the drain existed: 285955 (87%).
-    // 0.25% sits ~3x above the worst residual (265) and below every unfixed
-    // measurement: 1655 and 3684 at 256 threads, 6474 at 128, 285955 before
-    // the drain existed. The margins are not large, which is why this is a
-    // probabilistic guard and not a proof.
+    // What this phase can and cannot guard, stated plainly because getting it
+    // wrong cost three rounds of threshold-chasing across two machines.
     //
-    // Note the limit of this test on a SMALL host: with little true
-    // parallelism the unfixed code loses only 203 blocks at 64 threads, which
-    // this allowance does not catch. It discriminates on a machine with enough
-    // cores to expose the race — which is where the bug was reported from — and
-    // is a weak guard on a laptop. Like test_span_descriptor_race_*, one run on
-    // one machine is not a verdict.
+    // It CAN catch a catastrophic regression: with no drain at all, 285955 of
+    // 320000 blocks (87%) fell out. It CANNOT reliably catch the subtler race
+    // it was originally written for — one thread taking the whole decommit
+    // queue while others conclude nothing is recoverable. That residual scales
+    // with real parallelism and varies run to run: 0-8 of 320000 at 64 threads
+    // on an 8-CPU host, 34-303 at 256 threads there, and 1537 at 256 threads on
+    // a 128-CPU one. The unfixed code overlaps that range from below (203 at 64
+    // threads on the small host), so no fixed threshold separates them on every
+    // machine, and a ratio does not either — measured 3x on one run and 37x on
+    // the next.
+    //
+    // So the ceiling is 2%, which is a catastrophic-regression guard, and the
+    // single-threaded phase above carries the precise assertion: it is
+    // deterministic, it caught the original defect at 4.5%, and it is 0 on both
+    // hosts. For the race itself, measure deliberately with SMASH_NO_DRAIN_WAIT
+    // rather than trusting this number.
     const long total = static_cast<long>(kThreads) * kPerThread;
-    const long allowed = total / 400;   // 0.25%, i.e. 800 of 320000
+    const long allowed = total / 50;   // 2%
     if (out_total > allowed || null_total) {
         fprintf(stderr, "FAIL: %d threads x %ld round trips gave %ld block(s) outside "
                 "the compressible arena (allowed %ld of %ld) and %ld NULL\n",
@@ -181,9 +184,10 @@ static void runLinux() {
                 null_total.load());
         ++g_failures;
     } else if (out_total) {
-        printf("concurrent churn: %ld of %ld blocks fell back (allowed %ld) — "
-               "in-flight frees the bounded wait did not catch\n",
-               out_total.load(), total, allowed);
+        printf("concurrent churn: %ld of %ld blocks fell back (%.3f%%, ceiling %ld) — "
+               "in-flight frees the bounded wait did not catch; compare with "
+               "SMASH_NO_DRAIN_WAIT=1 to see what the wait is worth here\n",
+               out_total.load(), total, 100.0 * out_total.load() / total, allowed);
     }
     if (!out_total && !null_total)
         printf("concurrent churn: %d threads x %ld round trips over %zu node(s), "
