@@ -1198,6 +1198,38 @@ python3 bench/verify_paper_claims.py --apps redis,memcached   # external service
 ```
 Measured on the EPYC 9R14 (full datasets): memcached 86%, rocksdb 76%, sqlite 64%, redis 54%, redis-ext 64%, redis-patched 55%, redis-ext-patched 77% — five of seven beat the paper, two match.
 
+**Two things in this harness were broken and reported the compressor as dead.**
+Both were found by re-running the benchmarks after a compressor change and
+asking why a green suite sat next to a failing paper check:
+
+- `bench_rss` ran with **no smash at all**. Its `AppSpec` had
+  `needs_preload=False`, on the stale claim that "bench_rss links smash
+  statically" — it links only libdl and allocates through the standard malloc
+  API, which is why `run_quick_ci.py` preloads it. So the check measured 0%
+  against a 30% floor and could never pass.
+- The reduction was parsed from a hard-coded `t=10s` line that **cannot exist**
+  under this harness's own settings: `MODE_ENV` pins
+  `SMASH_COLD_TIMEOUT_SEC=2` and `bench_rss` samples for `cold_timeout + 5` =
+  7 s. It now takes the best reduction across the window and passes
+  `--wait 20`, both for the reasons `run_quick_ci.py` already documents (the
+  reclaim pipeline is multi-tick and its timing slips under load — measured
+  72% at t=6s on one run and nothing inside the 7 s window on the next).
+
+After the fix, three runs report 71.0% for `bench_rss` and 67.9% for sqlite.
+The rocksdb rows need `-DSMASH_BUILD_BENCH_DEPS=ON`, which the CI build (and
+any build following the Benchmarks section above) does not set.
+
+**The benchmark that does discriminate compressor work is `bench_sqlite`.**
+`bench_rss` saturates — 72% for every library built in this session, before and
+after the syscall batching — while sqlite separates them cleanly: **60.7–60.8%
+before the PROT_READ arm batching and 67.7–67.9% after**, two runs each. Use it,
+not `bench_rss`, to tell whether a compressor change did anything.
+
+`bench_churn_reheat` exits 140 (SIGUSR2) unless `SMASH_STATS_SIGNAL=1` is set:
+it signals itself for the stats dump, and with the handler off by default the
+disposition kills it. That happens **with no preload at all**, so it is the
+benchmark's own requirement, not a smash fault.
+
 ## Project Structure
 
 ```

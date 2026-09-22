@@ -85,7 +85,8 @@ class AppSpec:
     peak_metric: str = "peak_rss_mb"
     min_metric: str = "min_rss_mb"
     timeout: int = 240
-    # bench_rss links smash statically (no preload); the apps interpose.
+    # False only for a binary that links smash itself; everything that goes
+    # through the standard malloc API needs it interposed.
     needs_preload: bool = True
     # runner_app: external-service workloads (redis, memcached) are not
     # standalone METRIC-emitting binaries — they need a live server plus a
@@ -103,11 +104,24 @@ class AppSpec:
 APPS: dict[str, AppSpec] = {
     "rss": AppSpec(
         name="bench_rss (64 MiB compressible micro-bench)",
-        binary="bench_rss", args=[],
+        # --wait 20 for the same reason run_quick_ci.py uses it: reclaiming a
+        # page is a multi-tick pipeline (cold detect -> compress -> shadow ->
+        # Phase B decommit), and bench_rss's own default window is
+        # cold_timeout + 5 s = 7 s here, which the pipeline does not reliably
+        # fit in — measured 72% at t=6s on one run and nothing inside the
+        # window on the next.
+        binary="bench_rss", args=["--wait", "20"],
         # bench_rss prints its own reduction line, parsed specially below.
         # 4 KiB chunks → no large allocations, so large-only is not run.
+        #
+        # needs_preload: bench_rss allocates through the standard malloc API
+        # and links only libdl — smash has to be interposed, exactly as
+        # run_quick_ci.py does it. This said False, on the stale claim that
+        # bench_rss "links smash statically", so the check ran the benchmark
+        # with no smash at all and compared its 0% against a 30% floor: it
+        # could never pass, and reported the compressor as broken.
         expect={"full": ModeExpect(paper_pct=97.0, hard_pct=30.0)},
-        timeout=60, needs_preload=False,
+        timeout=60, needs_preload=True,
     ),
     "sqlite": AppSpec(
         name="sqlite (in-memory DB)",
@@ -210,10 +224,20 @@ def parse_metric(out: str, name: str) -> float | None:
 
 
 def parse_bench_rss_pct(out: str) -> float | None:
-    # "  t=10s: RSS=73.7 MB (46% reduction from peak)"
-    m = re.search(r"^\s*t=10s:\s+RSS=[\d.]+ MB\s+\((-?\d+)% reduction",
-                  out, re.MULTILINE)
-    return float(m.group(1)) if m else None
+    # "  t= 6s: RSS=24.9 MB (72% reduction from peak)"
+    #
+    # Best reduction across the whole sampling window, not the t=10s sample.
+    # Two reasons, and the first made this check impossible to pass: bench_rss
+    # samples for cold_timeout + 5 s, and MODE_ENV pins SMASH_COLD_TIMEOUT_SEC
+    # to 2, so the window is 7 s and a t=10s line is never printed — the check
+    # reported "could not parse reduction" on a run that reached 72% at t=6s.
+    # Second, reclaiming a page is a multi-tick pipeline whose timing slips on
+    # a loaded machine, so a single sample can land mid-decompression; this is
+    # the same best-across-window rule run_quick_ci.py already uses and
+    # documents.
+    pcts = re.findall(r"^\s*t=\s*\d+s:\s+RSS=[\d.]+ MB\s+\((-?\d+)% reduction",
+                      out, re.MULTILINE)
+    return float(max(int(p) for p in pcts)) if pcts else None
 
 
 def run_via_runner(spec: AppSpec, mode: str, exp: ModeExpect,
