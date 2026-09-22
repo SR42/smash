@@ -45,17 +45,34 @@ static in_arena_fn g_in_arena = nullptr;
 static int g_failures = 0;
 static bool inArena(void* p) { return p && g_in_arena(p); }
 
-static int threadCount() {
+// Threads scale with the host, but the LIVE SET must stay a small fraction of
+// the arena or the test measures capacity instead of the defect. Each thread
+// holds one block at a time, so the cap is arena / (16 * block): on a 128-CPU
+// host the unbounded rule picked 256 threads, which is 512 MiB live in a 1 GiB
+// arena, and 17389 of 160000 blocks legitimately fell back. The same run at 32
+// and 64 threads gives 99 and 221 — the failure tracked the live-set fraction,
+// not the bug.
+static int threadCount(size_t block) {
+    // SMASH_TEST_THREADS reproduces a many-core host's thread count on a small
+    // one, which is how the 128-CPU failures were diagnosed without one.
+    if (const char* t = std::getenv("SMASH_TEST_THREADS"); t && std::atoi(t) > 0)
+        return std::atoi(t);
     const long cpus = sysconf(_SC_NPROCESSORS_ONLN);
-    const long want = (cpus > 0 ? cpus : 2) * 8;
-    return static_cast<int>(want < 8 ? 8 : (want > 256 ? 256 : want));
+    long want = (cpus > 0 ? cpus : 2) * 8;
+    if (want > 256) want = 256;
+    const char* gib = std::getenv("SMASH_VM_GIB");
+    const long arena_gib = gib ? std::atol(gib) : 16;
+    const long by_arena =
+        static_cast<long>((arena_gib > 0 ? arena_gib : 16) * (1u << 30) / (16 * block));
+    if (want > by_arena) want = by_arena;
+    return static_cast<int>(want < 4 ? 4 : want);
 }
 
 // PHASE A: concurrent churn of blocks above kLargeAllocVmThreshold.
 static void phaseA() {
     constexpr size_t kBlock = 2u << 20;
     constexpr long kTotal = 160000;
-    const int threads = threadCount();
+    const int threads = threadCount(kBlock);
     const long per_thread = kTotal / threads;
     std::atomic<long> out{0}, nulls{0};
     std::vector<std::thread> th;
@@ -80,14 +97,14 @@ static void phaseA() {
     // wait for in-flight frees is bounded, so under enough concurrency it can
     // expire with runs still in transit. 0.01% sits far above what the fixed
     // build produces and three orders of magnitude below the unfixed 29-90%.
-    // The allowance comes from measurement, not taste. Fixed build, 160000
-    // round trips of 2 MiB through a 1 GiB arena: 70 at 4 threads, 84 at 8,
-    // 129 at 16, 174 at 64 — flat in thread count, so it is not the race. What
-    // is left is a bounded wait expiring and, for a 512-page contiguous
-    // request, the free map genuinely not holding a run that long at that
-    // instant. Unfixed, the same runs gave 1728 / 46263 / 93726 / 144241, and
-    // at this test's thread count (8x CPUs) that is ~90%. 0.5% sits ~5x above
-    // the observed residual and ~180x below the unfixed figure.
+    // The allowance comes from measurement. Fixed build, 160000 round trips of
+    // 2 MiB through a 1 GiB arena: 70 at 4 threads, 84 at 8, 129 at 16, 174 at
+    // 64, 99 at 32 — a few hundredths of a percent, flat in thread count, so it
+    // is not the race. What is left is a bounded wait expiring and, for a
+    // 512-page contiguous request, the free map not holding a run that long at
+    // that instant. Unfixed the same runs gave 1728 / 46263 / 93726 / 144241,
+    // i.e. 4% to 90%. 0.5% sits ~6x above the residual and ~60x below the
+    // smallest unfixed figure.
     const long total = per_thread * threads;
     const long allowed = total / 200;
     if (out > allowed || nulls) {
@@ -98,8 +115,10 @@ static void phaseA() {
             threads, per_thread, out.load(), allowed, total, nulls.load());
         ++g_failures;
     } else {
-        std::printf("phase A: %d threads x %ld round trips of 2 MiB, %ld outside "
-                    "the arena (allowed %ld)\n", threads, per_thread, out.load(), allowed);
+        std::printf("phase A: %d threads x %ld round trips of 2 MiB (live set %ld MiB), "
+                    "%ld outside the arena (allowed %ld)\n", threads, per_thread,
+                    static_cast<long>(threads) * static_cast<long>(kBlock) / (1 << 20),
+                    out.load(), allowed);
     }
 }
 
