@@ -25,6 +25,14 @@ compile_commands.json
 __pycache__/
 *.pyc
 
+# Downloaded packages/archives that sometimes land in the repo root; a
+# `git add -A` once swept an 85 KiB liblz4-dev .deb into a source commit.
+*.deb
+*.rpm
+*.tar.gz
+*.tgz
+*.zip
+
 # Misc
 *.log
 *.core
