@@ -118,12 +118,25 @@ class VmRegion {
     }
 
     void recycleDecommitEntry(DecommitEntry* e) {
+        // Balances the increment in queueForDecommit: an entry is recycled
+        // exactly once, after it has been processed and its run is back in the
+        // free map. The two paths that process a stack entry instead of a
+        // queued one (queueForDecommit's no-entry fallback and
+        // releasePagesNow) never reach here, so the count stays balanced.
+        decommit_pending_.fetch_sub(1, std::memory_order_acq_rel);
         LockGuard guard(decommit_pool_lock_);
         e->next = decommit_pool_;
         decommit_pool_ = e;
     }
 
     void queueForDecommit(void* addr, size_t num_pages, size_t page_index, int node) {
+        // Counted from before the entry even exists. A run that has left its
+        // owner but has not yet reached the free map is invisible to an
+        // allocation looking for it, and newDecommitEntry() can block on the
+        // pool lock — a window wide enough to matter: with the count taken
+        // only at the push, a 128-thread churn still put 23 of 320000 blocks
+        // outside the arena.
+        decommit_pending_.fetch_add(1, std::memory_order_acq_rel);
         DecommitEntry* e = newDecommitEntry();
         if (!e) {
             // The metadata arena is exhausted (it reports that itself). Do the
@@ -136,6 +149,7 @@ class VmRegion {
             local.page_index = page_index;
             local.node = node;
             processDecommitEntry(&local);
+            decommit_pending_.fetch_sub(1, std::memory_order_acq_rel);
             return;
         }
         e->addr = addr;
@@ -454,6 +468,11 @@ public:
     // would otherwise claim fresh region or fail outright, never a fast path.
     size_t drainDecommitQueueNow() {
         DecommitEntry* batch = decommit_head_.exchange(nullptr, std::memory_order_acquire);
+        if (!batch) return 0;
+        // Published before the entries are processed and cleared after, so a
+        // thread that lost the exchange can tell "nothing queued" from
+        // "another thread is holding the queue" — see drainInFlight().
+        decommit_draining_.fetch_add(1, std::memory_order_acq_rel);
         size_t drained = 0;
         while (batch) {
             DecommitEntry* next = batch->next;
@@ -462,7 +481,16 @@ public:
             batch = next;
             ++drained;
         }
+        decommit_draining_.fetch_sub(1, std::memory_order_acq_rel);
         return drained;
+    }
+
+    // Is a run still on its way back to the free map, either queued or being
+    // processed by another thread right now?
+    bool drainInFlight() const {
+        return decommit_pending_.load(std::memory_order_acquire) != 0 ||
+               decommit_head_.load(std::memory_order_acquire) != nullptr ||
+               decommit_draining_.load(std::memory_order_acquire) != 0;
     }
 
     // ── Allocation (full mode only) ─────────────────────────────────────────
@@ -1073,6 +1101,7 @@ private:
         // retry below reads, so dropping the lock costs only a re-check.
         drainDecommitQueueNow();
 
+        {
         LockGuard guard(na.lock);
         if (const size_t idx = free_map_.takeAligned(num_pages, owner, align_pages, phase);
             idx != PageRunMap::kNone)
@@ -1086,28 +1115,7 @@ private:
         const size_t chunk_pages =
             (need + kNodeChunkPages - 1) / kNodeChunkPages * kNodeChunkPages;
         const size_t start = carveNodeChunk(chunk_pages);
-        if (start == kNoChunk) {
-            // The region has no fresh chunk left, so this node's own freed
-            // pages are the only source there is. Drain once more — a run
-            // queued since the drain above can still rescue this — and only
-            // then give up, because the caller's fallback is a separate
-            // mapping that is never compressed. Under the lock this time: the
-            // alternative is returning uncompressible memory, which is worth
-            // more than the contention.
-            //
-            // The shared arena's exhausted hook is deliberately not called
-            // here: it returns empty slab spans, which are shared-owner pages,
-            // and runs of different owners never merge. It cannot produce a
-            // chunk for this node.
-            if (drainDecommitQueueNow()) {
-                if (const size_t idx =
-                        free_map_.takeAligned(num_pages, owner, align_pages, phase);
-                    idx != PageRunMap::kNone)
-                    return base_ + idx * kPageSize;
-            }
-            errno = ENOMEM;
-            return nullptr;
-        }
+        if (start == kNoChunk) goto exhausted;   // handled below, outside na.lock
         void* chunk = base_ + start * kPageSize;
         // Freshly carved, so nothing in the chunk has been touched: no pages
         // to move.
@@ -1131,6 +1139,48 @@ private:
         if (void* p = fromTail()) return p;
         errno = ENOMEM;   // chunk_pages covers `need`, so this is unreachable
         return nullptr;
+        }
+
+exhausted:
+        // The region has no fresh chunk left, so this node's own freed pages
+        // are the only source there is — and a run that is merely in flight
+        // must not be mistaken for one that is gone.
+        //
+        // drainDecommitQueueNow() takes the WHOLE queue with one exchange, so
+        // exactly one thread gets it and every other concurrent caller sees an
+        // empty queue. Giving up on that is what let 20 of 320000 blocks fall
+        // out of the arena on a 16-thread aarch64 run and, reproduced here by
+        // oversubscribing, 203 of 320000 at 64 threads and 6474 at 128. So
+        // keep retrying while any run is queued or another thread is draining
+        // one, and only conclude "nothing left" when both are false.
+        //
+        // Not under na.lock: the wait would otherwise block every other thread
+        // on this node behind it, and the drain itself does syscalls.
+        //
+        // The shared arena's exhausted hook is deliberately not called here:
+        // it returns empty slab spans, which are shared-owner pages, and runs
+        // of different owners never merge. It cannot produce a chunk for this
+        // node.
+        for (int attempt = 0; attempt < kDrainWaitAttempts; ++attempt) {
+            // Drained WITHOUT na.lock, as in the common path: holding it
+            // across the drain's mprotect/madvise serialises every other
+            // thread on this node and was measured at 18.5 s against 2.8 s for
+            // a 128-thread churn, while leaving the residual unchanged — so
+            // the fast path taking a recovered run before this one re-acquires
+            // is not what limits it either.
+            drainDecommitQueueNow();
+            {
+                LockGuard guard(na.lock);
+                if (const size_t idx =
+                        free_map_.takeAligned(num_pages, owner, align_pages, phase);
+                    idx != PageRunMap::kNone)
+                    return base_ + idx * kPageSize;
+            }
+            if (!drainInFlight()) break;   // genuinely nothing to wait for
+            sched_yield();
+        }
+        errno = ENOMEM;
+        return nullptr;
     }
 
 public:
@@ -1146,9 +1196,21 @@ private:
     };
     static constexpr size_t kNoChunk = ~size_t{0};
 
+    // How many times an exhausted node allocation re-checks for a run that is
+    // still on its way back to the free map. Bounded so a genuinely full arena
+    // still fails promptly; each attempt only spins when another thread is
+    // demonstrably mid-drain.
+    static constexpr int kDrainWaitAttempts = 64;
+
     // Both created on first use, indexed by node id and by grid chunk.
     // node_of_chunk_[c] is node+1, or 0 for a chunk no node arena owns. It is
     // written before any of the chunk's pages are handed out.
+    // Threads currently inside drainDecommitQueueNow() with a batch in hand.
+    std::atomic<int> decommit_draining_{0};
+    // Runs that have left their owner and not yet reached the free map:
+    // queued, being processed, or still on their way to being queued.
+    std::atomic<int> decommit_pending_{0};
+
     std::atomic<NodeArena*> node_arenas_{nullptr};
     std::atomic<std::atomic<uint16_t>*> node_of_chunk_{nullptr};
     Spinlock numa_init_lock_;
