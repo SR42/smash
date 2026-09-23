@@ -351,6 +351,7 @@ add_large_alloc_threshold_test(test_large_alloc_threshold_lowered
 if(NOT APPLE)
   add_executable(stdio_after_compression_test stdio_after_compression_test.cpp)
   set_target_properties(stdio_after_compression_test PROPERTIES CXX_STANDARD 20)
+  target_link_libraries(stdio_after_compression_test PRIVATE ${CMAKE_DL_LIBS} Threads::Threads)
   add_test(
     NAME test_stdio_after_compression
     COMMAND ${CMAKE_COMMAND} -E env
@@ -361,6 +362,13 @@ if(NOT APPLE)
       $<TARGET_FILE:stdio_after_compression_test>
   )
   set_tests_properties(test_stdio_after_compression PROPERTIES TIMEOUT 180)
+  # The same retry must never repeat, skip or hide bytes: EFAULTs injected
+  # through fopencookie, outcomes compared with glibc's own functions.
+  add_executable(stdio_partial_retry_test stdio_partial_retry_test.cpp)
+  target_link_libraries(stdio_partial_retry_test PRIVATE ${CMAKE_DL_LIBS})
+  add_test(NAME test_stdio_partial_retry COMMAND ${CMAKE_COMMAND} -E env
+    "LD_PRELOAD=$<TARGET_FILE:smash>" $<TARGET_FILE:stdio_partial_retry_test>)
+  set_tests_properties(test_stdio_partial_retry PROPERTIES TIMEOUT 60)
 endif()
 
 # read-back of BOTH classes. The mode is read from the env at runtime, never a

@@ -15,6 +15,9 @@
 // because raw read goes through smash's EFAULT-retry wrapper and stdio does
 // not.
 #include <cerrno>
+#include <chrono>
+#include <dlfcn.h>
+#include <thread>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -88,6 +91,21 @@ int main() {
 
     // Each of these opens a FRESH stream, so glibc allocates its buffer inside
     // the first read — the case that has no buffer to warm up front.
+    //
+    // Called through dlsym'd pointers. With a buffer of known size,
+    // _FORTIFY_SOURCE turns a direct fgets/fread into __fgets_chk/__fread_chk,
+    // which smash deliberately does not wrap, and then this test never reaches
+    // the code it guards: the UBSan build does exactly that, and failed the
+    // fgets check against the pre-fix and fixed libraries alike.
+    using fgets_fn = char* (*)(char*, int, FILE*);
+    using fread_fn = size_t (*)(void*, size_t, size_t, FILE*);
+    auto fgets_p = reinterpret_cast<fgets_fn>(dlsym(RTLD_DEFAULT, "fgets"));
+    auto fread_p = reinterpret_cast<fread_fn>(dlsym(RTLD_DEFAULT, "fread"));
+    if (!fgets_p || !fread_p) {
+        std::fprintf(stderr, "FAIL: dlsym(fgets/fread)\n");
+        unlink(path);
+        return 1;
+    }
     {   // fgets over a procfs file (no size known in advance)
         FILE* f = std::fopen("/proc/self/maps", "r");
         if (!f) { std::fprintf(stderr, "FAIL: fopen /proc/self/maps\n"); ++failures; }
@@ -95,7 +113,7 @@ int main() {
             char line[1024];
             long lines = 0;
             errno = 0;
-            while (std::fgets(line, sizeof(line), f)) ++lines;
+            while (fgets_p(line, sizeof(line), f)) ++lines;
             const int e = errno;
             if (lines == 0 || std::ferror(f)) fail("fgets(/proc/self/maps)", lines, e);
             else std::fprintf(stderr, "stdio_after_compression: fgets read %ld lines\n", lines);
@@ -110,7 +128,7 @@ int main() {
             char buf[8192];
             size_t n;
             errno = 0;
-            while ((n = std::fread(buf, 1, sizeof(buf), f)) > 0) got.append(buf, n);
+            while ((n = fread_p(buf, 1, sizeof(buf), f)) > 0) got.append(buf, n);
             const int e = errno;
             if (std::ferror(f) || got.size() != want.size())
                 fail("fread(temp file)", static_cast<long>(got.size()), e);
@@ -129,6 +147,44 @@ int main() {
             const int e = errno;
             if (c == EOF || std::ferror(f)) fail("fgetc(temp file)", c, e);
             std::fclose(f);
+        }
+    }
+
+    {   // A stream whose buffer already exists, blocked in fgets on a pipe for
+        // longer than the cold timeout. The buffer page goes cold while the
+        // reader waits, the writer's data then meets a compressed page in the
+        // kernel's copy, and glibc reports EFAULT having consumed nothing.
+        // Warming before the call cannot help here — the page cools during
+        // it — so this is the retry's other job besides the lazy buffer, and
+        // the one a retry restricted to bufferless streams broke: 2 of 2 runs
+        // failed with errno 14.
+        auto fg = fgets_p;
+        int fds[2];
+        FILE* f = nullptr;
+        if (pipe(fds) != 0 || !(f = fdopen(fds[0], "r"))) {
+            std::fprintf(stderr, "FAIL: pipe / fdopen\n"); ++failures;
+        } else {
+            char line[128];
+            const char first[] = "first\n";
+            if (write(fds[1], first, sizeof(first) - 1) != sizeof(first) - 1 ||
+                !fg(line, sizeof(line), f)) {
+                std::fprintf(stderr, "FAIL: first line through the pipe\n"); ++failures;
+            } else {
+                std::thread writer([&] {
+                    std::this_thread::sleep_for(std::chrono::seconds(8));
+                    const char l[] = "second line, after the reader went cold\n";
+                    if (write(fds[1], l, sizeof(l) - 1) != sizeof(l) - 1) std::abort();
+                });
+                errno = 0;
+                char* r = fg(line, sizeof(line), f);
+                const int e = errno;
+                writer.join();
+                if (!r || std::strcmp(line, "second line, after the reader went cold\n") != 0)
+                    fail("fgets(pipe) after blocking 8 s", r ? 1 : 0, e);
+                else std::fprintf(stderr, "stdio_after_compression: blocked fgets recovered\n");
+            }
+            std::fclose(f);
+            close(fds[1]);
         }
     }
 

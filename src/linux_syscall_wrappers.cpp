@@ -137,9 +137,22 @@ static inline void warmGlibcFileBuffer(FILE* stream, smash::VmRegion* vm) {
 // the whole bug, since raw read goes through the EFAULT retry and stdio does
 // not (test_stdio_after_compression).
 //
-// After the failed call the buffer DOES exist, so warm it and retry. Only a
-// call that made no progress is retried: a read that returned EFAULT consumed
-// nothing, but a partial write cannot be safely repeated.
+// After the failed call the buffer DOES exist, so warm it and retry. The same
+// retry covers a buffer that already existed but went cold while the call was
+// blocked -- a program waiting in fgets(stdin) longer than the cold timeout --
+// since warming before the call cannot keep a page warm through a long read.
+//
+// A retry is only correct when the failed call moved nothing, and each caller
+// has to establish that precisely (test_stdio_partial_retry):
+//   - fread/fwrite count whole items, so an 8 KiB item half-written before the
+//     EFAULT returned 0 and was written again in full, duplicating 4096 bytes.
+//     They pass size 1 and scale the result, so progress is counted in bytes.
+//   - A failed flush makes glibc reset its write pointers, discarding bytes an
+//     EARLIER call had accepted. fwrite therefore never retries when output
+//     was pending, or a zero-progress call turns glibc's error into a success
+//     with a hole in the output.
+//   - fgets returns NULL whether or not it consumed part of a line; see its
+//     wrapper for how it keeps the retry to a call that consumed nothing.
 template <typename Op, typename NoProgress>
 static inline auto retryStdioOnEfault(FILE* stream, Op op, NoProgress no_progress)
     -> decltype(op()) {
@@ -1827,10 +1840,14 @@ SMASH_VISIBLE size_t fread(void* ptr, size_t size, size_t nmemb, FILE* stream) {
     bool pin_buf = total && bufferInHeap(ptr, total, vm);
     if (pin_buf) smash::vm::warmPages(ptr, total, vm);
     warmGlibcFileBuffer(stream, vm);
-    size_t ret = retryStdioOnEfault(stream,
-        [&] { return real_fread(ptr, size, nmemb, stream); },
+    if (total == 0) return real_fread(ptr, size, nmemb, stream);
+    // In bytes, so a partly read item counts as progress (see
+    // retryStdioOnEfault); glibc's own result is bytes_read / size.
+    size_t bytes = retryStdioOnEfault(stream,
+        [&] { return real_fread(ptr, 1, total, stream); },
         [](size_t r) { return r == 0; });
-    return ret;
+    if (__builtin_expect(bytes == total, 1)) return nmemb;   // no divide; see fwrite
+    return bytes / size;
 }
 
 SMASH_VISIBLE char* fgets(char* s, int size, FILE* stream) {
@@ -1841,9 +1858,44 @@ SMASH_VISIBLE char* fgets(char* s, int size, FILE* stream) {
     bool pin_s = (s && size > 0) && bufferInHeap(s, static_cast<size_t>(size), vm);
     if (pin_s) smash::vm::warmPages(s, size, vm);
     warmGlibcFileBuffer(stream, vm);
-    char* ret = retryStdioOnEfault(stream,
-        [&] { return real_fgets(s, size, stream); },
-        [](char* r) { return r == nullptr; });
+    // fgets returns NULL on an error whether or not it had already consumed
+    // part of the line, so NULL alone cannot tell a safe retry from one that
+    // silently drops those characters. A call that starts with buffered data
+    // consumes it before any refill, so any failure is partial: no retry. A
+    // call that starts with an empty buffer is split so that exactly one
+    // refill -- the first, which consumes nothing if it fails -- is retried:
+    // read one character on its own, then the rest of the line without retry.
+    if (!stream || !vm || !s || size < 2) return real_fgets(s, size, stream);
+    // The common case -- data already buffered -- is decided without the
+    // lock, which would cost ~5 ns a line; the buffer only empties once per
+    // refill. An empty buffer is re-checked under the stream's (recursive)
+    // lock, held across both halves so no other thread can take characters
+    // from the middle of this line. A stream whose error flag is already set
+    // is left to glibc: the second half's ferror() below has to mean an error
+    // in this call.
+    if (stream->_IO_read_ptr < stream->_IO_read_end) return real_fgets(s, size, stream);
+    flockfile(stream);
+    char* ret;
+    if (stream->_IO_read_ptr < stream->_IO_read_end || ferror(stream)) {
+        ret = real_fgets(s, size, stream);
+    } else if (!retryStdioOnEfault(stream,
+                   [&] { return real_fgets(s, 2, stream); },
+                   [](char* r) { return r == nullptr; })) {
+        ret = nullptr;
+    } else if (size == 2 || s[0] == '\n') {
+        ret = s;
+    } else {
+        // A NULL here with nothing more read is end of file, and the line is
+        // the one character -- glibc's own short last line. An error returns
+        // NULL, as glibc does after consuming part of a line, except EAGAIN,
+        // for which glibc returns what it has.
+        const int saved_errno = errno;
+        errno = 0;
+        ret = (!real_fgets(s + 1, size - 1, stream) && ferror(stream) && errno != EAGAIN)
+            ? nullptr : s;
+        if (errno == 0) errno = saved_errno;
+    }
+    funlockfile(stream);
     return ret;
 }
 
@@ -1873,10 +1925,31 @@ SMASH_VISIBLE size_t fwrite(const void* ptr, size_t size, size_t nmemb, FILE* st
     if (total && bufferInHeap(ptr, total, vm))
         smash::vm::warmPages(const_cast<void*>(ptr), total, vm);
     warmGlibcFileBuffer(stream, vm);
-    size_t ret = retryStdioOnEfault(stream,
-        [&] { return real_fwrite(ptr, size, nmemb, stream); },
-        [](size_t r) { return r == 0; });   // a partial write must not repeat
-    return ret;
+    if (total == 0 || !stream) return real_fwrite(ptr, size, nmemb, stream);
+    // In bytes: a partly written item is progress and must not be written
+    // again. And not at all with output pending: a failed flush discards it
+    // (see retryStdioOnEfault).
+    //
+    // The pending check reads the stream unlocked. Holding flockfile() across
+    // the check and the call cost ~6 ns on every fwrite, a fifth of the call.
+    // What the lock would buy is narrow: another thread buffering output
+    // between the check and this call, then a failed flush -- and that
+    // thread's own fwrite had already returned success, so glibc would not
+    // have told it either; the lock only decides whether THIS caller hears of
+    // the loss.
+    size_t bytes;
+    if (stream->_IO_write_ptr > stream->_IO_write_base) {
+        bytes = real_fwrite(ptr, 1, total, stream);
+    } else {
+        bytes = retryStdioOnEfault(stream,
+            [&] { return real_fwrite(ptr, 1, total, stream); },
+            [](size_t r) { return r == 0; });
+    }
+    // A branch, not `bytes == total ? nmemb : bytes / size`: the compiler
+    // turned that into an unconditional 64-bit divide plus a cmov, ~9 ns on
+    // every call.
+    if (__builtin_expect(bytes == total, 1)) return nmemb;
+    return bytes / size;
 }
 
 SMASH_VISIBLE int fflush(FILE* stream) {
