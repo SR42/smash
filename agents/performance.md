@@ -461,3 +461,8 @@ neither is in the tree:
 
 The lesson for the next attempt: on this path, `perf` attribution and A/B timing
 disagree, and only the timing is load-bearing.
+
+## Two review findings that measured as noise or near it (2026-09-22)
+
+- **An empty `dispatch(5)` every tick.** On Linux the coordinator calls `dispatch(5)` (the NUMA node-queue phase) every tick even when no node group has work, and `dispatch()` bumps `work_gen_` and busy-waits for every active helper. It looks expensive; it is not, because the coordinator ticks once per **second** (`kCompressIntervalMs = 1000`), and at idle the adaptive worker count is 1, so there is no barrier at all. Instrumented with `SMASH_NUMA_COMPRESSOR=0` (the single-node case) under 2 GiB re-dirtied continuously: 162 µs spent in empty phase-5 dispatches over 33 s, with the smash threads using 108% of a CPU. Left as is. Note that helpers poll `work_gen_` with `usleep(100)`, so one barrier with helpers active costs ~100–160 µs of coordinator spin; that bound is what a faster tick rate would have to revisit.
+- **`[[gnu::always_inline, gnu::hot]]` on the wrong function.** Inserting `BootstrapAlloc::usage()` above `owns()` moved the attribute onto `usage()`, and `owns()` became an out-of-line `.constprop` clone called from `xxfree`, `xxrealloc` (4 sites), `xxmalloc_usable_size` and the sized frees. Interleaved, pinned, 30M malloc/free pairs: **no difference in full mode** (13.5–13.9 ns either way), but in large-only mode, where every small free goes through `freeSlow()`, the out-of-line call cost 0.6 ns per pair (22.7–22.9 → 22.2–22.4 ns, non-overlapping in 5 of 5 rounds) and ~0.5 ns per batched free. Fixed by moving the attribute back.

@@ -25,8 +25,22 @@ library: ASan replaces malloc, which is exactly what smash exists to do, so the
 two fight over the same job. Use it to instrument a single direct-linked test
 binary, not libsmash.
 
-**The suite is clean under UBSan: 58/58 with 0 findings**, unprivileged *and* as root
-(re-run 2026-09-20, after the Round 6 syscall wrappers). Two things are worth
+**The suite is clean under UBSan: 0 findings**, unprivileged (75/75) *and* as root
+on claudepc (74/75, idle-page tracking exercised), 2026-09-23, after the mid-bin /
+NUMA-hint / stdio-retry fixes. The one root failure is the pre-existing
+`test_arena_reclaim_concurrent` phase B, which fails on that 2-CPU host with the
+pre-change library as well. That round turned up two things that were not UB:
+
+- `test_stdio_after_compression` was **vacuous in this build**: the sanitized
+  test binary binds `__fgets_chk`/`__fread_chk` (fortified, which smash does not
+  wrap) where the normal build binds `fgets`/`fread`, so its fgets check failed
+  against the pre-fix library too. It now calls them through `dlsym`. Check
+  `objdump -d … | grep _chk` on any stdio test that must reach a wrapper.
+- `test_arena_reclaim_concurrent` phase B failed once in the full run and 3 of
+  18 reruns, then 0 of 80. It reproduces on every build under CPU contention,
+  the pre-change one included; see its entry in [tests.md](tests.md).
+
+Earlier: Two things are worth
 repeating on any future sanitizer round:
 
 - **Confirm the reporting mechanism before believing the silence.** "No report
