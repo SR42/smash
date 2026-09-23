@@ -15,7 +15,10 @@
 //     is on the node;
 //   - the blob of every compressed page of the block is on the node;
 //   - reading the block back from off-node CPUs restores every byte, with
-//     every page on the node.
+//     every page on the node;
+//   - once that off-node read-back has gone cold again, the recompressed
+//     block's blobs are still on the node: the read-back leaves a node hint
+//     pointing elsewhere, and the binding must win over it.
 // Then the same for ordinary malloc memory, which carries no binding: the
 // compressor has to discover each page's node, and the blobs must still land
 // on the node the page was first touched from.
@@ -316,7 +319,7 @@ static bool runLinux(numa_fn numa, info_fn info, blob_fn blob) {
                  node, off, pages, first);
         printf("node %d: %zu/%zu pages compressed, %zu blobs on the node, %zu/%zu pages "
                "restored onto it\n", node, evicted[k], pages, blobs, pages - off, pages);
-        free(p);
+        // Kept for the second round below, not freed.
     }
     // Ordinary malloc memory: unbound, node discovered per page. Its blobs
     // must still follow the page's own node. Before the routing batch was made
@@ -357,6 +360,56 @@ static bool runLinux(numa_fn numa, info_fn info, blob_fn blob) {
                  node, differ);
         printf("malloc block on node %d: %zu/%zu pages compressed, %zu/%zu blobs on "
                "the node\n", node, plain_evicted[k], pages, blobs - off, blobs);
+        free(p);
+    }
+
+    // Second round for the bound blocks. The off-node read-back above faulted
+    // every page in on a CPU outside the node, and the fault handler records
+    // the faulting CPU's node as the page's node hint (notePageNode) — right
+    // for ordinary memory, wrong for a malloc_numa page, whose node is fixed
+    // by its binding. Once the blocks go cold again, their blobs must still be
+    // on the block's own node: a group that trusted the hint over the binding
+    // handed every page to the other node's group and its store.
+    for (int round_ms = 0; round_ms <= 30000; round_ms += 250) {
+        bool all = true;
+        for (size_t k = 0; k < count; ++k) {
+            if (!blocks[k]) continue;
+            evicted[k] = 0;
+            if (mincore(blocks[k], kBlock, vec) == 0)
+                for (size_t i = 0; i < pages; ++i) evicted[k] += !(vec[i] & 1);
+            if (evicted[k] < pages / 2) all = false;
+        }
+        if (all) {
+            printf("second compression wait: %d ms\n", round_ms);
+            break;
+        }
+        usleep(250 * 1000);
+    }
+    for (size_t k = 0; k < count; ++k) {
+        unsigned char* p = blocks[k];
+        if (!p) continue;
+        const int node = nodes[k];
+        if (evicted[k] < pages / 2) {
+            fail("node %d: only %zu of %zu pages left RSS again within 30 s of the "
+                 "read-back", node, evicted[k], pages);
+            free(p);
+            continue;
+        }
+        size_t blobs = 0;
+        if (mincore(p, kBlock, vec) == 0) {
+            for (size_t i = 0; i < pages; ++i) {
+                if (vec[i] & 1) continue;
+                if (void* b = blob(p + i * ps)) ptrs[blobs++] = b;
+            }
+        }
+        int first = 0;
+        const size_t off = offNode(ptrs, status, blobs, node, false, &first);
+        if (blobs == 0 || off)
+            fail("node %d: after an off-node read-back, %zu of %zu blobs of the "
+                 "recompressed block are not on the node (first status=%d) — the page's "
+                 "node hint overrode its binding", node, off, blobs, first);
+        printf("node %d: recompressed after off-node reads, %zu/%zu blobs on the node\n",
+               node, blobs - off, blobs);
         free(p);
     }
 

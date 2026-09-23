@@ -1685,7 +1685,14 @@ private:
                      [[maybe_unused]] std::atomic<uint32_t>& pages_compressed) {
 #if defined(__linux__)
         if (numa_threads_running_ == 0 || !page_node_) return false;
-        const int node = static_cast<int>(page_node_[i]) - 1;
+        // A malloc_numa page's node is its binding, full stop. page_node_ is
+        // only a hint, and the fault handler sets it to the faulting CPU's
+        // node — so one off-node read of a bound page used to send its next
+        // compression to the reader's group and its blob to the reader's
+        // store (test_numa_compressor's second round: 4095 of 4095 blobs off
+        // the node, on every node).
+        const int bound = vm_->nodeOfPage(i);
+        const int node = bound >= 0 ? bound : static_cast<int>(page_node_[i]) - 1;
         if (node < 0) {
             // Rolling batch: resolve a full one right here and carry on
             // deferring, so a range longer than the batch still routes every
