@@ -1871,8 +1871,7 @@ public:
                     if (!g_system_alloc.malloc) return nullptr;
                     void* new_ptr = g_system_alloc.malloc(size);
                     if (new_ptr) {
-                        size_t old_size = sp->is_large ? sp->large_size
-                                                       : classSize(sp->size_class);
+                        size_t old_size = blockSize(sp);
                         __builtin_memcpy(new_ptr, old_ptr,
                                          old_size < size ? old_size : size);
                         this->free(old_ptr);
@@ -1905,8 +1904,7 @@ public:
             if (g_system_alloc.realloc) return g_system_alloc.realloc(old_ptr, size);
             return nullptr;
         }
-        size_t old_size = sp->is_large ? sp->large_size
-                                       : classSize(sp->size_class);
+        size_t old_size = blockSize(sp);
         void* new_ptr = this->malloc(size);
         if (new_ptr) {
             __builtin_memcpy(new_ptr, old_ptr, old_size < size ? old_size : size);
@@ -1952,11 +1950,20 @@ public:
             if (g_system_alloc.malloc_size) return g_system_alloc.malloc_size(ptr);
             return 0;
         }
+        return blockSize(span);
+    }
+
+    // Usable size of a block owned by `span`. The one place that knows a span
+    // can be any of three kinds: getSize() and both of realloc()'s copies go
+    // through it, so they cannot disagree.
+    static size_t blockSize(const Span* span) {
         if (span->is_large) return span->large_size;
         // A mid-size chunk's blocks are its object_size, not a slab class:
-        // reporting classSize(size_class) here would hand realloc a wildly
-        // wrong length (size_class on these spans is the large-alloc tracking
-        // bucket, a page count, not a byte size).
+        // size_class on these spans is the large-alloc tracking bucket (a page
+        // count), and classSize() of it reads past the end of the class table.
+        // realloc used to do exactly that, and in the build where it was found
+        // the garbage was ~4 GiB, so growing a block copied the whole new size
+        // and read straight through its neighbours.
         if (span->is_mid) return span->object_size;
         return classSize(span->size_class);
     }

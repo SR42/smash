@@ -11,7 +11,9 @@
 //      neighbouring frees and reuse, and reports a usable size >= requested;
 //   3. an emptied chunk goes back to the arena, so a workload that frees a
 //      batch of mid-size blocks does not keep the space from a later large
-//      allocation.
+//      allocation;
+//   4. realloc copies a binned block's real size — its size lives in the
+//      chunk's Span::object_size, not in the slab size-class table.
 // The expectation follows the env var, so the off-registration asserts the
 // opposite of the on-registration from the same source.
 #include <cstdarg>
@@ -131,6 +133,116 @@ int main() {
                 if (cold[o] != 0x11) { fail("cold block corrupted at offset %zu", o); break; }
             std::free(cold);
         }
+    }
+
+    // ── 4. realloc keeps a binned block's bytes ─────────────────────────────
+    // realloc has to know the old block's size to copy it, and a binned block
+    // is neither a slab object nor a LargeAlloc block: its size lives in
+    // Span::object_size. Asking the slab size-class table instead indexes past
+    // its end and copies a garbage length, truncating or over-reading the data.
+    // Every mid class, grown within the band, grown out of it and shrunk below
+    // half (the shrink that actually moves).
+    {
+        const size_t from[] = { 17u << 10, 20u << 10, 28u << 10, 48u << 10, 100u << 10,
+                                192u << 10, 300u << 10, 500u << 10, 700u << 10, 1000u << 10 };
+        size_t bad = 0, checked = 0;
+        for (size_t sz : from) {
+            const size_t to[] = { sz + (sz >> 1), 2u << 20, sz / 3 };
+            for (size_t nsz : to) {
+                auto* p = static_cast<unsigned char*>(std::malloc(sz));
+                if (!p) { fail("malloc(%zu) for realloc returned nullptr", sz); continue; }
+                for (size_t o = 0; o < sz; ++o)
+                    p[o] = static_cast<unsigned char>((o * 131 + sz) >> 3);
+                auto* q = static_cast<unsigned char*>(std::realloc(p, nsz));
+                if (!q) { fail("realloc(%zu -> %zu) returned nullptr", sz, nsz); std::free(p); continue; }
+                const size_t keep = sz < nsz ? sz : nsz;
+                size_t o = 0;
+                for (; o < keep; ++o)
+                    if (q[o] != static_cast<unsigned char>((o * 131 + sz) >> 3)) break;
+                ++checked;
+                if (o != keep) {
+                    ++bad;
+                    fail("realloc(%zu -> %zu) lost the block's data from offset %zu of %zu",
+                         sz, nsz, o, keep);
+                }
+                std::free(q);
+            }
+        }
+        std::printf("  realloc of band blocks: %zu of %zu kept their bytes\n",
+                    checked - bad, checked);
+    }
+
+    // ── 5. realloc reads only the old block ─────────────────────────────────
+    // The garbage length above is not necessarily short. In the build where
+    // this was found, the out-of-table read gave ~4 GiB, so memcpy copied the
+    // whole NEW size: growing a block read straight through its neighbours
+    // (and near the arena's commit edge, into reserved PROT_NONE pages). The
+    // bytes check in section 4 cannot see that, so watch the neighbours: fill
+    // one whole chunk, let it go cold until its pages leave RSS, grow the
+    // first block, and require the others to stay out of RSS. A copy of the
+    // right length touches only the first block — plus what the fault handler
+    // prefetches around it: up to kPrefetchWindow (2) pages either side,
+    // within the span, and a chunk is one span. As root that prefetch shows
+    // up as exactly 2 neighbour pages (claudepc, 2026-09-23), so pages within
+    // two of the block are allowed; the defect brought back a whole neighbour
+    // (60 pages).
+    if (bins_on) {
+        constexpr size_t kSz = 240u << 10;       // a class nothing above uses: 8 per chunk
+        constexpr int kN = 8;
+        const size_t ps = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+        unsigned char* nb[kN] = {};
+        for (int i = 0; i < kN; ++i) {
+            nb[i] = static_cast<unsigned char*>(std::malloc(kSz));
+            if (!nb[i]) { fail("malloc(240 KiB) returned nullptr"); break; }
+            for (size_t o = 0; o < kSz; ++o) nb[i][o] = static_cast<unsigned char>(i * 17 + o / 4096);
+        }
+        constexpr size_t kPrefetchWindow = 2;    // include/smash/config.h default
+        // Resident pages of the neighbours, excluding those within the
+        // prefetch window of the first block (nb[0] as it was, before realloc).
+        const auto* first = nb[0];
+        auto residentPages = [&](int from) {
+            size_t r = 0;
+            std::vector<unsigned char> vec(kSz / ps);
+            for (int i = from; i < kN; ++i) {
+                if (!nb[i] || mincore(nb[i], kSz, vec.data()) != 0) continue;
+                for (size_t k = 0; k < vec.size(); ++k) {
+                    const unsigned char* a = nb[i] + k * ps;
+                    const bool near = first && a + kPrefetchWindow * ps >= first &&
+                                      a < first + kSz + kPrefetchWindow * ps;
+                    if (!near) r += vec[k] & 1;
+                }
+            }
+            return r;
+        };
+        size_t before = residentPages(1);
+        for (int i = 0; i < 120 && before > 0; ++i) {  // up to 30 s
+            usleep(250 * 1000);
+            before = residentPages(1);
+        }
+        const size_t all = (kN - 1) * (kSz / ps);
+        std::printf("  neighbours before realloc: %zu of %zu pages resident\n", before, all);
+        if (before * 4 > all) {
+            fail("the chunk's blocks did not leave RSS (%zu of %zu pages resident); the "
+                 "over-read check below would prove nothing", before, all);
+        } else if (nb[0]) {
+            auto* q = static_cast<unsigned char*>(std::realloc(nb[0], 2 * kSz));
+            const size_t after = residentPages(1);
+            std::printf("  neighbours after growing the first block: %zu pages resident "
+                        "beyond the prefetch window\n", after);
+            if (after > before)
+                fail("growing one 240 KiB block faulted %zu pages of its neighbours back "
+                     "in — realloc copied past the end of the old block", after - before);
+            if (!q) fail("realloc(240 KiB -> 480 KiB) returned nullptr");
+            else {
+                for (size_t o = 0; o < kSz; ++o)
+                    if (q[o] != static_cast<unsigned char>(o / 4096)) {
+                        fail("realloc lost the block's data at offset %zu", o);
+                        break;
+                    }
+                nb[0] = q;
+            }
+        }
+        for (int i = 0; i < kN; ++i) std::free(nb[i]);
     }
 
     for (auto* p : blocks) std::free(p);
