@@ -12,6 +12,7 @@
 #include <new>
 #include <sys/mman.h>
 #include <pthread.h>
+#include <sched.h>
 #include <signal.h>
 #include <unistd.h>
 #include "smash/config.h"
@@ -97,24 +98,60 @@ class VmRegion {
         size_t num_pages;
         size_t page_index;
         int node;  // owning NUMA node arena, or -1 for the shared free lists
+        unsigned shard;  // the entry pool shard it came from and returns to
         DecommitEntry* next;
     };
 
-    std::atomic<DecommitEntry*> decommit_head_{nullptr};
-    DecommitEntry* decommit_pool_ = nullptr;
-    Spinlock decommit_pool_lock_;
+    // The pool of spare entries is sharded by CPU, one cache line per shard.
+    // It used to be one list under one spinlock, taken twice per large free
+    // (here, and again when the entry is recycled) — on a 128-thread
+    // malloc_numa workload on 128 cores that lock was 32% of all CPU, under
+    // releasePages. It also shared a cache line with decommit_head_, which
+    // every free CASes, so the line bounced even when the lock was free.
+    //
+    // An entry goes back to the shard it came from, not the recycler's, so the
+    // shards stay balanced even though entries are taken by freeing threads
+    // and recycled by whichever thread drains the queue. A thread that finds
+    // its shard empty (it migrated, or its CPU's frees are all in flight)
+    // allocates a new entry, which then belongs to that shard; the total is
+    // bounded by what can be in flight per shard, and entries are 48 bytes.
+    // No thread-local state, so nothing is stranded when a thread exits.
+    static constexpr unsigned kEntryShards = 64;
+    struct alignas(64) EntryShard {
+        Spinlock lock;
+        DecommitEntry* head = nullptr;
+    };
+    EntryShard entry_shards_[kEntryShards];
+
+    alignas(64) std::atomic<DecommitEntry*> decommit_head_{nullptr};
     pthread_t decommit_thread_{};
     std::atomic<bool> decommit_running_{false};
 
+    static unsigned currentEntryShard() {
+#if defined(__linux__)
+        // glibc reads this from rseq where the kernel supports it: no syscall.
+        const int cpu = sched_getcpu();
+        if (cpu >= 0) return static_cast<unsigned>(cpu) & (kEntryShards - 1);
+#endif
+        // No CPU number: spread by thread instead.
+        const auto t = reinterpret_cast<uintptr_t>(pthread_self());
+        return static_cast<unsigned>((t >> 12) ^ (t >> 20)) & (kEntryShards - 1);
+    }
+
     DecommitEntry* newDecommitEntry() {
-        LockGuard guard(decommit_pool_lock_);
-        if (decommit_pool_) {
-            DecommitEntry* e = decommit_pool_;
-            decommit_pool_ = e->next;
-            return e;
+        const unsigned s = currentEntryShard();
+        EntryShard& sh = entry_shards_[s];
+        {
+            LockGuard guard(sh.lock);
+            if (DecommitEntry* e = sh.head) {
+                sh.head = e->next;
+                return e;           // e->shard == s already
+            }
         }
-        return static_cast<DecommitEntry*>(
+        auto* e = static_cast<DecommitEntry*>(
             BootstrapAlloc::instance().allocate(sizeof(DecommitEntry), alignof(DecommitEntry)));
+        if (e) e->shard = s;
+        return e;
     }
 
     void recycleDecommitEntry(DecommitEntry* e) {
@@ -124,9 +161,10 @@ class VmRegion {
         // queued one (queueForDecommit's no-entry fallback and
         // releasePagesNow) never reach here, so the count stays balanced.
         decommit_pending_.fetch_sub(1, std::memory_order_acq_rel);
-        LockGuard guard(decommit_pool_lock_);
-        e->next = decommit_pool_;
-        decommit_pool_ = e;
+        EntryShard& sh = entry_shards_[e->shard];
+        LockGuard guard(sh.lock);
+        e->next = sh.head;
+        sh.head = e;
     }
 
     void queueForDecommit(void* addr, size_t num_pages, size_t page_index, int node) {

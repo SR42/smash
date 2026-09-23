@@ -466,3 +466,41 @@ disagree, and only the timing is load-bearing.
 
 - **An empty `dispatch(5)` every tick.** On Linux the coordinator calls `dispatch(5)` (the NUMA node-queue phase) every tick even when no node group has work, and `dispatch()` bumps `work_gen_` and busy-waits for every active helper. It looks expensive; it is not, because the coordinator ticks once per **second** (`kCompressIntervalMs = 1000`), and at idle the adaptive worker count is 1, so there is no barrier at all. Instrumented with `SMASH_NUMA_COMPRESSOR=0` (the single-node case) under 2 GiB re-dirtied continuously: 162 µs spent in empty phase-5 dispatches over 33 s, with the smash threads using 108% of a CPU. Left as is. Note that helpers poll `work_gen_` with `usleep(100)`, so one barrier with helpers active costs ~100–160 µs of coordinator spin; that bound is what a faster tick rate would have to revisit.
 - **`[[gnu::always_inline, gnu::hot]]` on the wrong function.** Inserting `BootstrapAlloc::usage()` above `owns()` moved the attribute onto `usage()`, and `owns()` became an out-of-line `.constprop` clone called from `xxfree`, `xxrealloc` (4 sites), `xxmalloc_usable_size` and the sized frees. Interleaved, pinned, 30M malloc/free pairs: **no difference in full mode** (13.5–13.9 ns either way), but in large-only mode, where every small free goes through `freeSlow()`, the out-of-line call cost 0.6 ns per pair (22.7–22.9 → 22.2–22.4 ns, non-overlapping in 5 of 5 rounds) and ~0.5 ns per batched free. Fixed by moving the attribute back.
+
+## The decommit-entry pool was one lock for every large free (2026-09-23)
+
+A 128-thread `malloc_numa` workload on a 128-core, 4-node box profiled at
+**36.6% of all CPU in `smash::Spinlock::lock()`, 32.3% of it under
+`VmRegion::releasePages` ← `LargeAlloc::deallocate`**, and 10.2% in
+`drainDecommitQueueNow` under `LargeAlloc::allocateOnNode`. `releasePages` takes
+exactly one lock: `queueForDecommit` → `newDecommitEntry()` popped a 48-byte
+queue record from one global list under one spinlock, and `recycleDecommitEntry`
+pushed it back under the same lock — twice per large free, from every thread.
+The lock also sat on the same cache line as `decommit_head_`, which every free
+CASes, so the line bounced even while the lock was free.
+
+The pool is now 64 shards, one cache line each, indexed by `sched_getcpu()`
+(rseq-backed in glibc, so no syscall). An entry records its shard and is
+recycled to it, not to the recycler's, so shards stay balanced although
+entries are taken by freeing threads and returned by whichever thread drains.
+No thread-local state, so nothing is stranded at thread exit.
+
+**Measured here it is at best a small win, and that is expected:** an 8-CPU
+box cannot reproduce 128 cores contending on one line. `malloc_numa` churn
+(1–8 MiB blocks, node = thread % 4), interleaved: 8 threads (1:1) 73.7–75.3k →
+75.6–76.5k ops/s, 3 of 3 rounds; at 64 and 128 threads (8x and 16x
+oversubscribed) the runs overlap (128: 3.8–4.9k vs 4.2–4.9k over 8 rounds) and
+are dominated by the node-allocation path's locks, not this one. The verdict
+belongs to the 128-core box.
+
+Profiling traps on the way, both cost a round trip: `perf report` sorts by
+`comm,dso,sym`, so with named threads each thread is its own row and a 36%
+lock shows as ~0.67% per thread — use `--sort sym`; and `-S` matches the
+demangled name, so `-S _ZN5smash8Spinlock4lockEv` silently matches nothing —
+use `--symbol-filter="Spinlock::lock"`. libsmash has no frame pointers in
+RelWithDebInfo, so use `--call-graph dwarf` (or `lbr` on Intel).
+
+What an 8-CPU box does show at 1:1 is the next cost: `releaseHook` —
+`releaseCompressedPages` walking every page of every freed block under its
+page lock (40% at 8 threads, 30% in the large-only repro) whether or not any
+page was ever compressed.
