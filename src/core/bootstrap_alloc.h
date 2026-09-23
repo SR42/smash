@@ -217,7 +217,6 @@ public:
         return p;
     }
 
-    [[gnu::always_inline, gnu::hot]]
     // Diagnostics: bytes handed out, bytes mapped, and region count. Every
     // slab span costs a descriptor plus a bitmap here, so this is what runs
     // out on a very large heap (reported on the SIGUSR2 stats line as boot=).
@@ -231,6 +230,7 @@ public:
         *used = u; *capacity = c; *regions = n;
     }
 
+    [[gnu::always_inline, gnu::hot]]
     bool owns(const void* ptr) const {
         auto p = reinterpret_cast<uintptr_t>(ptr);
         // Fast-reject: ptr outside any bootstrap region's envelope.
