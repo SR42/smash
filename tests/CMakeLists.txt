@@ -608,6 +608,30 @@ if(NOT APPLE)
     test_run_cache_on_softdirty0 PROPERTIES TIMEOUT 180)
 endif()
 
+# smash_sim (tools/smash_sim.cpp): drives the real large-block allocator —
+# LargeAlloc, VmRegion's shared and node arenas, the free map, the decommit
+# queue, the run cache, the span pools — with the page-level OS calls stubbed
+# out (-DSMASH_SIM) and no compressor, so it runs at full rate without touching
+# memory and reports lock contention per call site. The smoke test runs it
+# briefly with the invariant checks on (no double hand-out, page map intact,
+# every carved page free again after a full drain), cache off and on.
+if(NOT APPLE)
+  add_executable(smash_sim ${CMAKE_CURRENT_SOURCE_DIR}/../tools/smash_sim.cpp
+                 ${printf_SOURCE_DIR}/printf.cpp)
+  target_include_directories(smash_sim PRIVATE ${SMASH_TEST_INCLUDE_DIRS})
+  target_compile_definitions(smash_sim PRIVATE SMASH_SIM)
+  target_link_libraries(smash_sim PRIVATE alloc8::headers Threads::Threads ${CMAKE_DL_LIBS})
+  set_target_properties(smash_sim PROPERTIES CXX_STANDARD 20)
+  add_test(NAME test_smash_sim_smoke COMMAND ${CMAKE_COMMAND} -E env
+    $<TARGET_FILE:smash_sim> --threads 8 --seconds 2 --nodes 4 --arena-gib 4
+    --cold 0.1 --cross-free 0.2 --numa 0.7)
+  add_test(NAME test_smash_sim_smoke_run_cache COMMAND ${CMAKE_COMMAND} -E env
+    $<TARGET_FILE:smash_sim> --threads 8 --seconds 2 --nodes 4 --arena-gib 4
+    --cold 0.1 --cross-free 0.2 --numa 0.7 --run-cache-mib 32)
+  set_tests_properties(test_smash_sim_smoke test_smash_sim_smoke_run_cache
+    PROPERTIES TIMEOUT 120)
+endif()
+
 # malloc_numa_aligned(node, size, align): malloc_numa plus an alignment
 # guarantee. Sweeps alignments from one page to 16 MiB against sizes across the
 # routing boundaries on every online node, and re-checks the whole malloc_numa

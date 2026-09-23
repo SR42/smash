@@ -5,7 +5,46 @@
 #include <cstdint>
 #include "thread_safety.h"
 
+#if defined(SMASH_SIM)
+#include <time.h>
+#endif
+
 namespace smash {
+
+#if defined(SMASH_SIM)
+// Simulator build only (tools/smash_sim.cpp): contended acquisitions and the
+// time spent waiting, per call site — the return address into the function
+// that took the lock — so the simulator can say which lock is hot without
+// perf. A small open-addressed table; a full table drops new sites.
+namespace sim {
+struct LockSite {
+    std::atomic<uintptr_t> ra{0};
+    std::atomic<uint64_t> contended{0};
+    std::atomic<uint64_t> wait_ns{0};
+};
+inline constexpr unsigned kLockSites = 1024;
+inline LockSite g_lock_sites[kLockSites];
+inline LockSite* lockSite(uintptr_t ra) {
+    unsigned h = static_cast<unsigned>((ra >> 4) * 2654435761u) & (kLockSites - 1);
+    for (unsigned i = 0; i < kLockSites; ++i, h = (h + 1) & (kLockSites - 1)) {
+        uintptr_t cur = g_lock_sites[h].ra.load(std::memory_order_acquire);
+        if (cur == ra) return &g_lock_sites[h];
+        if (cur == 0 && g_lock_sites[h].ra.compare_exchange_strong(cur, ra))
+            return &g_lock_sites[h];
+        if (cur == ra) return &g_lock_sites[h];
+    }
+    return nullptr;
+}
+inline uint64_t nowNs() {
+    timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return static_cast<uint64_t>(t.tv_sec) * 1000000000ull + static_cast<uint64_t>(t.tv_nsec);
+}
+}  // namespace sim
+#define SMASH_SIM_NOINLINE __attribute__((noinline))
+#else
+#define SMASH_SIM_NOINLINE
+#endif
 
 // CPU relax hint for the spin-wait body.
 static inline void spinRelax() {
@@ -33,9 +72,22 @@ class SMASH_CAPABILITY("mutex") Spinlock {
     std::atomic<uint8_t> state_{0};   // 0 = free, 1 = held
 
 public:
-    void lock() SMASH_ACQUIRE() {
+    SMASH_SIM_NOINLINE void lock() SMASH_ACQUIRE() {
         // Fast path: uncontended acquire.
         if (tryLockRelaxed()) return;
+#if defined(SMASH_SIM)
+        const uintptr_t ra = reinterpret_cast<uintptr_t>(__builtin_return_address(0));
+        const uint64_t t0 = sim::nowNs();
+        struct Record {
+            uintptr_t ra; uint64_t t0;
+            ~Record() {
+                if (sim::LockSite* site = sim::lockSite(ra)) {
+                    site->contended.fetch_add(1, std::memory_order_relaxed);
+                    site->wait_ns.fetch_add(sim::nowNs() - t0, std::memory_order_relaxed);
+                }
+            }
+        } record{ra, t0};
+#endif
         unsigned backoff = 1;
         for (;;) {
             // Read-spin: no atomic RMW, line stays Shared, zero coherence

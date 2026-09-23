@@ -12,6 +12,8 @@
 #include <windows.h>
 #else
 #include <sys/mman.h>
+#include <atomic>
+#include <time.h>
 #include <unistd.h>
 #if defined(__linux__)
 #include <sys/syscall.h>
@@ -97,6 +99,33 @@ inline int rawMunmap(void* addr, size_t size) { return munmap(addr, size); }
 #endif
 
 // Map anonymous private pages. Returns nullptr on failure.
+#if defined(SMASH_SIM)
+// Simulator build only (tools/smash_sim.cpp defines SMASH_SIM; the library
+// never does). The page-level calls below become no-ops so the allocator's
+// own logic — node arenas, the free map, the decommit queue, the run cache,
+// the span pools — can be driven at full rate without touching memory. An
+// optional busy-wait stands in for each call's kernel cost. Counted per
+// thread: a shared counter would add the very contention being measured.
+inline constinit thread_local uint64_t tl_sim_os_calls = 0;
+inline uint64_t g_sim_os_call_ns = 0;
+inline void simOsCall() {
+    ++tl_sim_os_calls;
+    if (g_sim_os_call_ns == 0) return;
+    timespec t0, t;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    do {
+        clock_gettime(CLOCK_MONOTONIC, &t);
+    } while (static_cast<uint64_t>(t.tv_sec - t0.tv_sec) * 1000000000ull +
+                 static_cast<uint64_t>(t.tv_nsec) - static_cast<uint64_t>(t0.tv_nsec) <
+             g_sim_os_call_ns);
+}
+#define SMASH_SIM_OS_CALL(ret) do { ::smash::vm::simOsCall(); return ret; } while (0)
+#define SMASH_SIM_OS_CALL_VOID() do { ::smash::vm::simOsCall(); return; } while (0)
+#else
+#define SMASH_SIM_OS_CALL(ret) do {} while (0)
+#define SMASH_SIM_OS_CALL_VOID() do {} while (0)
+#endif
+
 inline void* mapPages(size_t size) {
 #if defined(_WIN32)
     return VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
@@ -144,6 +173,7 @@ inline void* mapPagesNoReserve(size_t size) {
 
 // Commit pages within a reserved region (make them accessible).
 inline bool commitPages(void* addr, size_t size) {
+    SMASH_SIM_OS_CALL(true);
 #if defined(_WIN32)
     return VirtualAlloc(addr, size, MEM_COMMIT, PAGE_READWRITE) != nullptr;
 #else
@@ -173,6 +203,7 @@ inline bool noDecommitEnabled() {
 }
 
 inline void decommitPages(void* addr, size_t size) {
+    SMASH_SIM_OS_CALL_VOID();
     if (noDecommitEnabled()) return;
     // Bounds check: madvise(DONTNEED) on wrong address drops backing for
     // libc/ld.so pages, causing mysterious SIGSEGV later.
@@ -232,6 +263,7 @@ inline void decommitPages(void* addr, size_t size) {
 // trap a wild pointer, and the caller has established the range is a mapping
 // it created. Not used on Windows, where the region path recommits explicitly.
 inline void decommitOwnMapping(void* addr, size_t size) {
+    SMASH_SIM_OS_CALL_VOID();
     if (noDecommitEnabled()) return;
 #if defined(__linux__)
     static const int madv = madvMode();
@@ -267,6 +299,7 @@ inline void unmapPages(void* addr, size_t size) {
 // compiles with many cold pages, this hits the cap and subsequent
 // mprotect() calls silently fail. Callers should check the return.
 inline bool protectPages(void* addr, size_t size, bool read, bool write) {
+    SMASH_SIM_OS_CALL(true);
 #if defined(_WIN32)
     DWORD prot = PAGE_NOACCESS;
     if (read && write) prot = PAGE_READWRITE;
@@ -342,6 +375,7 @@ inline void (*g_after_remap_track_hook)(void* addr, size_t size) = nullptr;
 // MAP_FIXED replaces the existing mapping atomically; the kernel will
 // re-merge with adjacent identically-protected VMAs after the call.
 inline bool remapPages(void* addr, size_t size, bool read, bool write) {
+    SMASH_SIM_OS_CALL(true);
 #if defined(_WIN32)
     // No analogous primitive on Windows that's strictly safer than
     // VirtualProtect — fall back to a plain protect call.
@@ -426,6 +460,7 @@ inline constexpr uint32_t kMaxNumaNodes = 1024;
 inline bool bindPagesToNode(void* addr, size_t size, uint32_t node,
                             unsigned flags = 0) {
     if (node >= kMaxNumaNodes) { errno = EINVAL; return false; }
+    SMASH_SIM_OS_CALL(true);
     constexpr size_t kBitsPerWord = 8 * sizeof(unsigned long);
     unsigned long mask[kMaxNumaNodes / kBitsPerWord] = {};
     mask[node / kBitsPerWord] = 1UL << (node % kBitsPerWord);
@@ -437,6 +472,7 @@ inline bool bindPagesToNode(void* addr, size_t size, uint32_t node,
 
 // Reset the range to MPOL_DEFAULT. Best effort.
 inline void unbindPages(void* addr, size_t size) {
+    SMASH_SIM_OS_CALL_VOID();
     (void)syscall(SYS_mbind, addr, size, MPOL_DEFAULT, nullptr, 0, 0);
 }
 #endif

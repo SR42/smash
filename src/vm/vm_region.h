@@ -1229,15 +1229,24 @@ public:
     // live blocks cost, which an address span cannot tell you once the arena
     // has any history — blocks legitimately scatter across existing free runs.
     // False if this region has no node arenas (none has been used yet).
+    // `free_pages` includes the unused tail of the node's newest chunk
+    // ([cur, end)), which is free but not in the free map. Without it,
+    // carved - free was live blocks PLUS that tail, and a block served from
+    // the tail changed neither number — found by smash_sim's end-of-run check
+    // (every carved page free again), which failed on every node with a tail.
     bool nodeArenaInfo(uint32_t node, size_t* carved, size_t* free_pages) {
         if (node >= vm::kMaxNumaNodes) return false;
         NodeArena* arenas = node_arenas_.load(std::memory_order_acquire);
         if (!arenas) return false;
+        size_t tail = 0;
         {
             LockGuard guard(arenas[node].lock);
             *carved = arenas[node].carved;
+            tail = arenas[node].end - arenas[node].cur;
+            // Read under the same lock: a concurrent tail allocation moves a
+            // run from the tail to a live block, never into the free map.
+            *free_pages = free_map_.freePages(ownerOfNode(static_cast<int>(node))) + tail;
         }
-        *free_pages = free_map_.freePages(ownerOfNode(static_cast<int>(node)));
         return true;
     }
     size_t arenaLongestFreeRun() { return free_map_.longestRunAtLeast(kSharedOwner); }

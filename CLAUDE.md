@@ -42,7 +42,7 @@ codegen bug: [agents/sanitizers.md](agents/sanitizers.md).
 cd build && ctest --output-on-failure
 ```
 
-All 79 tests must pass; none are registered `DISABLED`. Run the suite **as root** too when touching the compressor: idle-page read tracking only exists with root, and CI (`.github/workflows/ci.yml`, `ubuntu-latest` + `macos-latest`, every push and PR) runs unprivileged. After ctest, CI runs `bench/run_quick_ci.py` (`bench_rss` ≥30 %, `bench_sqlite --quick` ≥5 % RSS reduction).
+All 81 tests must pass; none are registered `DISABLED`. Run the suite **as root** too when touching the compressor: idle-page read tracking only exists with root, and CI (`.github/workflows/ci.yml`, `ubuntu-latest` + `macos-latest`, every push and PR) runs unprivileged. After ctest, CI runs `bench/run_quick_ci.py` (`bench_rss` ≥30 %, `bench_sqlite --quick` ≥5 % RSS reduction).
 
 **Before changing a test or its threshold, read its entry in [agents/tests.md](agents/tests.md).** Thresholds encode measurements, several tests are probabilistic (one run is not a verdict), and some harness shapes (sharing a process between phases, `fork()` with smash threads running) reproduce the very symptom under test.
 
@@ -68,6 +68,7 @@ Read the relevant file before working in that area; none of it is loaded automat
 | [agents/config.md](agents/config.md) | All `config.h` constants and `SMASH_*` environment variables |
 | [agents/sanitizers.md](agents/sanitizers.md) | UBSan rounds, the `__*_chk` gap, the GCC `constinit` bug |
 | [agents/syscall-compat.md](agents/syscall-compat.md) | EFAULT retry, interposed functions, `_FORTIFY_SOURCE` aliases |
+| [agents/simulator.md](agents/simulator.md) | `smash_sim`: drive the large-block allocator (arenas, free map, decommit queue, run cache) at full rate with stubbed OS calls, per-site lock contention, invariant checks |
 | [agents/benchmarks.md](agents/benchmarks.md) | Benchmark procedures, paper experiments, `verify_paper_claims.py` |
 | [agents/external-tracking.md](agents/external-tracking.md), [agents/macos-arm64e.md](agents/macos-arm64e.md), [agents/releases.md](agents/releases.md), [agents/neuron-cc-investigation.md](agents/neuron-cc-investigation.md) | As named |
 

@@ -1,0 +1,430 @@
+// smash_sim.cpp - drive smash's large-block memory management at full rate
+// without touching memory and without the compressor.
+//
+// Built with -DSMASH_SIM, which turns the page-level OS calls (mprotect,
+// madvise, mbind) into no-ops with an optional simulated cost (--os-call-ns)
+// and makes Spinlock record contention per call site. Everything else is the
+// real code: LargeAlloc, VmRegion (shared arena, per-node arenas, the free
+// map, the decommit queue and thread, the run cache), the span-descriptor
+// pools and the page map. The compressor is replaced by a release hook that
+// reports a chosen fraction of frees as "had compressed pages" (--cold).
+//
+// Block memory is never written: the arena is a PROT_NONE reservation and no
+// commit reaches the kernel, so a million 8 MiB blocks cost no RSS. What is
+// real is every lock, atomic and list the allocator uses, so the lock report
+// shows where threads wait on this machine. It cannot make 8 cores contend
+// like 128 — oversubscription is not parallelism — but it measures policy
+// (cache hit rates for a size mix, arena walk, fragmentation) exactly, and
+// checks invariants under stress:
+//   - no page is ever handed to two live blocks (a shadow ownership map);
+//   - the page map resolves every live block to its own span;
+//   - after everything is freed and drained, every carved page is free.
+//
+// Usage: smash_sim [--threads N] [--seconds S] [--nodes K] [--arena-gib G]
+//                  [--sizes 1M,2M:3,...] [--live K] [--numa F] [--cold F]
+//                  [--cross-free F] [--run-cache-mib M] [--os-call-ns NS]
+//                  [--no-check] [--seed X]
+// Exit status is 1 if an invariant failed.
+#include "smash/config.h"
+#include "core/large_alloc.h"
+#include "core/page_map.h"
+#include "vm/page_state.h"
+#include "vm/vm_region.h"
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cinttypes>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <dlfcn.h>
+#include <mutex>
+#include <string>
+#include <sys/mman.h>
+#include <thread>
+#include <vector>
+
+using namespace smash;
+
+namespace {
+
+struct Options {
+    int threads = 8;
+    int seconds = 5;
+    int nodes = 4;
+    size_t arena_gib = 16;
+    std::vector<std::pair<size_t, unsigned>> sizes;   // bytes, weight
+    int live = 8;
+    double numa = 1.0;        // fraction of allocations through the node path
+    double cold = 0.0;        // fraction of frees reported as compressed
+    double cross_free = 0.0;  // fraction of frees handed to another thread
+    long run_cache_mib = 0;
+    uint64_t os_call_ns = 0;
+    bool check = true;
+    uint64_t seed = 1;
+};
+Options opt;
+
+size_t parseSize(const char* s) {
+    char* end = nullptr;
+    double v = std::strtod(s, &end);
+    switch (end && *end ? *end : 'B') {
+        case 'K': case 'k': v *= 1024; break;
+        case 'M': case 'm': v *= 1024 * 1024; break;
+        case 'G': case 'g': v *= 1024.0 * 1024 * 1024; break;
+        default: break;
+    }
+    return static_cast<size_t>(v);
+}
+
+void parseSizes(const char* list) {
+    opt.sizes.clear();
+    std::string s(list);
+    size_t pos = 0;
+    while (pos <= s.size()) {
+        size_t comma = s.find(',', pos);
+        std::string item = s.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+        if (!item.empty()) {
+            unsigned w = 1;
+            if (size_t colon = item.find(':'); colon != std::string::npos) {
+                w = static_cast<unsigned>(std::atoi(item.c_str() + colon + 1));
+                item.resize(colon);
+            }
+            opt.sizes.emplace_back(parseSize(item.c_str()), w ? w : 1);
+        }
+        if (comma == std::string::npos) break;
+        pos = comma + 1;
+    }
+}
+
+void usage() {
+    std::fprintf(stderr,
+        "usage: smash_sim [--threads N] [--seconds S] [--nodes K] [--arena-gib G]\n"
+        "                 [--sizes 1M,2M:3,...] [--live K] [--numa F] [--cold F]\n"
+        "                 [--cross-free F] [--run-cache-mib M] [--os-call-ns NS]\n"
+        "                 [--no-check] [--seed X]\n");
+    std::exit(2);
+}
+
+void parseArgs(int argc, char** argv) {
+    parseSizes("1M,2M,3M,4M,5M,6M,7M,8M");
+    for (int i = 1; i < argc; ++i) {
+        const std::string a = argv[i];
+        auto next = [&]() -> const char* { if (i + 1 >= argc) usage(); return argv[++i]; };
+        if (a == "--threads") opt.threads = std::atoi(next());
+        else if (a == "--seconds") opt.seconds = std::atoi(next());
+        else if (a == "--nodes") opt.nodes = std::atoi(next());
+        else if (a == "--arena-gib") opt.arena_gib = std::strtoull(next(), nullptr, 10);
+        else if (a == "--sizes") parseSizes(next());
+        else if (a == "--live") opt.live = std::atoi(next());
+        else if (a == "--numa") opt.numa = std::atof(next());
+        else if (a == "--cold") opt.cold = std::atof(next());
+        else if (a == "--cross-free") opt.cross_free = std::atof(next());
+        else if (a == "--run-cache-mib") opt.run_cache_mib = std::atol(next());
+        else if (a == "--os-call-ns") opt.os_call_ns = std::strtoull(next(), nullptr, 10);
+        else if (a == "--no-check") opt.check = false;
+        else if (a == "--seed") opt.seed = std::strtoull(next(), nullptr, 10);
+        else usage();
+    }
+    if (opt.threads < 1 || opt.seconds < 1 || opt.nodes < 1 || opt.live < 1 ||
+        opt.sizes.empty() || opt.nodes > static_cast<int>(vm::kMaxNumaNodes))
+        usage();
+}
+
+// ── The allocator under test ────────────────────────────────────────────────
+VmRegion g_vm;
+PageMap g_page_map;
+PageStateTable g_states;
+LargeAlloc g_large;
+
+// Stands in for the compressor's release: resets the pages as it would, and
+// reports a run as "had compressed pages" with probability --cold.
+thread_local uint64_t tl_rng = 0;
+uint64_t rnd() {
+    tl_rng ^= tl_rng << 13; tl_rng ^= tl_rng >> 7; tl_rng ^= tl_rng << 17;
+    return tl_rng;
+}
+double rnd01() { return static_cast<double>(rnd() >> 11) * (1.0 / 9007199254740992.0); }
+
+bool simRelease(size_t first, size_t count, void*) {
+    for (size_t i = first; i < first + count; ++i) g_states.set(i, PageState::EMPTY);
+    return !(opt.cold > 0 && rnd01() < opt.cold);
+}
+
+// ── Invariant checking without touching block memory ────────────────────────
+std::atomic<uint32_t>* g_owner = nullptr;   // per arena page: 0 or the owning block id
+std::atomic<uint64_t> g_double_handout{0}, g_owner_mismatch{0}, g_span_mismatch{0};
+std::atomic<uint32_t> g_next_block_id{1};
+
+void claim(void* p, size_t bytes, uint32_t id) {
+    if (!opt.check || !g_vm.inContigArena(reinterpret_cast<uintptr_t>(p))) return;
+    const size_t first = g_vm.contigPageIndex(reinterpret_cast<uintptr_t>(p));
+    for (size_t i = 0; i < (bytes + kPageSize - 1) / kPageSize; ++i) {
+        uint32_t expected = 0;
+        if (!g_owner[first + i].compare_exchange_strong(expected, id)) ++g_double_handout;
+    }
+}
+void unclaim(void* p, size_t bytes, uint32_t id) {
+    if (!opt.check || !g_vm.inContigArena(reinterpret_cast<uintptr_t>(p))) return;
+    const size_t first = g_vm.contigPageIndex(reinterpret_cast<uintptr_t>(p));
+    for (size_t i = 0; i < (bytes + kPageSize - 1) / kPageSize; ++i)
+        if (g_owner[first + i].exchange(0) != id) ++g_owner_mismatch;
+}
+
+struct Block { void* p = nullptr; size_t bytes = 0; uint32_t id = 0; };
+
+void freeBlock(const Block& b) {
+    unclaim(b.p, b.bytes, b.id);
+    Span* span = g_page_map.get(reinterpret_cast<uintptr_t>(b.p));
+    if (!span || span->base != b.p || !span->is_large) { ++g_span_mismatch; return; }
+    g_large.deallocate(span);
+}
+
+// ── Workers ─────────────────────────────────────────────────────────────────
+struct alignas(64) Inbox {
+    std::mutex m;
+    std::vector<Block> blocks;
+};
+std::vector<Inbox> g_inbox;
+std::atomic<bool> g_stop{false};
+std::atomic<uint64_t> g_ops{0}, g_outside{0}, g_nulls{0};
+uint64_t g_weight_total = 0;
+
+size_t pickSize() {
+    uint64_t r = rnd() % g_weight_total;
+    for (const auto& [bytes, w] : opt.sizes) {
+        if (r < w) return bytes;
+        r -= w;
+    }
+    return opt.sizes.back().first;
+}
+
+struct WorkerResult { uint64_t os_calls = 0; };
+
+void worker(int t, WorkerResult* out) {
+    tl_rng = opt.seed * 0x9E3779B97F4A7C15ull + static_cast<uint64_t>(t) + 1;
+    std::vector<Block> ring(static_cast<size_t>(opt.live));
+    std::vector<Block> incoming;
+    uint64_t ops = 0;
+    while (!g_stop.load(std::memory_order_relaxed)) {
+        Block& slot = ring[rnd() % ring.size()];
+        if (slot.p) {
+            if (opt.cross_free > 0 && opt.threads > 1 && rnd01() < opt.cross_free) {
+                Inbox& in = g_inbox[(t + 1 + rnd() % (opt.threads - 1)) % opt.threads];
+                std::lock_guard<std::mutex> g(in.m);
+                in.blocks.push_back(slot);
+            } else {
+                freeBlock(slot);
+            }
+            slot = Block{};
+        }
+        {
+            std::lock_guard<std::mutex> g(g_inbox[t].m);
+            incoming.swap(g_inbox[t].blocks);
+        }
+        for (const Block& b : incoming) freeBlock(b);
+        incoming.clear();
+
+        const size_t bytes = pickSize();
+        void* p;
+        if (rnd01() < opt.numa)
+            p = g_large.allocateOnNode(bytes, static_cast<uint32_t>(t % opt.nodes));
+        else
+            p = g_large.allocate(bytes, kMinAlignment, 0);
+        if (!p) { ++g_nulls; continue; }
+        if (!g_vm.inContigArena(reinterpret_cast<uintptr_t>(p))) ++g_outside;
+        slot = Block{p, bytes, g_next_block_id.fetch_add(1, std::memory_order_relaxed)};
+        claim(slot.p, slot.bytes, slot.id);
+        if ((++ops & 255) == 0) g_ops.fetch_add(256, std::memory_order_relaxed);
+    }
+    g_ops.fetch_add(ops & 255, std::memory_order_relaxed);
+    for (const Block& b : ring) if (b.p) freeBlock(b);
+    out->os_calls = vm::tl_sim_os_calls;
+}
+
+// ── Reporting ───────────────────────────────────────────────────────────────
+std::string symbolize(uintptr_t ra) {
+    Dl_info info{};
+    if (!dladdr(reinterpret_cast<void*>(ra), &info) || !info.dli_fname) return "?";
+    const uintptr_t off = ra - reinterpret_cast<uintptr_t>(info.dli_fbase) - 1;
+    char cmd[512];
+    std::snprintf(cmd, sizeof(cmd), "addr2line -f -C -i -e '%s' 0x%" PRIxPTR " 2>/dev/null",
+                  info.dli_fname, off);
+    std::string out;
+    if (FILE* f = popen(cmd, "r")) {
+        char line[512];
+        std::vector<std::string> lines;
+        while (std::fgets(line, sizeof(line), f)) {
+            line[std::strcspn(line, "\n")] = 0;
+            lines.push_back(line);
+        }
+        pclose(f);
+        // addr2line -i prints innermost first: function, file:line, then its
+        // inlined-into callers. Show the innermost frame that is not the lock
+        // guard, with its location.
+        for (size_t i = 0; i + 1 < lines.size(); i += 2) {
+            if (lines[i].find("LockGuard") != std::string::npos) continue;
+            std::string loc = lines[i + 1];
+            if (size_t slash = loc.rfind('/'); slash != std::string::npos) loc = loc.substr(slash + 1);
+            out = lines[i] + " @ " + loc;
+            break;
+        }
+    }
+    return out.empty() ? "?" : out;
+}
+
+void reportLocks(double seconds) {
+    struct Row { uint64_t wait_ns, contended; uintptr_t ra; };
+    std::vector<Row> rows;
+    for (const auto& s : sim::g_lock_sites) {
+        const uintptr_t ra = s.ra.load();
+        if (ra) rows.push_back({s.wait_ns.load(), s.contended.load(), ra});
+    }
+    std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) { return a.wait_ns > b.wait_ns; });
+    std::printf("lock contention (threads x seconds waiting, contended acquisitions, site):\n");
+    if (rows.empty()) std::printf("  none\n");
+    for (size_t i = 0; i < rows.size() && i < 10; ++i)
+        std::printf("  %6.1f%%  %10" PRIu64 "  %s\n",
+                    100.0 * static_cast<double>(rows[i].wait_ns) / 1e9 /
+                        (seconds * opt.threads),
+                    rows[i].contended, symbolize(rows[i].ra).c_str());
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+    parseArgs(argc, argv);
+    for (const auto& s : opt.sizes) g_weight_total += s.second;
+    // The run cache reads its settings from the environment on first use.
+    if (opt.run_cache_mib > 0) {
+        char v[32];
+        std::snprintf(v, sizeof(v), "%ld", opt.run_cache_mib);
+        setenv("SMASH_RUN_CACHE_MIB", v, 1);
+    }
+    vm::g_sim_os_call_ns = opt.os_call_ns;
+
+    const size_t arena_bytes = opt.arena_gib << 30;
+    g_page_map.init();
+    if (!g_vm.init(arena_bytes)) { std::fprintf(stderr, "VmRegion init failed\n"); return 2; }
+    g_page_map.attachVmRegion(&g_vm);
+    g_states.init(g_vm.totalPages());
+    g_large.init(&g_page_map, &g_vm, &g_states, simRelease, nullptr);
+    if (opt.check) {
+        const size_t bytes = g_vm.contigPages() * sizeof(std::atomic<uint32_t>);
+        void* m = mmap(nullptr, bytes, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+        if (m == MAP_FAILED) { std::fprintf(stderr, "shadow map failed\n"); return 2; }
+        g_owner = static_cast<std::atomic<uint32_t>*>(m);
+    }
+
+    std::printf("smash_sim: %d threads, %d s, %d node(s), %zu GiB arena, run cache %ld MiB/CPU, "
+                "OS call cost %" PRIu64 " ns, numa %.2f, cold %.2f, cross-free %.2f, live %d/thread, "
+                "%zu size(s)%s\n",
+                opt.threads, opt.seconds, opt.nodes, opt.arena_gib, opt.run_cache_mib,
+                opt.os_call_ns, opt.numa, opt.cold, opt.cross_free, opt.live, opt.sizes.size(),
+                opt.check ? ", checking" : "");
+
+    g_inbox = std::vector<Inbox>(static_cast<size_t>(opt.threads));
+    std::vector<WorkerResult> results(static_cast<size_t>(opt.threads));
+    std::vector<std::thread> th;
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int t = 0; t < opt.threads; ++t) th.emplace_back(worker, t, &results[t]);
+    // A corrupted free map or a lock never released shows up as no progress:
+    // report it and exit rather than hang (a planted double hand-out loops
+    // PageRunMap::take forever under its lock, and every other thread spins).
+    auto hang = [&](const char* when) {
+        std::printf("\nFAIL: no progress %s — a hang (a corrupted free list or a lock "
+                    "never released). Contended sites so far:\n", when);
+        reportLocks(std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+        std::fflush(stdout);
+        std::_Exit(3);
+    };
+    uint64_t last = 0;
+    int stalled = 0;
+    std::printf("ops/s:");
+    for (int s = 0; s < opt.seconds; ++s) {
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+        const uint64_t o = g_ops.load();
+        std::printf(" %" PRIu64, o - last);
+        std::fflush(stdout);
+        stalled = (o == last) ? stalled + 1 : 0;
+        if (stalled >= 3) hang("for 3 s during the run");
+        last = o;
+    }
+    std::printf("\n");
+    g_stop = true;
+    std::atomic<bool> joined{false};
+    std::thread watchdog([&] {
+        for (int i = 0; i < 100 && !joined.load(); ++i)
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        if (!joined.load()) hang("for 10 s after the workers were told to stop");
+    });
+    for (auto& x : th) x.join();
+    joined = true;
+    watchdog.join();
+    const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    // Frees parked in inboxes whose owner already stopped.
+    for (Inbox& in : g_inbox) for (const Block& b : in.blocks) freeBlock(b);
+
+    uint64_t os_calls = 0;
+    for (const auto& r : results) os_calls += r.os_calls;
+    const uint64_t ops = g_ops.load();
+    std::printf("throughput: %.0f allocate+free per second, %.2f us per op per thread; "
+                "%.2f OS calls per op\n",
+                static_cast<double>(ops) / secs,
+                secs * opt.threads * 1e6 / static_cast<double>(ops ? ops : 1),
+                static_cast<double>(os_calls) / static_cast<double>(ops ? ops : 1));
+    std::printf("placement: %" PRIu64 " blocks outside the arena, %" PRIu64 " NULL\n",
+                g_outside.load(), g_nulls.load());
+    const size_t bump = g_vm.rawNextPage();
+    std::printf("arena: %.2f of %zu GiB walked (bump), %.2f GiB free in the shared arena "
+                "(longest run %zu pages)\n",
+                static_cast<double>(bump * kPageSize) / (1ull << 30), opt.arena_gib,
+                static_cast<double>(g_vm.arenaFreePages() * kPageSize) / (1ull << 30),
+                g_vm.arenaLongestFreeRun());
+    if (g_vm.runCacheEnabled()) {
+        const auto rc = g_vm.runCacheStats();
+        std::printf("run cache: takes=%" PRIu64 " hits=%" PRIu64 " (%.1f%%) puts=%" PRIu64
+                    " evict=%" PRIu64 " trim=%" PRIu64 " declined_cold=%" PRIu64
+                    " declined_big=%" PRIu64 "\n",
+                    rc.takes, rc.hits, rc.takes ? 100.0 * rc.hits / rc.takes : 0.0, rc.puts,
+                    rc.evictions, rc.trimmed, rc.declined_cold, rc.declined_big);
+    }
+    reportLocks(secs);
+
+    // Drain: everything is freed; return cached runs, process the queue, and
+    // every carved page must be free again.
+    g_vm.trimRunCache(/*all=*/true);
+    for (int i = 0; i < 100 && g_vm.drainInFlight(); ++i) {
+        g_vm.drainDecommitQueueNow();
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    int failures = 0;
+    size_t carved_total = 0;
+    for (int n = 0; n < opt.nodes; ++n) {
+        size_t carved = 0, free_pages = 0;
+        if (!g_vm.nodeArenaInfo(static_cast<uint32_t>(n), &carved, &free_pages)) continue;
+        carved_total += carved;
+        std::printf("node %d: carved %zu pages, free %zu\n", n, carved, free_pages);
+        if (carved != free_pages) {
+            std::printf("FAIL: node %d: %zu pages carved but only %zu free after everything "
+                        "was freed and drained — pages leaked\n", n, carved, free_pages);
+            ++failures;
+        }
+    }
+    const size_t shared_free = g_vm.arenaFreePages();
+    if (bump != shared_free + carved_total) {
+        std::printf("FAIL: %zu pages walked, but %zu free in the shared arena + %zu carved by "
+                    "nodes after everything was freed — %zd pages unaccounted for\n",
+                    bump, shared_free, carved_total,
+                    static_cast<ssize_t>(bump) - static_cast<ssize_t>(shared_free + carved_total));
+        ++failures;
+    }
+    if (g_double_handout) { std::printf("FAIL: %" PRIu64 " pages handed to two live blocks\n", g_double_handout.load()); ++failures; }
+    if (g_owner_mismatch) { std::printf("FAIL: %" PRIu64 " freed pages owned by another block\n", g_owner_mismatch.load()); ++failures; }
+    if (g_span_mismatch) { std::printf("FAIL: %" PRIu64 " frees whose page map entry did not resolve to the block's span\n", g_span_mismatch.load()); ++failures; }
+    std::printf("invariants: %s%s\n", failures ? "FAILED" : "hold",
+                opt.check ? "" : " (ownership not checked: --no-check)");
+    return failures ? 1 : 0;
+}

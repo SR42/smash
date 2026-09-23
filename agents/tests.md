@@ -4,7 +4,7 @@ Why each test exists, what it asserts, and how it was verified as a real discrim
 
 ## End-to-end tests under interposition
 
-All 79 tests must pass; none are registered `DISABLED`. Run the suite **as root** too when touching the compressor: some paths only exist with root (see "Idle-page read tracking" in [defect-history.md](defect-history.md)), and an unprivileged run — which is all CI does — never executes them. CI (`.github/workflows/ci.yml`) runs the full suite on `ubuntu-latest` and `macos-latest` on every push and PR. Twenty-eight of the tests are end-to-end under `DYLD_INSERT_LIBRARIES` / `LD_PRELOAD`:
+All 81 tests must pass; none are registered `DISABLED`. Run the suite **as root** too when touching the compressor: some paths only exist with root (see "Idle-page read tracking" in [defect-history.md](defect-history.md)), and an unprivileged run — which is all CI does — never executes them. CI (`.github/workflows/ci.yml`) runs the full suite on `ubuntu-latest` and `macos-latest` on every push and PR. Twenty-eight of the tests are end-to-end under `DYLD_INSERT_LIBRARIES` / `LD_PRELOAD`:
 
 - `test_arena_routing` guards call-site arena routing — the invariant behind the paper's compression-homogeneity claim. Runs a program with 32 distinct noinline allocation sites under interposition and asserts, via the exported `smash_arena_for(ptr)` query, that they do **not** all collapse into one arena. This is the regression guard for the LTO/wrapper return-address bug: under dynamic interposition the return address seen inside the allocator can point into the wrapper library instead of the app, collapsing every call site into one arena (homogeneity 0%). Fast and deterministic (no compressor): full mode routes 256 B allocations through the slab, and `SMASH_CPU_ARENA=0` + default thread-hash-off make the arena a pure function of the return address, so a buggy capture yields exactly 1 distinct arena. Verified as a real discriminator (injecting a constant RA makes it fail with `distinct_arenas=1`). Must run under interposition — a direct-linked call would never exercise the wrapper path where the bug lives.
 
@@ -183,6 +183,12 @@ Four defects found by a code review of this branch (2026-09-22), each reproduced
   4. **Bound and drain**: freeing 16 x 8 MiB on one CPU caches exactly the 32 MiB cap, and 0 bytes 500 ms later.
 
   **Verified as a real discriminator by mutation:** caching runs whose release reported compressed pages fails phase 3 in both modes ("a block with compressed pages went into the run cache"); disabling the decommit thread's trim fails phase 4 with 32 MiB still cached. Neither mutation crashed — the fault handler restored the PROT_NONE pages as ACTIVE — so the guard is conservative, not the only thing between a cached cold run and a crash.
+
+## Simulator
+
+- `test_smash_sim_smoke` / `test_smash_sim_smoke_run_cache` run `smash_sim` (see [simulator.md](simulator.md)) for 2 s at 8 threads over 4 simulated nodes, with 10% of frees reported as compressed, 20% freed by another thread and 30% through the shared arena — cache off and on. They fail if any invariant does: a page handed to two live blocks, a free whose page map entry is not its span, a carved page not free after the full drain, or no progress (a hang). **Verified by planting bugs**: a run cache that returns a run without removing it (caught as a hang: the double hand-out corrupts the free map into a cycle), and a trim that drops runs (caught as leaked pages on every node).
+
+  Their first run found that `smash_numa_arena_info`'s "free" left out the unused tail of a node's newest chunk, so `test_malloc_numa_aligned_*`'s footprint check (`carved - free` before and after) could not see a block served from the tail. Fixed in `VmRegion::nodeArenaInfo`; the footprint tests pass on the corrected numbers.
 
 ## CI benchmarks
 
