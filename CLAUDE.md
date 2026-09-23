@@ -181,7 +181,7 @@ One line each; the incident and measurements behind each are in [agents/conventi
 - Never trust an idle-bitmap mark you have not read back, and never read the idle bit of a page you did not mark.
 - Never give a smash thread a fixed stack size — use `createSmashThread()` / `smashThreadStackSize()` (`util/thread_stack.h`).
 - Never make a shared free list lock-free unless it is ABA-safe (the span-descriptor Treiber stack crashed 64-thread workloads).
-- Never return empty slab spans to the arena on every free (~70 % on mi-stress); reclaim in the VmRegion exhausted hook, which must take other slab locks with `tryLock` only and never call `allocatePages()`.
+- Never return empty slab spans to the arena on every free (~70 % on mi-stress); reclaim in the VmRegion exhausted hook, which must take other slab locks with `tryLock` only, never call `allocatePages()`, and run one pass at a time (a skipped slab is usually one another pass is releasing).
 - A smash thread must never keep a process alive: register with `exit_guard::ThreadRegistration`, be stopped by `SmashHeap::stopAllSmashThreads()`, and never join the calling thread.
 - Compressor startup: constructor priority 201 (after alloc8's pthread hooks at 200) calls `xxthread_init()` — twice on macOS, once on Linux.
 - The fault handler handles ACTIVE (not just ACTIVE_MONITORING) pages, covering Phase 3's batched mprotect overwriting a per-page PROT_RW restore. A page's state is not proof of its protection.

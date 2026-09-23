@@ -24,9 +24,12 @@
 //   answer that is not authoritative, which is the same shape as phase A's bug.
 //   This phase provokes it: fill the arena with small objects, free them so the
 //   pages are held as empty spans, then take large blocks while other threads
-//   churn small objects across many size classes. It PASSES today (measured 0
-//   of 200 outside the arena with 0, 8 and 32 noisy threads) and is kept as a
-//   guard, not as a reproduction.
+//   churn small objects across many size classes. It was once believed not to
+//   reproduce (0 of 200 on an idle 8-CPU host); on a 2-CPU host it failed 9 of
+//   10 runs, because a noisy thread's reclaim pass held the slab of empty spans
+//   while every large allocation skipped it. Passes are now serialised; see
+//   reclaimEmptySpansHook. SMASH_NO_RECLAIM_WAIT=1 restores the old behaviour.
+//   It needs a contended host to fail on broken code.
 //
 //   It is self-evidencing: phase B first asserts it really exhausted the arena,
 //   because a phase that never fills it would pass while proving nothing.
@@ -211,7 +214,7 @@ static void phaseB() {
         std::fprintf(stderr,
             "FAIL: phase B: %ld of %d large blocks landed outside the arena and %ld "
             "were NULL while %d threads churned small objects — empty slab spans are "
-            "not reaching the arena, check reclaimEmptySpans()'s tryLock skip\n",
+            "not reaching the arena (compare with SMASH_NO_RECLAIM_WAIT=1)\n",
             big_out, kBig, big_null, kNoisy);
         ++g_failures;
     } else {

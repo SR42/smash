@@ -320,22 +320,61 @@ class Slab {
     // decommit and zero-fill faults on every round trip. Keeping empties is
     // free until the arena runs out; then they are exactly the memory to reuse.
     // tryLock: the caller may hold another slab's lock (allocateNewSpan), so
-    // blocking here could deadlock; a busy slab is simply skipped.
+    // blocking here could deadlock; a busy slab is simply skipped. That skip
+    // is only safe because the heap serialises passes (reclaimEmptySpansHook):
+    // a slab is almost always busy because another thread's pass is releasing
+    // it right now.
+    //
+    // Adjacent spans go back as one run. Releasing them one at a time cost an
+    // mprotect, an madvise and a free-map insert each: 82-92 ms for the ~42000
+    // spans a 1 GiB arena of 256-byte objects leaves, which is how long every
+    // other allocation that ran out of arena then waited. Spans empty in the
+    // order their objects were freed, so the list is nearly address-ordered
+    // (those 42000 formed 7 runs), and merging neighbours in list order needs
+    // no sort and no buffer.
 public:
     size_t reclaimEmptySpans() {
         if (!lock_.tryLock()) return 0;
         drainPending();
         size_t n = 0;
+        uintptr_t run_lo = 0, run_hi = 0;           // the pending run, [lo, hi)
+        auto flush = [&] {
+            if (run_hi == run_lo) return;
+            releaseRegionRun(reinterpret_cast<void*>(run_lo), (run_hi - run_lo) / kPageSize);
+            run_lo = run_hi = 0;
+        };
         while (Span* span = empty_.popFront()) {
-            releaseSpan(span, /*sync=*/true);
-            recycleSpanDescriptor(span);
             ++n;
+            if (!inRegion(span)) {
+                releaseSpan(span, /*sync=*/true);
+                recycleSpanDescriptor(span);
+                continue;
+            }
+            const uintptr_t lo = reinterpret_cast<uintptr_t>(span->base);
+            const uintptr_t hi = lo + span->page_count * kPageSize;
+            // Clear the ownership records before the pages go back, as
+            // releaseSpan does, so a reallocation cannot resolve to a dead span.
+            page_map_->clearRange(lo, span->page_count);
+            recycleSpanDescriptor(span);
+            if (run_hi != run_lo && lo == run_hi) run_hi = hi;
+            else if (run_hi != run_lo && hi == run_lo) run_lo = lo;
+            else { flush(); run_lo = lo; run_hi = hi; }
         }
+        flush();
         lock_.unlock();
         return n;
     }
 
 private:
+    // Return a run of arena pages whose spans are already gone: the
+    // compressor's release hook first, then straight to the free map.
+    void releaseRegionRun(void* base, size_t pages) {
+        if (release_hook_)
+            release_hook_(vm_region_->pageIndex(reinterpret_cast<uintptr_t>(base)), pages,
+                          release_ctx_);
+        vm_region_->releasePagesNow(base, pages);
+    }
+
     void releaseSpan(Span* span, bool sync = false) {
         page_map_->clearRange(reinterpret_cast<uintptr_t>(span->base), span->page_count);
         if (inRegion(span)) {

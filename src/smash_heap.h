@@ -500,6 +500,11 @@ class SmashHeap {
 
     LargeAlloc large_alloc_;
     MidAlloc mid_alloc_;
+    // Exhausted-hook serialisation (reclaimEmptySpansHook): the token, and
+    // how many passes have started / the last one that finished.
+    std::atomic<bool> reclaim_busy_{false};
+    std::atomic<uint64_t> reclaim_started_{0};
+    std::atomic<uint64_t> reclaim_done_{0};
     PageMap page_map_;
 
     // ── ASLR-resilient call-site hash cache ─────────────────────────────────
@@ -609,14 +614,55 @@ class SmashHeap {
     // VmRegion's exhausted hook: return every slab's empty spans to the
     // arena (see Slab::reclaimEmptySpans) so it reuses its own memory before
     // spilling into uncompressed direct mappings.
+    //
+    // Passes are serialised. A pass takes each slab with tryLock and skips a
+    // busy one, and the slab most likely to be busy is the one holding all the
+    // empty spans, because another thread's pass is releasing them. Treating
+    // that skip as "nothing to give" is what test_arena_reclaim_concurrent's
+    // phase B caught: on a 2-CPU host a noisy thread's pass was still
+    // releasing ~63000 spans while the main thread's 2 MiB allocations each
+    // skipped that slab, found no run, and fell back to a mapping that is
+    // never compressed — 130 of 200 blocks, 9 of 10 runs. So a thread that
+    // runs out while a pass is in progress waits for it, and runs a pass of
+    // its own only if no pass that STARTED after it arrived has finished
+    // (so a burst of misses does not queue one full pass per thread). A
+    // pass never blocks on a lock, so the wait cannot deadlock, even when
+    // the waiter holds a slab lock further up the stack.
     static void reclaimEmptySpansHook(void* ctx) {
         auto* heap = static_cast<SmashHeap*>(ctx);
-        for (Slab& s : heap->slabs_) s.reclaimEmptySpans();
+        if (reclaimWaitDisabled()) {
+            heap->reclaimPass();
+            return;
+        }
+        const uint64_t seen = heap->reclaim_started_.load(std::memory_order_acquire);
+        while (heap->reclaim_busy_.exchange(true, std::memory_order_acquire)) sched_yield();
+        if (heap->reclaim_done_.load(std::memory_order_relaxed) <= seen) {
+            const uint64_t pass = heap->reclaim_started_.fetch_add(1, std::memory_order_relaxed) + 1;
+            heap->reclaimPass();
+            heap->reclaim_done_.store(pass, std::memory_order_relaxed);
+        }
+        heap->reclaim_busy_.store(false, std::memory_order_release);
+    }
+
+    // SMASH_NO_RECLAIM_WAIT=1: every thread runs its own pass concurrently and
+    // takes a skipped slab as empty — the pre-fix behaviour, kept so the wait's
+    // value can be measured on the machine in question (like
+    // SMASH_NO_DRAIN_WAIT for the decommit queue).
+    static bool reclaimWaitDisabled() {
+        static const bool off = [] {
+            const char* v = std::getenv("SMASH_NO_RECLAIM_WAIT");
+            return v && v[0] == '1';
+        }();
+        return off;
+    }
+
+    void reclaimPass() {
+        for (Slab& s : slabs_) s.reclaimEmptySpans();
         // Mid-size chunks hold arena pages the same way, and a workload that
         // allocates a batch of mid-size blocks and frees them all would
         // otherwise keep the arena forever while big allocations spill into
         // uncompressible mappings.
-        if (midBinsEnabled()) heap->mid_alloc_.reclaimEmptyChunks();
+        if (midBinsEnabled()) mid_alloc_.reclaimEmptyChunks();
     }
 
     uint8_t callsiteArena(uint8_t sc, uintptr_t ra) {
@@ -1063,6 +1109,14 @@ public:
         compressor_.resumeAfterFork();
     }
     void resetForFork() {
+        // A pass in another parent thread may hold the reclaim token between
+        // slabs (never mid-slab: each slab's runs go back under its lock, and
+        // the prepare handler holds every slab lock). That thread does not
+        // exist here, so release the token or the child's first exhausted
+        // allocation spins on it forever.
+        reclaim_busy_.store(false, std::memory_order_relaxed);
+        reclaim_done_.store(reclaim_started_.load(std::memory_order_relaxed),
+                            std::memory_order_relaxed);
         if (!compression_inited_) return;
         // Reset decommit thread first (it doesn't exist in child after fork).
         // These reset internal bookkeeping only; they must not allocate or take

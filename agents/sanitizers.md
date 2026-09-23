@@ -26,10 +26,10 @@ two fight over the same job. Use it to instrument a single direct-linked test
 binary, not libsmash.
 
 **The suite is clean under UBSan: 0 findings**, unprivileged (75/75) *and* as root
-on claudepc (74/75, idle-page tracking exercised), 2026-09-23, after the mid-bin /
-NUMA-hint / stdio-retry fixes. The one root failure is the pre-existing
-`test_arena_reclaim_concurrent` phase B, which fails on that 2-CPU host with the
-pre-change library as well. That round turned up two things that were not UB:
+on claudepc (idle-page tracking exercised), 2026-09-23, after the mid-bin /
+NUMA-hint / stdio-retry fixes: 74/75 there, the failure being the pre-existing
+`test_arena_reclaim_concurrent` phase B, then 75/75 in both suites once that was
+fixed. That round turned up two things that were not UB:
 
 - `test_stdio_after_compression` was **vacuous in this build**: the sanitized
   test binary binds `__fgets_chk`/`__fread_chk` (fortified, which smash does not
@@ -37,8 +37,9 @@ pre-change library as well. That round turned up two things that were not UB:
   against the pre-fix library too. It now calls them through `dlsym`. Check
   `objdump -d … | grep _chk` on any stdio test that must reach a wrapper.
 - `test_arena_reclaim_concurrent` phase B failed once in the full run and 3 of
-  18 reruns, then 0 of 80. It reproduces on every build under CPU contention,
-  the pre-change one included; see its entry in [tests.md](tests.md).
+  18 reruns, then 0 of 80. It reproduced on every build under CPU contention,
+  the pre-change one included — a real defect in the exhausted hook, since
+  fixed; see its entry in [tests.md](tests.md).
 
 Earlier: Two things are worth
 repeating on any future sanitizer round:
