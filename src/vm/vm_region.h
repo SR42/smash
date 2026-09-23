@@ -124,9 +124,27 @@ class VmRegion {
     };
     EntryShard entry_shards_[kEntryShards];
 
-    alignas(64) std::atomic<DecommitEntry*> decommit_head_{nullptr};
-    pthread_t decommit_thread_{};
-    std::atomic<bool> decommit_running_{false};
+    // One decommit queue per owner — the shared arena and each node arena —
+    // each with its own head, in-flight counters and thread. A single global
+    // queue made every large free CAS one cache line and every freed run wait
+    // for one thread's mprotect + madvise: on smash_sim that thread ran a full
+    // core and the 1..7-thread sweep fitted a serial fraction of 9.5%, which
+    // caps speedup near 10x however many cores there are. A node's runs only
+    // ever go back to that node's free map, so nothing needs to see another
+    // node's queue: an allocation that misses drains and waits on its own.
+    struct alignas(64) DecommitQueue {
+        std::atomic<DecommitEntry*> head{nullptr};
+        // Runs that have left their owner and not yet reached its free map:
+        // queued, being processed, or still on their way to being queued.
+        std::atomic<int> pending{0};
+        // Threads inside drainQueueNow() with a batch of this queue in hand.
+        std::atomic<int> draining{0};
+        std::atomic<bool> running{false};
+        pthread_t thread{};
+        VmRegion* region = nullptr;
+        int node = -1;              // -1: the shared arena's queue
+    };
+    DecommitQueue shared_queue_;
 
     DecommitEntry* newDecommitEntry() {
         const unsigned s = currentCpuShard(kEntryShards);
@@ -150,7 +168,7 @@ class VmRegion {
         // free map. The two paths that process a stack entry instead of a
         // queued one (queueForDecommit's no-entry fallback and
         // releasePagesNow) never reach here, so the count stays balanced.
-        decommit_pending_.fetch_sub(1, std::memory_order_acq_rel);
+        queueOf(e->node).pending.fetch_sub(1, std::memory_order_acq_rel);
         EntryShard& sh = entry_shards_[e->shard];
         LockGuard guard(sh.lock);
         e->next = sh.head;
@@ -158,13 +176,14 @@ class VmRegion {
     }
 
     void queueForDecommit(void* addr, size_t num_pages, size_t page_index, int node) {
+        DecommitQueue& q = queueOf(node);
         // Counted from before the entry even exists. A run that has left its
         // owner but has not yet reached the free map is invisible to an
         // allocation looking for it, and newDecommitEntry() can block on the
         // pool lock — a window wide enough to matter: with the count taken
         // only at the push, a 128-thread churn still put 23 of 320000 blocks
         // outside the arena.
-        decommit_pending_.fetch_add(1, std::memory_order_acq_rel);
+        q.pending.fetch_add(1, std::memory_order_acq_rel);
         DecommitEntry* e = newDecommitEntry();
         if (!e) {
             // The metadata arena is exhausted (it reports that itself). Do the
@@ -177,18 +196,18 @@ class VmRegion {
             local.page_index = page_index;
             local.node = node;
             processDecommitEntry(&local);
-            decommit_pending_.fetch_sub(1, std::memory_order_acq_rel);
+            q.pending.fetch_sub(1, std::memory_order_acq_rel);
             return;
         }
         e->addr = addr;
         e->num_pages = num_pages;
         e->page_index = page_index;
         e->node = node;
-        // Lock-free push to MPSC queue
-        DecommitEntry* head = decommit_head_.load(std::memory_order_relaxed);
+        // Lock-free push to this owner's MPSC queue
+        DecommitEntry* head = q.head.load(std::memory_order_relaxed);
         do {
             e->next = head;
-        } while (!decommit_head_.compare_exchange_weak(head, e,
+        } while (!q.head.compare_exchange_weak(head, e,
             std::memory_order_release, std::memory_order_relaxed));
     }
 
@@ -211,7 +230,7 @@ class VmRegion {
         // NOW add to the free map (safe - pages are decommitted and PROT_RW),
         // merging with free neighbours of the same owner. A node arena's pages
         // go back to that arena only (see NodeArena).
-        free_map_.insert(e->page_index, e->num_pages, ownerOfNode(e->node));
+        mapOf(ownerOfNode(e->node)).insert(e->page_index, e->num_pages, ownerOfNode(e->node));
     }
 
     static void* decommitThreadEntry(void* arg) {
@@ -233,20 +252,22 @@ class VmRegion {
         // Not an application thread: the process-exit guard must not count
         // this one as a reason to keep the process alive (util/exit_guard.h).
         exit_guard::ThreadRegistration exit_reg;
-        auto* self = static_cast<VmRegion*>(arg);
+        auto* q = static_cast<DecommitQueue*>(arg);
+        VmRegion* self = q->region;
         uint64_t last_trim_ms = 0;
-        while (self->decommit_running_.load(std::memory_order_relaxed)) {
+        while (q->running.load(std::memory_order_relaxed)) {
             // Return cached runs that have aged out (see cacheFreedRun). The
             // clock is the coarse vDSO one, so this costs a few ns per wake.
-            if (runCacheCapBytes() != 0) {
+            // One thread does it: the shared queue's.
+            if (q->node < 0 && runCacheCapBytes() != 0) {
                 const uint64_t now = nowMs();
                 if (now - last_trim_ms >= kRunCacheTrimIntervalMs) {
                     last_trim_ms = now;
                     self->trimRunCache(/*all=*/false);
                 }
             }
-            // Drain the queue
-            DecommitEntry* batch = self->decommit_head_.exchange(nullptr, std::memory_order_acquire);
+            // Drain this owner's queue
+            DecommitEntry* batch = q->head.exchange(nullptr, std::memory_order_acquire);
             if (batch) {
                 while (batch) {
                     DecommitEntry* next = batch->next;
@@ -261,14 +282,15 @@ class VmRegion {
         return nullptr;
     }
 
-    void startDecommitThread() {
+    void startDecommitThread(DecommitQueue& q) {
         if (tracking_mode_) return;
         bool expected = false;
-        if (!decommit_running_.compare_exchange_strong(expected, true,
+        if (!q.running.compare_exchange_strong(expected, true,
                 std::memory_order_acq_rel, std::memory_order_relaxed)) {
             return;
         }
-        if (pthread_create(&decommit_thread_, nullptr, decommitThreadEntry, this) != 0) {
+        q.region = this;
+        if (pthread_create(&q.thread, nullptr, decommitThreadEntry, &q) != 0) {
             // EAGAIN under thread exhaustion. Without the rollback,
             // decommit_running_ claims a drainer exists while nothing ever
             // pops the MPSC queue: freed runs never reach the free list
@@ -276,9 +298,9 @@ class VmRegion {
             // drops). Roll back so the next release retries creation, and
             // drain whatever is queued right now inline (the exchange-based
             // drain is safe from any thread).
-            decommit_running_.store(false, std::memory_order_release);
+            q.running.store(false, std::memory_order_release);
             DecommitEntry* batch =
-                decommit_head_.exchange(nullptr, std::memory_order_acquire);
+                q.head.exchange(nullptr, std::memory_order_acquire);
             while (batch) {
                 DecommitEntry* next = batch->next;
                 processDecommitEntry(batch);
@@ -288,26 +310,41 @@ class VmRegion {
         }
     }
 
-    void ensureDecommitThreadStarted() {
+    void ensureDecommitThreadStarted(DecommitQueue& q) {
         if (tracking_mode_) return;
-        if (decommit_running_.load(std::memory_order_relaxed)) return;
-        startDecommitThread();
+        if (q.running.load(std::memory_order_relaxed)) return;
+        startDecommitThread(q);
     }
 
-    void stopDecommitThread() {
-        if (!decommit_running_.load(std::memory_order_relaxed)) return;
-        decommit_running_.store(false, std::memory_order_release);
+    void stopDecommitThread(DecommitQueue& q) {
+        if (!q.running.load(std::memory_order_relaxed)) return;
+        q.running.store(false, std::memory_order_release);
         // Never join self — see the same guard in CompressorThread::stop().
-        if (!pthread_equal(decommit_thread_, pthread_self()))
-            pthread_join(decommit_thread_, nullptr);
+        if (!pthread_equal(q.thread, pthread_self()))
+            pthread_join(q.thread, nullptr);
         // Drain any remaining entries
-        DecommitEntry* batch = decommit_head_.exchange(nullptr, std::memory_order_acquire);
+        DecommitEntry* batch = q.head.exchange(nullptr, std::memory_order_acquire);
         while (batch) {
             DecommitEntry* next = batch->next;
             processDecommitEntry(batch);
             recycleDecommitEntry(batch);
             batch = next;
         }
+    }
+
+    // Every queue: the shared one and each node's that exists.
+    template <typename Fn> void forEachQueue(Fn&& fn) {
+        fn(shared_queue_);
+        if (NodeArena* arenas = node_arenas_.load(std::memory_order_acquire))
+            for (uint32_t n = 0; n < vm::kMaxNumaNodes; ++n) fn(arenas[n].queue);
+    }
+    template <typename Fn> void forEachQueue(Fn&& fn) const {
+        fn(shared_queue_);
+        if (const NodeArena* arenas = node_arenas_.load(std::memory_order_acquire))
+            for (uint32_t n = 0; n < vm::kMaxNumaNodes; ++n) fn(arenas[n].queue);
+    }
+    void stopDecommitThread() {
+        forEachQueue([&](DecommitQueue& q) { stopDecommitThread(q); });
     }
 
     // ── Tracking mode: hash map for arbitrary page addresses ────────────────
@@ -493,8 +530,8 @@ public:
     // child (Linux fork only clones the calling thread), so we must reset state
     // so ensureDecommitThreadStarted() will restart it on first releasePages().
     void resetDecommitThreadForFork() {
-        // Thread doesn't exist in child - don't try to join it
-        decommit_running_.store(false, std::memory_order_relaxed);
+        // Threads don't exist in child - don't try to join them
+        forEachQueue([](DecommitQueue& q) { q.running.store(false, std::memory_order_relaxed); });
         // A parent thread may have held a pool or run-cache shard lock at the
         // fork; that thread does not exist here. Each critical section is a
         // few pointer moves, so the lists themselves are consistent enough to
@@ -510,13 +547,13 @@ public:
     // to find out whether the pages it wants are merely in flight rather than
     // gone. Does the mprotect/madvise work inline, so it is for paths that
     // would otherwise claim fresh region or fail outright, never a fast path.
-    size_t drainDecommitQueueNow() {
-        DecommitEntry* batch = decommit_head_.exchange(nullptr, std::memory_order_acquire);
+    size_t drainQueueNow(DecommitQueue& q) {
+        DecommitEntry* batch = q.head.exchange(nullptr, std::memory_order_acquire);
         if (!batch) return 0;
         // Published before the entries are processed and cleared after, so a
         // thread that lost the exchange can tell "nothing queued" from
-        // "another thread is holding the queue" — see drainInFlight().
-        decommit_draining_.fetch_add(1, std::memory_order_acq_rel);
+        // "another thread is holding the queue" — see inFlight().
+        q.draining.fetch_add(1, std::memory_order_acq_rel);
         size_t drained = 0;
         while (batch) {
             DecommitEntry* next = batch->next;
@@ -525,16 +562,28 @@ public:
             batch = next;
             ++drained;
         }
-        decommit_draining_.fetch_sub(1, std::memory_order_acq_rel);
+        q.draining.fetch_sub(1, std::memory_order_acq_rel);
         return drained;
     }
 
-    // Is a run still on its way back to the free map, either queued or being
-    // processed by another thread right now?
+    // Is a run of this queue's owner still on its way back to its free map,
+    // either queued or being processed by another thread right now?
+    static bool inFlight(const DecommitQueue& q) {
+        return q.pending.load(std::memory_order_acquire) != 0 ||
+               q.head.load(std::memory_order_acquire) != nullptr ||
+               q.draining.load(std::memory_order_acquire) != 0;
+    }
+
+    // Every queue, for shutdown, fork and tools: how many entries drained.
+    size_t drainDecommitQueueNow() {
+        size_t n = 0;
+        forEachQueue([&](DecommitQueue& q) { n += drainQueueNow(q); });
+        return n;
+    }
     bool drainInFlight() const {
-        return decommit_pending_.load(std::memory_order_acquire) != 0 ||
-               decommit_head_.load(std::memory_order_acquire) != nullptr ||
-               decommit_draining_.load(std::memory_order_acquire) != 0;
+        bool any = false;
+        forEachQueue([&](const DecommitQueue& q) { any = any || inFlight(q); });
+        return any;
     }
 
     // ── Per-CPU cache of freed large runs (SMASH_RUN_CACHE_MIB) ──────────────
@@ -572,7 +621,7 @@ public:
         RunCacheShard& sh = run_cache_[currentCpuShard(kRunCacheShards)];
         if (!reusable) { bump(sh.declined_cold); return false; }
         if (bytes > cap || bytes > kRunCacheMaxRunBytes) { bump(sh.declined_big); return false; }
-        ensureDecommitThreadStarted();   // the trim runs there
+        ensureDecommitThreadStarted(shared_queue_);   // the trim runs there
         const int node = nodeOfPage(pageIndex(a));
         CachedRun evicted[kRunCacheSlots];
         unsigned n_evicted = 0;
@@ -787,12 +836,12 @@ public:
             trimRunCache(/*all=*/true);
             for (int attempt = 0; drainWaitEnabled() && attempt < kDrainWaitAttempts;
                  ++attempt) {
-                drainDecommitQueueNow();
+                drainQueueNow(shared_queue_);
                 if (const size_t idx = free_map_.take(num_pages, kSharedOwner);
                     idx != PageRunMap::kNone) {
                     return base_ + idx * kPageSize;
                 }
-                if (!drainInFlight()) break;
+                if (!inFlight(shared_queue_)) break;
                 sched_yield();
             }
             return nullptr;
@@ -901,15 +950,16 @@ public:
             // fall through to normal queue+decommit+reuse path
         }
 
-        // Start decommit thread lazily on first release (avoids reentrancy
-        // during early library initialization when pthread_create might malloc).
-        ensureDecommitThreadStarted();
-
-        // Two-phase release: queue pages for background decommit. The background
-        // thread will decommit them and THEN add to free list. This ensures
-        // pages can't be reallocated before decommit completes.
+        // Two-phase release: queue pages for background decommit on their
+        // owner's queue. Its thread will decommit them and THEN add them to
+        // that owner's free map. This ensures pages can't be reallocated
+        // before decommit completes. The thread starts lazily on the first
+        // release (avoids reentrancy during early library initialization,
+        // when pthread_create might malloc).
         size_t page_idx = pageIndex(reinterpret_cast<uintptr_t>(addr));
-        queueForDecommit(addr, num_pages, page_idx, nodeOfPage(page_idx));
+        const int node = nodeOfPage(page_idx);
+        ensureDecommitThreadStarted(queueOf(node));
+        queueForDecommit(addr, num_pages, page_idx, node);
     }
 
     static bool landminesEnabled() {
@@ -1245,7 +1295,9 @@ public:
             tail = arenas[node].end - arenas[node].cur;
             // Read under the same lock: a concurrent tail allocation moves a
             // run from the tail to a live block, never into the free map.
-            *free_pages = free_map_.freePages(ownerOfNode(static_cast<int>(node))) + tail;
+            *free_pages = (arenas[node].map_ready.load(std::memory_order_acquire)
+                               ? arenas[node].map.freePages(ownerOfNode(static_cast<int>(node)))
+                               : 0) + tail;
         }
         return true;
     }
@@ -1346,6 +1398,11 @@ private:
         NodeArena& na = arenas[node];
         const uint32_t owner = ownerOfNode(static_cast<int>(node));
         const size_t phase = basePhase(align_pages);
+        if (!ensureNodeMap(na)) {
+            errno = ENOMEM;
+            return nullptr;
+        }
+        PageRunMap& node_map = na.map;
 
         // Serve from the unused tail of this node's newest chunk, rounding the
         // cursor up to the alignment and donating only the pages skipped — so
@@ -1354,14 +1411,14 @@ private:
         auto fromTail = [&]() -> void* {
             const size_t start = na.cur + alignGap(na.cur, align_pages, phase);
             if (start < na.cur || start + num_pages > na.end) return nullptr;
-            if (start > na.cur) free_map_.insert(na.cur, start - na.cur, owner);
+            if (start > na.cur) node_map.insert(na.cur, start - na.cur, owner);
             na.cur = start + num_pages;
             return base_ + start * kPageSize;
         };
 
         {
             LockGuard guard(na.lock);
-            if (const size_t idx = free_map_.takeAligned(num_pages, owner, align_pages, phase);
+            if (const size_t idx = node_map.takeAligned(num_pages, owner, align_pages, phase);
                 idx != PageRunMap::kNone)
                 return base_ + idx * kPageSize;
             if (void* p = fromTail()) return p;
@@ -1386,11 +1443,11 @@ private:
         // the drain touches a NodeArena — processDecommitEntry only takes the
         // free map's own lock — and the state it publishes is exactly what the
         // retry below reads, so dropping the lock costs only a re-check.
-        drainDecommitQueueNow();
+        drainQueueNow(na.queue);
 
         {
         LockGuard guard(na.lock);
-        if (const size_t idx = free_map_.takeAligned(num_pages, owner, align_pages, phase);
+        if (const size_t idx = node_map.takeAligned(num_pages, owner, align_pages, phase);
             idx != PageRunMap::kNone)
             return base_ + idx * kPageSize;
         if (void* p = fromTail()) return p;
@@ -1419,7 +1476,7 @@ private:
              c < (start + chunk_pages) / kNodeChunkPages; ++c)
             table[c].store(static_cast<uint16_t>(node + 1), std::memory_order_release);
         if (na.end > na.cur)
-            free_map_.insert(na.cur, na.end - na.cur, owner);
+            node_map.insert(na.cur, na.end - na.cur, owner);
         na.cur = start;
         na.end = start + chunk_pages;
         na.carved += chunk_pages;
@@ -1457,15 +1514,15 @@ exhausted:
             // a 128-thread churn, while leaving the residual unchanged — so
             // the fast path taking a recovered run before this one re-acquires
             // is not what limits it either.
-            drainDecommitQueueNow();
+            drainQueueNow(na.queue);
             {
                 LockGuard guard(na.lock);
                 if (const size_t idx =
-                        free_map_.takeAligned(num_pages, owner, align_pages, phase);
+                        node_map.takeAligned(num_pages, owner, align_pages, phase);
                     idx != PageRunMap::kNone)
                     return base_ + idx * kPageSize;
             }
-            if (!drainInFlight()) break;   // genuinely nothing to wait for
+            if (!inFlight(na.queue)) break;   // genuinely nothing to wait for
             sched_yield();
         }
         errno = ENOMEM;
@@ -1476,13 +1533,43 @@ public:
 #endif
 
 private:
+    // Created all-zero by bootstrapArray (no constructors run): an unlocked
+    // Spinlock, an empty queue and a PageRunMap awaiting init() are all zero.
     struct NodeArena {
-        Spinlock lock;      // guards cur/end/carved; freed pages live in free_map_
+        Spinlock lock;      // guards cur/end/carved; freed pages live in `map`
         size_t cur = 0;     // unused tail of the newest chunk, [cur, end);
         size_t end = 0;     // guarded by lock
         size_t carved = 0;  // total pages this node's arena has taken from the
                             // region, for the diagnostic below
+        // This node's own free map and decommit queue, so nothing on this
+        // node takes a lock or a cache line that another node uses. The map's
+        // storage is demand-paged and a page belongs to one owner for life (a
+        // node chunk never returns to the shared arena), so a map per owner
+        // costs address space, not memory.
+        std::atomic<bool> map_ready{false};
+        PageRunMap map;
+        DecommitQueue queue;
     };
+
+    PageRunMap& mapOf(uint32_t owner) {
+        return owner == kSharedOwner
+            ? free_map_
+            : node_arenas_.load(std::memory_order_acquire)[owner - 1].map;
+    }
+    DecommitQueue& queueOf(int node) {
+        return node < 0 ? shared_queue_
+                        : node_arenas_.load(std::memory_order_acquire)[node].queue;
+    }
+    // Before a node's first page is handed out, so every later insert — here
+    // or from its decommit queue — finds the map ready.
+    bool ensureNodeMap(NodeArena& na) {
+        if (na.map_ready.load(std::memory_order_acquire)) [[likely]] return true;
+        LockGuard guard(numa_init_lock_);
+        if (na.map_ready.load(std::memory_order_relaxed)) return true;
+        if (!na.map.init(contig_pages_)) return false;
+        na.map_ready.store(true, std::memory_order_release);
+        return true;
+    }
     static constexpr size_t kNoChunk = ~size_t{0};
 
     // How many times an exhausted node allocation re-checks for a run that is
@@ -1494,11 +1581,6 @@ private:
     // Both created on first use, indexed by node id and by grid chunk.
     // node_of_chunk_[c] is node+1, or 0 for a chunk no node arena owns. It is
     // written before any of the chunk's pages are handed out.
-    // Threads currently inside drainDecommitQueueNow() with a batch in hand.
-    std::atomic<int> decommit_draining_{0};
-    // Runs that have left their owner and not yet reached the free map:
-    // queued, being processed, or still on their way to being queued.
-    std::atomic<int> decommit_pending_{0};
 
     std::atomic<NodeArena*> node_arenas_{nullptr};
     std::atomic<std::atomic<uint16_t>*> node_of_chunk_{nullptr};
@@ -1516,6 +1598,10 @@ private:
             (contig_pages_ + kNodeChunkPages - 1) / kNodeChunkPages);
         auto* arenas = bootstrapArray<NodeArena>(vm::kMaxNumaNodes);
         if (!table || !arenas) return nullptr;
+        for (uint32_t n = 0; n < vm::kMaxNumaNodes; ++n) {
+            arenas[n].queue.region = this;
+            arenas[n].queue.node = static_cast<int>(n);
+        }
         node_of_chunk_.store(table, std::memory_order_release);
         // The first region to use node arenas owns the remap hook: the heap's
         // region in production, while tests may create others.

@@ -518,3 +518,42 @@ What an 8-CPU box does show at 1:1 is the next cost: `releaseHook` —
 `releaseCompressedPages` walking every page of every freed block under its
 page lock (40% at 8 threads, 30% in the large-only repro) whether or not any
 page was ever compressed.
+
+## One free map and one decommit queue per node (2026-09-23)
+
+`smash_sim` swept 1..7 threads (one per core, `--os-call-ns 3000`) and the
+Universal Scalability Law fitted the large-block path with a **serial fraction
+of 9.1% with the run cache off and 19.5% with it on**, and no coherency term:
+Amdahl-shaped, capped near 10x and 5x however many cores. The serialized work
+was the one decommit queue and thread every large free goes through (that
+thread ran a full core) and the one `PageRunMap` lock every owner's runs sit
+behind — although runs of different owners never merge.
+
+Now each node arena has its own `PageRunMap` and its own `DecommitQueue`
+(head, in-flight counters, thread), kept in its `NodeArena` slot and created on
+the node's first allocation; the shared arena keeps `free_map_` and
+`shared_queue_`. A page belongs to one owner for life (a node chunk never
+returns to the shared arena), so a map per owner costs address space, not
+memory: the maps are demand-paged and each only touches its own pages. An
+allocation that misses drains and waits only on its own owner's queue. The run
+cache's trim stays on the shared queue's thread.
+
+Interleaved, same sweep, fitted on 1..4 threads (past 4, the four node
+threads plus the workers exceed this box's 8 cores):
+
+| | 4-thread speedup | 4-thread ops/s | serial fraction |
+|---|---|---|---|
+| before, cache off | 3.18x | 631k | 9.1% |
+| after, cache off | 3.82x | 740k (+17%) | ~0 |
+| before, cache 128 MiB | 2.53x | 1.57M | 19.5% |
+| after, cache 128 MiB | 3.55x | 2.13M (+35%) | 2.2% |
+
+Contended free-map acquisitions at 4 threads fell from 101k to 27k, and the
+drain waits vanished. No 128-thread projection is claimed: with four points
+and little loss left the fit cannot separate serial work from coherency, and it
+attributes the remainder to a quadratic term that predicts a spurious collapse.
+The 128-core curve should be measured there with `smash_sim` (both builds, 8 to
+128 threads), which needs no memory.
+
+Cost: one more decommit thread per NUMA node in use, idle-polling every 100 us
+like the existing one.

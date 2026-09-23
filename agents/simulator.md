@@ -101,3 +101,16 @@ in `releasePages`, and points at rounding cached runs to size classes.
 128 threads, 512 GiB arena, `--os-call-ns 3000`, cache off: the node arena's
 lock (`allocatePagesOnNodeImpl`, fast path and post-drain retry) is 71% of
 thread time waiting — the same site the 128-core profile put at 26.6% of CPU.
+
+## Scaling sweep and the per-node prototype
+
+1..8 threads, one per core, `--os-call-ns 3000`: efficiency fell steadily
+(53% at 8 threads cache off, 40% cache on) with recorded lock waits of only
+~7-10% of thread time; the single decommit thread ran a full core (8 workers
+plus it oversubscribe the box, hence 8 < 7). A USL fit on 1..7 gave a pure
+serial fraction (9.5% / 17.5%, coherency 0). Splitting the free map and the
+decommit queue per node took it to ~0 / 2.2% on 1..4 threads — see "One free
+map and one decommit queue per node" in [performance.md](performance.md).
+Fitting a curve past the point where background threads exceed the cores is
+meaningless: the plateau is the CPU budget, and the fit's error jumps from
+~0.01 to 0.24-0.49 when it is included.
