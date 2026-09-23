@@ -561,17 +561,21 @@ public:
 
     // Park a freed run (its compressed state already released). False when the
     // run is not cacheable; the caller then releases it the ordinary way.
-    bool cacheFreedRun(void* addr, size_t num_pages) {
+    // `reusable` is the compressor release's verdict; a run it declined is
+    // counted (see runCacheStats) and not cached.
+    bool cacheFreedRun(void* addr, size_t num_pages, bool reusable) {
         if (!runCacheEnabled()) return false;
         const auto a = reinterpret_cast<uintptr_t>(addr);
         const size_t bytes = num_pages * kPageSize;
         const size_t cap = runCacheCapBytes();
-        if (!inContigArena(a) || bytes > cap || bytes > kRunCacheMaxRunBytes) return false;
+        if (!inContigArena(a)) return false;
+        RunCacheShard& sh = run_cache_[currentCpuShard(kRunCacheShards)];
+        if (!reusable) { bump(sh.declined_cold); return false; }
+        if (bytes > cap || bytes > kRunCacheMaxRunBytes) { bump(sh.declined_big); return false; }
         ensureDecommitThreadStarted();   // the trim runs there
         const int node = nodeOfPage(pageIndex(a));
         CachedRun evicted[kRunCacheSlots];
         unsigned n_evicted = 0;
-        RunCacheShard& sh = run_cache_[currentCpuShard(kRunCacheShards)];
         {
             LockGuard guard(sh.lock);
             // Make room, oldest first. Terminates: bytes <= cap was checked.
@@ -586,6 +590,9 @@ public:
             sh.runs[sh.count++] = CachedRun{addr, static_cast<uint32_t>(num_pages),
                                             static_cast<int32_t>(node), nowMs()};
             sh.bytes += bytes;
+            bump(sh.puts);
+            if (n_evicted) sh.evictions.store(sh.evictions.load(std::memory_order_relaxed) +
+                                              n_evicted, std::memory_order_relaxed);
             sh.bytes_published.store(sh.bytes, std::memory_order_relaxed);
         }
         for (unsigned i = 0; i < n_evicted; ++i)
@@ -600,6 +607,7 @@ public:
         if (!runCacheEnabled()) return nullptr;
         RunCacheShard& sh = run_cache_[currentCpuShard(kRunCacheShards)];
         LockGuard guard(sh.lock);
+        bump(sh.takes);
         // Newest first: the most recently freed run is the likeliest to be
         // warm in cache.
         for (unsigned i = sh.count; i-- > 0;) {
@@ -611,8 +619,7 @@ public:
             sh.bytes -= num_pages * kPageSize;
             sh.runs[i] = sh.runs[--sh.count];
             sh.bytes_published.store(sh.bytes, std::memory_order_relaxed);
-            sh.hits.store(sh.hits.load(std::memory_order_relaxed) + 1,
-                          std::memory_order_relaxed);
+            bump(sh.hits);
             return addr;
         }
         return nullptr;
@@ -639,9 +646,35 @@ public:
                 }
             }
             sh.bytes_published.store(sh.bytes, std::memory_order_relaxed);
+            if (n) sh.trimmed.store(sh.trimmed.load(std::memory_order_relaxed) + n,
+                                    std::memory_order_relaxed);
             sh.lock.unlock();
             for (unsigned i = 0; i < n; ++i) releasePages(out[i].addr, out[i].pages);
         }
+    }
+
+    // Every counter summed over the shards, for the SIGUSR2 stats line.
+    // takes: allocations that looked in the cache; hits: of those, served;
+    // puts: frees parked; evictions: parked runs pushed out to make room (a
+    // put that evicts still ends in releasePages); trimmed: aged out;
+    // declined_cold / declined_big: frees not offered because a page was
+    // compressed, or the run is over the per-run or per-shard limit.
+    struct RunCacheStats {
+        uint64_t takes, hits, puts, evictions, trimmed, declined_cold, declined_big, bytes;
+    };
+    RunCacheStats runCacheStats() const {
+        RunCacheStats t{};
+        for (const RunCacheShard& sh : run_cache_) {
+            t.takes += sh.takes.load(std::memory_order_relaxed);
+            t.hits += sh.hits.load(std::memory_order_relaxed);
+            t.puts += sh.puts.load(std::memory_order_relaxed);
+            t.evictions += sh.evictions.load(std::memory_order_relaxed);
+            t.trimmed += sh.trimmed.load(std::memory_order_relaxed);
+            t.declined_cold += sh.declined_cold.load(std::memory_order_relaxed);
+            t.declined_big += sh.declined_big.load(std::memory_order_relaxed);
+            t.bytes += sh.bytes_published.load(std::memory_order_relaxed);
+        }
+        return t;
     }
 
     // Diagnostics behind smash_run_cache_info(): total hits and bytes cached
@@ -674,9 +707,15 @@ private:
         size_t bytes = 0;
         // Published copies for the lock-free readers (trim's skip test, info).
         std::atomic<size_t> bytes_published{0};
-        std::atomic<uint64_t> hits{0};
+        // Counters (see runCacheStats). Per shard, so they share the shard's
+        // line rather than adding a global one; most are bumped under its lock.
+        std::atomic<uint64_t> takes{0}, hits{0}, puts{0}, evictions{0}, trimmed{0};
+        std::atomic<uint64_t> declined_cold{0}, declined_big{0};
         CachedRun runs[kRunCacheSlots];
     };
+    static void bump(std::atomic<uint64_t>& c) {
+        c.fetch_add(1, std::memory_order_relaxed);
+    }
     RunCacheShard run_cache_[kRunCacheShards];
 
     static size_t runCacheCapBytes() {

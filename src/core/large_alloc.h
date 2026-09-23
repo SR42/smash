@@ -250,7 +250,7 @@ public:
             // A run with no compressed page may be parked for reuse by this
             // CPU (SMASH_RUN_CACHE_MIB); anything else goes the ordinary way,
             // which restores protection and decommits.
-            if (!(reusable && vm_region_->cacheFreedRun(base, num_pages)))
+            if (!vm_region_->cacheFreedRun(base, num_pages, reusable))
                 vm_region_->releasePages(base, num_pages);
         } else {
             vm::unmapPages(base, num_pages * kPageSize);

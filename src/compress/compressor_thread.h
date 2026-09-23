@@ -5954,7 +5954,7 @@ public:
         // there, and it is what runs out on a very large heap.
         size_t boot_used = 0, boot_cap = 0, boot_regions = 0;
         BootstrapAlloc::instance().usage(&boot_used, &boot_cap, &boot_regions);
-        char buf[480];
+        char buf[768];
         int n = smash::safe_snprintf(buf, sizeof(buf),
             "[smash stats] [%s] pid=%d committed=%zu  active=%zu  monitor=%zu"
             "  compressing=%zu  compressed=%zu  shadow=%zu  empty=%zu"
@@ -5970,6 +5970,21 @@ public:
             (unsigned long long)g_reheat_events.load(std::memory_order_relaxed),
             writeTrackerName(self->write_tracker_),
             boot_used >> 20, boot_cap >> 20, boot_regions);
+        // The per-CPU run cache (SMASH_RUN_CACHE_MIB), when on: whether it is
+        // actually absorbing the large-block churn, or evicting as fast as it
+        // parks (a free that evicts still goes through releasePages).
+        if (n > 0 && self->vm_ && self->vm_->runCacheEnabled() &&
+            static_cast<size_t>(n) < sizeof(buf)) {
+            const auto rc = self->vm_->runCacheStats();
+            n += smash::safe_snprintf(buf + n, sizeof(buf) - static_cast<size_t>(n),
+                "[smash runcache] takes=%llu hits=%llu puts=%llu evict=%llu trim=%llu"
+                " declined_cold=%llu declined_big=%llu cached=%lluMiB\n",
+                (unsigned long long)rc.takes, (unsigned long long)rc.hits,
+                (unsigned long long)rc.puts, (unsigned long long)rc.evictions,
+                (unsigned long long)rc.trimmed, (unsigned long long)rc.declined_cold,
+                (unsigned long long)rc.declined_big, (unsigned long long)(rc.bytes >> 20));
+            if (n >= static_cast<int>(sizeof(buf))) n = static_cast<int>(sizeof(buf)) - 1;
+        }
         // Cast to void to silence -Wunused-result on glibc (write is
         // marked __wur there). We're inside a signal handler — there's
         // no useful recovery if write() short-returns.
