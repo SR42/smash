@@ -292,6 +292,15 @@ if(NOT APPLE)
     "SMASH_COLD_TIMEOUT_SEC=1" "SMASH_DEFER_PHASES_MS=0"
     $<TARGET_FILE:mid_bins_test>)
   set_tests_properties(test_mid_bins_off test_mid_bins_on PROPERTIES TIMEOUT 180)
+  # An emptied chunk the exhausted arena takes back must release its blobs.
+  # SMASH_VM_GIB=1 is load-bearing: the test has to run the arena out.
+  add_executable(mid_bins_reclaim_test mid_bins_reclaim_test.cpp)
+  target_link_libraries(mid_bins_reclaim_test PRIVATE ${CMAKE_DL_LIBS})
+  add_test(NAME test_mid_bins_reclaim COMMAND ${CMAKE_COMMAND} -E env
+    "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=1" "SMASH_MID_BINS=1"
+    "SMASH_VM_GIB=1" "SMASH_COLD_TIMEOUT_SEC=1" "SMASH_DEFER_PHASES_MS=0"
+    $<TARGET_FILE:mid_bins_reclaim_test>)
+  set_tests_properties(test_mid_bins_reclaim PROPERTIES TIMEOUT 180)
 endif()
 
 # ── Transparent hugepages for the arena (Linux) ─────────────────────────────

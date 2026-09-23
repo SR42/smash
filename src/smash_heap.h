@@ -1258,10 +1258,12 @@ public:
                 large_alloc_.init(&page_map_);
             }
             // Mid-size bins live in the arena, so they need the same wiring as
-            // an arena-backed large block: page states for the compressor and
-            // the page map for free()'s ownership lookup.
+            // an arena-backed large block: page states for the compressor, the
+            // page map for free()'s ownership lookup, and the release hook for
+            // a chunk handed back to the arena.
             if (compression_inited_)
-                mid_alloc_.init(&vm_region_, &page_states_, &page_map_);
+                mid_alloc_.init(&vm_region_, &page_states_, &page_map_,
+                                releaseHook, this);
         }
         log_time("large_alloc_init");
         log_time("TOTAL_CONSTRUCTOR");

@@ -53,10 +53,14 @@ inline constexpr int kNumMidClasses =
 
 class MidAlloc {
 public:
-    void init(VmRegion* vm, PageStateTable* states, PageMap* page_map) {
+    void init(VmRegion* vm, PageStateTable* states, PageMap* page_map,
+              void (*release_hook)(size_t, size_t, void*) = nullptr,
+              void* release_ctx = nullptr) {
         vm_ = vm;
         states_ = states;
         page_map_ = page_map;
+        release_hook_ = release_hook;
+        release_ctx_ = release_ctx;
     }
 
     // Smallest class that fits, or -1 if the size is outside the band. The
@@ -150,6 +154,15 @@ public:
                     // a reallocation of the same range cannot resolve to this
                     // dead chunk.
                     page_map_->setRange(reinterpret_cast<uintptr_t>(base), pages, nullptr);
+                    // An idle chunk is exactly what the compressor takes, so
+                    // its pages usually hold blobs. Release them and reset the
+                    // page states first, as LargeAlloc and Slab do; otherwise
+                    // every blob leaks and the pages reach their next owner
+                    // still marked COMPRESSED (test_mid_bins_reclaim: 3200 of
+                    // 3200 pages kept their blobs).
+                    if (release_hook_)
+                        release_hook_(vm_->pageIndex(reinterpret_cast<uintptr_t>(base)),
+                                      pages, release_ctx_);
                     vm_->releasePagesNow(base, pages);
                     recycleSpanDescriptor(s);
                 }
@@ -224,6 +237,8 @@ private:
     VmRegion* vm_ = nullptr;
     PageStateTable* states_ = nullptr;
     PageMap* page_map_ = nullptr;
+    void (*release_hook_)(size_t, size_t, void*) = nullptr;
+    void* release_ctx_ = nullptr;
 };
 
 }  // namespace smash
