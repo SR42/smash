@@ -12,7 +12,6 @@
 #include <new>
 #include <sys/mman.h>
 #include <pthread.h>
-#include <sched.h>
 #include <signal.h>
 #include <unistd.h>
 #include "smash/config.h"
@@ -21,6 +20,7 @@
 #include "page_state.h"
 #include "../core/bootstrap_alloc.h"
 #include "../util/spinlock.h"
+#include "../util/cpu_shard.h"
 #include "../util/exit_guard.h"
 
 #include <atomic>
@@ -127,19 +127,8 @@ class VmRegion {
     pthread_t decommit_thread_{};
     std::atomic<bool> decommit_running_{false};
 
-    static unsigned currentEntryShard() {
-#if defined(__linux__)
-        // glibc reads this from rseq where the kernel supports it: no syscall.
-        const int cpu = sched_getcpu();
-        if (cpu >= 0) return static_cast<unsigned>(cpu) & (kEntryShards - 1);
-#endif
-        // No CPU number: spread by thread instead.
-        const auto t = reinterpret_cast<uintptr_t>(pthread_self());
-        return static_cast<unsigned>((t >> 12) ^ (t >> 20)) & (kEntryShards - 1);
-    }
-
     DecommitEntry* newDecommitEntry() {
-        const unsigned s = currentEntryShard();
+        const unsigned s = currentCpuShard(kEntryShards);
         EntryShard& sh = entry_shards_[s];
         {
             LockGuard guard(sh.lock);

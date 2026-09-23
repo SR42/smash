@@ -10,6 +10,7 @@
 #include "../util/bitops.h"
 #include "../util/double_free.h"
 #include "../util/spinlock.h"
+#include "../util/cpu_shard.h"
 #include "../vm/page_state.h"
 
 #include <atomic>
@@ -72,6 +73,7 @@ struct Span {
     // so the inner allocate loop doesn't have to call back into VmRegion.
     PageStateTable* page_states;
     uint32_t        first_page_vm_idx;
+    uint8_t         free_shard;      // descriptor-cache shard it returns to (fills padding)
     // Optional: per-page cold-tick counter array owned by CompressorThread.
     // allocate() resets the counter for the page that just received a chunk,
     // so phase2 doesn't compress pages that are still being filled.
@@ -530,20 +532,30 @@ static_assert(sizeof(Span) <= 112,
 // slab spans pass through it. It was a lock-free Treiber stack whose pop read
 // s->next_free and then CASed the head — the textbook ABA race: between the
 // read and the CAS another thread can pop `s`, pop its successor, and push `s`
-// back, and the CAS then installs a successor that is in use. A spinlock costs
-// one uncontended atomic per span creation, which is rare next to object
-// allocation.
-struct SpanFreeList {
+// back, and the CAS then installs a successor that is in use. So it is locked.
+//
+// And sharded by CPU. One lock was assumed cheap because "span creation is
+// rare next to object allocation", which does not hold for large blocks: every
+// large malloc and every large free takes it. On a 128-thread malloc_numa
+// workload on 128 cores it was 24% of all CPU, under LargeAlloc::deallocate,
+// once the decommit-entry pool (the same pattern) had been sharded. A
+// descriptor returns to the shard it was taken from (Span::free_shard), not
+// the freeing thread's, so producer/consumer patterns — allocated on one
+// thread, freed on another — cannot drain one shard into another and make the
+// empty side mint new descriptors from BootstrapAlloc, which never frees.
+struct alignas(64) SpanFreeList {
     Spinlock lock;
     Span* head = nullptr;
 };
-inline SpanFreeList& spanFreeList() {
-    static SpanFreeList list;
-    return list;
+inline constexpr unsigned kSpanFreeShards = 64;
+inline SpanFreeList& spanFreeList(unsigned shard) {
+    static SpanFreeList lists[kSpanFreeShards];
+    return lists[shard];
 }
 
 inline Span* newSpanDescriptor() {
-    SpanFreeList& fl = spanFreeList();
+    const unsigned shard = currentCpuShard(kSpanFreeShards);
+    SpanFreeList& fl = spanFreeList(shard);
     Span* s = nullptr;
     {
         LockGuard guard(fl.lock);
@@ -559,11 +571,12 @@ inline Span* newSpanDescriptor() {
     __builtin_memset(s, 0, sizeof(Span));
     s->bitmap_store = store;
     s->bitmap_store_words = words;
+    s->free_shard = static_cast<uint8_t>(shard);
     return s;
 }
 
 inline void recycleSpanDescriptor(Span* s) {
-    SpanFreeList& fl = spanFreeList();
+    SpanFreeList& fl = spanFreeList(s->free_shard);
     LockGuard guard(fl.lock);
     s->next_free = fl.head;
     fl.head = s;

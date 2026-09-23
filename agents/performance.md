@@ -500,6 +500,20 @@ demangled name, so `-S _ZN5smash8Spinlock4lockEv` silently matches nothing —
 use `--symbol-filter="Spinlock::lock"`. libsmash has no frame pointers in
 RelWithDebInfo, so use `--call-graph dwarf` (or `lbr` on Intel).
 
+**On the 128-core box it took `Spinlock::lock` from 36.6% to 30%, and the
+remainder moved to `LargeAlloc::deallocate` (24%).** Its one direct lock is
+the span-descriptor cache (`recycleSpanDescriptor`, and `newSpanDescriptor`
+on every large allocation): the same pattern, one global list, justified in
+its comment by "span creation is rare next to object allocation", which is
+false for churned large blocks. It is sharded the same way now, 64 per-CPU
+shards, and a descriptor returns to the shard it was taken from
+(`Span::free_shard`, a byte of existing padding — `sizeof(Span)` stays 112).
+Returning it to the freeing thread's shard instead would let a
+producer/consumer pattern drain one shard into another and make the empty
+side mint descriptors from BootstrapAlloc, which never frees. Neutral at 8
+threads here (74.2-75.1k vs 74.2-75.6k); the span-descriptor race test
+passes. `util/cpu_shard.h` holds the shard pick both pools use.
+
 What an 8-CPU box does show at 1:1 is the next cost: `releaseHook` —
 `releaseCompressedPages` walking every page of every freed block under its
 page lock (40% at 8 threads, 30% in the large-only repro) whether or not any
