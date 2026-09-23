@@ -42,7 +42,7 @@ codegen bug: [agents/sanitizers.md](agents/sanitizers.md).
 cd build && ctest --output-on-failure
 ```
 
-All 75 tests must pass; none are registered `DISABLED`. Run the suite **as root** too when touching the compressor: idle-page read tracking only exists with root, and CI (`.github/workflows/ci.yml`, `ubuntu-latest` + `macos-latest`, every push and PR) runs unprivileged. After ctest, CI runs `bench/run_quick_ci.py` (`bench_rss` ≥30 %, `bench_sqlite --quick` ≥5 % RSS reduction).
+All 79 tests must pass; none are registered `DISABLED`. Run the suite **as root** too when touching the compressor: idle-page read tracking only exists with root, and CI (`.github/workflows/ci.yml`, `ubuntu-latest` + `macos-latest`, every push and PR) runs unprivileged. After ctest, CI runs `bench/run_quick_ci.py` (`bench_rss` ≥30 %, `bench_sqlite --quick` ≥5 % RSS reduction).
 
 **Before changing a test or its threshold, read its entry in [agents/tests.md](agents/tests.md).** Thresholds encode measurements, several tests are probabilistic (one run is not a verdict), and some harness shapes (sharing a process between phases, `fork()` with smash threads running) reproduce the very symptom under test.
 
@@ -233,4 +233,5 @@ Full list of constants and environment variables: [agents/config.md](agents/conf
 - `SMASH_LARGE_ALLOC_VM_THRESHOLD=N` (default 1 MiB): below it, a block is never compressed.
 - `SMASH_COLD_TIMEOUT_SEC=N`: cold timeout override (tests use 1–2).
 - `SMASH_WRITE_TRACK=auto|softdirty|uffd|none`, `SMASH_SOFTDIRTY=0`: write detection.
+- `SMASH_RUN_CACHE_MIB=N` (default off): per-CPU cache of freed large runs — about 2x large-block churn throughput one thread per core, at up to 64 x N MiB of extra RSS. See [agents/design-run-cache.md](agents/design-run-cache.md).
 - `SMASH_STATS_SIGNAL=1`: enable the SIGUSR2 stats line (`compressed=`, `track=`, `boot=`, `reheat=`).

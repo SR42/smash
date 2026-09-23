@@ -4,7 +4,7 @@ Why each test exists, what it asserts, and how it was verified as a real discrim
 
 ## End-to-end tests under interposition
 
-All 75 tests must pass; none are registered `DISABLED`. Run the suite **as root** too when touching the compressor: some paths only exist with root (see "Idle-page read tracking" in [defect-history.md](defect-history.md)), and an unprivileged run — which is all CI does — never executes them. CI (`.github/workflows/ci.yml`) runs the full suite on `ubuntu-latest` and `macos-latest` on every push and PR. Twenty-eight of the tests are end-to-end under `DYLD_INSERT_LIBRARIES` / `LD_PRELOAD`:
+All 79 tests must pass; none are registered `DISABLED`. Run the suite **as root** too when touching the compressor: some paths only exist with root (see "Idle-page read tracking" in [defect-history.md](defect-history.md)), and an unprivileged run — which is all CI does — never executes them. CI (`.github/workflows/ci.yml`) runs the full suite on `ubuntu-latest` and `macos-latest` on every push and PR. Twenty-eight of the tests are end-to-end under `DYLD_INSERT_LIBRARIES` / `LD_PRELOAD`:
 
 - `test_arena_routing` guards call-site arena routing — the invariant behind the paper's compression-homogeneity claim. Runs a program with 32 distinct noinline allocation sites under interposition and asserts, via the exported `smash_arena_for(ptr)` query, that they do **not** all collapse into one arena. This is the regression guard for the LTO/wrapper return-address bug: under dynamic interposition the return address seen inside the allocator can point into the wrapper library instead of the app, collapsing every call site into one arena (homogeneity 0%). Fast and deterministic (no compressor): full mode routes 256 B allocations through the slab, and `SMASH_CPU_ARENA=0` + default thread-hash-off make the arena a pure function of the return address, so a buggy capture yields exactly 1 distinct arena. Verified as a real discriminator (injecting a constant RA makes it fail with `distinct_arenas=1`). Must run under interposition — a direct-linked call would never exercise the wrapper path where the bug lives.
 
@@ -173,6 +173,16 @@ Four defects found by a code review of this branch (2026-09-22), each reproduced
   **Cost, measured interleaved** (`fwrite` of 47 bytes to `/dev/null`, `fgets` over a 2M-line file, pinned, large-only): the first version of the fix cost `fwrite` 28 → 43 ns. ~6 ns was `flockfile` around the pending check, now an unlocked read (the lock would only decide which caller hears of a loss another thread's buffered bytes suffered); ~9 ns was the compiler turning `bytes == total ? nmemb : bytes / size` into an unconditional 64-bit `div` plus `cmov`, now a branch. After: 28.1 → 28.9 ns for `fwrite`, `fgets` unchanged within noise (43–45 ns; the lock is taken only when the buffer is empty).
 
   The functions are called through `dlsym`'d pointers: `_FORTIFY_SOURCE` rewrites a direct `fread`/`fgets` into `__fread_chk`/`__fgets_chk`, which smash deliberately does not wrap.
+
+## Per-CPU run cache
+
+- `test_run_cache_{off,on,on_full,on_softdirty0}` (`run_cache_test.cpp`) guard `SMASH_RUN_CACHE_MIB` (see [design-run-cache.md](design-run-cache.md)). One body; the expectation follows the variable, so "off" must mean off.
+  1. **Reuse**: a 4 MiB block freed warm and reallocated at the same size on the same CPU (the test pins itself) comes back as the same block, with a hit, still on its node — and re-touching it takes **0 minor faults**, against **1024 of 1024** without the cache, because today's path decommits. Faults are the discriminator, not an export: they failed the "on" variant against the pre-cache library for the right reason, before the export existed.
+  2. **Churn**: 16 threads, 1-4 MiB, plain and node blocks; every page's first word carries its owner's tag and must survive to the free (a run handed to two owners overwrites it); sampled node pages checked with `move_pages`. Measured: 855-1108 hits, 0 corrupted, 0 off node.
+  3. **Cold**: a block left to compress (all 1024 pages out of RSS), then freed, must not enter the cache — its pages may be PROT_NONE — and the reallocation must be writable and byte-exact, also under `SMASH_SOFTDIRTY=0`.
+  4. **Bound and drain**: freeing 16 x 8 MiB on one CPU caches exactly the 32 MiB cap, and 0 bytes 500 ms later.
+
+  **Verified as a real discriminator by mutation:** caching runs whose release reported compressed pages fails phase 3 in both modes ("a block with compressed pages went into the run cache"); disabling the decommit thread's trim fails phase 4 with 32 MiB still cached. Neither mutation crashed — the fault handler restored the PROT_NONE pages as ACTIVE — so the guard is conservative, not the only thing between a cached cold run and a crash.
 
 ## CI benchmarks
 

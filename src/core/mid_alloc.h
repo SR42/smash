@@ -54,7 +54,7 @@ inline constexpr int kNumMidClasses =
 class MidAlloc {
 public:
     void init(VmRegion* vm, PageStateTable* states, PageMap* page_map,
-              void (*release_hook)(size_t, size_t, void*) = nullptr,
+              bool (*release_hook)(size_t, size_t, void*) = nullptr,
               void* release_ctx = nullptr) {
         vm_ = vm;
         states_ = states;
@@ -237,7 +237,7 @@ private:
     VmRegion* vm_ = nullptr;
     PageStateTable* states_ = nullptr;
     PageMap* page_map_ = nullptr;
-    void (*release_hook_)(size_t, size_t, void*) = nullptr;
+    bool (*release_hook_)(size_t, size_t, void*) = nullptr;
     void* release_ctx_ = nullptr;
 };
 

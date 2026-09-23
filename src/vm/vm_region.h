@@ -12,6 +12,7 @@
 #include <new>
 #include <sys/mman.h>
 #include <pthread.h>
+#include <time.h>
 #include <signal.h>
 #include <unistd.h>
 #include "smash/config.h"
@@ -233,7 +234,17 @@ class VmRegion {
         // this one as a reason to keep the process alive (util/exit_guard.h).
         exit_guard::ThreadRegistration exit_reg;
         auto* self = static_cast<VmRegion*>(arg);
+        uint64_t last_trim_ms = 0;
         while (self->decommit_running_.load(std::memory_order_relaxed)) {
+            // Return cached runs that have aged out (see cacheFreedRun). The
+            // clock is the coarse vDSO one, so this costs a few ns per wake.
+            if (runCacheCapBytes() != 0) {
+                const uint64_t now = nowMs();
+                if (now - last_trim_ms >= kRunCacheTrimIntervalMs) {
+                    last_trim_ms = now;
+                    self->trimRunCache(/*all=*/false);
+                }
+            }
             // Drain the queue
             DecommitEntry* batch = self->decommit_head_.exchange(nullptr, std::memory_order_acquire);
             if (batch) {
@@ -484,6 +495,12 @@ public:
     void resetDecommitThreadForFork() {
         // Thread doesn't exist in child - don't try to join it
         decommit_running_.store(false, std::memory_order_relaxed);
+        // A parent thread may have held a pool or run-cache shard lock at the
+        // fork; that thread does not exist here. Each critical section is a
+        // few pointer moves, so the lists themselves are consistent enough to
+        // keep; the locks are not.
+        for (EntryShard& sh : entry_shards_) new (&sh.lock) Spinlock();
+        for (RunCacheShard& sh : run_cache_) new (&sh.lock) Spinlock();
         drainDecommitQueueNow();
     }
 
@@ -520,6 +537,175 @@ public:
                decommit_draining_.load(std::memory_order_acquire) != 0;
     }
 
+    // ── Per-CPU cache of freed large runs (SMASH_RUN_CACHE_MIB) ──────────────
+    // A large block freed warm is parked on the freeing CPU's shard instead of
+    // going through the decommit queue, and the next allocation of the same
+    // page count on that CPU and node takes it back. That cycle then skips the
+    // node arena's lock, the free map, the queue, mprotect, madvise and the
+    // zero-fill fault on every page — at 128 threads over 4 nodes the node
+    // arena's lock alone was 26.6% of all CPU. Design and trade-offs:
+    // agents/design-run-cache.md.
+    //
+    // A cached run's pages stay resident and EMPTY (the compressor ignores
+    // EMPTY pages), so this is RSS on loan: bounded per shard by
+    // SMASH_RUN_CACHE_MIB and kRunCacheSlots, and returned by the decommit
+    // thread once older than SMASH_RUN_CACHE_AGE_MS. Off by default. Only a run
+    // the compressor's release reported reusable is offered (no page was
+    // COMPRESSED, so none can be PROT_NONE or unbacked); a run is only ever
+    // handed back to the same node, so NUMA binding is unchanged.
+public:
+    bool runCacheEnabled() const {
+        return runCacheCapBytes() != 0 && !tracking_mode_ && !landminesEnabled() &&
+               !zeroFreeEnabled();
+    }
+
+    // Park a freed run (its compressed state already released). False when the
+    // run is not cacheable; the caller then releases it the ordinary way.
+    bool cacheFreedRun(void* addr, size_t num_pages) {
+        if (!runCacheEnabled()) return false;
+        const auto a = reinterpret_cast<uintptr_t>(addr);
+        const size_t bytes = num_pages * kPageSize;
+        const size_t cap = runCacheCapBytes();
+        if (!inContigArena(a) || bytes > cap || bytes > kRunCacheMaxRunBytes) return false;
+        ensureDecommitThreadStarted();   // the trim runs there
+        const int node = nodeOfPage(pageIndex(a));
+        CachedRun evicted[kRunCacheSlots];
+        unsigned n_evicted = 0;
+        RunCacheShard& sh = run_cache_[currentCpuShard(kRunCacheShards)];
+        {
+            LockGuard guard(sh.lock);
+            // Make room, oldest first. Terminates: bytes <= cap was checked.
+            while (sh.count == kRunCacheSlots || sh.bytes + bytes > cap) {
+                unsigned oldest = 0;
+                for (unsigned i = 1; i < sh.count; ++i)
+                    if (sh.runs[i].freed_ms < sh.runs[oldest].freed_ms) oldest = i;
+                evicted[n_evicted++] = sh.runs[oldest];
+                sh.bytes -= sh.runs[oldest].pages * kPageSize;
+                sh.runs[oldest] = sh.runs[--sh.count];
+            }
+            sh.runs[sh.count++] = CachedRun{addr, static_cast<uint32_t>(num_pages),
+                                            static_cast<int32_t>(node), nowMs()};
+            sh.bytes += bytes;
+            sh.bytes_published.store(sh.bytes, std::memory_order_relaxed);
+        }
+        for (unsigned i = 0; i < n_evicted; ++i)
+            releasePages(evicted[i].addr, evicted[i].pages);
+        return true;
+    }
+
+    // A cached run of exactly `num_pages` for `node` (-1: the shared arena)
+    // whose address is `align_bytes`-aligned, from this CPU's shard; nullptr
+    // on a miss.
+    void* takeCachedRun(size_t num_pages, int node, size_t align_bytes) {
+        if (!runCacheEnabled()) return nullptr;
+        RunCacheShard& sh = run_cache_[currentCpuShard(kRunCacheShards)];
+        LockGuard guard(sh.lock);
+        // Newest first: the most recently freed run is the likeliest to be
+        // warm in cache.
+        for (unsigned i = sh.count; i-- > 0;) {
+            const CachedRun& r = sh.runs[i];
+            if (r.pages != num_pages || r.node != node ||
+                (reinterpret_cast<uintptr_t>(r.addr) & (align_bytes - 1)) != 0)
+                continue;
+            void* addr = r.addr;
+            sh.bytes -= num_pages * kPageSize;
+            sh.runs[i] = sh.runs[--sh.count];
+            sh.bytes_published.store(sh.bytes, std::memory_order_relaxed);
+            sh.hits.store(sh.hits.load(std::memory_order_relaxed) + 1,
+                          std::memory_order_relaxed);
+            return addr;
+        }
+        return nullptr;
+    }
+
+    // Return cached runs to the arena: those older than the age limit, or all
+    // of them. Skips a shard whose lock is busy; the next sweep takes it.
+    void trimRunCache(bool all) {
+        if (!runCacheEnabled()) return;
+        const uint64_t now = nowMs();
+        const uint64_t age = runCacheAgeMs();
+        for (RunCacheShard& sh : run_cache_) {
+            if (sh.bytes_published.load(std::memory_order_relaxed) == 0) continue;
+            CachedRun out[kRunCacheSlots];
+            unsigned n = 0;
+            if (!sh.lock.tryLock()) continue;
+            for (unsigned i = 0; i < sh.count;) {
+                if (all || now - sh.runs[i].freed_ms >= age) {
+                    out[n++] = sh.runs[i];
+                    sh.bytes -= sh.runs[i].pages * kPageSize;
+                    sh.runs[i] = sh.runs[--sh.count];
+                } else {
+                    ++i;
+                }
+            }
+            sh.bytes_published.store(sh.bytes, std::memory_order_relaxed);
+            sh.lock.unlock();
+            for (unsigned i = 0; i < n; ++i) releasePages(out[i].addr, out[i].pages);
+        }
+    }
+
+    // Diagnostics behind smash_run_cache_info(): total hits and bytes cached
+    // now. Returns whether the cache is enabled.
+    bool runCacheInfo(uint64_t* hits, uint64_t* bytes) const {
+        uint64_t h = 0, b = 0;
+        for (const RunCacheShard& sh : run_cache_) {
+            h += sh.hits.load(std::memory_order_relaxed);
+            b += sh.bytes_published.load(std::memory_order_relaxed);
+        }
+        *hits = h;
+        *bytes = b;
+        return runCacheEnabled();
+    }
+
+private:
+    struct CachedRun {
+        void* addr;
+        uint32_t pages;
+        int32_t node;       // -1: the shared arena
+        uint64_t freed_ms;
+    };
+    static constexpr unsigned kRunCacheShards = 64;
+    static constexpr unsigned kRunCacheSlots = 8;
+    static constexpr size_t kRunCacheMaxRunBytes = size_t{64} << 20;
+    static constexpr uint64_t kRunCacheTrimIntervalMs = 10;
+    struct alignas(64) RunCacheShard {
+        Spinlock lock;
+        unsigned count = 0;
+        size_t bytes = 0;
+        // Published copies for the lock-free readers (trim's skip test, info).
+        std::atomic<size_t> bytes_published{0};
+        std::atomic<uint64_t> hits{0};
+        CachedRun runs[kRunCacheSlots];
+    };
+    RunCacheShard run_cache_[kRunCacheShards];
+
+    static size_t runCacheCapBytes() {
+        static const size_t cap = [] {
+            const char* v = std::getenv("SMASH_RUN_CACHE_MIB");
+            const long mib = v ? std::atol(v) : 0;
+            return mib > 0 ? static_cast<size_t>(mib) << 20 : size_t{0};
+        }();
+        return cap;
+    }
+    static uint64_t runCacheAgeMs() {
+        static const uint64_t ms = [] {
+            const char* v = std::getenv("SMASH_RUN_CACHE_AGE_MS");
+            const long n = v ? std::atol(v) : 0;
+            return n > 0 ? static_cast<uint64_t>(n) : uint64_t{50};
+        }();
+        return ms;
+    }
+    static uint64_t nowMs() {
+        timespec t;
+#if defined(CLOCK_MONOTONIC_COARSE)
+        clock_gettime(CLOCK_MONOTONIC_COARSE, &t);   // vDSO, no syscall
+#else
+        clock_gettime(CLOCK_MONOTONIC, &t);
+#endif
+        return static_cast<uint64_t>(t.tv_sec) * 1000 + static_cast<uint64_t>(t.tv_nsec) / 1000000;
+    }
+
+public:
     // ── Allocation (full mode only) ─────────────────────────────────────────
     void* allocatePages(size_t num_pages) {
         if (tracking_mode_) return nullptr;
@@ -555,6 +741,11 @@ public:
             // drainInFlight() covers both a queued run and one another thread
             // is already processing, so this only stops retrying when there is
             // genuinely nothing left to come back.
+            //
+            // Runs parked in the per-CPU run cache are free memory too: hand
+            // them all back first, or a full cache would push this allocation
+            // out of the arena.
+            trimRunCache(/*all=*/true);
             for (int attempt = 0; drainWaitEnabled() && attempt < kDrainWaitAttempts;
                  ++attempt) {
                 drainDecommitQueueNow();
@@ -1208,7 +1399,8 @@ exhausted:
         // The shared arena's exhausted hook is deliberately not called here:
         // it returns empty slab spans, which are shared-owner pages, and runs
         // of different owners never merge. It cannot produce a chunk for this
-        // node.
+        // node. Cached runs can (some are this node's), so they go back first.
+        trimRunCache(/*all=*/true);
         for (int attempt = 0; drainWaitEnabled() && attempt < kDrainWaitAttempts;
              ++attempt) {
             // Drained WITHOUT na.lock, as in the common path: holding it

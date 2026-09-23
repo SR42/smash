@@ -1433,6 +1433,19 @@ int smash_in_arena(const void* ptr) {
     return heap && heap->inArena(ptr) ? 1 : 0;
 }
 
+// Diagnostic / test hook (not public API): hits served by the per-CPU run
+// cache so far, and bytes parked in it now. 0 if the cache is enabled
+// (SMASH_RUN_CACHE_MIB), -1 if not; the counters are filled either way.
+extern "C" __attribute__((visibility("default")))
+int smash_run_cache_info(uint64_t* hits, uint64_t* cached_bytes) {
+    uint64_t h = 0, b = 0;
+    auto* heap = SmashRedirect::getHeap();
+    const bool on = heap && heap->runCacheInfo(&h, &b);
+    if (hits) *hits = h;
+    if (cached_bytes) *cached_bytes = b;
+    return on ? 0 : -1;
+}
+
 // Public NUMA allocation API, declared in smash/smash.h. Exported the same way
 // as smash_arena_for: default visibility plus a version-script entry.
 extern "C" __attribute__((visibility("default")))

@@ -24,13 +24,13 @@ class LargeAlloc {
     PageMap* page_map_;
     VmRegion* vm_region_ = nullptr;
     PageStateTable* page_states_ = nullptr;
-    void (*release_hook_)(size_t, size_t, void*) = nullptr;
+    bool (*release_hook_)(size_t, size_t, void*) = nullptr;
     void* release_ctx_ = nullptr;
 
 public:
     void init(PageMap* pm,
               VmRegion* vr = nullptr, PageStateTable* ps = nullptr,
-              void (*hook)(size_t, size_t, void*) = nullptr,
+              bool (*hook)(size_t, size_t, void*) = nullptr,
               void* hook_ctx = nullptr) {
         page_map_ = pm;
         vm_region_ = vr;
@@ -84,7 +84,9 @@ public:
 
         // Route large-enough allocations through VmRegion for compression
         if (vm_region_ && alignment <= kPageSize && alloc_size >= largeAllocVmThreshold()) {
-            mem = vm_region_->allocatePages(num_pages);
+            // A run this CPU freed warm, if SMASH_RUN_CACHE_MIB is on.
+            mem = vm_region_->takeCachedRun(num_pages, /*node=*/-1, kPageSize);
+            if (!mem) mem = vm_region_->allocatePages(num_pages);
             if (mem && page_states_) {
                 size_t idx = vm_region_->pageIndex(reinterpret_cast<uintptr_t>(mem));
                 for (uint32_t p = 0; p < num_pages; ++p)
@@ -160,10 +162,15 @@ public:
 
         void* mem = nullptr;
         if (vm_region_) {
-            mem = vm_region_->allocatePagesOnNodeAligned(num_pages, node, alignment);
-            // Any failure but exhaustion (bad node, mbind refused) would fail
-            // the same way on a separate mapping.
-            if (!mem && errno != ENOMEM) return nullptr;
+            // A run this CPU freed warm on this node, if SMASH_RUN_CACHE_MIB is
+            // on; it skips the node arena's lock entirely.
+            mem = vm_region_->takeCachedRun(num_pages, static_cast<int>(node), alignment);
+            if (!mem) {
+                mem = vm_region_->allocatePagesOnNodeAligned(num_pages, node, alignment);
+                // Any failure but exhaustion (bad node, mbind refused) would
+                // fail the same way on a separate mapping.
+                if (!mem && errno != ENOMEM) return nullptr;
+            }
             if (mem && page_states_) {
                 size_t idx = vm_region_->pageIndex(reinterpret_cast<uintptr_t>(mem));
                 for (uint32_t p = 0; p < num_pages; ++p)
@@ -235,11 +242,16 @@ public:
         // later re-mints as base_+idx*kPageSize — past the arena end (#84).
         // Only pages actually placed in the contiguous arena go back to it.
         if (vm_region_ && vm_region_->inContigArena(reinterpret_cast<uintptr_t>(base))) {
+            bool reusable = true;   // no compressor: nothing ever changed protection
             if (release_hook_) {
                 size_t idx = vm_region_->pageIndex(reinterpret_cast<uintptr_t>(base));
-                release_hook_(idx, num_pages, release_ctx_);
+                reusable = release_hook_(idx, num_pages, release_ctx_);
             }
-            vm_region_->releasePages(base, num_pages);
+            // A run with no compressed page may be parked for reuse by this
+            // CPU (SMASH_RUN_CACHE_MIB); anything else goes the ordinary way,
+            // which restores protection and decommits.
+            if (!(reusable && vm_region_->cacheFreedRun(base, num_pages)))
+                vm_region_->releasePages(base, num_pages);
         } else {
             vm::unmapPages(base, num_pages * kPageSize);
         }

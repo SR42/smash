@@ -1037,9 +1037,10 @@ private:
     }
 
     // Release hook: called by slab when freeing spans that may be compressed
-    static void releaseHook(size_t page_idx, size_t page_count, void* ctx) {
+    // Returns whether the run may be reused as-is (see releaseCompressedPages).
+    static bool releaseHook(size_t page_idx, size_t page_count, void* ctx) {
         auto* self = static_cast<SmashHeap*>(ctx);
-        self->compressor_.releaseCompressedPages(page_idx, page_count);
+        return self->compressor_.releaseCompressedPages(page_idx, page_count);
     }
 
     void startCompression() {
@@ -2049,6 +2050,10 @@ public:
     // compressible VmRegion arena (as opposed to a direct-mmap fallback,
     // BootstrapAlloc, or foreign memory)? Measures whether freed memory is
     // actually reused by the arena rather than spilling past it.
+    bool runCacheInfo(uint64_t* hits, uint64_t* bytes) const {
+        return compression_inited_ && vm_region_.runCacheInfo(hits, bytes);
+    }
+
     bool inArena(const void* ptr) const {
         return ptr && vm_region_.inContigArena(reinterpret_cast<uintptr_t>(ptr));
     }

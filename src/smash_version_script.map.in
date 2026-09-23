@@ -77,6 +77,7 @@
     # to guard the call-site-arena invariant.
     smash_arena_for;
     smash_in_arena;
+    smash_run_cache_info;
 
     # Public NUMA allocation API (include/smash/smash.h).
     malloc_numa;

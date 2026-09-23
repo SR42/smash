@@ -6491,8 +6491,13 @@ public:
         }
     }
 
-    // Release any compressed data for a range of pages (called during span release)
-    void releaseCompressedPages(size_t start_page, size_t num_pages) {
+    // Release any compressed data for a range of pages (called during span
+    // release). Returns true when no page was COMPRESSED — i.e. every page is
+    // still mapped read/write-able (a PROT_READ page from monitoring faults
+    // back through the ACTIVE path once reused) and backed by its original
+    // frame, so the caller may reuse the run without restoring protection.
+    bool releaseCompressedPages(size_t start_page, size_t num_pages) {
+        bool reusable = true;
         for (size_t i = start_page; i < start_page + num_pages; ++i) {
             locks_->lock(i);
             // Clear deferred-madvise pending BEFORE the state transitions
@@ -6503,6 +6508,7 @@ public:
                 deferred_pending_[i].store(false, std::memory_order_release);
             }
             PageState st = states_->get(i);
+            if (st == PageState::COMPRESSED) reusable = false;
             if ((st == PageState::COMPRESSED || st == PageState::COMPRESSED_SHADOW)
                 && compressed_[i].data) {
                 releaseBlob(i);
@@ -6520,6 +6526,7 @@ public:
             accessed_[i].store(false, std::memory_order_relaxed);
             locks_->unlock(i);
         }
+        return reusable;
     }
 };
 

@@ -46,7 +46,7 @@ class Slab {
     // it just handed out a chunk on — pages still receiving allocations
     // should not be eligible for compression yet.
     uint8_t* cold_counts_ = nullptr;
-    void (*release_hook_)(size_t, size_t, void*) = nullptr;
+    bool (*release_hook_)(size_t, size_t, void*) = nullptr;
     void* release_ctx_ = nullptr;
 
     // ── Lock-free deferred free (Approach A) ────────────────────────────────
@@ -435,7 +435,7 @@ private:
 public:
     void init(uint8_t sc, PageMap* pm,
               VmRegion* vr = nullptr, PageStateTable* ps = nullptr,
-              void (*hook)(size_t, size_t, void*) = nullptr,
+              bool (*hook)(size_t, size_t, void*) = nullptr,
               void* hook_ctx = nullptr,
               uint8_t arena_id = 0,
               uint32_t max_slots_per_page = 0,

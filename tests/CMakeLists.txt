@@ -585,6 +585,29 @@ add_smash_mode_test(test_numa_arena_churn_full       numa_arena_churn_test 0 600
 add_smash_mode_test(test_numa_arena_churn_large_only numa_arena_churn_test 1 600
                     "SMASH_VM_GIB=1")
 
+# Per-CPU cache of freed large runs (SMASH_RUN_CACHE_MIB, agents/design-run-cache.md).
+# One body, four registrations: off must mean off (every reused page faults, no
+# hits); on, in both heap modes; and on with SMASH_SOFTDIRTY=0, where Phase 3's
+# PROT_READ monitoring can leave a freed page read-only.
+if(NOT APPLE)
+  add_executable(run_cache_test run_cache_test.cpp)
+  set_target_properties(run_cache_test PROPERTIES CXX_STANDARD 20)
+  target_link_libraries(run_cache_test PRIVATE ${CMAKE_DL_LIBS} Threads::Threads)
+  set(_rc_env "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_COLD_TIMEOUT_SEC=1"
+              "SMASH_DEFER_PHASES_MS=0")
+  add_test(NAME test_run_cache_off COMMAND ${CMAKE_COMMAND} -E env ${_rc_env}
+    "SMASH_LARGE_ONLY=1" $<TARGET_FILE:run_cache_test>)
+  add_test(NAME test_run_cache_on COMMAND ${CMAKE_COMMAND} -E env ${_rc_env}
+    "SMASH_LARGE_ONLY=1" "SMASH_RUN_CACHE_MIB=32" $<TARGET_FILE:run_cache_test>)
+  add_test(NAME test_run_cache_on_full COMMAND ${CMAKE_COMMAND} -E env ${_rc_env}
+    "SMASH_LARGE_ONLY=0" "SMASH_RUN_CACHE_MIB=32" $<TARGET_FILE:run_cache_test>)
+  add_test(NAME test_run_cache_on_softdirty0 COMMAND ${CMAKE_COMMAND} -E env ${_rc_env}
+    "SMASH_LARGE_ONLY=1" "SMASH_RUN_CACHE_MIB=32" "SMASH_SOFTDIRTY=0"
+    $<TARGET_FILE:run_cache_test>)
+  set_tests_properties(test_run_cache_off test_run_cache_on test_run_cache_on_full
+    test_run_cache_on_softdirty0 PROPERTIES TIMEOUT 180)
+endif()
+
 # malloc_numa_aligned(node, size, align): malloc_numa plus an alignment
 # guarantee. Sweeps alignments from one page to 16 MiB against sizes across the
 # routing boundaries on every online node, and re-checks the whole malloc_numa
