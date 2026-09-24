@@ -103,7 +103,8 @@ class VmRegion {
         DecommitEntry* next;
     };
 
-    // The pool of spare entries is sharded by CPU, one cache line per shard.
+    // The pool of spare entries is sharded by CPU (256 shards, see
+    // util/cpu_shard.h), one cache line per shard.
     // It used to be one list under one spinlock, taken twice per large free
     // (here, and again when the entry is recycled) — on a 128-thread
     // malloc_numa workload on 128 cores that lock was 32% of all CPU, under
@@ -117,7 +118,7 @@ class VmRegion {
     // allocates a new entry, which then belongs to that shard; the total is
     // bounded by what can be in flight per shard, and entries are 48 bytes.
     // No thread-local state, so nothing is stranded when a thread exits.
-    static constexpr unsigned kEntryShards = 64;
+    static constexpr unsigned kEntryShards = 256;
     struct alignas(64) EntryShard {
         Spinlock lock;
         DecommitEntry* head = nullptr;
@@ -746,7 +747,7 @@ private:
         int32_t node;       // -1: the shared arena
         uint64_t freed_ms;
     };
-    static constexpr unsigned kRunCacheShards = 64;
+    static constexpr unsigned kRunCacheShards = 256;
     static constexpr unsigned kRunCacheSlots = 8;
     static constexpr size_t kRunCacheMaxRunBytes = size_t{64} << 20;
     static constexpr uint64_t kRunCacheTrimIntervalMs = 10;

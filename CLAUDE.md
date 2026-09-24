@@ -234,5 +234,5 @@ Full list of constants and environment variables: [agents/config.md](agents/conf
 - `SMASH_LARGE_ALLOC_VM_THRESHOLD=N` (default 1 MiB): below it, a block is never compressed.
 - `SMASH_COLD_TIMEOUT_SEC=N`: cold timeout override (tests use 1–2).
 - `SMASH_WRITE_TRACK=auto|softdirty|uffd|none`, `SMASH_SOFTDIRTY=0`: write detection.
-- `SMASH_RUN_CACHE_MIB=N` (default off): per-CPU cache of freed large runs — about 2x large-block churn throughput one thread per core, at up to 64 x N MiB of extra RSS. See [agents/design-run-cache.md](agents/design-run-cache.md).
+- `SMASH_RUN_CACHE_MIB=N` (default off): per-CPU cache of freed large runs — about 2x large-block churn throughput one thread per core, at up to (CPUs) x N MiB of extra RSS. See [agents/design-run-cache.md](agents/design-run-cache.md).
 - `SMASH_STATS_SIGNAL=1`: enable the SIGUSR2 stats line (`compressed=`, `track=`, `boot=`, `reheat=`).

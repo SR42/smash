@@ -479,7 +479,7 @@ pushed it back under the same lock — twice per large free, from every thread.
 The lock also sat on the same cache line as `decommit_head_`, which every free
 CASes, so the line bounced even while the lock was free.
 
-The pool is now 64 shards, one cache line each, indexed by `sched_getcpu()`
+The pool is now 256 shards (64 at first; see below), one cache line each, indexed by `sched_getcpu()`
 (rseq-backed in glibc, so no syscall). An entry records its shard and is
 recycled to it, not to the recycler's, so shards stay balanced although
 entries are taken by freeing threads and returned by whichever thread drains.
@@ -557,3 +557,16 @@ The 128-core curve should be measured there with `smash_sim` (both builds, 8 to
 
 Cost: one more decommit thread per NUMA node in use, idle-polling every 100 us
 like the existing one.
+
+## 64 shards paired CPUs across sockets (2026-09-24)
+
+The three per-CPU pools (decommit entries, span descriptors, run cache)
+started with 64 shards, picked as CPU mod 64. On the 128-core, 4-node box CPU
+c and c + 64 shared a shard, so node 0 shared every shard with node 2 and node
+1 with node 3: each shard's lock and cache line crossed sockets, and each
+run-cache shard's 8 slots were split between two CPUs. Pinning threads to
+their node made the pairing systematic, and `smash_sim` showed the symptom as
+pinned threads being *slower* at 32 threads (1.5M against 2.0M
+allocate+free/s unpinned), while pinning still helped at 128 (1.3M against
+1.0M). All three pools are 256 shards now: one per CPU on hosts up to 256.
+The run cache's cap is per CPU, so its worst case is CPUs x cap.

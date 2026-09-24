@@ -24,7 +24,7 @@ allocate → free → allocate cycle.
 
 ## Design
 
-**Per-CPU, keyed by node.** 64 shards (as `util/cpu_shard.h`), each one cache
+**Per-CPU, keyed by node.** 256 shards, one per CPU up to 256 (as `util/cpu_shard.h`; 64 at first, which paired CPUs c and c + 64 across sockets), each one cache
 line of header plus a small array of cached runs `{addr, pages, node, freed_at}`.
 Per-CPU rather than per-thread: no TLS, nothing to flush at thread exit, and
 bounded by CPUs rather than threads. A run is reused only for the same node
@@ -54,8 +54,8 @@ that long, and a workload that stops churning returns everything.
 
 **Caps and defaults.** `SMASH_RUN_CACHE_MIB` = bytes per shard (0 disables);
 at most 8 runs per shard; runs above a size limit (e.g. 64 MiB) never cached.
-Worst-case extra RSS is `shards × cap` (64 × 32 MiB = 2 GiB) — bounded by
-shards, not by threads. **Off by default** until measured on the 128-core box;
+Worst-case extra RSS is `CPUs in use × cap` (128 × 32 MiB = 4 GiB) — bounded by
+CPUs, not by threads. **Off by default** until measured on the 128-core box;
 then decide.
 
 **Bypassed** under `SMASH_LANDMINES`, `SMASH_ZERO_FREE`, tracking mode and

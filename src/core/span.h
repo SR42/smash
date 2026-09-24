@@ -547,7 +547,7 @@ struct alignas(64) SpanFreeList {
     Spinlock lock;
     Span* head = nullptr;
 };
-inline constexpr unsigned kSpanFreeShards = 64;
+inline constexpr unsigned kSpanFreeShards = 256;
 inline SpanFreeList& spanFreeList(unsigned shard) {
     static SpanFreeList lists[kSpanFreeShards];
     return lists[shard];
