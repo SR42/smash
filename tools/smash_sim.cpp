@@ -535,6 +535,19 @@ int main(int argc, char** argv) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
     int failures = 0;
+    // Sub-arenas: where their free pages sit as the run left them, before
+    // anything is purged (every block is freed by now).
+    if (opt.subarenas >= 0) {
+        for (int n = -1; n < opt.nodes; ++n) {
+            const auto b = g_vm.subSetBreakdown(n);
+            if (!b.dirty && !b.clean && !b.tails && !b.pooled) continue;
+            auto gib = [](size_t pages) { return static_cast<double>(pages * kPageSize) / (1ull << 30); };
+            std::printf("%s %d free: dirty %.2f GiB, clean %.2f GiB (%zu runs, %zu whole chunks), "
+                        "tails %.2f GiB, pooled %.2f GiB\n", n < 0 ? "shared set" : "node", n,
+                        gib(b.dirty), gib(b.clean), b.clean_runs, b.whole_clean, gib(b.tails),
+                        gib(b.pooled));
+        }
+    }
     // Sub-arenas: their free lists are consistent as the run left them (a
     // misrouted free is visible only now: a full purge turns whole chunks
     // clean and pools them, whoever held the runs), and a full purge leaves

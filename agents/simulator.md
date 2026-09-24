@@ -153,21 +153,32 @@ Those runs were unpinned: thread t allocated on node t % 4 from any CPU, so
 locks and queue heads crossed sockets; `--pin` was added to separate that
 from contention within a node.
 
-## Sub-arenas for plain malloc (2026-09-24, same host)
+## Sub-arenas, node and plain malloc (2026-09-24, same host)
 
-`--numa 0` (every block through the shared arena), same flags, pinned:
+`--nodes 4 --arena-gib 64 --no-check --os-call-ns 3000 --pin`, allocate+free
+per second, on the code with the shared set, the exhaustion fixes and the
+immediate purge:
 
-| threads | cache off | run cache 128 MiB | sub-arenas |
-|---|---|---|---|
-| 1 | 180k | 530k | 924k |
-| 2 | 299k | 756k | 1783k |
-| 4 | 413k | 1127k | 3432k |
-| 8 | 379k | 994k | 6114k |
+| threads | node: off | node: run cache 128 MiB | node: sub-arenas | malloc: off | malloc: run cache | malloc: sub-arenas |
+|---|---|---|---|---|---|---|
+| 1 | 198k | 616k | 1163k | 189k | 550k | 989k |
+| 2 | 389k | 1180k | 2254k | 293k | 747k | 1894k |
+| 4 | 769k | 2252k | 4296k | 417k | 1093k | 3761k |
+| 8 | 924k | 2334k | 7245k | 407k | 911k | 6418k |
 
-The shared path was worse off than the node path (its one free map and one
-decommit queue serve every thread): sub-arenas are 16x the baseline and 6x the
-run cache at 8 threads. 30% cross-thread frees: 5.40M vs 0.62M; 30% cold:
-1.77M vs 0.90M.
+8 threads, 30% of frees on another thread: 6.09M vs 1.30M (node), 5.56M vs
+0.70M (malloc); 30% cold: 2.09M vs 1.94M and 1.72M vs 0.84M — cold frees
+still go through one decommit thread per queue.
+
+With `--subarenas` the run also prints where each set's free pages sit when
+the workers stop (dirty, clean, tails, pooled). That line found the next
+problem: a 64K..63 MiB mix walked 40 of 64 GiB for a 0.8 GiB live set, with
+37 GiB of it in the pools at the end. Traced every 100 ms, dirty memory sat at
+7-13 GiB against a 2 GiB total cap: the purger enforced the cap only at its
+50 ms sweep, and wholly free chunks only reach the pool when purged, so
+between sweeps 63 MiB blocks found the pool empty and carved. A free over the
+cap now wakes the purger at once: dirty 0.6-1.4 GiB, 7.6 GiB walked (3.9 with
+sub-arenas off), same throughput.
 
 ## Sub-arenas (2026-09-24, 8-CPU 4-node host)
 

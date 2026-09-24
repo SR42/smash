@@ -17,7 +17,8 @@
 //      the first -> the same block, no faults
 //   3. cold: a block compressed before it is freed is not reused dirty, and
 //      is fully writable afterwards
-//   4. dirty memory stays under the cap and drains to 0 after the decay time
+//   4. dirty memory stays under the cap (within 5 ms of the frees, not only
+//      at the purger's next epoch) and drains to 0 after the decay time
 //   5. sibling scan: a sub-arena with nothing free takes a sibling's dirty run
 //      instead of carving a new chunk
 //   6. churn: tagged blocks from many threads never overlap and stay on node
@@ -227,12 +228,43 @@ void phaseDirtyBound(int cpu) {
         blocks.push_back(p);
     }
     for (void* p : blocks) free(p);
+    // The blocks can come from either of node0's two sub-arenas (earlier
+    // phases left runs in both, and the sibling scan takes them), and each
+    // frees home to its own cap: the bound is the two caps together.
+    const size_t bound = 2 * cap_bytes + (8u << 20);
+    // Promptly, too: the purger's epoch is 50 ms, and a free that takes a
+    // sub-arena over its cap must not wait for it (between epochs a fast
+    // churn held 4-6x the cap dirty). 5 ms after each of three rounds, well
+    // inside one epoch, so all three passing by luck is unlikely.
+    if (on) {
+        for (int round = 0; round < 3; ++round) {
+            usleep(5 * 1000);
+            const uint64_t soon = dirtyBytes();
+            std::printf("  5 ms after freeing 128 MiB (round %d): %llu MiB dirty\n", round + 1,
+                        static_cast<unsigned long long>(soon >> 20));
+            if (soon > bound) {
+                fail("%llu MiB dirty 5 ms after the frees, over two sub-arenas' %zu MiB caps: "
+                     "the cap waits for the purger's epoch",
+                     static_cast<unsigned long long>(soon >> 20), cap_bytes >> 20);
+                break;
+            }
+            if (round == 2) break;
+            blocks.clear();
+            for (int i = 0; i < 16; ++i) {
+                auto* p = alloc(8u << 20);
+                if (!p) break;
+                touchFaults(p, 8u << 20, 3);
+                blocks.push_back(p);
+            }
+            for (void* p : blocks) free(p);
+        }
+    }
     usleep(120 * 1000);   // two purge epochs: the cap is enforced by the purger
     const uint64_t held = dirtyBytes();
     std::printf("  after freeing 128 MiB on one CPU: %llu MiB dirty (cap %zu MiB)\n",
                 static_cast<unsigned long long>(held >> 20), cap_bytes >> 20);
-    if (on && held > cap_bytes + (8u << 20))
-        fail("%llu bytes dirty in one sub-arena, over its %zu-byte cap",
+    if (on && held > bound)
+        fail("%llu bytes dirty in node0's two sub-arenas, over their %zu-byte caps",
              static_cast<unsigned long long>(held), cap_bytes);
     if (on && held == 0) fail("freeing 128 MiB of warm blocks left nothing dirty");
     if (!on && held) fail("%llu bytes dirty with sub-arenas off",

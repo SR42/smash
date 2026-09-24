@@ -148,6 +148,9 @@ class VmRegion {
         // Threads inside drainQueueNow() with a batch of this queue in hand.
         std::atomic<int> draining{0};
         std::atomic<bool> running{false};
+        // A sub-arena of this queue's set went over its dirty cap: purge on
+        // the thread's next pass instead of waiting for the epoch.
+        std::atomic<bool> purge_now{false};
         pthread_t thread{};
         VmRegion* region = nullptr;
         int node = -1;              // -1: the shared arena's queue
@@ -304,7 +307,9 @@ class VmRegion {
             // One thread does it: the shared queue's.
             if (subarenasEnabled()) {
                 const uint64_t now = nowMs();
-                if (now - last_purge_ms >= kPurgeEpochMs) {
+                const bool urgent = q->purge_now.load(std::memory_order_relaxed) &&
+                                    q->purge_now.exchange(false, std::memory_order_acq_rel);
+                if (urgent || now - last_purge_ms >= kPurgeEpochMs) {
                     last_purge_ms = now;
                     if (q->node >= 0)
                         self->purgeNodeSubArenas(static_cast<uint32_t>(q->node), /*all=*/false);
@@ -2162,6 +2167,12 @@ public:
             na.map.insertUnlocked(idx, num_pages, ownerDirty(s), kNodeChunkPages, stampNow());
             na.subs[s].dirty_pages += num_pages;
             na.subs[s].dirty_published.store(na.subs[s].dirty_pages, std::memory_order_relaxed);
+            // Over the cap: the purger takes the oldest now, not at its next
+            // 50 ms epoch — between epochs a fast churn otherwise held 4-6x
+            // the cap dirty (smash_sim, 8 sub-arenas: 7-13 GiB against 2).
+            if (na.subs[s].dirty_pages > dirtyMaxPages() &&
+                !subQueue(na).purge_now.load(std::memory_order_relaxed))
+                subQueue(na).purge_now.store(true, std::memory_order_release);
         }
         ensureDecommitThreadStarted(subQueue(na));   // its thread purges this set
         return true;
@@ -2209,6 +2220,35 @@ public:
     }
 
 #if defined(SMASH_SIM)
+    // smash_sim: where a set's free pages sit (node -1: the shared set).
+    struct SubSetBreakdown { size_t dirty, clean, tails, pooled, carved, clean_runs, whole_clean; };
+    SubSetBreakdown subSetBreakdown(int node) {
+        SubSetBreakdown b{};
+        NodeArena* set = nullptr;
+        if (node < 0) set = shared_set_.load(std::memory_order_acquire);
+        else if (NodeArena* arenas = node_arenas_.load(std::memory_order_acquire))
+            set = &arenas[node];
+        if (!set || !set->subs_ready.load(std::memory_order_acquire)) return b;
+        NodeArena& na = *set;
+        for (uint32_t i = 0; i < na.nsubs; ++i) {
+            LockGuard guard(na.subs[i].lock);
+            b.dirty += na.map.freePages(ownerDirty(i));
+            b.clean += na.map.freePages(ownerClean(i));
+            b.tails += na.subs[i].end - na.subs[i].cur;
+            na.map.forEachRunUnlocked(ownerClean(i), [&](size_t, size_t len, uint32_t) {
+                ++b.clean_runs;
+                b.whole_clean += len == kNodeChunkPages;
+            });
+        }
+        {
+            LockGuard guard(na.chunk_lock);
+            b.pooled = na.nfree_chunks * kNodeChunkPages;
+        }
+        LockGuard guard(na.lock);
+        b.carved = na.carved;
+        return b;
+    }
+
     // smash_sim, with no allocations or frees running (the purger may be):
     // every free page of `node`'s sub-arenas (dirty and clean runs, tails,
     // pooled chunks) listed once, in a chunk its sub-arena owns, each

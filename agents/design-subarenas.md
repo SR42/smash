@@ -247,6 +247,14 @@ memory freed by one sub-arena is not stranded there.
   consecutive indices in the sorted pool) before carving fresh ones. Phase 1
   always carved, so freed big blocks only fed the pool and 70 MiB churn walked
   a 64 GiB arena in 2 s (`test_subarena_exhaust_big`).
+- **The cap is enforced at once**: a free that takes a sub-arena over
+  `SMASH_DIRTY_MAX_MIB` sets its queue's `purge_now`, and the purger (which
+  polls every 100 µs) purges on its next pass instead of at the 50 ms sweep.
+  Before, a fast churn held 4-6x the cap dirty between sweeps (`smash_sim`,
+  8 sub-arenas: 7-13 GiB against 2), and because wholly free chunks only
+  reach the pool when purged, 63 MiB blocks found it empty and carved fresh
+  chunks: 40 of 64 GiB walked for a 0.8 GiB live set, now 7.6 (3.9 with
+  sub-arenas off).
 - **Address space**: sub-arenas walk more of the arena than the single free
   map (`smash_sim`, 6 threads, 1-70 MiB blocks: 16.6 / 18.1 GiB vs 11.3 / 4.2
   GiB, shared / node): each keeps partly used chunks and up to its dirty cap.
