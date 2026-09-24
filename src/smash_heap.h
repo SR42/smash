@@ -2050,6 +2050,10 @@ public:
     // compressible VmRegion arena (as opposed to a direct-mmap fallback,
     // BootstrapAlloc, or foreign memory)? Measures whether freed memory is
     // actually reused by the arena rather than spilling past it.
+    bool subArenaInfo(uint64_t* dirty_bytes, uint64_t* purged_runs) const {
+        return compression_inited_ && vm_region_.subArenaInfo(dirty_bytes, purged_runs);
+    }
+
     bool runCacheInfo(uint64_t* hits, uint64_t* bytes) const {
         return compression_inited_ && vm_region_.runCacheInfo(hits, bytes);
     }

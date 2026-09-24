@@ -32,6 +32,12 @@ pages (`--cold`), which is what decides whether a run may enter the run cache.
 - **Nothing leaks**: after every block is freed, the run cache flushed and the
   decommit queue drained, every page a node arena carved is free again, and the
   walked arena equals shared free + node carved.
+- **Sub-arena free lists** (with `--subarenas`), before and after a full
+  purge, holding every sub-arena lock: every dirty or clean run lies in one
+  chunk its sub-arena owns, no page is listed twice across dirty runs, clean
+  runs, tails and the chunk pool, each owner's counter equals its runs; and
+  nothing is dirty after the purge (which also waits for the purger's
+  in-flight runs, so the leak check cannot race it).
 - **No hang**: no progress for 3 s, or workers not stopping within 10 s, is
   reported with the contended sites so far and exit status 3.
 
@@ -53,6 +59,7 @@ the footprint tests still pass on the corrected numbers.
 smash_sim [--threads N] [--seconds S] [--nodes K] [--arena-gib G]
           [--sizes 1M,2M:3,...] [--live K] [--numa F] [--cold F]
           [--cross-free F] [--run-cache-mib M] [--os-call-ns NS]
+          [--subarenas S] [--decay-ms MS] [--dirty-max-mib M]
           [--no-check] [--pin] [--seed X]
 ```
 
@@ -65,6 +72,9 @@ smash_sim [--threads N] [--seconds S] [--nodes K] [--arena-gib G]
   mmap and are reported as outside the arena.
 - `--cross-free F` fraction of frees handed to another thread (the
   `FreeDynMem` pattern: allocated on one thread, freed on another).
+- `--subarenas S` turns on sub-arenas for the node arenas (`SMASH_SUBARENAS=1`),
+  S per node; 0 = one per CPU of the real node. `--decay-ms` and
+  `--dirty-max-mib` set `SMASH_DIRTY_DECAY_MS` / `SMASH_DIRTY_MAX_MIB`.
 - `--no-check` skips the ownership shadow for maximum rate.
 - `--pin` runs thread t on the CPUs of node t % nodes, so every allocation is
   node-local. Without it, threads allocate on node t % nodes from wherever the
@@ -140,3 +150,29 @@ error 8-12% on five points. Per-node is still 55% below its own peak at 128.
 Those runs were unpinned: thread t allocated on node t % 4 from any CPU, so
 locks and queue heads crossed sockets; `--pin` was added to separate that
 from contention within a node.
+
+## Sub-arenas (2026-09-24, 8-CPU 4-node host)
+
+`--nodes 4 --arena-gib 64 --numa 1 --no-check --os-call-ns 3000 --pin`,
+allocate+free per second (two runs each, within 2%):
+
+| threads | cache off | run cache 128 MiB | sub-arenas (one per CPU) |
+|---|---|---|---|
+| 1 | 199k | 575k | 896k |
+| 2 | 389k | 1096k | 1756k |
+| 4 | 766k | 2212k | 3318k |
+| 8 | 904k | 2170k | 5844k |
+
+Sub-arenas scale at 82% efficiency to 8 threads with **0 OS calls per op**
+(warm frees never leave the sub-arena, and reuse is within decay); the run
+cache is flat past 4. Unpinned 8 threads: 5.77M vs 2.12M; with 30% of frees
+handed to another thread: 4.97M vs 1.21M. With 30% of frees cold the gap
+closes (1.99M vs 1.84M): cold frees still go through the node's one decommit
+thread, which saturates at 3 µs per OS call — the next bottleneck if the
+application frees many compressed blocks.
+
+**Findings on first run**: the sub-arenas' free-map owner ids aliased the node
+arenas' own (node n uses owner n+1, which was sub-arena 0's dirty or clean
+owner), so node 2's free pages were counted twice (free > carved); fixed by
+numbering sub-arena owners after every node's. The pre-purge check was added
+after a planted misrouted free passed the post-purge one.

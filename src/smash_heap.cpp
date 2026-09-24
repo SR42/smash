@@ -1433,6 +1433,18 @@ int smash_in_arena(const void* ptr) {
     return heap && heap->inArena(ptr) ? 1 : 0;
 }
 
+// Diagnostic / test hook (not public API): bytes held dirty in sub-arenas now
+// and runs purged so far (SMASH_SUBARENAS). 0 if sub-arenas are on, -1 if not.
+extern "C" __attribute__((visibility("default")))
+int smash_subarena_info(uint64_t* dirty_bytes, uint64_t* purged_runs) {
+    uint64_t d = 0, p = 0;
+    auto* heap = SmashRedirect::getHeap();
+    const bool on = heap && heap->subArenaInfo(&d, &p);
+    if (dirty_bytes) *dirty_bytes = d;
+    if (purged_runs) *purged_runs = p;
+    return on ? 0 : -1;
+}
+
 // Diagnostic / test hook (not public API): hits served by the per-CPU run
 // cache so far, and bytes parked in it now. 0 if the cache is enabled
 // (SMASH_RUN_CACHE_MIB), -1 if not; the counters are filled either way.

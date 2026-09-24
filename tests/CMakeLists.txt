@@ -608,6 +608,32 @@ if(NOT APPLE)
     test_run_cache_on_softdirty0 PROPERTIES TIMEOUT 180)
 endif()
 
+# Per-CPU sub-arenas with immediate dirty reuse (SMASH_SUBARENAS,
+# agents/design-subarenas.md). One body, four registrations: off must mean
+# today's behaviour; on in both heap modes; on with SMASH_SOFTDIRTY=0 (Phase 3
+# PROT_READ monitoring can leave a freed page read-only). Two sub-arenas per
+# node so the go-home and sibling phases can use two CPUs of one node; a short
+# decay and a small cap so the drain and bound phases are quick.
+if(NOT APPLE)
+  add_executable(subarena_test subarena_test.cpp)
+  set_target_properties(subarena_test PROPERTIES CXX_STANDARD 20)
+  target_link_libraries(subarena_test PRIVATE ${CMAKE_DL_LIBS} Threads::Threads)
+  set(_sa_env "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_COLD_TIMEOUT_SEC=1"
+              "SMASH_DEFER_PHASES_MS=0" "SMASH_SUBARENAS_PER_NODE=2"
+              "SMASH_DIRTY_DECAY_MS=200" "SMASH_DIRTY_MAX_MIB=32")
+  add_test(NAME test_subarena_off COMMAND ${CMAKE_COMMAND} -E env ${_sa_env}
+    "SMASH_LARGE_ONLY=1" $<TARGET_FILE:subarena_test>)
+  add_test(NAME test_subarena_on COMMAND ${CMAKE_COMMAND} -E env ${_sa_env}
+    "SMASH_LARGE_ONLY=1" "SMASH_SUBARENAS=1" $<TARGET_FILE:subarena_test>)
+  add_test(NAME test_subarena_on_full COMMAND ${CMAKE_COMMAND} -E env ${_sa_env}
+    "SMASH_LARGE_ONLY=0" "SMASH_SUBARENAS=1" $<TARGET_FILE:subarena_test>)
+  add_test(NAME test_subarena_on_softdirty0 COMMAND ${CMAKE_COMMAND} -E env ${_sa_env}
+    "SMASH_LARGE_ONLY=1" "SMASH_SUBARENAS=1" "SMASH_SOFTDIRTY=0"
+    $<TARGET_FILE:subarena_test>)
+  set_tests_properties(test_subarena_off test_subarena_on test_subarena_on_full
+    test_subarena_on_softdirty0 PROPERTIES TIMEOUT 180)
+endif()
+
 # smash_sim (tools/smash_sim.cpp): drives the real large-block allocator —
 # LargeAlloc, VmRegion's shared and node arenas, the free map, the decommit
 # queue, the run cache, the span pools — with the page-level OS calls stubbed
@@ -642,8 +668,13 @@ if(NOT APPLE)
   add_test(NAME test_smash_sim_smoke_run_cache COMMAND ${CMAKE_COMMAND} -E env
     $<TARGET_FILE:smash_sim> --threads 8 --seconds 2 --nodes 4 --arena-gib 4
     --cold 0.1 --cross-free 0.2 --numa 0.7 --run-cache-mib 32)
+  # Sub-arenas with a short decay and a small cap, so purges, partial purges
+  # and chunks returning to the pool all happen within the 2 s.
+  add_test(NAME test_smash_sim_smoke_subarenas COMMAND ${CMAKE_COMMAND} -E env
+    $<TARGET_FILE:smash_sim> --threads 8 --seconds 2 --nodes 4 --arena-gib 4
+    --cold 0.1 --cross-free 0.2 --numa 0.7 --subarenas 2 --decay-ms 20 --dirty-max-mib 4)
   set_tests_properties(test_smash_sim_smoke test_smash_sim_smoke_run_cache
-    PROPERTIES TIMEOUT 120)
+    test_smash_sim_smoke_subarenas PROPERTIES TIMEOUT 120)
 endif()
 
 # malloc_numa_aligned(node, size, align): malloc_numa plus an alignment

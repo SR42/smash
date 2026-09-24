@@ -23,6 +23,7 @@
 // Usage: smash_sim [--threads N] [--seconds S] [--nodes K] [--arena-gib G]
 //                  [--sizes 1M,2M:3,...] [--live K] [--numa F] [--cold F]
 //                  [--cross-free F] [--run-cache-mib M] [--os-call-ns NS]
+//                  [--subarenas S] [--decay-ms MS] [--dirty-max-mib M]
 //                  [--no-check] [--pin] [--seed X]
 // Exit status is 1 if an invariant failed.
 #include "smash/config.h"
@@ -69,6 +70,9 @@ struct Options {
     double cold = 0.0;        // fraction of frees reported as compressed
     double cross_free = 0.0;  // fraction of frees handed to another thread
     long run_cache_mib = 0;
+    int subarenas = -1;         // -1 off; 0 one per CPU of the node; else per node
+    long decay_ms = -1;
+    long dirty_max_mib = -1;
     uint64_t os_call_ns = 0;
     bool check = true;
     bool pin = false;         // run thread t on the CPUs of node t % nodes
@@ -113,6 +117,7 @@ void usage() {
         "usage: smash_sim [--threads N] [--seconds S] [--nodes K] [--arena-gib G]\n"
         "                 [--sizes 1M,2M:3,...] [--live K] [--numa F] [--cold F]\n"
         "                 [--cross-free F] [--run-cache-mib M] [--os-call-ns NS]\n"
+        "                 [--subarenas S] [--decay-ms MS] [--dirty-max-mib M]\n"
         "                 [--no-check] [--pin] [--seed X]\n");
     std::exit(2);
 }
@@ -132,6 +137,9 @@ void parseArgs(int argc, char** argv) {
         else if (a == "--cold") opt.cold = std::atof(next());
         else if (a == "--cross-free") opt.cross_free = std::atof(next());
         else if (a == "--run-cache-mib") opt.run_cache_mib = std::atol(next());
+        else if (a == "--subarenas") opt.subarenas = std::atoi(next());
+        else if (a == "--decay-ms") opt.decay_ms = std::atol(next());
+        else if (a == "--dirty-max-mib") opt.dirty_max_mib = std::atol(next());
         else if (a == "--os-call-ns") opt.os_call_ns = std::strtoull(next(), nullptr, 10);
         else if (a == "--no-check") opt.check = false;
         else if (a == "--pin") opt.pin = true;
@@ -402,6 +410,18 @@ int main(int argc, char** argv) {
         std::snprintf(v, sizeof(v), "%ld", opt.run_cache_mib);
         setenv("SMASH_RUN_CACHE_MIB", v, 1);
     }
+    // Sub-arenas too (SMASH_SUBARENAS*, SMASH_DIRTY_*), read on first use.
+    auto setNum = [](const char* name, long v) {
+        char b[32];
+        std::snprintf(b, sizeof(b), "%ld", v);
+        setenv(name, b, 1);
+    };
+    if (opt.subarenas >= 0) {
+        setenv("SMASH_SUBARENAS", "1", 1);
+        setNum("SMASH_SUBARENAS_PER_NODE", opt.subarenas);
+    }
+    if (opt.decay_ms >= 0) setNum("SMASH_DIRTY_DECAY_MS", opt.decay_ms);
+    if (opt.dirty_max_mib >= 0) setNum("SMASH_DIRTY_MAX_MIB", opt.dirty_max_mib);
     vm::g_sim_os_call_ns = opt.os_call_ns;
 
     const size_t arena_bytes = opt.arena_gib << 30;
@@ -424,6 +444,11 @@ int main(int argc, char** argv) {
                 opt.threads, opt.seconds, opt.nodes, opt.arena_gib, opt.run_cache_mib,
                 opt.os_call_ns, opt.numa, opt.cold, opt.cross_free, opt.live, opt.sizes.size(),
                 opt.check ? ", checking" : "");
+    if (opt.subarenas >= 0)
+        std::printf("sub-arenas: %s per node, decay %s ms, dirty cap %s MiB each\n",
+                    opt.subarenas ? std::to_string(opt.subarenas).c_str() : "one per CPU",
+                    opt.decay_ms >= 0 ? std::to_string(opt.decay_ms).c_str() : "1000",
+                    opt.dirty_max_mib >= 0 ? std::to_string(opt.dirty_max_mib).c_str() : "256");
 
     if (opt.pin) {
         loadNodeCpus();
@@ -496,6 +521,10 @@ int main(int argc, char** argv) {
                     rc.takes, rc.hits, rc.takes ? 100.0 * rc.hits / rc.takes : 0.0, rc.puts,
                     rc.evictions, rc.trimmed, rc.declined_cold, rc.declined_big);
     }
+    uint64_t dirty_bytes = 0, purged_runs = 0;
+    if (g_vm.subArenaInfo(&dirty_bytes, &purged_runs))
+        std::printf("sub-arenas: %.1f MiB dirty now, %" PRIu64 " runs purged\n",
+                    static_cast<double>(dirty_bytes) / (1 << 20), purged_runs);
     reportLocks(secs);
 
     // Drain: everything is freed; return cached runs, process the queue, and
@@ -506,6 +535,29 @@ int main(int argc, char** argv) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
     int failures = 0;
+    // Sub-arenas: their free lists are consistent as the run left them (a
+    // misrouted free is visible only now: a full purge turns whole chunks
+    // clean and pools them, whoever held the runs), and a full purge leaves
+    // nothing dirty (dirty runs count as free below, so a purge that drops
+    // runs shows up there, one that skips them here).
+    for (int n = 0; n < opt.nodes; ++n) {
+        if (const int bad = g_vm.checkSubArenas(static_cast<uint32_t>(n))) {
+            std::printf("FAIL: node %d: %d sub-arena free-list problem(s) before the purge (above)\n", n, bad);
+            ++failures;
+        }
+    }
+    g_vm.purgeAllDirtyNow();
+    if (g_vm.subArenaInfo(&dirty_bytes, &purged_runs) && dirty_bytes != 0) {
+        std::printf("FAIL: %.1f MiB still dirty after purging everything\n",
+                    static_cast<double>(dirty_bytes) / (1 << 20));
+        ++failures;
+    }
+    for (int n = 0; n < opt.nodes; ++n) {
+        if (const int bad = g_vm.checkSubArenas(static_cast<uint32_t>(n))) {
+            std::printf("FAIL: node %d: %d sub-arena free-list problem(s) after the purge (above)\n", n, bad);
+            ++failures;
+        }
+    }
     size_t carved_total = 0;
     for (int n = 0; n < opt.nodes; ++n) {
         size_t carved = 0, free_pages = 0;

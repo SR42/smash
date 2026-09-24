@@ -250,7 +250,12 @@ public:
             // A run with no compressed page may be parked for reuse by this
             // CPU (SMASH_RUN_CACHE_MIB); anything else goes the ordinary way,
             // which restores protection and decommits.
-            if (!vm_region_->cacheFreedRun(base, num_pages, reusable))
+            // A never-compressed run of a sub-arena chunk goes straight back
+            // to its sub-arena, dirty (SMASH_SUBARENAS); otherwise the per-CPU
+            // run cache may park it (SMASH_RUN_CACHE_MIB); anything else goes
+            // the ordinary way, which restores protection and decommits.
+            if (!(reusable && vm_region_->freeRunDirty(base, num_pages)) &&
+                !vm_region_->cacheFreedRun(base, num_pages, reusable))
                 vm_region_->releasePages(base, num_pages);
         } else {
             vm::unmapPages(base, num_pages * kPageSize);

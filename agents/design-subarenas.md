@@ -1,7 +1,8 @@
 # Design: per-CPU sub-arenas with immediate dirty reuse
 
-Status: **accepted** (2026-09-24), not implemented yet. Open questions resolved
-at the end.
+Status: **phase 1 implemented** (2026-09-24) behind `SMASH_SUBARENAS=1`;
+phase 2 (measuring on the 128-core box) pending. Open questions resolved at the
+end; what the implementation changed is under "Phase 1 as built".
 
 ## Problem
 
@@ -186,3 +187,31 @@ memory freed by one sub-arena is not stranded there.
    per CPU; `smash_sim` sweeps it to choose the default for real.
 2. Decay: configurable (`SMASH_DIRTY_DECAY_MS`), default 1 s.
 3. Sibling scans never cross nodes: a node's pages stay bound to it, as today.
+
+## Phase 1 as built (2026-09-24)
+
+- **Where**: `VmRegion` (`src/vm/vm_region.h`, section "Sub-arenas"); the free
+  map gained caller-locked operations with a coalescing `boundary` (the chunk
+  size) and a per-run `stamp` (`insertUnlocked`, `takeAlignedUnlocked`,
+  `forEachRunUnlocked`, `removeRunUnlocked` in `page_run_map.h`). Sub-arena
+  owners are numbered after every node's (`PageRunMap::kFirstSubOwner`), so
+  they never alias a node's own owner in its map.
+- **Dirty LRU**: no list; the purger collects a sub-arena's dirty runs (up to
+  256) with their stamps and sorts them oldest first. A merge keeps the newest
+  stamp. Beyond the cap it purges the oldest runs and **splits** the run that
+  crosses it (freed blocks coalesce into chunk-sized runs, so whole-run purging
+  overshot to 0 dirty).
+- **Blocks larger than a chunk** get dedicated fresh chunks marked `kChunkBig`;
+  their free (always through the decommit queue) returns the chunks to the
+  node's pool. Chunks an alignment gap leaves untouched go to the pool at once.
+- **`free()`**: `LargeAlloc::deallocate` offers a reusable run to
+  `freeRunDirty` first; it declines outside sub-arena chunks and whenever
+  tracking mode, landmines or zero-on-free is on, and the run then takes the
+  ordinary path.
+- **Purger**: the node's decommit thread, every 50 ms, trylock per sub-arena;
+  it `madvise`s with the lock dropped and counts itself in `purging` so
+  `purgeAllDirtyNow()` can wait for it.
+- **Exposure**: `smash_subarena_info(&dirty_bytes, &purged_runs)`;
+  `smash_numa_arena_info` counts dirty, clean, tails and pooled chunks as free.
+- **Tests**: `test_subarena_*` (7 phases) and `test_smash_sim_smoke_subarenas`;
+  see [tests.md](tests.md) and [simulator.md](simulator.md) for measurements.
