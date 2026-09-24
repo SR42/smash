@@ -39,6 +39,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <dlfcn.h>
+#include <link.h>
+#include <cxxabi.h>
 #include <mutex>
 #include <sched.h>
 #include <string>
@@ -48,6 +50,11 @@
 #include <vector>
 
 using namespace smash;
+
+// The embedded printf library (safe_printf) expects its user to supply this;
+// smash_heap.cpp does in the library. With -rdynamic every printf entry point
+// is exported and kept, so the reference has to resolve here too.
+extern "C" void _putchar(char c) { std::fputc(c, stderr); }
 
 namespace {
 
@@ -283,60 +290,88 @@ void worker(int t, WorkerResult* out) {
 }
 
 // ── Reporting ───────────────────────────────────────────────────────────────
-std::string symbolize(uintptr_t ra) {
-    Dl_info info{};
-    if (!dladdr(reinterpret_cast<void*>(ra), &info) || !info.dli_fbase) {
-        char raw[40];
-        std::snprintf(raw, sizeof(raw), "0x%" PRIxPTR " (unresolved)", ra);
-        return raw;
-    }
-    const uintptr_t off = ra - reinterpret_cast<uintptr_t>(info.dli_fbase) - 1;
-    // dladdr gives the main program's path as it was launched — relative
-    // ("./tests/smash_sim") or empty — so resolve our own executable here.
-    // Not "/proc/self/exe" itself: addr2line runs as a child process, where
-    // that link names addr2line.
-    std::string file;
-    if (info.dli_fname && info.dli_fname[0] == '/') {
-        file = info.dli_fname;
-    } else {
+// The link-time address of `ra` in the object that contains it, and that
+// object's path. dl_iterate_phdr gives the load bias, which is what addr2line
+// needs subtracted: dladdr's dli_fbase is the mapping base, which equals the
+// bias for a PIE but is 0x400000 (or wherever) for a non-PIE executable.
+struct ObjAddr { uintptr_t link_addr = 0; std::string path; bool found = false; };
+ObjAddr objectAddress(uintptr_t ra) {
+    struct Ctx { uintptr_t ra; ObjAddr out; } ctx{ra, {}};
+    dl_iterate_phdr([](dl_phdr_info* info, size_t, void* data) -> int {
+        auto* c = static_cast<Ctx*>(data);
+        for (int i = 0; i < info->dlpi_phnum; ++i) {
+            const ElfW(Phdr)& ph = info->dlpi_phdr[i];
+            if (ph.p_type != PT_LOAD) continue;
+            const uintptr_t lo = info->dlpi_addr + ph.p_vaddr;
+            if (c->ra >= lo && c->ra < lo + ph.p_memsz) {
+                c->out.link_addr = c->ra - info->dlpi_addr;
+                c->out.path = info->dlpi_name ? info->dlpi_name : "";
+                c->out.found = true;
+                return 1;
+            }
+        }
+        return 0;
+    }, &ctx);
+    // The main program's entry has an empty name; resolve our own executable
+    // here (not "/proc/self/exe" itself, which in addr2line's process names
+    // addr2line).
+    if (ctx.out.found && (ctx.out.path.empty() || ctx.out.path[0] != '/')) {
         char self[4096];
         const ssize_t n = readlink("/proc/self/exe", self, sizeof(self) - 1);
-        if (n > 0) { self[n] = 0; file = self; }
-        else if (info.dli_fname) file = info.dli_fname;
+        if (n > 0) { self[n] = 0; ctx.out.path = self; }
     }
-    char cmd[640];
-    std::snprintf(cmd, sizeof(cmd), "addr2line -f -C -i -e '%s' 0x%" PRIxPTR " 2>/dev/null",
-                  file.c_str(), off);
-    std::string out;
-    if (FILE* f = popen(cmd, "r")) {
-        char line[512];
-        std::vector<std::string> lines;
-        while (std::fgets(line, sizeof(line), f)) {
-            line[std::strcspn(line, "\n")] = 0;
-            lines.push_back(line);
+    return ctx.out;
+}
+
+// Name a lock call site. Two sources, because either can fail on a given host:
+//   - dladdr + demangling, from the executable's own dynamic symbol table
+//     (smash_sim links with -rdynamic): the enclosing function, needs nothing
+//     external, but no line and no inlined frames;
+//   - addr2line on the debug info: the innermost inlined frame with file:line,
+//     but it needs binutils that can read this compiler's DWARF (GCC 11+
+//     writes DWARF 5, which older binutils — e.g. RHEL 8's — print as ??).
+// The addr2line answer is used when it has one; otherwise the dladdr name.
+std::string symbolize(uintptr_t ra) {
+    const uintptr_t call = ra - 1;   // inside the call instruction, not after it
+    std::string name;
+    Dl_info info{};
+    if (dladdr(reinterpret_cast<void*>(call), &info) && info.dli_sname) {
+        int status = 0;
+        char* dem = abi::__cxa_demangle(info.dli_sname, nullptr, nullptr, &status);
+        name = (status == 0 && dem) ? dem : info.dli_sname;
+        std::free(dem);
+    }
+    const ObjAddr oa = objectAddress(call);
+    std::string line;
+    if (oa.found && !oa.path.empty()) {
+        char cmd[4300];
+        std::snprintf(cmd, sizeof(cmd), "addr2line -f -C -i -e '%s' 0x%" PRIxPTR " 2>/dev/null",
+                      oa.path.c_str(), oa.link_addr);
+        if (FILE* f = popen(cmd, "r")) {
+            char buf[512];
+            std::vector<std::string> lines;
+            while (std::fgets(buf, sizeof(buf), f)) {
+                buf[std::strcspn(buf, "\n")] = 0;
+                lines.push_back(buf);
+            }
+            pclose(f);
+            // addr2line -i prints innermost first: function, file:line, then
+            // its inlined-into callers. Take the innermost frame that is not
+            // the lock guard and has a name.
+            for (size_t i = 0; i + 1 < lines.size(); i += 2) {
+                if (lines[i] == "??" || lines[i].find("LockGuard") != std::string::npos) continue;
+                std::string loc = lines[i + 1];
+                if (size_t slash = loc.rfind('/'); slash != std::string::npos) loc = loc.substr(slash + 1);
+                line = lines[i] + " @ " + loc;
+                break;
+            }
         }
-        pclose(f);
-        // addr2line -i prints innermost first: function, file:line, then its
-        // inlined-into callers. Show the innermost frame that is not the lock
-        // guard, with its location.
-        for (size_t i = 0; i + 1 < lines.size(); i += 2) {
-            if (lines[i].find("LockGuard") != std::string::npos) continue;
-            if (lines[i] == "??") continue;
-            std::string loc = lines[i + 1];
-            if (size_t slash = loc.rfind('/'); slash != std::string::npos) loc = loc.substr(slash + 1);
-            out = lines[i] + " @ " + loc;
-            break;
-        }
     }
-    if (out.empty()) {
-        // No addr2line, or no debug info (-g): print the offset so it can be
-        // resolved by hand with `addr2line -f -C -i -e smash_sim 0x...`.
-        char raw[96];
-        std::snprintf(raw, sizeof(raw), "offset 0x%" PRIxPTR " in smash_sim (install binutils / "
-                      "build with -g to name it)", off);
-        out = raw;
-    }
-    return out;
+    if (!line.empty()) return line;
+    char off[48];
+    std::snprintf(off, sizeof(off), " (+0x%" PRIxPTR ")", oa.found ? oa.link_addr : call);
+    if (!name.empty()) return name + off + " [no line: addr2line gave none]";
+    return std::string("unresolved") + off;
 }
 
 void reportLocks(double seconds) {

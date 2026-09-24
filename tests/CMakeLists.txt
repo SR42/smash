@@ -621,6 +621,20 @@ if(NOT APPLE)
   target_include_directories(smash_sim PRIVATE ${SMASH_TEST_INCLUDE_DIRS})
   target_compile_definitions(smash_sim PRIVATE SMASH_SIM)
   target_link_libraries(smash_sim PRIVATE alloc8::headers Threads::Threads ${CMAKE_DL_LIBS})
+  # -rdynamic: the lock report names call sites through dladdr, which needs the
+  # executable's own functions in its dynamic symbol table (addr2line only adds
+  # file:line, and may not read this compiler's DWARF).
+  target_link_options(smash_sim PRIVATE -rdynamic)
+  # ...and default visibility for this tool, or the global -fvisibility=hidden
+  # leaves -rdynamic nothing to export (verified: 0 smash symbols in .dynsym).
+  # DWARF 4, not GCC 11+'s default DWARF 5: older binutils (RHEL/Rocky 8's
+  # addr2line) print every DWARF 5 frame as "??", which is how the lock report
+  # loses its names on such a host.
+  # No LTO either: its link-time partitions ignore the compile-time -gdwarf-4
+  # (verified: two DWARF 5 units remained) and only make call sites harder to
+  # name. This is a diagnostic tool, not the library.
+  target_compile_options(smash_sim PRIVATE -fvisibility=default -gdwarf-4 -fno-lto)
+  target_link_options(smash_sim PRIVATE -fno-lto)
   set_target_properties(smash_sim PROPERTIES CXX_STANDARD 20)
   add_test(NAME test_smash_sim_smoke COMMAND ${CMAKE_COMMAND} -E env
     $<TARGET_FILE:smash_sim> --threads 8 --seconds 2 --nodes 4 --arena-gib 4
