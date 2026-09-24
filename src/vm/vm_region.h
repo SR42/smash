@@ -241,13 +241,18 @@ class VmRegion {
 #if defined(__linux__)
         // Sub-arena chunks: a compressed block's pages go back to their
         // sub-arena as clean; a block larger than a chunk returns its chunks.
-        if (subarenasEnabled() && e->node >= 0) {
+        // The shared set's chunks carry no node, so e->node is -1 for them.
+        if (subarenasEnabled()) {
             auto* owners = chunk_sub_.load(std::memory_order_acquire);
             const uint8_t o = owners ? owners[chunkOfPage(e->page_index)].load(
                                            std::memory_order_acquire)
                                      : kChunkUnowned;
-            NodeArena& na = node_arenas_.load(std::memory_order_acquire)[e->node];
-            if (o == kChunkBig) {
+            NodeArena* set = nullptr;
+            if (o != kChunkUnowned)
+                set = e->node >= 0 ? &node_arenas_.load(std::memory_order_acquire)[e->node]
+                                   : shared_set_.load(std::memory_order_acquire);
+            if (set && o == kChunkBig) {
+                NodeArena& na = *set;
                 const size_t c0 = chunkOfPage(e->page_index);
                 const size_t c1 = chunkOfPage(e->page_index + e->num_pages - 1);
                 LockGuard guard(na.chunk_lock);
@@ -257,7 +262,8 @@ class VmRegion {
                 }
                 return;
             }
-            if (o != kChunkUnowned) {
+            if (set) {
+                NodeArena& na = *set;
                 const uint32_t sidx = static_cast<uint32_t>(o - 1);
                 LockGuard guard(na.subs[sidx].lock);
                 na.map.insertUnlocked(e->page_index, e->num_pages, ownerClean(sidx),
@@ -291,16 +297,19 @@ class VmRegion {
         exit_guard::ThreadRegistration exit_reg;
         auto* q = static_cast<DecommitQueue*>(arg);
         VmRegion* self = q->region;
-        uint64_t last_trim_ms = 0;
+        uint64_t last_trim_ms = 0, last_purge_ms = 0;
         while (q->running.load(std::memory_order_relaxed)) {
             // Return cached runs that have aged out (see cacheFreedRun). The
             // clock is the coarse vDSO one, so this costs a few ns per wake.
             // One thread does it: the shared queue's.
-            if (q->node >= 0 && subarenasEnabled()) {
+            if (subarenasEnabled()) {
                 const uint64_t now = nowMs();
-                if (now - last_trim_ms >= kPurgeEpochMs) {
-                    last_trim_ms = now;
-                    self->purgeNodeSubArenas(static_cast<uint32_t>(q->node), /*all=*/false);
+                if (now - last_purge_ms >= kPurgeEpochMs) {
+                    last_purge_ms = now;
+                    if (q->node >= 0)
+                        self->purgeNodeSubArenas(static_cast<uint32_t>(q->node), /*all=*/false);
+                    else
+                        self->purgeSharedSubArenas(/*all=*/false);
                 }
             }
             if (q->node < 0 && runCacheCapBytes() != 0) {
@@ -582,19 +591,20 @@ public:
         // keep; the locks are not.
         for (EntryShard& sh : entry_shards_) new (&sh.lock) Spinlock();
         for (RunCacheShard& sh : run_cache_) new (&sh.lock) Spinlock();
-        if (NodeArena* arenas = node_arenas_.load(std::memory_order_acquire)) {
-            for (uint32_t n = 0; n < vm::kMaxNumaNodes; ++n) {
+        if (NodeArena* arenas = node_arenas_.load(std::memory_order_acquire))
+            for (uint32_t n = 0; n < vm::kMaxNumaNodes; ++n)
                 new (&arenas[n].chunk_lock) Spinlock();
-                // A purge the parent's decommit thread had in flight never
-                // finishes here: its runs are lost to the child, and its
-                // count must not make purgeAllDirtyNow() wait forever.
-                if (arenas[n].subs_ready.load(std::memory_order_acquire))
-                    for (uint32_t i = 0; i < arenas[n].nsubs; ++i) {
-                        new (&arenas[n].subs[i].lock) Spinlock();
-                        arenas[n].subs[i].purging.store(0, std::memory_order_relaxed);
-                    }
+        if (NodeArena* s = shared_set_.load(std::memory_order_acquire))
+            new (&s->chunk_lock) Spinlock();
+        // A purge the parent's decommit thread had in flight never finishes
+        // here: its runs are lost to the child, and its count must not make
+        // purgeAllDirtyNow() wait forever.
+        forEachSubSet([](NodeArena& na, int) {
+            for (uint32_t i = 0; i < na.nsubs; ++i) {
+                new (&na.subs[i].lock) Spinlock();
+                na.subs[i].purging.store(0, std::memory_order_relaxed);
             }
-        }
+        });
         drainDecommitQueueNow();
     }
 
@@ -867,6 +877,13 @@ public:
         size_t start = next_page_.fetch_add(num_pages, std::memory_order_release);
         if (start + num_pages > contig_pages_) {
             next_page_.fetch_sub(num_pages, std::memory_order_relaxed);
+            // Wholly free chunks pooled by the shared sub-arenas are fresh
+            // or purged, and nothing else could ever use them now.
+            if (donateSharedPool()) {
+                if (const size_t idx = free_map_.take(num_pages, kSharedOwner);
+                    idx != PageRunMap::kNone)
+                    return base_ + idx * kPageSize;
+            }
             // Arena exhausted: let the heap return empty slab spans, which
             // then coalesce in the free map, and try once more.
             if (exhausted_hook_) {
@@ -1330,7 +1347,13 @@ public:
     size_t rawNextPage() const { return next_page_.load(std::memory_order_acquire); }
 
     // Arena occupancy, for the exhausted warning and the stats line.
-    size_t arenaFreePages() { return free_map_.freePages(kSharedOwner); }
+    size_t arenaFreePages() {
+        size_t f = free_map_.freePages(kSharedOwner);
+#if defined(__linux__)
+        if (NodeArena* s = shared_set_.load(std::memory_order_acquire)) f += subSetFreePages(*s);
+#endif
+        return f;
+    }
 
     // Diagnostic: pages `node`'s arena has taken from the region, and how many
     // of them are currently free. The difference is exactly what the node's
@@ -1360,17 +1383,7 @@ public:
 #if defined(__linux__)
         // Sub-arenas: their dirty and clean runs, their unused tails, and the
         // node's pool of wholly free chunks are all free.
-        NodeArena& na = arenas[node];
-        if (na.subs_ready.load(std::memory_order_acquire)) {
-            size_t f = 0;
-            for (uint32_t i = 0; i < na.nsubs; ++i) {
-                LockGuard guard(na.subs[i].lock);
-                f += na.map.freePages(ownerDirty(i)) + na.map.freePages(ownerClean(i)) +
-                     (na.subs[i].end - na.subs[i].cur);
-            }
-            LockGuard guard(na.chunk_lock);
-            *free_pages += f + na.nfree_chunks * kNodeChunkPages;
-        }
+        *free_pages += subSetFreePages(arenas[node]);
 #endif
         return true;
     }
@@ -1641,6 +1654,9 @@ private:
     int16_t cpu_node_[CPU_SETSIZE];
     int16_t cpu_rank_[CPU_SETSIZE];
     uint16_t node_ncpus_[vm::kMaxNumaNodes];
+    // The shared set's slice of sub-arenas per node (sharedSubLayout).
+    uint8_t shared_node_base_[vm::kMaxNumaNodes];
+    uint8_t shared_node_count_[vm::kMaxNumaNodes];
     std::atomic<bool> cpu_tables_ready_{false};
 
     static bool subarenasEnabled() {
@@ -1708,8 +1724,117 @@ private:
         cpu_tables_ready_.store(true, std::memory_order_release);
     }
 
+    // The shared set (plain malloc's large blocks): one slice of sub-arenas
+    // per node with CPUs, SMASH_SUBARENAS_PER_NODE (default: the node's CPUs)
+    // each, scaled down to kMaxSubArenas in total. Fills shared_node_base_ /
+    // shared_node_count_ and returns the total. Under numa_init_lock_.
+    uint32_t sharedSubLayout() {
+        uint32_t want[vm::kMaxNumaNodes];
+        uint64_t total = 0;
+        for (uint32_t n = 0; n < vm::kMaxNumaNodes; ++n) {
+            want[n] = node_ncpus_[n] ? (subarenasPerNodeEnv() ? subarenasPerNodeEnv()
+                                                             : node_ncpus_[n])
+                                     : 0;
+            total += want[n];
+        }
+        if (total == 0) {   // no NUMA topology: one per online CPU
+            const long c = sysconf(_SC_NPROCESSORS_ONLN);
+            return c > 0 ? static_cast<uint32_t>(c < kMaxSubArenas ? c : kMaxSubArenas) : 1;
+        }
+        uint32_t base = 0;
+        for (uint32_t n = 0; n < vm::kMaxNumaNodes; ++n) {
+            if (!want[n]) { shared_node_count_[n] = 0; continue; }
+            uint64_t k = total > kMaxSubArenas ? want[n] * kMaxSubArenas / total : want[n];
+            if (k == 0) k = 1;
+            if (base + k > kMaxSubArenas) k = base < kMaxSubArenas ? kMaxSubArenas - base : 0;
+            shared_node_base_[n] = static_cast<uint8_t>(base < kMaxSubArenas ? base : 0);
+            shared_node_count_[n] = static_cast<uint8_t>(k ? k : 1);
+            base += static_cast<uint32_t>(k);
+        }
+        return base ? (base < kMaxSubArenas ? base : kMaxSubArenas) : 1;
+    }
+
+    // The queue a sub-arena set's compressed frees go through (and whose
+    // thread purges it): the node's own, or the shared arena's.
+    DecommitQueue& subQueue(NodeArena& na) {
+        return &na == shared_set_.load(std::memory_order_relaxed) ? shared_queue_ : na.queue;
+    }
+    NodeArena* ensureSharedSet() {
+        if (NodeArena* s = shared_set_.load(std::memory_order_acquire)) [[likely]] return s;
+        LockGuard guard(numa_init_lock_);
+        if (NodeArena* s = shared_set_.load(std::memory_order_relaxed)) return s;
+        NodeArena* s = bootstrapArray<NodeArena>(1);
+        if (!s || !s->map.init(contig_pages_)) return nullptr;
+        s->map_ready.store(true, std::memory_order_relaxed);
+        shared_set_.store(s, std::memory_order_release);
+        return s;
+    }
+    // Every sub-arena set that exists: fn(na, node), node -1 for the shared one.
+    template <typename Fn> void forEachSubSet(Fn&& fn) {
+        if (NodeArena* arenas = node_arenas_.load(std::memory_order_acquire))
+            for (uint32_t n = 0; n < vm::kMaxNumaNodes; ++n)
+                if (arenas[n].subs_ready.load(std::memory_order_acquire))
+                    fn(arenas[n], static_cast<int>(n));
+        if (NodeArena* s = shared_set_.load(std::memory_order_acquire))
+            if (s->subs_ready.load(std::memory_order_acquire)) fn(*s, -1);
+    }
+    // Move the shared set's pooled chunks to the shared free map, for the
+    // non-sub-arena users of the region (slab spans, the fallback) once it
+    // is exhausted. A pooled chunk has no runs in the set's map and no owner.
+    //
+    // First make every chunk that is wholly free poolable: purge dirty runs
+    // (their chunks become clean) and retire each sub-arena's unused tail to
+    // its clean runs, so a tail chunk with nothing live is pooled too.
+    // Without that, 8 threads' sub-arenas held up to 512 MiB of a 1 GiB
+    // arena in tails that slab spans could never use.
+    bool donateSharedPool() {
+        NodeArena* s = shared_set_.load(std::memory_order_acquire);
+        if (!s || !s->subs_ready.load(std::memory_order_acquire)) return false;
+        for (uint32_t i = 0; i < s->nsubs; ++i) purgeSubArena(*s, i, /*all=*/true);
+        for (uint32_t i = 0; i < s->nsubs; ++i) {
+            SubArena& sa = s->subs[i];
+            LockGuard guard(sa.lock);
+            if (sa.cur >= sa.end) continue;
+            const size_t idx = sa.cur;
+            s->map.insertUnlocked(sa.cur, sa.end - sa.cur, ownerClean(i), kNodeChunkPages, 0);
+            sa.cur = sa.end;
+            maybeReturnChunkLocked(*s, i, idx);
+        }
+        bool any = false;
+        for (;;) {
+            size_t c;
+            {
+                LockGuard guard(s->chunk_lock);
+                if (!s->nfree_chunks) break;
+                c = s->free_chunks[--s->nfree_chunks];
+            }
+            donateToShared(c * kNodeChunkPages, kNodeChunkPages);
+            any = true;
+        }
+        return any;
+    }
+
+    // A set's free pages: dirty and clean runs, unused tails, pooled chunks.
+    size_t subSetFreePages(NodeArena& na) {
+        if (!na.subs_ready.load(std::memory_order_acquire)) return 0;
+        size_t f = 0;
+        for (uint32_t i = 0; i < na.nsubs; ++i) {
+            LockGuard guard(na.subs[i].lock);
+            f += na.map.freePages(ownerDirty(i)) + na.map.freePages(ownerClean(i)) +
+                 (na.subs[i].end - na.subs[i].cur);
+        }
+        LockGuard guard(na.chunk_lock);
+        return f + na.nfree_chunks * kNodeChunkPages;
+    }
+    // The sub-arena set owning page `idx` (its chunk is sub-owned).
+    NodeArena* subSetOfPage(size_t idx) {
+        const int node = nodeOfPage(idx);
+        if (node >= 0) return &node_arenas_.load(std::memory_order_acquire)[node];
+        return shared_set_.load(std::memory_order_acquire);
+    }
+
     // Before the node's first sub-arena allocation.
-    bool ensureSubArenas(NodeArena& na, uint32_t node) {
+    bool ensureSubArenas(NodeArena& na, int node) {
         if (na.subs_ready.load(std::memory_order_acquire)) [[likely]] return true;
         ensureCpuTables();
         LockGuard guard(numa_init_lock_);
@@ -1720,8 +1845,8 @@ private:
             if (!t) return false;
             chunk_sub_.store(t, std::memory_order_release);
         }
-        uint32_t n = subarenasPerNodeEnv();
-        if (n == 0) n = node_ncpus_[node] ? node_ncpus_[node] : 1;
+        uint32_t n = node < 0 ? sharedSubLayout() : subarenasPerNodeEnv();
+        if (n == 0) n = node >= 0 && node_ncpus_[node] ? node_ncpus_[node] : 1;
         if (n > kMaxSubArenas) n = kMaxSubArenas;
         auto* subs = bootstrapArray<SubArena>(n);
         auto* pool = bootstrapArray<uint32_t>(
@@ -1736,9 +1861,18 @@ private:
 
     // This thread's sub-arena of `node`: a CPU of the node maps by its rank,
     // any other CPU (an unpinned thread allocating remotely) by its number.
-    uint32_t subIndex(uint32_t node, uint32_t nsubs) const {
+    uint32_t subIndex(int node, uint32_t nsubs) const {
         const int cpu = sched_getcpu();
         if (cpu < 0 || cpu >= CPU_SETSIZE) return 0;
+        if (node < 0) {
+            // Shared set: a slice per node, so CPUs of one node share
+            // sub-arenas (and the pages they first touched) with each other.
+            const int cn = cpu_node_[cpu];
+            if (cn >= 0 && shared_node_count_[cn])
+                return (shared_node_base_[cn] +
+                        static_cast<uint32_t>(cpu_rank_[cpu]) % shared_node_count_[cn]) % nsubs;
+            return static_cast<uint32_t>(cpu) % nsubs;
+        }
         if (cpu_node_[cpu] == static_cast<int16_t>(node))
             return static_cast<uint32_t>(cpu_rank_[cpu]) % nsubs;
         return static_cast<uint32_t>(cpu) % nsubs;
@@ -1747,11 +1881,12 @@ private:
     // Carve `pages` (a multiple of the chunk size) of fresh region, bind it to
     // `node` and record it in node_of_chunk_. kNoChunk if the region is
     // exhausted or the binding failed (errno says which).
-    size_t carveBoundChunks(uint32_t node, size_t pages) {
+    size_t carveBoundChunks(int node, size_t pages) {
         const size_t start = carveNodeChunk(pages);
         if (start == kNoChunk) { errno = ENOMEM; return kNoChunk; }
+        if (node < 0) return start;   // the shared set: no binding, no node
         void* chunk = base_ + start * kPageSize;
-        if (!vm::bindPagesToNode(chunk, pages * kPageSize, node)) {
+        if (!vm::bindPagesToNode(chunk, pages * kPageSize, static_cast<uint32_t>(node))) {
             const int err = errno;
             vm::unbindPages(chunk, pages * kPageSize);
             donateToShared(start, pages);
@@ -1766,7 +1901,7 @@ private:
 
     // A chunk for sub-arena `s`: from the node's pool of wholly free chunks,
     // else freshly carved. Page index of its start, or kNoChunk.
-    size_t chunkForSubArena(NodeArena& na, uint32_t node, uint32_t s) {
+    size_t chunkForSubArena(NodeArena& na, int node, uint32_t s) {
         size_t start = kNoChunk;
         {
             LockGuard guard(na.chunk_lock);
@@ -1812,7 +1947,7 @@ private:
         return base_ + start * kPageSize;
     }
 
-    void* allocateOnSubArena(NodeArena& na, uint32_t node, size_t num_pages,
+    void* allocateOnSubArena(NodeArena& na, int node, size_t num_pages,
                              size_t align_pages, size_t phase) {
         if (!ensureSubArenas(na, node)) { errno = ENOMEM; return nullptr; }
         const size_t need = num_pages + (align_pages > 1 ? align_pages - 1 : 0);
@@ -1845,16 +1980,18 @@ private:
             if (void* p = takeFromSubLocked(na, me, num_pages, align_pages, phase, true)) return p;
         }
         // The node is out of region: compressed frees may be in flight to
-        // clean runs, and siblings are worth waiting for now.
+        // clean runs, and siblings are worth waiting for now — their unused
+        // tails too (a block there belongs to the sibling's chunk and goes
+        // home to it), or free space parked in them fails the allocation.
         for (int attempt = 0; attempt < kDrainWaitAttempts; ++attempt) {
-            drainQueueNow(na.queue);
+            drainQueueNow(subQueue(na));
             for (uint32_t i = 0; i < n; ++i) {
                 const uint32_t s = (me + i) % n;
                 LockGuard guard(na.subs[s].lock);
-                if (void* p = takeFromSubLocked(na, s, num_pages, align_pages, phase, s == me))
+                if (void* p = takeFromSubLocked(na, s, num_pages, align_pages, phase, true))
                     return p;
             }
-            if (!inFlight(na.queue)) break;
+            if (!inFlight(subQueue(na))) break;
             sched_yield();
         }
         errno = ENOMEM;
@@ -1863,15 +2000,19 @@ private:
 
     // A block larger than a chunk: dedicated fresh chunks, marked kChunkBig,
     // never in the map; freeing it returns the chunks to the node's pool.
-    void* allocateBigOnSubArenas(NodeArena& na, uint32_t node, size_t num_pages,
+    void* allocateBigOnSubArenas(NodeArena& na, int node, size_t num_pages,
                                  size_t align_pages, size_t phase) {
         const size_t need = num_pages + (align_pages > 1 ? align_pages - 1 : 0);
         const size_t pages = (need + kNodeChunkPages - 1) / kNodeChunkPages * kNodeChunkPages;
         auto* owners = chunk_sub_.load(std::memory_order_acquire);
         LockGuard guard(na.chunk_lock);
-        const size_t start = carveBoundChunks(node, pages);
-        if (start == kNoChunk) return nullptr;
-        {
+        // Consecutive pooled chunks first: a freed big block returns its
+        // chunks to the pool, and carving fresh ones instead walked the whole
+        // region (64 GiB in 2 s of 70 MiB churn, then everything fell out).
+        size_t start = takePooledRunLocked(na, pages / kNodeChunkPages);
+        if (start == kNoChunk) {
+            start = carveBoundChunks(node, pages);
+            if (start == kNoChunk) return nullptr;
             LockGuard carved_guard(na.lock);
             na.carved += pages;
         }
@@ -1888,6 +2029,27 @@ private:
             }
         }
         return base_ + blk * kPageSize;
+    }
+
+    // Under na.chunk_lock: `k` consecutive chunks from the pool, removed from
+    // it; page index of the first, or kNoChunk. Sorts the pool (a stack of
+    // chunk indices), so the cost is on the big-block path only.
+    size_t takePooledRunLocked(NodeArena& na, size_t k) {
+        if (k == 0 || na.nfree_chunks < k) return kNoChunk;
+        uint32_t* c = na.free_chunks;
+        const size_t n = na.nfree_chunks;
+        for (size_t i = 1; i < n; ++i)   // insertion sort: no allocation, n is small
+            for (size_t j = i; j > 0 && c[j] < c[j - 1]; --j) {
+                const uint32_t t = c[j]; c[j] = c[j - 1]; c[j - 1] = t;
+            }
+        for (size_t i = 0; i + k <= n; ++i) {
+            if (c[i + k - 1] - c[i] != k - 1) continue;   // sorted and distinct
+            const size_t first = c[i];
+            for (size_t j = i + k; j < n; ++j) c[j - k] = c[j];
+            na.nfree_chunks = n - k;
+            return first * kNodeChunkPages;
+        }
+        return kNoChunk;
     }
 
     // Under sa.lock, after inserting a clean run: if the chunk holding
@@ -1971,6 +2133,11 @@ private:
         NodeArena& na = arenas[node];
         for (uint32_t s = 0; s < na.nsubs; ++s) purgeSubArena(na, s, all);
     }
+    void purgeSharedSubArenas(bool all) {
+        NodeArena* na = shared_set_.load(std::memory_order_acquire);
+        if (!na || !na->subs_ready.load(std::memory_order_acquire)) return;
+        for (uint32_t s = 0; s < na->nsubs; ++s) purgeSubArena(*na, s, all);
+    }
 
 public:
     // A freed, never-compressed run of a sub-arena chunk goes straight back to
@@ -1982,12 +2149,13 @@ public:
         const auto a = reinterpret_cast<uintptr_t>(addr);
         if (!inContigArena(a)) return false;
         const size_t idx = pageIndex(a);
-        const int node = nodeOfPage(idx);
         auto* owners = chunk_sub_.load(std::memory_order_acquire);
-        if (node < 0 || !owners) return false;
+        if (!owners) return false;
         const uint8_t o = owners[chunkOfPage(idx)].load(std::memory_order_acquire);
         if (o == kChunkUnowned || o == kChunkBig) return false;
-        NodeArena& na = node_arenas_.load(std::memory_order_acquire)[node];
+        NodeArena* set = subSetOfPage(idx);   // a sub-owned chunk's set exists
+        if (!set) return false;
+        NodeArena& na = *set;
         const uint32_t s = static_cast<uint32_t>(o - 1);
         {
             LockGuard guard(na.subs[s].lock);
@@ -1995,23 +2163,49 @@ public:
             na.subs[s].dirty_pages += num_pages;
             na.subs[s].dirty_published.store(na.subs[s].dirty_pages, std::memory_order_relaxed);
         }
-        ensureDecommitThreadStarted(na.queue);   // its thread purges this node
+        ensureDecommitThreadStarted(subQueue(na));   // its thread purges this set
         return true;
     }
 
-    // Purge every sub-arena's dirty runs now (tools and tests).
-    // Purge every dirty run, and return only once no purge (this one or the
-    // purger's) has runs out of the free lists.
+    // Purge every dirty run now (tools and tests), and return only once no
+    // purge (this one or the purger's) has runs out of the free lists.
     void purgeAllDirtyNow() {
         if (!subarenasEnabled()) return;
-        for (uint32_t n = 0; n < vm::kMaxNumaNodes; ++n) purgeNodeSubArenas(n, true);
-        NodeArena* arenas = node_arenas_.load(std::memory_order_acquire);
-        if (!arenas) return;
-        for (uint32_t n = 0; n < vm::kMaxNumaNodes; ++n) {
-            if (!arenas[n].subs_ready.load(std::memory_order_acquire)) continue;
-            for (uint32_t s = 0; s < arenas[n].nsubs; ++s)
-                while (arenas[n].subs[s].purging.load(std::memory_order_acquire)) sched_yield();
+        forEachSubSet([&](NodeArena& na, int) {
+            for (uint32_t s = 0; s < na.nsubs; ++s) purgeSubArena(na, s, true);
+        });
+        forEachSubSet([&](NodeArena& na, int) {
+            for (uint32_t s = 0; s < na.nsubs; ++s)
+                while (na.subs[s].purging.load(std::memory_order_acquire)) sched_yield();
+        });
+    }
+
+    // Large blocks of plain malloc: from the shared set of sub-arenas when
+    // they are on, else (or when it cannot serve) the shared arena as before.
+    void* allocateLargePages(size_t num_pages) {
+        if (subarenasEnabled() && !tracking_mode_ && base_ && num_pages &&
+            num_pages <= contig_pages_) {
+            if (NodeArena* na = ensureSharedSet()) {
+                if (void* p = allocateOnSubArena(*na, -1, num_pages, 1, 0)) return p;
+            }
         }
+        return allocatePages(num_pages);
+    }
+
+    // Behind smash_shared_arena_info(): pages the shared arena has taken from
+    // the region (everything walked except node chunks) and how many of them
+    // are free — its free map, and its sub-arenas' runs, tails and pool.
+    void sharedArenaInfo(size_t* used, size_t* free_pages) {
+        size_t walked = next_page_.load(std::memory_order_acquire);
+        if (walked > contig_pages_) walked = contig_pages_;
+        size_t node_carved = 0;
+        if (NodeArena* arenas = node_arenas_.load(std::memory_order_acquire))
+            for (uint32_t n = 0; n < vm::kMaxNumaNodes; ++n) {
+                LockGuard guard(arenas[n].lock);
+                node_carved += arenas[n].carved;
+            }
+        *used = walked - node_carved;
+        *free_pages = arenaFreePages();
     }
 
 #if defined(SMASH_SIM)
@@ -2021,10 +2215,14 @@ public:
     // owner's counter equal to its runs' sum. Holds every sub-arena lock and
     // the pool lock, so a purge in flight is only absent, never half-moved.
     // Prints what it finds; returns the number of problems.
-    int checkSubArenas(uint32_t node) {
-        NodeArena* arenas = node_arenas_.load(std::memory_order_acquire);
-        if (!arenas || !arenas[node].subs_ready.load(std::memory_order_acquire)) return 0;
-        NodeArena& na = arenas[node];
+    // `node` -1 checks the shared set.
+    int checkSubArenas(int node) {
+        NodeArena* set = nullptr;
+        if (node < 0) set = shared_set_.load(std::memory_order_acquire);
+        else if (NodeArena* arenas = node_arenas_.load(std::memory_order_acquire))
+            set = &arenas[node];
+        if (!set || !set->subs_ready.load(std::memory_order_acquire)) return 0;
+        NodeArena& na = *set;
         for (uint32_t i = 0; i < na.nsubs; ++i) na.subs[i].lock.lock();
         na.chunk_lock.lock();
         struct Unlock {
@@ -2046,19 +2244,19 @@ public:
                     ivs.push_back({st, len, kind, i});
                     sum += len;
                     if (chunkOfPage(st) != chunkOfPage(st + len - 1)) {
-                        std::printf("  node %u sub %u: %s run %zu+%zu crosses a chunk\n",
+                        std::printf("  node %d sub %u: %s run %zu+%zu crosses a chunk\n",
                                     node, i, kind ? "clean" : "dirty", st, len);
                         ++bad;
                     }
                     if (owners[chunkOfPage(st)].load() != i + 1) {
-                        std::printf("  node %u sub %u: %s run %zu+%zu in a chunk owned by %u\n",
+                        std::printf("  node %d sub %u: %s run %zu+%zu in a chunk owned by %u\n",
                                     node, i, kind ? "clean" : "dirty", st, len,
                                     owners[chunkOfPage(st)].load());
                         ++bad;
                     }
                 });
                 if (sum != na.map.freePages(o)) {
-                    std::printf("  node %u sub %u: %s runs sum to %zu, counter says %zu\n", node,
+                    std::printf("  node %d sub %u: %s runs sum to %zu, counter says %zu\n", node,
                                 i, kind ? "clean" : "dirty", sum, na.map.freePages(o));
                     ++bad;
                 }
@@ -2069,11 +2267,25 @@ public:
         for (size_t k = 0; k < na.nfree_chunks; ++k)
             ivs.push_back({static_cast<size_t>(na.free_chunks[k]) * kNodeChunkPages,
                            kNodeChunkPages, 3, 0});
+        if (node < 0) {
+            // Pages of the shared free map (the old path, and the fallback)
+            // never lie in a chunk a sub-arena owns.
+            LockGuard fm_guard(free_map_.lockForCheck());
+            free_map_.forEachRunUnlocked(kSharedOwner, [&](size_t st, size_t len, uint32_t) {
+                for (size_t c = chunkOfPage(st); c <= chunkOfPage(st + len - 1); ++c) {
+                    if (owners[c].load() == kChunkUnowned) continue;
+                    std::printf("  shared free map run %zu+%zu lies in chunk %zu, owned by %u\n",
+                                st, len, c, owners[c].load());
+                    ++bad;
+                    break;
+                }
+            });
+        }
         std::sort(ivs.begin(), ivs.end(), [](const Iv& a, const Iv& b) { return a.start < b.start; });
         static const char* const kKind[] = {"dirty", "clean", "tail", "pool"};
         for (size_t k = 1; k < ivs.size(); ++k) {
             if (ivs[k].start < ivs[k - 1].start + ivs[k - 1].len) {
-                std::printf("  node %u: %s %zu+%zu (sub %u) overlaps %s %zu+%zu (sub %u)\n", node,
+                std::printf("  node %d: %s %zu+%zu (sub %u) overlaps %s %zu+%zu (sub %u)\n", node,
                             kKind[ivs[k].kind], ivs[k].start, ivs[k].len, ivs[k].sub,
                             kKind[ivs[k - 1].kind], ivs[k - 1].start, ivs[k - 1].len,
                             ivs[k - 1].sub);
@@ -2086,17 +2298,14 @@ public:
 
     // Diagnostics behind smash_subarena_info(): dirty bytes held now, and runs
     // purged so far. Returns whether sub-arenas are on.
-    bool subArenaInfo(uint64_t* dirty_bytes, uint64_t* purged_runs) const {
+    bool subArenaInfo(uint64_t* dirty_bytes, uint64_t* purged_runs) {
         uint64_t d = 0, p = 0;
-        if (const NodeArena* arenas = node_arenas_.load(std::memory_order_acquire)) {
-            for (uint32_t n = 0; n < vm::kMaxNumaNodes; ++n) {
-                if (!arenas[n].subs_ready.load(std::memory_order_acquire)) continue;
-                for (uint32_t s = 0; s < arenas[n].nsubs; ++s) {
-                    d += arenas[n].subs[s].dirty_published.load(std::memory_order_relaxed) * kPageSize;
-                    p += arenas[n].subs[s].purged_runs.load(std::memory_order_relaxed);
-                }
+        forEachSubSet([&](NodeArena& na, int) {
+            for (uint32_t s = 0; s < na.nsubs; ++s) {
+                d += na.subs[s].dirty_published.load(std::memory_order_relaxed) * kPageSize;
+                p += na.subs[s].purged_runs.load(std::memory_order_relaxed);
             }
-        }
+        });
         *dirty_bytes = d;
         *purged_runs = p;
         return subarenasEnabled();
@@ -2107,7 +2316,14 @@ public:
 public:
     bool freeRunDirty(void*, size_t) { return false; }
     void purgeAllDirtyNow() {}
-    bool subArenaInfo(uint64_t* dirty_bytes, uint64_t* purged_runs) const {
+    void* allocateLargePages(size_t num_pages) { return allocatePages(num_pages); }
+    bool donateSharedPool() { return false; }
+    void sharedArenaInfo(size_t* used, size_t* free_pages) {
+        size_t walked = next_page_.load(std::memory_order_acquire);
+        *used = walked > contig_pages_ ? contig_pages_ : walked;
+        *free_pages = arenaFreePages();
+    }
+    bool subArenaInfo(uint64_t* dirty_bytes, uint64_t* purged_runs) {
         *dirty_bytes = *purged_runs = 0;
         return false;
     }
@@ -2173,6 +2389,9 @@ private:
     // written before any of the chunk's pages are handed out.
 
     std::atomic<NodeArena*> node_arenas_{nullptr};
+    // Sub-arenas for plain malloc's large blocks (SMASH_SUBARENAS): a
+    // NodeArena whose chunks are unbound, created on first use.
+    std::atomic<NodeArena*> shared_set_{nullptr};
     std::atomic<std::atomic<uint16_t>*> node_of_chunk_{nullptr};
     Spinlock numa_init_lock_;
     // Region that vm::g_after_remap_hook binds pages again for.

@@ -609,11 +609,12 @@ if(NOT APPLE)
 endif()
 
 # Per-CPU sub-arenas with immediate dirty reuse (SMASH_SUBARENAS,
-# agents/design-subarenas.md). One body, four registrations: off must mean
+# agents/design-subarenas.md). One body, seven registrations: off must mean
 # today's behaviour; on in both heap modes; on with SMASH_SOFTDIRTY=0 (Phase 3
 # PROT_READ monitoring can leave a freed page read-only). Two sub-arenas per
 # node so the go-home and sibling phases can use two CPUs of one node; a short
-# decay and a small cap so the drain and bound phases are quick.
+# decay and a small cap so the drain and bound phases are quick. The plain
+# variants run the phases through malloc() and the shared arena's sub-arenas.
 if(NOT APPLE)
   add_executable(subarena_test subarena_test.cpp)
   set_target_properties(subarena_test PROPERTIES CXX_STANDARD 20)
@@ -630,8 +631,36 @@ if(NOT APPLE)
   add_test(NAME test_subarena_on_softdirty0 COMMAND ${CMAKE_COMMAND} -E env ${_sa_env}
     "SMASH_LARGE_ONLY=1" "SMASH_SUBARENAS=1" "SMASH_SOFTDIRTY=0"
     $<TARGET_FILE:subarena_test>)
+  # The same phases through plain malloc(): the shared arena's sub-arenas.
+  add_test(NAME test_subarena_plain_off COMMAND ${CMAKE_COMMAND} -E env ${_sa_env}
+    "SMASH_LARGE_ONLY=1" "SUBARENA_TEST_PLAIN=1" $<TARGET_FILE:subarena_test>)
+  add_test(NAME test_subarena_plain_on COMMAND ${CMAKE_COMMAND} -E env ${_sa_env}
+    "SMASH_LARGE_ONLY=1" "SMASH_SUBARENAS=1" "SUBARENA_TEST_PLAIN=1"
+    $<TARGET_FILE:subarena_test>)
+  add_test(NAME test_subarena_plain_on_full COMMAND ${CMAKE_COMMAND} -E env ${_sa_env}
+    "SMASH_LARGE_ONLY=0" "SMASH_SUBARENAS=1" "SUBARENA_TEST_PLAIN=1"
+    $<TARGET_FILE:subarena_test>)
   set_tests_properties(test_subarena_off test_subarena_on test_subarena_on_full
-    test_subarena_on_softdirty0 PROPERTIES TIMEOUT 180)
+    test_subarena_on_softdirty0 test_subarena_plain_off test_subarena_plain_on
+    test_subarena_plain_on_full PROPERTIES TIMEOUT 180)
+
+  # Sub-arenas must not strand free space when a 1 GiB region runs out:
+  # siblings' tails for a node arena, tails and pooled chunks handed to slab
+  # spans for the shared arena (full mode), and pooled chunks reused by blocks
+  # larger than a chunk.
+  add_executable(subarena_exhaust_test subarena_exhaust_test.cpp)
+  set_target_properties(subarena_exhaust_test PROPERTIES CXX_STANDARD 20)
+  target_link_libraries(subarena_exhaust_test PRIVATE ${CMAKE_DL_LIBS} Threads::Threads)
+  set(_sx_env "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_VM_GIB=1" "SMASH_SUBARENAS=1"
+              "SMASH_SUBARENAS_PER_NODE=2" "SMASH_DIRTY_DECAY_MS=100")
+  add_test(NAME test_subarena_exhaust_node COMMAND ${CMAKE_COMMAND} -E env ${_sx_env}
+    "SMASH_LARGE_ONLY=1" "SUBARENA_EXHAUST_PHASE=A" $<TARGET_FILE:subarena_exhaust_test>)
+  add_test(NAME test_subarena_exhaust_shared COMMAND ${CMAKE_COMMAND} -E env ${_sx_env}
+    "SMASH_LARGE_ONLY=0" "SUBARENA_EXHAUST_PHASE=B" $<TARGET_FILE:subarena_exhaust_test>)
+  add_test(NAME test_subarena_exhaust_big COMMAND ${CMAKE_COMMAND} -E env ${_sx_env}
+    "SMASH_LARGE_ONLY=1" "SUBARENA_EXHAUST_PHASE=C" $<TARGET_FILE:subarena_exhaust_test>)
+  set_tests_properties(test_subarena_exhaust_node test_subarena_exhaust_shared
+    test_subarena_exhaust_big PROPERTIES TIMEOUT 120)
 endif()
 
 # smash_sim (tools/smash_sim.cpp): drives the real large-block allocator —

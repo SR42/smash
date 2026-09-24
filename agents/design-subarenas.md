@@ -1,7 +1,9 @@
 # Design: per-CPU sub-arenas with immediate dirty reuse
 
-Status: **phase 1 implemented** (2026-09-24) behind `SMASH_SUBARENAS=1`;
-phase 2 (measuring on the 128-core box) pending. Open questions resolved at the
+Status: **phases 1 and 3a implemented** (2026-09-24) behind
+`SMASH_SUBARENAS=1` — node arenas, then the shared arena; phase 2 (measuring
+on the 128-core box) pending, and with it making them the default and
+retiring the run cache (3b). Open questions resolved at the
 end; what the implementation changed is under "Phase 1 as built".
 
 ## Problem
@@ -153,8 +155,8 @@ memory freed by one sub-arena is not stranded there.
 2. Measure: `smash_sim` invariants and 1..4-thread comparison here; 8..128
    threads pinned/unpinned on the 128-core box against `fcfaca0`/`4c28970`;
    then the application (lock profile, RSS vs 86 GB).
-3. Shared arena; make default; retire the run cache and the free-path
-   decommit queue.
+3. (a) Shared arena, behind the same flag — done. (b) Make default; retire the
+   run cache and the free-path decommit queue — after phase 2.
 
 ## Tests (written first, failing against today's code)
 
@@ -215,3 +217,37 @@ memory freed by one sub-arena is not stranded there.
   `smash_numa_arena_info` counts dirty, clean, tails and pooled chunks as free.
 - **Tests**: `test_subarena_*` (7 phases) and `test_smash_sim_smoke_subarenas`;
   see [tests.md](tests.md) and [simulator.md](simulator.md) for measurements.
+
+## Phase 3a as built: the shared arena (2026-09-24)
+
+- **One more set**: `shared_set_`, a `NodeArena` created on first use with its
+  own free map, whose chunks are carved off the same bump pointer but never
+  bound (`carveBoundChunks(-1, …)` skips `mbind` and `node_of_chunk_`). The
+  sub-arena functions take `node` -1 for it; its compressed frees and its
+  purger use the shared decommit queue (`subQueue`).
+- **Which sub-arena**: a slice per node with CPUs (`sharedSubLayout`),
+  `SMASH_SUBARENAS_PER_NODE` each (default the node's CPUs), scaled to 64 in
+  total — so on the 128-CPU box, 16 per node, two CPUs of the same node each.
+  Dirty memory is first-touched on the freeing CPU's node, so keeping reuse
+  within a node keeps it local.
+- **Only `LargeAlloc`** goes through it (`allocateLargePages`); slab spans and
+  mid bins keep `allocatePages`. When the set cannot serve (region
+  exhausted), the block falls back to the shared free map as before.
+- **Accounting**: `arenaFreePages()` counts the set; `smash_shared_arena_info`
+  reports pages in use by the shared arena vs free.
+- **Region exhaustion**: when the shared free map runs the region out
+  (`allocatePages`), the shared set purges its dirty runs, retires every
+  sub-arena's unused tail into its clean runs, and donates every wholly free
+  chunk to the shared free map (`donateSharedPool`). Without it 8 threads'
+  sub-arenas stranded up to half of a 1 GiB region (448-704 MiB of small
+  objects fit instead of 960; 978 with sub-arenas off). For any set, the
+  last-resort retry after the region is out also takes siblings' tails, not
+  only the caller's own. Both are `test_subarena_exhaust_*`.
+- **Blocks larger than a chunk reuse pooled chunks** (`takePooledRunLocked`:
+  consecutive indices in the sorted pool) before carving fresh ones. Phase 1
+  always carved, so freed big blocks only fed the pool and 70 MiB churn walked
+  a 64 GiB arena in 2 s (`test_subarena_exhaust_big`).
+- **Address space**: sub-arenas walk more of the arena than the single free
+  map (`smash_sim`, 6 threads, 1-70 MiB blocks: 16.6 / 18.1 GiB vs 11.3 / 4.2
+  GiB, shared / node): each keeps partly used chunks and up to its dirty cap.
+  It is address space, not RSS; size `SMASH_VM_GIB` with that margin.

@@ -1445,6 +1445,21 @@ int smash_subarena_info(uint64_t* dirty_bytes, uint64_t* purged_runs) {
     return on ? 0 : -1;
 }
 
+// Diagnostic / test hook (not public API): pages the shared arena has taken
+// from the compressible region (everything walked except NUMA node chunks),
+// and how many of them are free right now — its free map plus, with
+// SMASH_SUBARENAS, its sub-arenas' runs, tails and pooled chunks. With nothing
+// allocated from it (large-only mode, every block freed and drained), the two
+// are equal. 0 on success, -1 without a heap.
+extern "C" __attribute__((visibility("default")))
+int smash_shared_arena_info(size_t* used_pages, size_t* free_pages) {
+    if (!used_pages || !free_pages) return -1;
+    auto* heap = SmashRedirect::getHeap();
+    if (!heap) return -1;
+    heap->sharedArenaInfo(used_pages, free_pages);
+    return 0;
+}
+
 // Diagnostic / test hook (not public API): hits served by the per-CPU run
 // cache so far, and bytes parked in it now. 0 if the cache is enabled
 // (SMASH_RUN_CACHE_MIB), -1 if not; the counters are filled either way.

@@ -210,6 +210,9 @@ public:
     }
 
     size_t numPages() const { return num_pages_; }
+#if defined(SMASH_SIM)
+    Spinlock& lockForCheck() { return lock_; }   // smash_sim's quiescent checks
+#endif
 
     // Free pages held by `owner`, and a lower bound on its longest run (the
     // start of the highest non-empty size bin). Together they separate "the

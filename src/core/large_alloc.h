@@ -86,7 +86,7 @@ public:
         if (vm_region_ && alignment <= kPageSize && alloc_size >= largeAllocVmThreshold()) {
             // A run this CPU freed warm, if SMASH_RUN_CACHE_MIB is on.
             mem = vm_region_->takeCachedRun(num_pages, /*node=*/-1, kPageSize);
-            if (!mem) mem = vm_region_->allocatePages(num_pages);
+            if (!mem) mem = vm_region_->allocateLargePages(num_pages);
             if (mem && page_states_) {
                 size_t idx = vm_region_->pageIndex(reinterpret_cast<uintptr_t>(mem));
                 for (uint32_t p = 0; p < num_pages; ++p)

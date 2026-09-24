@@ -540,9 +540,10 @@ int main(int argc, char** argv) {
     // clean and pools them, whoever held the runs), and a full purge leaves
     // nothing dirty (dirty runs count as free below, so a purge that drops
     // runs shows up there, one that skips them here).
-    for (int n = 0; n < opt.nodes; ++n) {
-        if (const int bad = g_vm.checkSubArenas(static_cast<uint32_t>(n))) {
-            std::printf("FAIL: node %d: %d sub-arena free-list problem(s) before the purge (above)\n", n, bad);
+    for (int n = -1; n < opt.nodes; ++n) {   // -1: the shared arena's set
+        if (const int bad = g_vm.checkSubArenas(n)) {
+            std::printf("FAIL: %s %d: %d sub-arena free-list problem(s) before the purge (above)\n",
+                        n < 0 ? "shared set" : "node", n, bad);
             ++failures;
         }
     }
@@ -552,9 +553,10 @@ int main(int argc, char** argv) {
                     static_cast<double>(dirty_bytes) / (1 << 20));
         ++failures;
     }
-    for (int n = 0; n < opt.nodes; ++n) {
-        if (const int bad = g_vm.checkSubArenas(static_cast<uint32_t>(n))) {
-            std::printf("FAIL: node %d: %d sub-arena free-list problem(s) after the purge (above)\n", n, bad);
+    for (int n = -1; n < opt.nodes; ++n) {   // -1: the shared arena's set
+        if (const int bad = g_vm.checkSubArenas(n)) {
+            std::printf("FAIL: %s %d: %d sub-arena free-list problem(s) after the purge (above)\n",
+                        n < 0 ? "shared set" : "node", n, bad);
             ++failures;
         }
     }

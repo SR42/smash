@@ -23,6 +23,13 @@
 //   6. churn: tagged blocks from many threads never overlap and stay on node
 //   7. nothing lost: blocks larger than a chunk (one aligned past a whole
 //      chunk), then every node's free pages equal what it carved
+//
+// SUBARENA_TEST_PLAIN=1 runs the same phases through plain malloc(), whose
+// large blocks come from the shared arena's sub-arenas (unbound chunks)
+// instead of a node's. Node placement checks and the aligned node block are
+// skipped there; "nothing lost" compares the shared arena's pages in use with
+// its free pages (smash_shared_arena_info), in large-only mode only, where
+// nothing else lives in the arena.
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
@@ -46,7 +53,10 @@ namespace {
 using numa_fn = void* (*)(uint32_t, size_t);
 using info_fn = int (*)(uint64_t*, uint64_t*);
 using arena_info_fn = int (*)(uint32_t, size_t*, size_t*);
+using shared_info_fn = int (*)(size_t*, size_t*);
 numa_fn g_numa = nullptr;
+shared_info_fn g_shared_info = nullptr;
+bool plain = false;         // SUBARENA_TEST_PLAIN: malloc() and the shared arena
 info_fn g_info = nullptr;
 arena_info_fn g_arena_info = nullptr;
 int failures = 0;
@@ -86,13 +96,22 @@ uint64_t dirtyBytes() {
     if (g_info) g_info(&d, &p);
     return d;
 }
+// Pages the shared arena has taken from the region (not counting node
+// chunks), and how many of them are free.
+bool sharedInfo(size_t* used, size_t* free_pages) {
+    *used = *free_pages = 0;
+    return g_shared_info && g_shared_info(used, free_pages) == 0;
+}
+// Grows when the allocator under test carves a new chunk.
 size_t carved(int node) {
     size_t c = 0, f = 0;
-    if (g_arena_info) g_arena_info(static_cast<uint32_t>(node), &c, &f);
+    if (plain) sharedInfo(&c, &f);
+    else if (g_arena_info) g_arena_info(static_cast<uint32_t>(node), &c, &f);
     return c;
 }
 unsigned char* alloc(size_t n) {
-    return static_cast<unsigned char*>(g_numa(static_cast<uint32_t>(node0), n));
+    return static_cast<unsigned char*>(plain ? malloc(n)
+                                             : g_numa(static_cast<uint32_t>(node0), n));
 }
 
 // CPUs of node0 this process may use, in the kernel's order: with two
@@ -112,11 +131,11 @@ std::vector<int> node0Cpus() {
 void phaseDifferentSize(int cpu) {
     pinTo(cpu);
     auto* p = alloc(4u << 20);
-    if (!p) { fail("malloc_numa(4 MiB) failed"); return; }
+    if (!p) { fail("allocating 4 MiB failed"); return; }
     touchFaults(p, 4u << 20, 1);
     free(p);
     auto* q = alloc(3u << 20);
-    if (!q) { fail("malloc_numa(3 MiB) failed"); return; }
+    if (!q) { fail("allocating 3 MiB failed"); return; }
     const long faults = touchFaults(q, 3u << 20, 2);
     const size_t pages = (3u << 20) / ps;
     // Reuse means the new block lies (almost) inside the freed one: the freed
@@ -138,7 +157,7 @@ void phaseDifferentSize(int cpu) {
     std::vector<void*> ptrs;
     for (size_t o = 0; o < (3u << 20); o += ps) ptrs.push_back(q + o);
     int first = 0;
-    if (size_t off = numa_test::pointersOffNode(ptrs, node0, &first))
+    if (size_t off = plain ? 0 : numa_test::pointersOffNode(ptrs, node0, &first))
         fail("%zu pages of a reused block are off node %d (first status %d)", off, node0, first);
     free(q);
 }
@@ -147,11 +166,11 @@ void phaseDifferentSize(int cpu) {
 void phaseGoesHome(int cpu_a, int cpu_b) {
     pinTo(cpu_a);
     auto* p = alloc(4u << 20);
-    if (!p) { fail("malloc_numa(4 MiB) failed"); return; }
+    if (!p) { fail("allocating 4 MiB failed"); return; }
     touchFaults(p, 4u << 20, 1);
     std::thread([&] { pinTo(cpu_b); free(p); }).join();
     auto* q = alloc(4u << 20);
-    if (!q) { fail("malloc_numa(4 MiB) failed"); return; }
+    if (!q) { fail("allocating 4 MiB failed"); return; }
     const long faults = touchFaults(q, 4u << 20, 2);
     std::printf("  freed on CPU %d, reallocated on CPU %d: %s, %ld faults\n", cpu_b, cpu_a,
                 q == p ? "same block" : "different block", faults);
@@ -167,7 +186,7 @@ void phaseCold(int cpu) {
     constexpr size_t kSize = 4u << 20;
     const size_t pages = kSize / ps;
     auto* p = alloc(kSize);
-    if (!p) { fail("malloc_numa(4 MiB) failed"); return; }
+    if (!p) { fail("allocating 4 MiB failed"); return; }
     std::memset(p, 0x5A, kSize);
     std::vector<unsigned char> vec(pages);
     size_t gone = 0;
@@ -203,7 +222,7 @@ void phaseDirtyBound(int cpu) {
     std::vector<void*> blocks;
     for (int i = 0; i < 16; ++i) {
         auto* p = alloc(8u << 20);
-        if (!p) { fail("malloc_numa(8 MiB) failed"); break; }
+        if (!p) { fail("allocating 8 MiB failed"); break; }
         touchFaults(p, 8u << 20, 3);
         blocks.push_back(p);
     }
@@ -229,7 +248,7 @@ void phaseDirtyBound(int cpu) {
 void phaseSibling(int cpu_a, int cpu_b) {
     pinTo(cpu_a);
     auto* p = alloc(8u << 20);
-    if (!p) { fail("malloc_numa(8 MiB) failed"); return; }
+    if (!p) { fail("allocating 8 MiB failed"); return; }
     touchFaults(p, 8u << 20, 4);
     free(p);                               // dirty in cpu_a's sub-arena
     const size_t c0 = carved(node0);
@@ -241,7 +260,7 @@ void phaseSibling(int cpu_a, int cpu_b) {
         // there); fill whatever it holds so its own free runs and tail miss.
         std::vector<void*> fill;
         for (int i = 0; i < 64; ++i) {
-            void* f = g_numa(static_cast<uint32_t>(node0), 8u << 20);
+            void* f = alloc(8u << 20);
             if (!f || f == p) { if (f == p) q = static_cast<unsigned char*>(f); else free(f); break; }
             fill.push_back(f);
             if (carved(node0) != c0) break;  // it had to carve: its own space ran out
@@ -282,11 +301,12 @@ void phaseChurn(const std::vector<int>& nodes) {
                 }
                 b.bytes = ((s >> 4) % 6 + 1) * (1u << 20);
                 b.tag = (static_cast<uint64_t>(t) << 40) | ++seq;
-                b.node = nodes[(s >> 12) % nodes.size()];
-                b.p = static_cast<uint64_t*>(g_numa(static_cast<uint32_t>(b.node), b.bytes));
+                b.node = plain ? -1 : nodes[(s >> 12) % nodes.size()];
+                b.p = static_cast<uint64_t*>(
+                    plain ? malloc(b.bytes) : g_numa(static_cast<uint32_t>(b.node), b.bytes));
                 if (!b.p) continue;
                 for (size_t o = 0; o < b.bytes / 8; o += ps / 8) b.p[o] = b.tag;
-                if ((seq & 15) == 0) {
+                if (!plain && (seq & 15) == 0) {
                     int status = -1;
                     void* page = b.p;
                     if (syscall(SYS_move_pages, 0, 1, &page, nullptr, &status, 0) == 0 &&
@@ -318,12 +338,31 @@ void phaseAccounting(const std::vector<int>& nodes) {
     auto aligned = reinterpret_cast<aligned_fn>(dlsym(RTLD_DEFAULT, "malloc_numa_aligned"));
     const size_t mib = 1u << 20;
     unsigned char* big = alloc(100 * mib);
-    unsigned char* al = aligned ? static_cast<unsigned char*>(
+    unsigned char* al = aligned && !plain ? static_cast<unsigned char*>(
                                       aligned(static_cast<uint32_t>(node0), 70 * mib, 128 * mib))
                                 : nullptr;
-    if (!big || (aligned && !al)) fail("a block larger than a chunk was refused");
+    if (!big || (aligned && !plain && !al)) fail("a block larger than a chunk was refused");
     if (big) { touchFaults(big, 100 * mib, 1); free(big); }
     if (al) { touchFaults(al, 70 * mib, 2); free(al); }
+    if (plain) {
+        const char* lo = std::getenv("SMASH_LARGE_ONLY");
+        if (!(lo && lo[0] == '1')) {
+            std::printf("  skipped: full mode keeps slab spans in the shared arena\n");
+            return;
+        }
+        size_t u = 0, f = 0;
+        bool ok = false;
+        for (int i = 0; i < 300; ++i) {
+            if (!(ok = sharedInfo(&u, &f)) || u == f) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        std::printf("  shared arena: %zu pages in use by it, %zu free\n", u, f);
+        if (!ok) fail("smash_shared_arena_info is not exported");
+        else if (u != f)
+            fail("shared arena: %zu pages taken from the region, %zu free with nothing "
+                 "allocated — %s", u, f, f > u ? "pages counted twice" : "pages lost");
+        return;
+    }
     for (int n : nodes) {
         size_t c = 0, f = 0;
         for (int i = 0; i < 300; ++i) {
@@ -344,12 +383,16 @@ int main() {
     g_numa = reinterpret_cast<numa_fn>(dlsym(RTLD_DEFAULT, "malloc_numa"));
     g_info = reinterpret_cast<info_fn>(dlsym(RTLD_DEFAULT, "smash_subarena_info"));
     g_arena_info = reinterpret_cast<arena_info_fn>(dlsym(RTLD_DEFAULT, "smash_numa_arena_info"));
+    g_shared_info = reinterpret_cast<shared_info_fn>(dlsym(RTLD_DEFAULT, "smash_shared_arena_info"));
+    const char* pl = std::getenv("SUBARENA_TEST_PLAIN");
+    plain = pl && pl[0] == '1';
     if (!g_numa || !g_arena_info) { std::printf("SKIP: not running under libsmash\n"); return 0; }
     const char* v = std::getenv("SMASH_SUBARENAS");
     on = v && v[0] == '1';
     const char* cap = std::getenv("SMASH_DIRTY_MAX_MIB");
     cap_bytes = cap ? static_cast<size_t>(std::atol(cap)) << 20 : 256u << 20;
-    std::printf("subarena_test: SMASH_SUBARENAS=%s\n", on ? "1" : "(unset)");
+    std::printf("subarena_test: SMASH_SUBARENAS=%s, %s\n", on ? "1" : "(unset)",
+                plain ? "plain malloc (shared arena)" : "malloc_numa (node arenas)");
     // A missing export is a failure, but keep going: the phases below measure
     // behaviour (faults, addresses) that does not depend on it.
     if (!g_info) fail("smash_subarena_info is not exported");

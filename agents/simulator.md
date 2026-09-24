@@ -35,7 +35,9 @@ pages (`--cold`), which is what decides whether a run may enter the run cache.
 - **Sub-arena free lists** (with `--subarenas`), before and after a full
   purge, holding every sub-arena lock: every dirty or clean run lies in one
   chunk its sub-arena owns, no page is listed twice across dirty runs, clean
-  runs, tails and the chunk pool, each owner's counter equals its runs; and
+  runs, tails and the chunk pool, each owner's counter equals its runs, and
+  (for the shared arena's set) no run of the shared free map lies in a chunk
+  a sub-arena owns; and
   nothing is dirty after the purge (which also waits for the purger's
   in-flight runs, so the leak check cannot race it).
 - **No hang**: no progress for 3 s, or workers not stopping within 10 s, is
@@ -151,6 +153,22 @@ Those runs were unpinned: thread t allocated on node t % 4 from any CPU, so
 locks and queue heads crossed sockets; `--pin` was added to separate that
 from contention within a node.
 
+## Sub-arenas for plain malloc (2026-09-24, same host)
+
+`--numa 0` (every block through the shared arena), same flags, pinned:
+
+| threads | cache off | run cache 128 MiB | sub-arenas |
+|---|---|---|---|
+| 1 | 180k | 530k | 924k |
+| 2 | 299k | 756k | 1783k |
+| 4 | 413k | 1127k | 3432k |
+| 8 | 379k | 994k | 6114k |
+
+The shared path was worse off than the node path (its one free map and one
+decommit queue serve every thread): sub-arenas are 16x the baseline and 6x the
+run cache at 8 threads. 30% cross-thread frees: 5.40M vs 0.62M; 30% cold:
+1.77M vs 0.90M.
+
 ## Sub-arenas (2026-09-24, 8-CPU 4-node host)
 
 `--nodes 4 --arena-gib 64 --numa 1 --no-check --os-call-ns 3000 --pin`,
@@ -170,6 +188,13 @@ handed to another thread: 4.97M vs 1.21M. With 30% of frees cold the gap
 closes (1.99M vs 1.84M): cold frees still go through the node's one decommit
 thread, which saturates at 3 µs per OS call — the next bottleneck if the
 application frees many compressed blocks.
+
+**Finding with the shared set**: blocks larger than a chunk always carved
+fresh chunks and never reused the ones their frees pooled, so 70 MiB churn
+walked the whole 64 GiB arena in 2 s and node blocks then fell out of it
+(170717 in 2 s) — visible only in the placement line, since every page was
+still accounted for. Fixed; the invariant checks stay silent on placement by
+design, so read that line when a size mix includes blocks over 64 MiB.
 
 **Findings on first run**: the sub-arenas' free-map owner ids aliased the node
 arenas' own (node n uses owner n+1, which was sub-arena 0's dirty or clean
