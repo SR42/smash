@@ -23,7 +23,7 @@
 // Usage: smash_sim [--threads N] [--seconds S] [--nodes K] [--arena-gib G]
 //                  [--sizes 1M,2M:3,...] [--live K] [--numa F] [--cold F]
 //                  [--cross-free F] [--run-cache-mib M] [--os-call-ns NS]
-//                  [--no-check] [--seed X]
+//                  [--no-check] [--pin] [--seed X]
 // Exit status is 1 if an invariant failed.
 #include "smash/config.h"
 #include "core/large_alloc.h"
@@ -40,6 +40,7 @@
 #include <cstring>
 #include <dlfcn.h>
 #include <mutex>
+#include <sched.h>
 #include <string>
 #include <sys/mman.h>
 #include <thread>
@@ -62,6 +63,7 @@ struct Options {
     long run_cache_mib = 0;
     uint64_t os_call_ns = 0;
     bool check = true;
+    bool pin = false;         // run thread t on the CPUs of node t % nodes
     uint64_t seed = 1;
 };
 Options opt;
@@ -103,7 +105,7 @@ void usage() {
         "usage: smash_sim [--threads N] [--seconds S] [--nodes K] [--arena-gib G]\n"
         "                 [--sizes 1M,2M:3,...] [--live K] [--numa F] [--cold F]\n"
         "                 [--cross-free F] [--run-cache-mib M] [--os-call-ns NS]\n"
-        "                 [--no-check] [--seed X]\n");
+        "                 [--no-check] [--pin] [--seed X]\n");
     std::exit(2);
 }
 
@@ -124,6 +126,7 @@ void parseArgs(int argc, char** argv) {
         else if (a == "--run-cache-mib") opt.run_cache_mib = std::atol(next());
         else if (a == "--os-call-ns") opt.os_call_ns = std::strtoull(next(), nullptr, 10);
         else if (a == "--no-check") opt.check = false;
+        else if (a == "--pin") opt.pin = true;
         else if (a == "--seed") opt.seed = std::strtoull(next(), nullptr, 10);
         else usage();
     }
@@ -181,6 +184,37 @@ void freeBlock(const Block& b) {
     g_large.deallocate(span);
 }
 
+// ── Pinning ─────────────────────────────────────────────────────────────────
+// --pin: thread t runs on the CPUs of node t % nodes, so every allocation is
+// node-local — the NUMA-aware pattern. Without it a thread allocates on node
+// t % nodes from wherever the scheduler put it, and every lock and queue head
+// it touches may live on another socket. Simulated node n maps to real node
+// n % (real nodes); a host whose node lists cannot be read is not pinned.
+std::vector<cpu_set_t> g_node_cpus;
+void loadNodeCpus() {
+    for (int n = 0;; ++n) {
+        char path[96];
+        std::snprintf(path, sizeof(path), "/sys/devices/system/node/node%d/cpulist", n);
+        FILE* f = std::fopen(path, "r");
+        if (!f) break;
+        cpu_set_t set;
+        CPU_ZERO(&set);
+        char buf[4096] = {};
+        if (std::fgets(buf, sizeof(buf), f)) {
+            for (char* tok = std::strtok(buf, ",\n"); tok; tok = std::strtok(nullptr, ",\n")) {
+                int lo = 0, hi = 0;
+                if (std::sscanf(tok, "%d-%d", &lo, &hi) == 2) {
+                    for (int c = lo; c <= hi && c < CPU_SETSIZE; ++c) CPU_SET(c, &set);
+                } else if (std::sscanf(tok, "%d", &lo) == 1 && lo < CPU_SETSIZE) {
+                    CPU_SET(lo, &set);
+                }
+            }
+        }
+        std::fclose(f);
+        if (CPU_COUNT(&set) > 0) g_node_cpus.push_back(set);
+    }
+}
+
 // ── Workers ─────────────────────────────────────────────────────────────────
 struct alignas(64) Inbox {
     std::mutex m;
@@ -204,6 +238,10 @@ struct WorkerResult { uint64_t os_calls = 0; };
 
 void worker(int t, WorkerResult* out) {
     tl_rng = opt.seed * 0x9E3779B97F4A7C15ull + static_cast<uint64_t>(t) + 1;
+    if (opt.pin && !g_node_cpus.empty()) {
+        const cpu_set_t& set = g_node_cpus[static_cast<size_t>(t % opt.nodes) % g_node_cpus.size()];
+        sched_setaffinity(0, sizeof(set), &set);
+    }
     std::vector<Block> ring(static_cast<size_t>(opt.live));
     std::vector<Block> incoming;
     uint64_t ops = 0;
@@ -325,6 +363,11 @@ int main(int argc, char** argv) {
                 opt.os_call_ns, opt.numa, opt.cold, opt.cross_free, opt.live, opt.sizes.size(),
                 opt.check ? ", checking" : "");
 
+    if (opt.pin) {
+        loadNodeCpus();
+        std::printf("pinning: thread t on node t %% %d's CPUs, %zu real node(s)%s\n", opt.nodes,
+                    g_node_cpus.size(), g_node_cpus.empty() ? " — none readable, not pinned" : "");
+    }
     g_inbox = std::vector<Inbox>(static_cast<size_t>(opt.threads));
     std::vector<WorkerResult> results(static_cast<size_t>(opt.threads));
     std::vector<std::thread> th;

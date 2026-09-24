@@ -53,7 +53,7 @@ the footprint tests still pass on the corrected numbers.
 smash_sim [--threads N] [--seconds S] [--nodes K] [--arena-gib G]
           [--sizes 1M,2M:3,...] [--live K] [--numa F] [--cold F]
           [--cross-free F] [--run-cache-mib M] [--os-call-ns NS]
-          [--no-check] [--seed X]
+          [--no-check] [--pin] [--seed X]
 ```
 
 - `--sizes` is a list with optional weights (`1M:5,8M:1`); each thread picks
@@ -66,6 +66,10 @@ smash_sim [--threads N] [--seconds S] [--nodes K] [--arena-gib G]
 - `--cross-free F` fraction of frees handed to another thread (the
   `FreeDynMem` pattern: allocated on one thread, freed on another).
 - `--no-check` skips the ownership shadow for maximum rate.
+- `--pin` runs thread t on the CPUs of node t % nodes, so every allocation is
+  node-local. Without it, threads allocate on node t % nodes from wherever the
+  scheduler puts them, and the locks and queue heads they touch may live on
+  another socket.
 
 Output: ops/s per second, throughput, OS calls per op, placement, how far the
 arena was walked, run-cache counters, the ten most contended lock sites (share
@@ -114,3 +118,25 @@ map and one decommit queue per node" in [performance.md](performance.md).
 Fitting a curve past the point where background threads exceed the cores is
 meaningless: the plateau is the CPU budget, and the fit's error jumps from
 ~0.01 to 0.24-0.49 when it is included.
+
+## On the 128-core, 4-node aarch64 box (2026-09-24)
+
+`--nodes 4 --arena-gib 512 --seconds 5 --no-check --os-call-ns 3000
+--run-cache-mib 128`, allocate+free per second:
+
+| threads | before (2f0398b) | per-node (fcfaca0) | ratio |
+|---|---|---|---|
+| 8 | 621k | 800k | 1.29x |
+| 16 | 1160k | 1395k | 1.20x |
+| 32 | 1198k | 2417k | 2.02x |
+| 64 | 675k | 1579k | 2.34x |
+| 128 | 414k | 1083k | 2.62x |
+
+Both curves are **retrograde** past ~32 threads — the thing an 8-core box
+cannot show. A USL fit with a free per-thread rate puts all of it in the
+coherency term (cross-node cache-line traffic): kappa 0.0018 before, 0.00079
+per-node, peak moving from ~24 to ~36 threads and doubling (1.2M -> 2.4M), fit
+error 8-12% on five points. Per-node is still 55% below its own peak at 128.
+Those runs were unpinned: thread t allocated on node t % 4 from any CPU, so
+locks and queue heads crossed sockets; `--pin` was added to separate that
+from contention within a node.
