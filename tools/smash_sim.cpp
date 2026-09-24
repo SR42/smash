@@ -44,6 +44,7 @@
 #include <string>
 #include <sys/mman.h>
 #include <thread>
+#include <unistd.h>
 #include <vector>
 
 using namespace smash;
@@ -290,9 +291,19 @@ std::string symbolize(uintptr_t ra) {
         return raw;
     }
     const uintptr_t off = ra - reinterpret_cast<uintptr_t>(info.dli_fbase) - 1;
-    // dladdr gives an empty or relative path for the main program on some
-    // systems; the smash code is linked into this executable, so use it.
-    std::string file = (info.dli_fname && info.dli_fname[0] == '/') ? info.dli_fname : "/proc/self/exe";
+    // dladdr gives the main program's path as it was launched — relative
+    // ("./tests/smash_sim") or empty — so resolve our own executable here.
+    // Not "/proc/self/exe" itself: addr2line runs as a child process, where
+    // that link names addr2line.
+    std::string file;
+    if (info.dli_fname && info.dli_fname[0] == '/') {
+        file = info.dli_fname;
+    } else {
+        char self[4096];
+        const ssize_t n = readlink("/proc/self/exe", self, sizeof(self) - 1);
+        if (n > 0) { self[n] = 0; file = self; }
+        else if (info.dli_fname) file = info.dli_fname;
+    }
     char cmd[640];
     std::snprintf(cmd, sizeof(cmd), "addr2line -f -C -i -e '%s' 0x%" PRIxPTR " 2>/dev/null",
                   file.c_str(), off);
