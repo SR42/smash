@@ -284,11 +284,18 @@ void worker(int t, WorkerResult* out) {
 // ── Reporting ───────────────────────────────────────────────────────────────
 std::string symbolize(uintptr_t ra) {
     Dl_info info{};
-    if (!dladdr(reinterpret_cast<void*>(ra), &info) || !info.dli_fname) return "?";
+    if (!dladdr(reinterpret_cast<void*>(ra), &info) || !info.dli_fbase) {
+        char raw[40];
+        std::snprintf(raw, sizeof(raw), "0x%" PRIxPTR " (unresolved)", ra);
+        return raw;
+    }
     const uintptr_t off = ra - reinterpret_cast<uintptr_t>(info.dli_fbase) - 1;
-    char cmd[512];
+    // dladdr gives an empty or relative path for the main program on some
+    // systems; the smash code is linked into this executable, so use it.
+    std::string file = (info.dli_fname && info.dli_fname[0] == '/') ? info.dli_fname : "/proc/self/exe";
+    char cmd[640];
     std::snprintf(cmd, sizeof(cmd), "addr2line -f -C -i -e '%s' 0x%" PRIxPTR " 2>/dev/null",
-                  info.dli_fname, off);
+                  file.c_str(), off);
     std::string out;
     if (FILE* f = popen(cmd, "r")) {
         char line[512];
@@ -303,13 +310,22 @@ std::string symbolize(uintptr_t ra) {
         // guard, with its location.
         for (size_t i = 0; i + 1 < lines.size(); i += 2) {
             if (lines[i].find("LockGuard") != std::string::npos) continue;
+            if (lines[i] == "??") continue;
             std::string loc = lines[i + 1];
             if (size_t slash = loc.rfind('/'); slash != std::string::npos) loc = loc.substr(slash + 1);
             out = lines[i] + " @ " + loc;
             break;
         }
     }
-    return out.empty() ? "?" : out;
+    if (out.empty()) {
+        // No addr2line, or no debug info (-g): print the offset so it can be
+        // resolved by hand with `addr2line -f -C -i -e smash_sim 0x...`.
+        char raw[96];
+        std::snprintf(raw, sizeof(raw), "offset 0x%" PRIxPTR " in smash_sim (install binutils / "
+                      "build with -g to name it)", off);
+        out = raw;
+    }
+    return out;
 }
 
 void reportLocks(double seconds) {
