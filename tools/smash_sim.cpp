@@ -174,7 +174,6 @@ bool simRelease(size_t first, size_t count, void*) {
 // ── Invariant checking without touching block memory ────────────────────────
 std::atomic<uint32_t>* g_owner = nullptr;   // per arena page: 0 or the owning block id
 std::atomic<uint64_t> g_double_handout{0}, g_owner_mismatch{0}, g_span_mismatch{0};
-std::atomic<uint32_t> g_next_block_id{1};
 
 void claim(void* p, size_t bytes, uint32_t id) {
     if (!opt.check || !g_vm.inContigArena(reinterpret_cast<uintptr_t>(p))) return;
@@ -261,6 +260,7 @@ void worker(int t, WorkerResult* out) {
     std::vector<Block> ring(static_cast<size_t>(opt.live));
     std::vector<Block> incoming;
     uint64_t ops = 0;
+    uint32_t local_ids = 0;
     while (!g_stop.load(std::memory_order_relaxed)) {
         Block& slot = ring[rnd() % ring.size()];
         if (slot.p) {
@@ -288,7 +288,15 @@ void worker(int t, WorkerResult* out) {
             p = g_large.allocate(bytes, kMinAlignment, 0);
         if (!p) { ++g_nulls; continue; }
         if (!g_vm.inContigArena(reinterpret_cast<uintptr_t>(p))) ++g_outside;
-        slot = Block{p, bytes, g_next_block_id.fetch_add(1, std::memory_order_relaxed)};
+        // A per-thread id (thread in the low 10 bits, a counter above), and
+        // only when checking: a global counter is one cache line every thread
+        // writes on every allocation — shared state of the simulator's own,
+        // not the allocator's, and with --no-check it served nothing. Unique
+        // among live blocks (a thread holds --live of them and wraps only
+        // after 4M allocations) and never 0.
+        uint32_t id = 0;
+        if (opt.check) id = (++local_ids << 10) | static_cast<uint32_t>(t % 1023 + 1);
+        slot = Block{p, bytes, id};
         claim(slot.p, slot.bytes, slot.id);
         if ((++ops & 255) == 0) g_ops.fetch_add(256, std::memory_order_relaxed);
     }
