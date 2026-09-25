@@ -220,44 +220,62 @@ void phaseCold(int cpu) {
 // ── 4 ──────────────────────────────────────────────────────────────────────
 void phaseDirtyBound(int cpu) {
     pinTo(cpu);
-    std::vector<void*> blocks;
-    for (int i = 0; i < 16; ++i) {
-        auto* p = alloc(8u << 20);
-        if (!p) { fail("allocating 8 MiB failed"); break; }
-        touchFaults(p, 8u << 20, 3);
-        blocks.push_back(p);
-    }
-    for (void* p : blocks) free(p);
+    using clk = std::chrono::steady_clock;
+    auto ms = [](clk::duration d) { return std::chrono::duration<double, std::milli>(d).count(); };
     // The blocks can come from either of node0's two sub-arenas (earlier
     // phases left runs in both, and the sibling scan takes them), and each
     // frees home to its own cap: the bound is the two caps together.
     const size_t bound = 2 * cap_bytes + (8u << 20);
+    // One round: 16 x 8 MiB allocated, touched and freed on this CPU, then
+    // the dirty total followed for 100 ms. The verdict is the 5 ms sample;
+    // the rest says why when it fails — when the total got under the bound,
+    // how many purges ran, and how long the frees themselves took.
+    auto round = [&](int r) -> bool {
+        std::vector<void*> blocks;
+        for (int i = 0; i < 16; ++i) {
+            auto* p = alloc(8u << 20);
+            if (!p) { fail("allocating 8 MiB failed"); break; }
+            touchFaults(p, 8u << 20, 3);
+            blocks.push_back(p);
+        }
+        uint64_t d0 = 0, p0 = 0;
+        if (g_info) g_info(&d0, &p0);
+        const auto f0 = clk::now();
+        for (void* p : blocks) free(p);
+        const auto t0 = clk::now();
+        uint64_t at[4] = {};                 // 5, 10, 20, 50 ms
+        const int marks[4] = {5, 10, 20, 50};
+        double under_ms = -1;
+        for (int k = 0, m = 0; k <= 100; ++k) {
+            const uint64_t d = dirtyBytes();
+            const double t = ms(clk::now() - t0);
+            if (under_ms < 0 && d <= bound) under_ms = t;
+            while (m < 4 && t >= marks[m]) at[m++] = d;
+            if (m == 4 && under_ms >= 0) break;
+            usleep(1000);
+        }
+        uint64_t d1 = 0, p1 = 0;
+        if (g_info) g_info(&d1, &p1);
+        std::printf("  round %d: frees took %.2f ms; dirty %llu/%llu/%llu/%llu MiB at 5/10/20/50 ms; "
+                    "under %zu MiB after %.1f ms; %llu runs purged\n", r, ms(t0 - f0),
+                    static_cast<unsigned long long>(at[0] >> 20),
+                    static_cast<unsigned long long>(at[1] >> 20),
+                    static_cast<unsigned long long>(at[2] >> 20),
+                    static_cast<unsigned long long>(at[3] >> 20), bound >> 20, under_ms,
+                    static_cast<unsigned long long>(p1 - p0));
+        return at[0] <= bound;
+    };
     // Promptly, too: the purger's epoch is 50 ms, and a free that takes a
     // sub-arena over its cap must not wait for it (between epochs a fast
     // churn held 4-6x the cap dirty). 5 ms after each of three rounds, well
     // inside one epoch, so all three passing by luck is unlikely.
-    if (on) {
-        for (int round = 0; round < 3; ++round) {
-            usleep(5 * 1000);
-            const uint64_t soon = dirtyBytes();
-            std::printf("  5 ms after freeing 128 MiB (round %d): %llu MiB dirty\n", round + 1,
-                        static_cast<unsigned long long>(soon >> 20));
-            if (soon > bound) {
-                fail("%llu MiB dirty 5 ms after the frees, over two sub-arenas' %zu MiB caps: "
-                     "the cap waits for the purger's epoch",
-                     static_cast<unsigned long long>(soon >> 20), cap_bytes >> 20);
-                break;
-            }
-            if (round == 2) break;
-            blocks.clear();
-            for (int i = 0; i < 16; ++i) {
-                auto* p = alloc(8u << 20);
-                if (!p) break;
-                touchFaults(p, 8u << 20, 3);
-                blocks.push_back(p);
-            }
-            for (void* p : blocks) free(p);
+    for (int r = 1; r <= 3; ++r) {
+        if (!round(r) && on) {
+            fail("over two sub-arenas' %zu MiB caps 5 ms after the frees (round %d): the cap "
+                 "waits for the purger's epoch", cap_bytes >> 20, r);
+            break;
         }
+        if (!on) break;
     }
     usleep(120 * 1000);   // two purge epochs: the cap is enforced by the purger
     const uint64_t held = dirtyBytes();
