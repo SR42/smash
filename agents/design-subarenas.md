@@ -243,6 +243,14 @@ memory freed by one sub-arena is not stranded there.
   objects fit instead of 960; 978 with sub-arenas off). For any set, the
   last-resort retry after the region is out also takes siblings' tails, not
   only the caller's own. Both are `test_subarena_exhaust_*`.
+- **A miss folds the tail into the clean runs** before looking at siblings
+  (the tail and its free neighbour can serve what neither can alone), and
+  both that fold and a tail change pool the chunk if it is now wholly free.
+  Without the second, a chunk stranded: a miss drops the lock, another
+  thread frees into the sub-arena's dirty runs, the tail change leaves the
+  old chunk wholly free but only in this sub-arena's clean runs, and the
+  request is served from the fresh dirty run instead (`smash_sim` now checks
+  that no wholly free chunk is left unpooled after a full purge).
 - **Blocks larger than a chunk reuse pooled chunks** (`takePooledRunLocked`:
   consecutive indices in the sorted pool) before carving fresh ones. Phase 1
   always carved, so freed big blocks only fed the pool and 70 MiB churn walked

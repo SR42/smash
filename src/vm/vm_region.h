@@ -309,7 +309,7 @@ class VmRegion {
                 const uint64_t now = nowMs();
                 const bool urgent = q->purge_now.load(std::memory_order_relaxed) &&
                                     q->purge_now.exchange(false, std::memory_order_acq_rel);
-                if (urgent || now - last_purge_ms >= kPurgeEpochMs) {
+                if (urgent || now - last_purge_ms >= purgeEpochMs()) {
                     last_purge_ms = now;
                     if (q->node >= 0)
                         self->purgeNodeSubArenas(static_cast<uint32_t>(q->node), /*all=*/false);
@@ -1653,7 +1653,7 @@ private:
     static constexpr uint8_t kChunkUnowned = 0;   // chunk_sub_: none / node-level
     static constexpr uint8_t kChunkBig = 0xFF;    // a block larger than a chunk
     static constexpr uint32_t kMaxSubArenas = 64;
-    static constexpr uint64_t kPurgeEpochMs = 50;
+    static constexpr uint64_t kPurgeEpochMs = 50;   // default of purgeEpochMs()
     std::atomic<std::atomic<uint8_t>*> chunk_sub_{nullptr};   // per chunk: sub + 1, or the above
 #if defined(__linux__)
     int16_t cpu_node_[CPU_SETSIZE];
@@ -1678,6 +1678,17 @@ private:
             return x > 0 ? static_cast<uint32_t>(x < kMaxSubArenas ? x : kMaxSubArenas) : 0u;
         }();
         return n;
+    }
+    // How often the purger sweeps for aged runs (SMASH_PURGE_EPOCH_MS, default
+    // 50). A free over the cap does not wait for it. Tests lengthen it so a
+    // purge that did wait would be visible.
+    static uint64_t purgeEpochMs() {
+        static const uint64_t ms = [] {
+            const char* v = std::getenv("SMASH_PURGE_EPOCH_MS");
+            const long long x = v ? std::atoll(v) : 0;
+            return x > 0 ? static_cast<uint64_t>(x) : kPurgeEpochMs;
+        }();
+        return ms;
     }
     static uint64_t dirtyDecayMs() {
         static const uint64_t ms = [] {
@@ -1959,10 +1970,22 @@ private:
         if (need > kNodeChunkPages) return allocateBigOnSubArenas(na, node, num_pages, align_pages, phase);
         const uint32_t n = na.nsubs;
         const uint32_t me = subIndex(node, n);
-        // Own sub-arena: dirty, clean, tail.
+        // Own sub-arena: dirty, clean, tail — then the tail folded into the
+        // clean runs, where it merges with a free neighbour (a request can fit
+        // the two together and neither alone), and if that still misses, the
+        // chunk pooled in case the fold made it wholly free.
         {
-            LockGuard guard(na.subs[me].lock);
+            SubArena& sa = na.subs[me];
+            LockGuard guard(sa.lock);
             if (void* p = takeFromSubLocked(na, me, num_pages, align_pages, phase, true)) return p;
+            if (sa.cur < sa.end) {
+                const size_t idx = sa.cur;
+                na.map.insertUnlocked(sa.cur, sa.end - sa.cur, ownerClean(me), kNodeChunkPages, 0);
+                sa.cur = sa.end;
+                if (void* p = takeFromSubLocked(na, me, num_pages, align_pages, phase, false))
+                    return p;
+                maybeReturnChunkLocked(na, me, idx);
+            }
         }
         // Siblings, trylock only: a busy sibling is skipped, not waited for.
         for (uint32_t i = 1; i < n; ++i) {
@@ -1977,11 +2000,19 @@ private:
         if (start != kNoChunk) {
             SubArena& sa = na.subs[me];
             LockGuard guard(sa.lock);
-            // The old tail's unused pages are fresh, never touched: clean.
-            if (sa.end > sa.cur)
+            // Another thread of this sub-arena may have set a tail since the
+            // fold above. Its unused pages are fresh: clean, and if that makes
+            // the chunk wholly free it goes to the pool — this request may be
+            // served from a dirty run freed meanwhile, and nothing else would
+            // ever pool it (found as a whole free chunk stranded in a
+            // sub-arena's clean runs, 8 threads on 2 CPUs).
+            const size_t old_cur = sa.cur;
+            const bool had_tail = sa.end > sa.cur;
+            if (had_tail)
                 na.map.insertUnlocked(sa.cur, sa.end - sa.cur, ownerClean(me), kNodeChunkPages, 0);
             sa.cur = start;
             sa.end = start + kNodeChunkPages;
+            if (had_tail) maybeReturnChunkLocked(na, me, old_cur);
             if (void* p = takeFromSubLocked(na, me, num_pages, align_pages, phase, true)) return p;
         }
         // The node is out of region: compressed frees may be in flight to
@@ -2255,8 +2286,10 @@ public:
     // owner's counter equal to its runs' sum. Holds every sub-arena lock and
     // the pool lock, so a purge in flight is only absent, never half-moved.
     // Prints what it finds; returns the number of problems.
-    // `node` -1 checks the shared set.
-    int checkSubArenas(int node) {
+    // `node` -1 checks the shared set. `quiet`: nothing is allocated and
+    // nothing is dirty (after a full purge), so a clean run covering a whole
+    // chunk is one that should have been pooled.
+    int checkSubArenas(int node, bool quiet = false) {
         NodeArena* set = nullptr;
         if (node < 0) set = shared_set_.load(std::memory_order_acquire);
         else if (NodeArena* arenas = node_arenas_.load(std::memory_order_acquire))
@@ -2283,6 +2316,11 @@ public:
                 na.map.forEachRunUnlocked(o, [&](size_t st, size_t len, uint32_t) {
                     ivs.push_back({st, len, kind, i});
                     sum += len;
+                    if (quiet && kind == 1 && len == kNodeChunkPages) {
+                        std::printf("  node %d sub %u: chunk %zu is wholly free but not pooled\n",
+                                    node, i, chunkOfPage(st));
+                        ++bad;
+                    }
                     if (chunkOfPage(st) != chunkOfPage(st + len - 1)) {
                         std::printf("  node %d sub %u: %s run %zu+%zu crosses a chunk\n",
                                     node, i, kind ? "clean" : "dirty", st, len);

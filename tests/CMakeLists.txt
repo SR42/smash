@@ -621,7 +621,7 @@ if(NOT APPLE)
   target_link_libraries(subarena_test PRIVATE ${CMAKE_DL_LIBS} Threads::Threads)
   set(_sa_env "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_COLD_TIMEOUT_SEC=1"
               "SMASH_DEFER_PHASES_MS=0" "SMASH_SUBARENAS_PER_NODE=2"
-              "SMASH_DIRTY_DECAY_MS=200" "SMASH_DIRTY_MAX_MIB=32")
+              "SMASH_DIRTY_DECAY_MS=200" "SMASH_DIRTY_MAX_MIB=32" "SMASH_PURGE_EPOCH_MS=200")
   add_test(NAME test_subarena_off COMMAND ${CMAKE_COMMAND} -E env ${_sa_env}
     "SMASH_LARGE_ONLY=1" $<TARGET_FILE:subarena_test>)
   add_test(NAME test_subarena_on COMMAND ${CMAKE_COMMAND} -E env ${_sa_env}

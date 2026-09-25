@@ -567,7 +567,7 @@ int main(int argc, char** argv) {
         ++failures;
     }
     for (int n = -1; n < opt.nodes; ++n) {   // -1: the shared arena's set
-        if (const int bad = g_vm.checkSubArenas(n)) {
+        if (const int bad = g_vm.checkSubArenas(n, /*quiet=*/true)) {
             std::printf("FAIL: %s %d: %d sub-arena free-list problem(s) after the purge (above)\n",
                         n < 0 ? "shared set" : "node", n, bad);
             ++failures;

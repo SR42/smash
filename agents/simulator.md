@@ -37,7 +37,8 @@ pages (`--cold`), which is what decides whether a run may enter the run cache.
   chunk its sub-arena owns, no page is listed twice across dirty runs, clean
   runs, tails and the chunk pool, each owner's counter equals its runs, and
   (for the shared arena's set) no run of the shared free map lies in a chunk
-  a sub-arena owns; and
+  a sub-arena owns; after the purge, no clean run covers a whole chunk (it
+  should be in the pool); and
   nothing is dirty after the purge (which also waits for the purger's
   in-flight runs, so the leak check cannot race it).
 - **No hang**: no progress for 3 s, or workers not stopping within 10 s, is

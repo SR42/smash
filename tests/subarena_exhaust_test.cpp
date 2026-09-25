@@ -16,9 +16,13 @@
 //   churn 2 MiB blocks, which leaves up to 8 sub-arenas each holding a tail
 //   and pooled chunks; after they are freed, 256-byte objects (slab spans,
 //   which never use sub-arenas) must still fill at least 900 MiB of the
-//   region. Measured on the 8-CPU host: 978 MiB with sub-arenas off, 960 MiB
-//   with sub-arenas on; 448 MiB without donating the pooled chunks and 576
-//   MiB without retiring the tails into them (both mutations fail).
+//   region. The churn runs on two CPUs of one node, so its threads share two
+//   sub-arenas and are preempted inside them. Measured on the 8-CPU host: 978
+//   MiB with sub-arenas off, 960 MiB with sub-arenas on (the rest is the chunk
+//   holding the test's own 36 MB pointer array); 448 MiB without donating the
+//   pooled chunks, 576 MiB without retiring the tails into them, and 768-896
+//   MiB in about half the runs when a chunk left wholly free by a tail change
+//   was not pooled (also seen on the 128-core aarch64 box: 896).
 //
 // PHASE C (SUBARENA_EXHAUST_PHASE=C) - blocks larger than a chunk get whole
 //   chunks of their own, which go back to the pool when freed; the next such
@@ -26,6 +30,7 @@
 //   allocate/free of a 100 MiB block, through malloc_numa and through plain
 //   malloc, must all stay in the 1 GiB region. With fresh chunks every time,
 //   the region runs out after a handful of rounds.
+
 #include <cerrno>
 #include <cstdint>
 #include <cstdio>
@@ -104,6 +109,29 @@ int phaseA() {
 int phaseB() {
     const char* lo = std::getenv("SMASH_LARGE_ONLY");
     if (lo && lo[0] == '1') { std::printf("SKIP: phase B needs full mode\n"); return 0; }
+    // Eight threads on two CPUs of one node: they share two sub-arenas and
+    // are preempted inside them, which is what stranded whole free chunks in
+    // a sub-arena's clean runs (768-896 MiB instead of 960, about half the
+    // runs, before the fix; the 128-core box's 896 was the same). Spread
+    // over more CPUs it did not show.
+    cpu_set_t allowed, two;
+    sched_getaffinity(0, sizeof(allowed), &allowed);
+    CPU_ZERO(&two);
+    {
+        const std::vector<int> nodes = numa_test::memoryNodes();
+        char path[96];
+        std::snprintf(path, sizeof(path), "/sys/devices/system/node/node%d/cpulist",
+                      nodes.empty() ? 0 : nodes[0]);
+        int picked = 0;
+        for (int c : numa_test::readList(path))
+            if (CPU_ISSET(c, &allowed) && picked < 2) { CPU_SET(c, &two); ++picked; }
+        if (picked == 0) two = allowed;
+    }
+    // The whole process from here, before its first large block, so smash's
+    // lazily started purger thread inherits the two CPUs as well: confining
+    // only the churn threads showed the stranding in 2 runs of 20, the whole
+    // process in about half.
+    sched_setaffinity(0, sizeof(two), &two);
     std::vector<std::thread> th;
     for (int t = 0; t < 8; ++t) {
         th.emplace_back([] {
@@ -179,7 +207,9 @@ int main() {
     g_in_arena = reinterpret_cast<in_arena_fn>(dlsym(RTLD_DEFAULT, "smash_in_arena"));
     if (!g_numa || !g_in_arena) { std::printf("SKIP: not running under libsmash\n"); return 0; }
     const char* ph = std::getenv("SUBARENA_EXHAUST_PHASE");
-    const int rc = ph && ph[0] == 'B' ? phaseB() : ph && ph[0] == 'C' ? phaseC() : phaseA();
+    const int rc = ph && ph[0] == 'B'   ? phaseB()
+                   : ph && ph[0] == 'C' ? phaseC()
+                                        : phaseA();
     std::printf("subarena_exhaust_test: %s\n", rc ? "FAILED" : "done");
     return rc;
 }

@@ -17,8 +17,8 @@
 //      the first -> the same block, no faults
 //   3. cold: a block compressed before it is freed is not reused dirty, and
 //      is fully writable afterwards
-//   4. dirty memory stays under the cap (within 5 ms of the frees, not only
-//      at the purger's next epoch) and drains to 0 after the decay time
+//   4. dirty memory stays under the cap (within 20 ms of the frees, not only
+//      at the purger's next sweep) and drains to 0 after the decay time
 //   5. sibling scan: a sub-arena with nothing free takes a sibling's dirty run
 //      instead of carving a new chunk
 //   6. churn: tagged blocks from many threads never overlap and stay on node
@@ -230,6 +230,13 @@ void phaseDirtyBound(int cpu) {
     // the dirty total followed for 100 ms. The verdict is the 5 ms sample;
     // the rest says why when it fails — when the total got under the bound,
     // how many purges ran, and how long the frees themselves took.
+    //
+    // The verdict is the 20 ms sample. Registered with a 200 ms purge sweep
+    // (SMASH_PURGE_EPOCH_MS), so a purge that waited for the sweep would get
+    // there in time in about one round of ten, and all three rounds about
+    // once in a thousand. 5 ms was too tight: the 128-core aarch64 box took
+    // 7.4 ms to get under the bound (madvise is slower with 128 CPUs to
+    // shoot down), this host 0-3.4 ms.
     auto round = [&](int r) -> bool {
         std::vector<void*> blocks;
         for (int i = 0; i < 16; ++i) {
@@ -243,7 +250,7 @@ void phaseDirtyBound(int cpu) {
         const auto f0 = clk::now();
         for (void* p : blocks) free(p);
         const auto t0 = clk::now();
-        uint64_t at[4] = {};                 // 5, 10, 20, 50 ms
+        uint64_t at[4] = {};                 // 5, 10, 20, 50 ms; the verdict is at 20
         const int marks[4] = {5, 10, 20, 50};
         double under_ms = -1;
         for (int k = 0, m = 0; k <= 100; ++k) {
@@ -263,21 +270,22 @@ void phaseDirtyBound(int cpu) {
                     static_cast<unsigned long long>(at[2] >> 20),
                     static_cast<unsigned long long>(at[3] >> 20), bound >> 20, under_ms,
                     static_cast<unsigned long long>(p1 - p0));
-        return at[0] <= bound;
+        return at[2] <= bound;
     };
-    // Promptly, too: the purger's epoch is 50 ms, and a free that takes a
-    // sub-arena over its cap must not wait for it (between epochs a fast
-    // churn held 4-6x the cap dirty). 5 ms after each of three rounds, well
-    // inside one epoch, so all three passing by luck is unlikely.
+    // Promptly, too: a free that takes a sub-arena over its cap must not wait
+    // for the purger's sweep (between sweeps a fast churn held 4-6x the cap
+    // dirty).
     for (int r = 1; r <= 3; ++r) {
         if (!round(r) && on) {
-            fail("over two sub-arenas' %zu MiB caps 5 ms after the frees (round %d): the cap "
-                 "waits for the purger's epoch", cap_bytes >> 20, r);
+            fail("over two sub-arenas' %zu MiB caps 20 ms after the frees (round %d): the cap "
+                 "waits for the purger's sweep", cap_bytes >> 20, r);
             break;
         }
         if (!on) break;
     }
-    usleep(120 * 1000);   // two purge epochs: the cap is enforced by the purger
+    // Still under the caps a little later, and not yet decayed (200 ms): the
+    // last frees were ~50 ms ago (the round's polling), so ~110 ms by now.
+    usleep(60 * 1000);
     const uint64_t held = dirtyBytes();
     std::printf("  after freeing 128 MiB on one CPU: %llu MiB dirty (cap %zu MiB)\n",
                 static_cast<unsigned long long>(held >> 20), cap_bytes >> 20);
@@ -287,7 +295,7 @@ void phaseDirtyBound(int cpu) {
     if (on && held == 0) fail("freeing 128 MiB of warm blocks left nothing dirty");
     if (!on && held) fail("%llu bytes dirty with sub-arenas off",
                           static_cast<unsigned long long>(held));
-    usleep(700 * 1000);   // decay 200 ms + epochs
+    usleep(700 * 1000);   // decay 200 ms + a 200 ms sweep, with margin
     const uint64_t left = dirtyBytes();
     std::printf("  700 ms later: %llu bytes dirty\n", static_cast<unsigned long long>(left));
     if (left) fail("%llu bytes still dirty well past the decay time",
