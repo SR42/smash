@@ -1589,6 +1589,10 @@ public:
                 span = page_map_.get(addr);
             }
             if (!span) [[unlikely]] return freeSlow(ptr);
+            // Large spans are never cached: freeing one does not bump the
+            // page-map generation (see g_pagemap_generation), so a cached
+            // large span could outlive its mapping.
+            if (span->is_large) [[unlikely]] { large_alloc_.deallocate(span); return; }
             // Repopulate-throttle: under sustained misses (a locality-free
             // workload) the populate stores are pure overhead, so only
             // repopulate every freeCacheRepopInterval()-th miss. A hit above

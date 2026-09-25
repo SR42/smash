@@ -232,7 +232,10 @@ public:
 
         // O(1) clear: only clear the first page (matches O(1) registration).
         // Must clear BEFORE releasing pages to prevent race with reallocation.
-        page_map_->set(reinterpret_cast<uintptr_t>(base), nullptr);
+        // No generation bump: large spans never enter free()'s TLS span
+        // cache, and the bump was one global cache line every large free
+        // wrote (see g_pagemap_generation).
+        page_map_->set(reinterpret_cast<uintptr_t>(base), nullptr, /*bump=*/false);
 
         // Placement test, NOT contains(): under SMASH_TRACK_EXTERNAL,
         // contains() also matches externally-TRACKED pages (including this

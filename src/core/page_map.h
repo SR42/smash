@@ -22,10 +22,15 @@
 namespace smash {
 
 // Global page→span mapping generation. Bumped every time a page's span
-// mapping is torn down (PageMap::set(addr, nullptr) — the universal teardown
-// signal for both Slab::releaseSpan and LargeAlloc::deallocate). Address-keyed
-// span caches (e.g. the free() TLS last-span cache) stamp this value at
-// populate time and discard the cache on mismatch.
+// mapping is torn down (PageMap::set(addr, nullptr)), except for a large
+// block's: large spans never enter an address-keyed cache, so nothing can go
+// stale when one goes, and LargeAlloc::deallocate passes bump = false.
+// Address-keyed span caches (the free() TLS last-span cache) stamp this value
+// at populate time and discard the cache on mismatch.
+//
+// Large frees used to bump it too, and at 128 threads that one cache line was
+// the allocator's bottleneck: 49% of smash_sim's time in PageMap::set on the
+// 128-core aarch64 box, with 1.8% waiting on any lock.
 //
 // Correctness rests on the load-before-read ordering at the cache site: read
 // the generation BEFORE reading the span mapping. A teardown that races the
@@ -92,7 +97,9 @@ public:
     // is to be consistent with the radix tree.
     void attachVmRegion(VmRegion* vr) { vm_region_ = vr; }
 
-    void set(uintptr_t addr, Span* span) {
+    // `bump` = false only for a span no address-keyed cache ever holds (large
+    // blocks, see g_pagemap_generation).
+    void set(uintptr_t addr, Span* span, bool bump = true) {
         const auto page_idx = addr >> kPageShift;
         const auto l1 = page_idx >> kPageMapL2Bits;
         const auto l2 = page_idx & (kPageMapL2Size - 1);
@@ -104,7 +111,7 @@ public:
         // cache. Bump after the store so observers that reload the generation
         // and re-resolve see the cleared mapping. release ordering pairs with
         // the acquire load at the cache site.
-        if (span == nullptr) {
+        if (span == nullptr && bump) {
             g_pagemap_generation.fetch_add(1, std::memory_order_release);
         }
     }

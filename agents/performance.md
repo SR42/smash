@@ -570,3 +570,26 @@ pinned threads being *slower* at 32 threads (1.5M against 2.0M
 allocate+free/s unpinned), while pinning still helped at 128 (1.3M against
 1.0M). All three pools are 256 shards now: one per CPU on hosts up to 256.
 The run cache's cap is per CPU, so its worst case is CPUs x cap.
+
+## Every large free bumped one global counter (2026-09-25)
+
+With sub-arenas the node and shared paths no longer meet at a lock, and
+`smash_sim` on the 128-core, 4-node aarch64 box still barely scaled with
+threads (plain malloc, pinned: ~1.5M allocate+free/s at 128 threads) while the
+busiest lock site waited 1.8% of thread time. `perf` put **49% of all time in
+`PageMap::set`**: `LargeAlloc::deallocate` clears the block's page-map entry,
+and every teardown did `g_pagemap_generation.fetch_add` — one cache line
+written by every large free on every core. The counter only invalidates
+free()'s per-thread last-span cache, and that cache must then never hold a
+large span: descriptors are recycled, so a stale entry would name whatever
+block its descriptor describes next (`test_large_free_span_cache` frees a
+live 1 MiB block that way when large spans are cached without the bump).
+Large spans are no longer cached (the fast path dispatches them before the
+fill) and a large free clears its entry with `bump = false`; slab and mid
+teardowns still bump.
+
+On the 8-CPU host the bump was worth 1-4% (plain malloc with sub-arenas, 8
+threads: 7.21M -> 7.62M). The simulator had its own global counter on the
+same path (`g_next_block_id`, a block id taken even with `--no-check`,
+removed in `2d4852a`); removing it alone did not help the 128-core box, which
+is how the page-map counter was found.

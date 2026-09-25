@@ -608,6 +608,18 @@ if(NOT APPLE)
     test_run_cache_on_softdirty0 PROPERTIES TIMEOUT 180)
 endif()
 
+# A large free must not leave a stale entry in free()'s per-thread span
+# cache: large spans never enter it, so large frees need not bump the global
+# page-map generation (large_free_span_cache_test.cpp).
+if(NOT APPLE)
+  add_executable(large_free_span_cache_test large_free_span_cache_test.cpp)
+  target_link_libraries(large_free_span_cache_test PRIVATE ${CMAKE_DL_LIBS})
+  add_test(NAME test_large_free_span_cache COMMAND ${CMAKE_COMMAND} -E env
+    "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=0" "SMASH_VM_GIB=1"
+    $<TARGET_FILE:large_free_span_cache_test>)
+  set_tests_properties(test_large_free_span_cache PROPERTIES TIMEOUT 120)
+endif()
+
 # Per-CPU sub-arenas with immediate dirty reuse (SMASH_SUBARENAS,
 # agents/design-subarenas.md). One body, seven registrations: off must mean
 # today's behaviour; on in both heap modes; on with SMASH_SOFTDIRTY=0 (Phase 3
