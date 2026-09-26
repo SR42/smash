@@ -106,10 +106,19 @@ static void phaseA() {
     // is not the race. What is left is a bounded wait expiring and, for a
     // 512-page contiguous request, the free map not holding a run that long at
     // that instant. Unfixed the same runs gave 1728 / 46263 / 93726 / 144241,
-    // i.e. 4% to 90%. 0.5% sits ~6x above the residual and ~60x below the
+    // i.e. 4% to 90%. 0.5% sat ~6x above the residual and ~60x below the
     // smallest unfixed figure.
+    //
+    // That residual was the bounded wait, and it was not harmless: over 1100
+    // blocks fell out on the 128-core aarch64 box (2026-09-26), 466-548 here
+    // with three copies running at once. The wait is now time-bounded (50 ms)
+    // and the drain skips a redundant mprotect that serialised the process
+    // (see processDecommitEntry): 0 of 160000, idle and loaded, in both
+    // modes. The allowance is 0.05% (80): still a margin for a stalled
+    // machine, and below the 130-274 the counted wait left here, so this
+    // phase fails on this host too if the wait regresses.
     const long total = per_thread * threads;
-    const long allowed = total / 200;
+    const long allowed = total / 2000;
     if (out > allowed || nulls) {
         std::fprintf(stderr,
             "FAIL: phase A: %d threads x %ld round trips of 2 MiB gave %ld block(s) "

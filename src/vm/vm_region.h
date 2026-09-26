@@ -107,6 +107,7 @@ class VmRegion {
         size_t page_index;
         int node;  // owning NUMA node arena, or -1 for the shared free lists
         unsigned shard;  // the entry pool shard it came from and returns to
+        bool reusable;   // no page was COMPRESSED: none is PROT_NONE (see processDecommitEntry)
         DecommitEntry* next;
     };
 
@@ -186,7 +187,8 @@ class VmRegion {
         sh.head = e;
     }
 
-    void queueForDecommit(void* addr, size_t num_pages, size_t page_index, int node) {
+    void queueForDecommit(void* addr, size_t num_pages, size_t page_index, int node,
+                          bool reusable) {
         DecommitQueue& q = queueOf(node);
         // Counted from before the entry even exists. A run that has left its
         // owner but has not yet reached the free map is invisible to an
@@ -206,6 +208,7 @@ class VmRegion {
             local.num_pages = num_pages;
             local.page_index = page_index;
             local.node = node;
+            local.reusable = reusable;
             processDecommitEntry(&local);
             q.pending.fetch_sub(1, std::memory_order_acq_rel);
             return;
@@ -214,6 +217,7 @@ class VmRegion {
         e->num_pages = num_pages;
         e->page_index = page_index;
         e->node = node;
+        e->reusable = reusable;
         // Lock-free push to this owner's MPSC queue
         DecommitEntry* head = q.head.load(std::memory_order_relaxed);
         do {
@@ -233,7 +237,19 @@ class VmRegion {
         // pages followed by reuse of those addresses (e.g. test7_full
         // walrus crash with "DenseMap node count imbalance" or null-deref
         // in nlohmann::json::destroy).
-        vm::commitPages(e->addr, e->num_pages * kPageSize);
+        //
+        // Only then, though. A run whose release reported no COMPRESSED page
+        // (`reusable`) has no PROT_NONE page, and a PROT_READ one left by
+        // Phase 3 monitoring is restored by the fault handler once the run's
+        // next owner marks it ACTIVE — every taker of free-map runs does (slab
+        // spans, mid bins, large blocks), the guarantee the run cache and the
+        // sub-arenas' dirty reuse rely on. Skipping the mprotect matters:
+        // it takes the process's mmap_lock for writing, and with 32 threads
+        // churning 2 MiB blocks it cost 251 us per run (0.8 us alone) and
+        // dragged the madvise after it from 6.7 to 123 us, so freed runs came
+        // back too slowly and allocations fell out of the arena
+        // (test_shared_arena_churn).
+        if (!e->reusable) vm::commitPages(e->addr, e->num_pages * kPageSize);
 
         // Decommit the pages (release physical backing).
         vm::decommitPages(e->addr, e->num_pages * kPageSize);
@@ -717,8 +733,8 @@ public:
                                               n_evicted, std::memory_order_relaxed);
             sh.bytes_published.store(sh.bytes, std::memory_order_relaxed);
         }
-        for (unsigned i = 0; i < n_evicted; ++i)
-            releasePages(evicted[i].addr, evicted[i].pages);
+        for (unsigned i = 0; i < n_evicted; ++i)   // only reusable runs are cached
+            releasePages(evicted[i].addr, evicted[i].pages, /*reusable=*/true);
         return true;
     }
 
@@ -771,7 +787,8 @@ public:
             if (n) sh.trimmed.store(sh.trimmed.load(std::memory_order_relaxed) + n,
                                     std::memory_order_relaxed);
             sh.lock.unlock();
-            for (unsigned i = 0; i < n; ++i) releasePages(out[i].addr, out[i].pages);
+            for (unsigned i = 0; i < n; ++i)
+                releasePages(out[i].addr, out[i].pages, /*reusable=*/true);
         }
     }
 
@@ -914,7 +931,8 @@ public:
             // them all back first, or a full cache would push this allocation
             // out of the arena.
             trimRunCache(/*all=*/true);
-            for (int attempt = 0; drainWaitEnabled() && attempt < kDrainWaitAttempts;
+            uint64_t deadline = 0;
+            for (int attempt = 0; drainWaitEnabled() && drainWaitMore(attempt, deadline);
                  ++attempt) {
                 drainQueueNow(shared_queue_);
                 if (const size_t idx = free_map_.take(num_pages, kSharedOwner);
@@ -973,7 +991,9 @@ public:
         committed_pages_.store(target, std::memory_order_release);
     }
 
-    void releasePages(void* addr, size_t num_pages) {
+    // `reusable`: the release reported no COMPRESSED page (LargeAlloc and
+    // cached runs know it); anything else takes the protection restore.
+    void releasePages(void* addr, size_t num_pages, bool reusable = false) {
         if (tracking_mode_) return;
 
         // Refuse non-arena addresses. The free list stores ARENA page indices;
@@ -1039,7 +1059,7 @@ public:
         size_t page_idx = pageIndex(reinterpret_cast<uintptr_t>(addr));
         const int node = nodeOfPage(page_idx);
         ensureDecommitThreadStarted(queueOf(node));
-        queueForDecommit(addr, num_pages, page_idx, node);
+        queueForDecommit(addr, num_pages, page_idx, node, reusable);
     }
 
     static bool landminesEnabled() {
@@ -1598,7 +1618,8 @@ exhausted:
         // of different owners never merge. It cannot produce a chunk for this
         // node. Cached runs can (some are this node's), so they go back first.
         trimRunCache(/*all=*/true);
-        for (int attempt = 0; drainWaitEnabled() && attempt < kDrainWaitAttempts;
+        uint64_t deadline = 0;
+        for (int attempt = 0; drainWaitEnabled() && drainWaitMore(attempt, deadline);
              ++attempt) {
             // Drained WITHOUT na.lock, as in the common path: holding it
             // across the drain's mprotect/madvise serialises every other
@@ -2019,7 +2040,8 @@ private:
         // clean runs, and siblings are worth waiting for now — their unused
         // tails too (a block there belongs to the sibling's chunk and goes
         // home to it), or free space parked in them fails the allocation.
-        for (int attempt = 0; attempt < kDrainWaitAttempts; ++attempt) {
+        uint64_t deadline = 0;
+        for (int attempt = 0; drainWaitMore(attempt, deadline); ++attempt) {
             drainQueueNow(subQueue(na));
             for (uint32_t i = 0; i < n; ++i) {
                 const uint32_t s = (me + i) % n;
@@ -2456,11 +2478,25 @@ private:
     }
     static constexpr size_t kNoChunk = ~size_t{0};
 
-    // How many times an exhausted node allocation re-checks for a run that is
-    // still on its way back to the free map. Bounded so a genuinely full arena
-    // still fails promptly; each attempt only spins when another thread is
-    // demonstrably mid-drain.
+    // How long an allocation that missed keeps re-checking for a run that is
+    // still on its way back to its free map: at least kDrainWaitAttempts
+    // tries, then until kDrainWaitMs have passed. The loops stop as soon as
+    // nothing is in flight, so a genuinely full arena still fails promptly;
+    // this only bounds a wait for runs another thread is processing. A count
+    // of yields alone was a few hundred microseconds, and with the whole
+    // arena in the decommit pipeline (32 threads churning 2 MiB blocks
+    // through 1 GiB) it expired while runs were still coming: 150-260 blocks
+    // of 160000 fell out here and over 1100 on the 128-core aarch64 box
+    // (test_shared_arena_churn). Waiting without a bound gave 0.
     static constexpr int kDrainWaitAttempts = 64;
+    static constexpr uint64_t kDrainWaitMs = 50;
+    // For those loops: whether to try again. `deadline` starts at 0.
+    static bool drainWaitMore(int attempt, uint64_t& deadline) {
+        if (attempt < kDrainWaitAttempts) return true;
+        const uint64_t now = nowMs();
+        if (deadline == 0) deadline = now + kDrainWaitMs;
+        return now < deadline;
+    }
 
     // Both created on first use, indexed by node id and by grid chunk.
     // node_of_chunk_[c] is node+1, or 0 for a chunk no node arena owns. It is

@@ -593,3 +593,26 @@ threads: 7.21M -> 7.62M). The simulator had its own global counter on the
 same path (`g_next_block_id`, a block id taken even with `--no-check`,
 removed in `2d4852a`); removing it alone did not help the 128-core box, which
 is how the page-map counter was found.
+
+## Freed runs came back too slowly, and the wait for them was too short (2026-09-26)
+
+`test_shared_arena_churn` phase A (32 threads churning 2 MiB blocks through a
+1 GiB arena) failed on the 128-core aarch64 box with 1192/1173 of 160000
+blocks outside the arena. With that much churn nearly the whole arena is in
+the decommit pipeline at any instant, so an allocation that misses has to wait
+for a run to be processed. Two things made that wait fail:
+
+- **The drain was serialised by a redundant `mprotect`.** Every entry did
+  `mprotect(RW)` before `madvise`, to undo compression's PROT_NONE — even when
+  the release had reported no COMPRESSED page. `mprotect` takes `mmap_lock` for
+  writing: 0.8 us per call alone, 251 us at 32 threads, and it dragged the
+  `madvise` from 6.7 to 123 us. A reusable run now skips it (the entry carries
+  `reusable`); a PROT_READ page left by monitoring is restored by the fault
+  handler once the next owner marks the page ACTIVE, which every taker does.
+- **The wait was 64 `sched_yield`s**, a few hundred microseconds. It is now
+  at least that, then up to 50 ms while runs are still in flight, in the
+  shared, node and sub-arena retry loops.
+
+Phase A: 0 of 160000 out, idle and with three copies at once (was 188-264 and
+466-548), and the phase takes half the time (1.1-1.3 s vs 2.3-2.5 s). The
+timed wait alone also reaches 0; the `mprotect` skip alone 23-85.

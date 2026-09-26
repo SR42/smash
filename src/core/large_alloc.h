@@ -259,7 +259,7 @@ public:
             // the ordinary way, which restores protection and decommits.
             if (!(reusable && vm_region_->freeRunDirty(base, num_pages)) &&
                 !vm_region_->cacheFreedRun(base, num_pages, reusable))
-                vm_region_->releasePages(base, num_pages);
+                vm_region_->releasePages(base, num_pages, reusable);
         } else {
             vm::unmapPages(base, num_pages * kPageSize);
         }
