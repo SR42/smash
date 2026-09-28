@@ -20,6 +20,11 @@
 #include <cstdlib>
 #include <unistd.h>
 #include <execinfo.h>
+#include <cstring>
+#if defined(__linux__)
+#include <dlfcn.h>
+#include <pthread.h>
+#endif
 #ifdef __linux__
 #include <sys/syscall.h>
 #endif
@@ -176,9 +181,65 @@ inline int& faultDepth() { return g_fault_depth; }
 class FaultHandler {
     FaultCallback callback_ = nullptr;
     void* callback_ctx_ = nullptr;
-    struct sigaction old_sigsegv_{};
-    struct sigaction old_sigbus_{};
     std::atomic<bool> running_{false};
+
+    // The handler a fault smash does not resolve is passed on to, per signal
+    // ([0] SIGSEGV, [1] SIGBUS): whatever was installed before smash, or what
+    // the application has installed since through sigaction()/signal(),
+    // which smash interposes (see interposedSigaction). The application
+    // writes it from any thread while the signal handler may be reading it,
+    // so it is a seqlock: writers serialise on chain_lock_ and bump `seq`
+    // around the copy; the handler retries a read that raced a write. A
+    // writer only ever touches smash's own memory while holding the lock, so
+    // it cannot fault there and deadlock against the handler.
+    struct Chain {
+        std::atomic<uint32_t> seq{0};
+        struct sigaction act{};
+    };
+    Chain chain_[2];
+    static inline std::atomic_flag chain_lock_ = ATOMIC_FLAG_INIT;
+    static int chainIndex(int sig) { return sig == SIGBUS ? 1 : 0; }
+    void writeChain(int sig, const struct sigaction& a) {
+        Chain& c = chain_[chainIndex(sig)];
+        while (chain_lock_.test_and_set(std::memory_order_acquire)) {}
+        const uint32_t s0 = c.seq.load(std::memory_order_relaxed);
+        c.seq.store(s0 + 1, std::memory_order_relaxed);
+        std::atomic_thread_fence(std::memory_order_release);
+        std::memcpy(&c.act, &a, sizeof(a));
+        c.seq.store(s0 + 2, std::memory_order_release);
+        chain_lock_.clear(std::memory_order_release);
+    }
+    struct sigaction readChain(int sig) const {
+        const Chain& c = chain_[chainIndex(sig)];
+        struct sigaction out;
+        for (;;) {
+            const uint32_t s0 = c.seq.load(std::memory_order_acquire);
+            if (s0 & 1) continue;
+            std::memcpy(&out, &c.act, sizeof(out));
+            std::atomic_thread_fence(std::memory_order_acquire);
+            if (c.seq.load(std::memory_order_relaxed) == s0) return out;
+        }
+    }
+
+    // libc's own sigaction. smash exports sigaction() (and signal() and
+    // friends) on Linux, so a plain call from smash's code would land in its
+    // own wrapper; installing and restoring the kernel's handler must go
+    // straight to libc. Resolved in start(), before any signal can arrive,
+    // so the signal handler only reads the pointer.
+    using SigactionFn = int (*)(int, const struct sigaction*, struct sigaction*);
+    static inline SigactionFn real_sigaction_ = nullptr;
+    static int sysSigaction(int sig, const struct sigaction* act, struct sigaction* oldact) {
+#if defined(__linux__)
+        if (!real_sigaction_)
+            real_sigaction_ = reinterpret_cast<SigactionFn>(dlsym(RTLD_NEXT, "sigaction"));
+        if (real_sigaction_) return real_sigaction_(sig, act, oldact);
+#endif
+        return ::sigaction(sig, act, oldact);
+    }
+    // SMASH_NO_SIGACTION_WRAP=1: the application's sigaction()/signal() go
+    // to libc untouched and smash re-claims its handler on compressor ticks
+    // only (the behaviour before the interposition).
+    static inline bool sigaction_wrap_disabled_ = false;
 
 #ifdef __APPLE__
     // Mach exception ports mode (SMASH_USE_MACH_EXCEPTIONS=1).
@@ -334,8 +395,8 @@ private:
         // ensureInstalled() re-claiming, can recurse smash → engine →
         // smash. The clean fix is task-level Mach exception ports
         // instead of POSIX signal handlers. Tracked in FIREFOX_PLAN.md.
-        struct sigaction* old = (sig == SIGSEGV)
-            ? &instance_->old_sigsegv_ : &instance_->old_sigbus_;
+        struct sigaction chained = instance_->readChain(sig);
+        struct sigaction* old = &chained;
 
         // SMASH_SIGTRACE=1 — async-signal-safe one-line trace per chain.
         // Flag cached at install time; getenv() here would not be
@@ -343,9 +404,9 @@ private:
         if (sigtrace_enabled_) {
             char buf[480];
             const char* kind = "?";
-            if (old->sa_flags & SA_SIGINFO) kind = "SA_SIGINFO";
-            else if (old->sa_handler == SIG_DFL) kind = "SIG_DFL";
+            if (old->sa_handler == SIG_DFL) kind = "SIG_DFL";
             else if (old->sa_handler == SIG_IGN) kind = "SIG_IGN";
+            else if (old->sa_flags & SA_SIGINFO) kind = "SA_SIGINFO";
             else kind = "OTHER";
             // What smash thinks the address is, as the fatal line says: the
             // one thing needed when the application's own handler takes the
@@ -364,7 +425,7 @@ private:
         // process. Say so: an application whose only symptom is "it died with
         // no message" cannot tell a smash bug from its own, and the faulting
         // address plus what smash thinks that address is settles it.
-        if (old->sa_handler == SIG_DFL && !(old->sa_flags & SA_SIGINFO)) {
+        if (old->sa_handler == SIG_DFL) {
             char what[288];
             what[0] = '\0';
             if (describe_hook_) describe_hook_(info->si_addr, what, sizeof(what));
@@ -386,7 +447,7 @@ private:
         // raise() ourselves, we let the original disposition fire.
         if (!isKernelFault(info)) {
             shutting_down_.store(true, std::memory_order_release);
-            sigaction(sig, old, nullptr);
+            sysSigaction(sig, old, nullptr);
             raise(sig);
             errno = saved_errno;
             return;
@@ -400,7 +461,6 @@ private:
         // Flag cached at install time (getenv() is not async-signal-safe).
         bool want_bt = dump_crash_bt_enabled_ &&
                        isKernelFault(info) &&
-                       !(old->sa_flags & SA_SIGINFO) &&
                        old->sa_handler == SIG_DFL;
         if (want_bt) {
             // Portable thread id: SYS_gettid is Linux-only; macOS uses
@@ -424,11 +484,13 @@ private:
             backtrace_symbols_fd(frames, nframes, 2);
         }
 
-        if (old->sa_flags & SA_SIGINFO) {
-            old->sa_sigaction(sig, info, ucontext);
-        } else if (old->sa_handler == SIG_DFL) {
+        // SIG_DFL and SIG_IGN are decided by the handler value alone, as the
+        // kernel does: sa_handler and sa_sigaction share storage, and a
+        // one-shot SA_SIGINFO handler reads back SIG_DFL with SA_SIGINFO
+        // still set once it has fired.
+        if (old->sa_handler == SIG_DFL) {
             shutting_down_.store(true, std::memory_order_release);
-            sigaction(sig, old, nullptr);
+            sysSigaction(sig, old, nullptr);
             raise(sig);
         } else if (old->sa_handler == SIG_IGN) {
             // Synchronous fault + caller asked to ignore = the
@@ -438,10 +500,24 @@ private:
             struct sigaction dfl{};
             dfl.sa_handler = SIG_DFL;
             sigemptyset(&dfl.sa_mask);
-            sigaction(sig, &dfl, nullptr);
+            sysSigaction(sig, &dfl, nullptr);
             raise(sig);
         } else {
-            old->sa_handler(sig);
+            // The application's handler, run as the kernel would have run it:
+            // with its sa_mask (plus the signal itself unless SA_NODEFER)
+            // blocked, and reset to SIG_DFL first if it asked for SA_RESETHAND
+            // (only the handler, as the kernel resets it; the flags stay).
+            if (old->sa_flags & SA_RESETHAND) {
+                struct sigaction reset = *old;
+                reset.sa_handler = SIG_DFL;
+                instance_->writeChain(sig, reset);
+            }
+            sigset_t block = old->sa_mask, prev;
+            if (!(old->sa_flags & SA_NODEFER)) sigaddset(&block, sig);
+            pthread_sigmask(SIG_BLOCK, &block, &prev);
+            if (old->sa_flags & SA_SIGINFO) old->sa_sigaction(sig, info, ucontext);
+            else old->sa_handler(sig);
+            pthread_sigmask(SIG_SETMASK, &prev, nullptr);
         }
     }
 
@@ -599,15 +675,55 @@ public:
         }
 #endif
 
+        const char* nw = std::getenv("SMASH_NO_SIGACTION_WRAP");
+        sigaction_wrap_disabled_ = nw && nw[0] == '1';
+
+        // No SA_ONSTACK, deliberately: smash's handler decompresses pages,
+        // and alternate signal stacks are often small (Rust gives every
+        // thread one of ~8 KiB). It runs on the faulting thread's own stack,
+        // as it always has — so a stack overflow still cannot reach an
+        // application's alternate-stack handler through smash.
         struct sigaction sa{};
         sa.sa_sigaction = signalHandler;
         sa.sa_flags = SA_SIGINFO | SA_NODEFER;
         sigemptyset(&sa.sa_mask);
 
-        sigaction(SIGSEGV, &sa, &old_sigsegv_);
-        sigaction(SIGBUS, &sa, &old_sigbus_);
-        running_.store(true);
+        struct sigaction prev{};
+        sysSigaction(SIGSEGV, &sa, &prev);
+        writeChain(SIGSEGV, prev);
+        sysSigaction(SIGBUS, &sa, &prev);
+        writeChain(SIGBUS, prev);
+        running_.store(true, std::memory_order_release);
         return true;
+    }
+
+    // sigaction() for the application (smash exports it on Linux, and
+    // __sigaction, signal, bsd_signal, ssignal, sysv_signal, sigset on top).
+    // For SIGSEGV and SIGBUS while smash's handler is installed, the
+    // application's handler becomes the one smash passes foreign faults to,
+    // `oldact` reports the one it replaces, and the kernel keeps smash's
+    // handler: before, the application's handler replaced smash's until the
+    // next compressor tick (0.3-3 s), and every fault smash had to resolve
+    // in that window — a compressed or monitored page — reached the
+    // application as a crash. Everything else goes to libc.
+    static int interposedSigaction(int sig, const struct sigaction* act,
+                                   struct sigaction* oldact) {
+        FaultHandler* h = instance_;
+        if ((sig != SIGSEGV && sig != SIGBUS) || !h || sigaction_wrap_disabled_ ||
+            !h->running_.load(std::memory_order_acquire) ||
+            shutting_down_.load(std::memory_order_acquire))
+            return sysSigaction(sig, act, oldact);
+#ifdef __APPLE__
+        if (h->mach_mode_) return sysSigaction(sig, act, oldact);
+#endif
+        // Copy the caller's structs outside the lock: they are the
+        // application's memory, and touching one can fault into smash.
+        struct sigaction in;
+        if (act) std::memcpy(&in, act, sizeof(in));
+        const struct sigaction prev = h->readChain(sig);
+        if (act) h->writeChain(sig, in);
+        if (oldact) std::memcpy(oldact, &prev, sizeof(prev));
+        return 0;
     }
 
     void stop() {
@@ -622,8 +738,9 @@ public:
             return;
         }
 #endif
-        sigaction(SIGSEGV, &old_sigsegv_, nullptr);
-        sigaction(SIGBUS, &old_sigbus_, nullptr);
+        const struct sigaction segv = readChain(SIGSEGV), bus = readChain(SIGBUS);
+        sysSigaction(SIGSEGV, &segv, nullptr);
+        sysSigaction(SIGBUS, &bus, nullptr);
         running_.store(false);
         instance_ = nullptr;
     }
@@ -655,13 +772,16 @@ public:
         if (mach_mode_) return;
 #endif
 
+        // With sigaction() interposed this only fires for a handler
+        // installed around libc (the raw rt_sigaction syscall, or the
+        // interposition switched off).
         struct sigaction current{};
-        sigaction(SIGSEGV, nullptr, &current);
+        sysSigaction(SIGSEGV, nullptr, &current);
         bool need_reinstall = (current.sa_sigaction != signalHandler);
 
 #ifdef __APPLE__
         if (!need_reinstall && isDeferredReclaimMode()) {
-            sigaction(SIGBUS, nullptr, &current);
+            sysSigaction(SIGBUS, nullptr, &current);
             need_reinstall = (current.sa_sigaction != signalHandler);
         }
 #endif
@@ -672,10 +792,14 @@ public:
         sa.sa_sigaction = signalHandler;
         sa.sa_flags = SA_SIGINFO | SA_NODEFER;
         sigemptyset(&sa.sa_mask);
-        sigaction(SIGSEGV, &sa, &old_sigsegv_);
+        struct sigaction displaced{};
+        sysSigaction(SIGSEGV, &sa, &displaced);
+        writeChain(SIGSEGV, displaced);
 #ifdef __APPLE__
-        if (isDeferredReclaimMode())
-            sigaction(SIGBUS, &sa, &old_sigbus_);
+        if (isDeferredReclaimMode()) {
+            sysSigaction(SIGBUS, &sa, &displaced);
+            writeChain(SIGBUS, displaced);
+        }
 #endif
     }
 

@@ -2652,4 +2652,109 @@ __asm__(".symver _ZdaPvmSt11align_val_t_CXXABI_1_3_11,_ZdaPvmSt11align_val_t@CXX
 __asm__(".symver _ZnwmSt11align_val_tRKSt9nothrow_t_CXXABI_1_3_11,_ZnwmSt11align_val_tRKSt9nothrow_t@CXXABI_1.3.11");
 __asm__(".symver _ZnamSt11align_val_tRKSt9nothrow_t_CXXABI_1_3_11,_ZnamSt11align_val_tRKSt9nothrow_t@CXXABI_1.3.11");
 
+
+// ── Signal handler installation ─────────────────────────────────────────────
+// An application's sigaction(SIGSEGV) used to replace smash's fault handler
+// until the compressor's next tick re-claimed it (0.3-3 s); every fault smash
+// had to resolve in between reached the application's handler as a crash
+// (seen under SMASH_SOFTDIRTY=0, where monitored pages fault often). These
+// route SIGSEGV and SIGBUS through FaultHandler::interposedSigaction, which
+// makes the application's handler the one smash passes foreign faults to and
+// leaves smash's in the kernel; every other signal goes to libc unchanged.
+// All are unversioned in glibc beyond the base version, so the base export
+// is the one callers bind.
+
+extern "C" int __sigaction(int, const struct sigaction*, struct sigaction*) noexcept;
+
+namespace {
+template <typename Fn>
+Fn realSignalFn(const char* name) {
+    return reinterpret_cast<Fn>(dlsym(RTLD_NEXT, name));
+}
+bool smashOwnsSignal(int sig) { return sig == SIGSEGV || sig == SIGBUS; }
+
+// signal()-family semantics for SIGSEGV/SIGBUS, expressed as a sigaction:
+// glibc's BSD signal() blocks the signal during its handler and restarts
+// system calls; the System V variants reset the handler after one delivery
+// and do not block it.
+__sighandler_t installSignalHandler(int sig, __sighandler_t handler, int flags, bool block_self) {
+    struct sigaction sa{};
+    sa.sa_handler = handler;
+    sigemptyset(&sa.sa_mask);
+    if (block_self) sigaddset(&sa.sa_mask, sig);
+    sa.sa_flags = flags;
+    struct sigaction old{};
+    if (smash::vm::FaultHandler::interposedSigaction(sig, &sa, &old) != 0) return SIG_ERR;
+    return (old.sa_flags & SA_SIGINFO) ? reinterpret_cast<__sighandler_t>(old.sa_sigaction)
+                                       : old.sa_handler;
+}
+}  // namespace
+
+extern "C" int sigaction(int sig, const struct sigaction* act, struct sigaction* oldact) noexcept {
+    return smash::vm::FaultHandler::interposedSigaction(sig, act, oldact);
+}
+
+extern "C" int __sigaction(int sig, const struct sigaction* act, struct sigaction* oldact) noexcept {
+    return smash::vm::FaultHandler::interposedSigaction(sig, act, oldact);
+}
+
+extern "C" __sighandler_t signal(int sig, __sighandler_t handler) noexcept {
+    if (!smashOwnsSignal(sig)) {
+        static const auto real = realSignalFn<__sighandler_t (*)(int, __sighandler_t)>("signal");
+        return real ? real(sig, handler) : SIG_ERR;
+    }
+    return installSignalHandler(sig, handler, SA_RESTART, true);
+}
+
+extern "C" __sighandler_t bsd_signal(int sig, __sighandler_t handler) noexcept {
+    if (!smashOwnsSignal(sig)) {
+        static const auto real = realSignalFn<__sighandler_t (*)(int, __sighandler_t)>("bsd_signal");
+        return real ? real(sig, handler) : SIG_ERR;
+    }
+    return installSignalHandler(sig, handler, SA_RESTART, true);
+}
+
+extern "C" __sighandler_t ssignal(int sig, __sighandler_t handler) noexcept {
+    if (!smashOwnsSignal(sig)) {
+        static const auto real = realSignalFn<__sighandler_t (*)(int, __sighandler_t)>("ssignal");
+        return real ? real(sig, handler) : SIG_ERR;
+    }
+    return installSignalHandler(sig, handler, SA_RESTART, true);
+}
+
+extern "C" __sighandler_t sysv_signal(int sig, __sighandler_t handler) noexcept {
+    if (!smashOwnsSignal(sig)) {
+        static const auto real = realSignalFn<__sighandler_t (*)(int, __sighandler_t)>("sysv_signal");
+        return real ? real(sig, handler) : SIG_ERR;
+    }
+    return installSignalHandler(sig, handler, SA_RESETHAND | SA_NODEFER, false);
+}
+
+extern "C" __sighandler_t __sysv_signal(int sig, __sighandler_t handler) noexcept {
+    if (!smashOwnsSignal(sig)) {
+        static const auto real = realSignalFn<__sighandler_t (*)(int, __sighandler_t)>("__sysv_signal");
+        return real ? real(sig, handler) : SIG_ERR;
+    }
+    return installSignalHandler(sig, handler, SA_RESETHAND | SA_NODEFER, false);
+}
+
+// sigset(): SIG_HOLD (block the signal) is a mask operation and goes to libc
+// even for SIGSEGV/SIGBUS; any other disposition is installed like signal()
+// and the signal unblocked, as sigset() does.
+extern "C" __sighandler_t sigset(int sig, __sighandler_t disp) noexcept {
+    if (!smashOwnsSignal(sig) || disp == SIG_HOLD) {
+        static const auto real = realSignalFn<__sighandler_t (*)(int, __sighandler_t)>("sigset");
+        return real ? real(sig, disp) : SIG_ERR;
+    }
+    sigset_t cur;
+    const bool was_held = pthread_sigmask(SIG_BLOCK, nullptr, &cur) == 0 && sigismember(&cur, sig);
+    const __sighandler_t prev = installSignalHandler(sig, disp, 0, false);
+    if (prev == SIG_ERR) return SIG_ERR;
+    sigset_t one;
+    sigemptyset(&one);
+    sigaddset(&one, sig);
+    pthread_sigmask(SIG_UNBLOCK, &one, nullptr);
+    return was_held ? SIG_HOLD : prev;
+}
+
 #endif // __linux__

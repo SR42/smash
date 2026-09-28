@@ -608,6 +608,18 @@ if(NOT APPLE)
     test_run_cache_on_softdirty0 PROPERTIES TIMEOUT 180)
 endif()
 
+# An application's own SIGSEGV handler must never displace smash's: smash
+# interposes sigaction()/signal() and chains to it (signal_chain_test.cpp).
+if(NOT APPLE)
+  add_executable(signal_chain_test signal_chain_test.cpp)
+  target_link_libraries(signal_chain_test PRIVATE ${CMAKE_DL_LIBS} Threads::Threads)
+  add_test(NAME test_signal_chain_large_only COMMAND ${CMAKE_COMMAND} -E env
+    "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=1" $<TARGET_FILE:signal_chain_test>)
+  add_test(NAME test_signal_chain_full COMMAND ${CMAKE_COMMAND} -E env
+    "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=0" $<TARGET_FILE:signal_chain_test>)
+  set_tests_properties(test_signal_chain_large_only test_signal_chain_full PROPERTIES TIMEOUT 60)
+endif()
+
 # SMASH_SIGTRACE=1 classifies the address of a fault smash passes on to the
 # application's own SIGSEGV handler (sigtrace_classify_test.cpp).
 if(NOT APPLE)

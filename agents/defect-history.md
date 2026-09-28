@@ -181,3 +181,37 @@ The compressor has to know which pages were written since the last tick. `select
 Two things the userfaultfd path has to handle, both verified with a standalone prototype before wiring it in: a `MAP_FIXED` remap creates a new VMA the userfaultfd no longer covers (writes become invisible), so `remapPages()` re-registers through `vm::g_after_remap_track_hook`; and a forked child inherits the fd but not the registration, so the post-fork reset closes it and the child selects afresh (verified: a forked child that starts a thread reports `track=uffd` with its hot set tracked). External pages (`SMASH_TRACK_EXTERNAL=1`) are the application's own mappings and are deliberately not registered, so they get no write signal under `uffd`.
 
 `test_uffd_write_tracking` (in-process, forced to `uffd`, skips before Linux 6.7) drives `compressTick()` with a page written before every tick, a cold page, and a written page that went through `remapPages()`, and requires that neither written page is compressed at **any** tick. **Verified as a real discriminator:** with `SMASH_WRITE_TRACK=none` both written pages compress at tick 1; with only the remap hook removed, just the remapped page compresses (tick 2). Checking only the final state is not enough — an untracked written page cycles between SHADOW and ACTIVE as Phase B discards its stale blobs, and the last tick can land on ACTIVE. Suite 53/53 in default and forced-`uffd` modes, unprivileged and as root.
+
+## An application's SIGSEGV handler displaced smash's (2026-09-28)
+
+An application on the 128-core aarch64 box (kernel 6.6) crashed with SIGSEGV
+under `SMASH_SOFTDIRTY=0`, on builds before and after the last free-path
+changes, and nothing from smash was printed. Signal handlers are per
+process: an application's `sigaction(SIGSEGV)` replaced smash's handler, and
+smash only put its own back on its next compressor tick (`ensureInstalled`,
+0.3-3 s measured). In between, every fault smash had to resolve — a compressed
+page, a monitored PROT_READ page, a page a batched mprotect had left
+read-only — went to the application's handler, which treats it as a crash.
+With `track=none` those faults are rare; with `SMASH_SOFTDIRTY=0` the first
+write to every monitored page is one. smash's own `[smash FATAL]` line never
+printed because the application's handler, not SIG_DFL, was next in line.
+
+(The cause of that application's crash is not confirmed — it had not been
+re-run with the fix when this was written — but the window is a defect on its
+own, and `test_signal_chain`'s phase A reproduces it deterministically.)
+
+Fix: smash interposes `sigaction`, `__sigaction`, `signal`, `bsd_signal`,
+`ssignal`, `sysv_signal`, `__sysv_signal` and `sigset`. For SIGSEGV and SIGBUS
+the application's handler becomes the one smash chains to; queries return it;
+the kernel keeps smash's. Found while writing it: dispatch treated a handler
+as SIG_DFL only without `SA_SIGINFO`, but the kernel resets a one-shot
+`SA_SIGINFO` handler to SIG_DFL with the flag still set, so a reset handler
+would have been called at address 0; it now decides by the handler value, as
+the kernel does. `SMASH_NO_SIGACTION_WRAP=1` restores the old behaviour.
+`SA_ONSTACK` is deliberately not set on smash's handler: alternate signal
+stacks are often small (~8 KiB per Rust thread) and the handler decompresses.
+
+Measured: `test_signal_chain` phase F, 4 threads swapping SIGSEGV handlers
+against 8 threads taking smash faults and their own for 1.5 s — 0 misrouted
+(~46000 of each); with the old behaviour all 165228 smash faults went to the
+application's handler.

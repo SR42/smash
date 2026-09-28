@@ -10,8 +10,10 @@
 // showed nothing smash-related for exactly that reason, so the trace line now
 // carries the same classification.
 //
-// The test installs its own SIGSEGV handler after smash, waits until smash's
-// compressor re-claims SIGSEGV (it checks on every tick), then writes to a
+// The test installs its own SIGSEGV handler after smash — which smash keeps
+// behind its own (sigaction() is interposed; before that, the test waited for
+// a compressor tick to re-claim SIGSEGV, and still does if the kernel's
+// handler is the test's) — then writes to a
 // freed smash block it has made read-only itself — a fault smash knows the
 // page of but does not resolve. Registered with PASS_REGULAR_EXPRESSION on the
 // classified trace line.
@@ -21,7 +23,15 @@
 #include <cstring>
 #include <dlfcn.h>
 #include <sys/mman.h>
+#include <sys/syscall.h>
 #include <unistd.h>
+
+// The kernel's current handler, bypassing the interposed sigaction().
+static void* kernelHandler(int sig) {
+    struct KSigaction { void* handler; unsigned long flags; void* restorer; unsigned long mask; } k{};
+    if (syscall(SYS_rt_sigaction, sig, nullptr, &k, sizeof(k.mask)) != 0) return nullptr;
+    return k.handler;
+}
 
 static void onSegv(int, siginfo_t* si, void*) {
     char b[96];
@@ -44,13 +54,12 @@ int main() {
     sa.sa_sigaction = onSegv;
     sa.sa_flags = SA_SIGINFO;
     sigaction(SIGSEGV, &sa, nullptr);
-    // Until smash re-claims SIGSEGV, a fault would go straight to onSegv.
-    bool reclaimed = false;
+    // If the kernel's handler is onSegv (sigaction() not interposed), a
+    // fault would go straight to it: wait for smash to re-claim SIGSEGV.
+    bool reclaimed = kernelHandler(SIGSEGV) != reinterpret_cast<void*>(onSegv);
     for (int i = 0; i < 200 && !reclaimed; ++i) {
         usleep(50 * 1000);
-        struct sigaction cur{};
-        sigaction(SIGSEGV, nullptr, &cur);
-        reclaimed = cur.sa_sigaction != onSegv;
+        reclaimed = kernelHandler(SIGSEGV) != reinterpret_cast<void*>(onSegv);
     }
     if (!reclaimed) { std::printf("SKIP: smash did not re-claim SIGSEGV within 10 s\n"); return 0; }
     std::fflush(stdout);

@@ -8,6 +8,17 @@
 
 @SMASH_GLIBC_BASE_VERSION@ {
   global:
+    # Signal handler installation: SIGSEGV/SIGBUS handlers become smash's
+    # chained handlers instead of replacing smash's (linux_syscall_wrappers.cpp)
+    sigaction;
+    __sigaction;
+    signal;
+    bsd_signal;
+    ssignal;
+    sysv_signal;
+    __sysv_signal;
+    sigset;
+
     # Core allocation functions (from alloc8)
     malloc;
     free;
