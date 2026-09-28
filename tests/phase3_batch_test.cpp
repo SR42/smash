@@ -13,6 +13,11 @@
 // SIGUSR2 stats dump prompted until Phase 3 has armed most of it; the
 // [smash pipeline] line's "p3 armed=A calls=C" must show at least 64 pages
 // per mprotect call.
+//
+// Phase 2 had the same shape: escalation to PROT_NONE and the compression
+// snapshot's mprotect(PROT_RW), one call per page each — 611 s of a tick on
+// the same box. Once 90% of the 256 MiB has been released, "p2 mprotect=M"
+// must be at most one call per 32 pages released.
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
@@ -48,14 +53,21 @@ int main() {
         blocks.push_back(p);
     }
     const unsigned long long want = (256ull << 20) / ps * 3 / 4;
-    unsigned long long armed = 0, calls = 0;
-    for (int i = 0; i < 120 && armed < want; ++i) {
+    const unsigned long long want_released = (256ull << 20) / ps * 9 / 10;
+    unsigned long long armed = 0, calls = 0, p2 = 0, released = 0;
+    for (int i = 0; i < 240 && (armed < want || released < want_released); ++i) {
         raise(SIGUSR2);
         usleep(250 * 1000);
         const std::string log = slurp(fd);
-        const size_t at = log.rfind("p3 armed=");
-        if (at != std::string::npos)
-            std::sscanf(log.c_str() + at, "p3 armed=%llu calls=%llu", &armed, &calls);
+        const size_t at = log.rfind("[smash pipeline]");
+        if (at == std::string::npos) continue;
+        const std::string line = log.substr(at, log.find('\n', at) - at);
+        const size_t a = line.find("p3 armed=");
+        if (a != std::string::npos)
+            std::sscanf(line.c_str() + a, "p3 armed=%llu calls=%llu p2 mprotect=%llu", &armed,
+                        &calls, &p2);
+        const size_t r = line.find("released=");
+        if (r != std::string::npos) std::sscanf(line.c_str() + r, "released=%llu", &released);
     }
     dup2(saved, 2);
     for (char* p : blocks) free(p);
@@ -70,6 +82,18 @@ int main() {
     if (armed < calls * 64) {
         std::printf("FAIL: phase 3 used an mprotect call per %.1f pages of contiguous idle memory; "
                     "each is a TLB shootdown to every core\n", static_cast<double>(armed) / calls);
+        return 1;
+    }
+    std::printf("phase 2: %llu mprotect calls for %llu pages released (%.1f pages per call)\n",
+                p2, released, p2 ? static_cast<double>(released) / static_cast<double>(p2) : 0.0);
+    if (released < want_released) {
+        std::printf("FAIL: only %llu of %llu pages released within the wait\n", released,
+                    want_released);
+        return 1;
+    }
+    if (p2 * 32 > released) {
+        std::printf("FAIL: phase 2 (escalation and compression snapshot) used an mprotect call "
+                    "per %.1f pages\n", static_cast<double>(released) / static_cast<double>(p2));
         return 1;
     }
     std::printf("phase3_batch_test: all checks passed\n");

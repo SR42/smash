@@ -453,6 +453,9 @@ class CompressorThread {
         // pages armed and the mprotect system calls it took, cumulative.
         std::atomic<uint64_t> phase_ms[5]{};
         std::atomic<uint64_t> p3_pages{0}, p3_calls{0};
+        // mprotect calls made by phase 2: escalation to PROT_NONE and the
+        // compression snapshot.
+        std::atomic<uint64_t> p2_mprotect{0};
     };
     PipelineCounters pc_;
     static void pcAdd(std::atomic<uint64_t>& c, uint64_t n) {
@@ -912,6 +915,11 @@ class CompressorThread {
         static constexpr size_t kPendingProtCap = 256;
         size_t pending_pn_pages[kPendingProtCap];
         size_t pending_pn_count = 0;
+        // Deferred mode: pages snapshotted through /proc/self/mem into
+        // COMPRESSED_SHADOW with their protection untouched (PROT_NONE from
+        // escalation), to be made PROT_READ in batches (flushShadowReadable).
+        size_t pending_ro_pages[kPendingProtCap];
+        size_t pending_ro_count = 0;
 
         // Eligible pages whose node is not known yet. One move_pages call at
         // the end of the range resolves the whole batch (see flushNodeQueries).
@@ -1469,6 +1477,16 @@ private:
         uint32_t floor = cfg.cold_ticks_floor;
         bool backoff_enabled = cfg.recompress_backoff;
         uint64_t n_at_floor = 0, n_escalated = 0, n_eligible = 0, n_hint_skip = 0, n_routed = 0;
+#ifdef __linux__
+        // Escalations are batched (escalateBatch) unless the idle-bit path is
+        // in use (root: no mprotect to batch).
+        const bool batch_escalations = !(idle_read_ok_ == 1 && idle_armed_);
+#else
+        const bool batch_escalations = false;
+#endif
+        constexpr size_t kEscalateBatch = 256;
+        size_t esc[kEscalateBatch];
+        size_t n_esc = 0;
 
         // No CPU-pressure multiplier and no per-tick compression budget.
         // The right signal for "don't compress this page yet" isn't
@@ -1702,7 +1720,12 @@ private:
                 // this just changes protection, not compression. It gives
                 // the compressor more accurate access info for thrashy
                 // pages (which we won't compress anyway until eff_floor).
-                escalateToDeepMonitoring(i);
+                if (batch_escalations) {
+                    esc[n_esc++] = i;
+                    if (n_esc == kEscalateBatch) { escalateBatch(esc, n_esc); n_esc = 0; }
+                } else {
+                    escalateToDeepMonitoring(i);
+                }
                 ++n_escalated;
             } else if (cold_count_[i] > profile_floor && cold_count_[i] >= eff_floor) {
                 // Page is eligible for compression — count it
@@ -1718,14 +1741,15 @@ private:
                     // Periodic mid-range flush so the pending list
                     // doesn't get too long and so the cap is never hit
                     // inside a hot inner loop.
-                    if (worker.pending_pn_count >=
-                        CompressWorker::kPendingProtCap / 2) {
+                    if (worker.pending_pn_count >= CompressWorker::kPendingProtCap / 2 ||
+                        worker.pending_ro_count >= CompressWorker::kPendingProtCap / 2) {
                         flushPhase2PendingProt(worker);
                     }
                 }
             }
         });
         // End-of-range flush.
+        escalateBatch(esc, n_esc);
         flushPhase2PendingProt(worker);
         flushNodeQueries(worker, pages_compressed);
         pcAdd(pc_.p2_at_floor, n_at_floor);
@@ -1793,6 +1817,9 @@ private:
             if (node < 0 || node == worker.node || !enqueueForNode(node, page)) {
                 if (compressPage(page, worker))
                     pages_compressed.fetch_add(1, std::memory_order_relaxed);
+                if (worker.pending_pn_count >= CompressWorker::kPendingProtCap / 2 ||
+                    worker.pending_ro_count >= CompressWorker::kPendingProtCap / 2)
+                    flushPhase2PendingProt(worker);
             }
         }
         flushPhase2PendingProt(worker);
@@ -1835,7 +1862,38 @@ private:
     // instead of one per consecutive run — on Linux, mprotect on a
     // single page within a larger VMA is fast (no VMA split needed
     // when the page is already independently mapped via prior faults).
+    // Make the pages compressPage left in COMPRESSED_SHADOW with their old
+    // protection readable again, one mprotect(PROT_READ) per contiguous
+    // stretch: shadow pages stay readable (reads during the shadow window
+    // cost nothing, as when the snapshot used to make them PROT_RW) while a
+    // write faults and the handler drops the blob. A page that changed state
+    // in between (faulted back to ACTIVE, freed) is benign: PROT_READ on an
+    // ACTIVE page is restored by the fault handler on the first write.
+    void flushShadowReadable(CompressWorker& w) {
+        const size_t n = w.pending_ro_count;
+        if (n == 0) return;
+        w.pending_ro_count = 0;
+        size_t* pg = w.pending_ro_pages;
+        for (size_t i = 1; i < n; ++i)   // insertion sort, n <= 256
+            for (size_t j = i; j > 0 && pg[j] < pg[j - 1]; --j) {
+                const size_t t = pg[j]; pg[j] = pg[j - 1]; pg[j - 1] = t;
+            }
+        size_t seg = 0;
+        for (size_t k = 1; k <= n; ++k) {
+            const bool breaks = k == n || pg[k] != pg[k - 1] + 1 ||
+                reinterpret_cast<uintptr_t>(vm_->pageAddress(pg[k])) !=
+                    reinterpret_cast<uintptr_t>(vm_->pageAddress(pg[k - 1])) + kPageSize;
+            if (!breaks) continue;
+            if (void* base = vm_->pageAddress(pg[seg])) {
+                pc_.p2_mprotect.fetch_add(1, std::memory_order_relaxed);
+                vm::protectPages(base, (k - seg) * kPageSize, true, false);  // PROT_READ
+            }
+            seg = k;
+        }
+    }
+
     void flushPhase2PendingProt(CompressWorker& w) {
+        flushShadowReadable(w);
         if (w.pending_pn_count == 0) return;
 
         for (size_t i = 0; i < w.pending_pn_count; ++i) {
@@ -1924,6 +1982,7 @@ private:
         locks_->lock(page_idx);
         if (states_->get(page_idx) == PageState::ACTIVE_MONITORING) {
             void* page_addr = vm_->pageAddress(page_idx);
+            pc_.p2_mprotect.fetch_add(1, std::memory_order_relaxed);
             vm::protectPages(page_addr, kPageSize, false, false);  // PROT_NONE
         }
         locks_->unlock(page_idx);
@@ -2088,6 +2147,59 @@ private:
         }
         pcAdd(pc_.p3_pages, n_pages);
         pcAdd(pc_.p3_calls, n_calls);
+    }
+
+    // A copy of the page at `page_addr` into `dst` through /proc/self/mem,
+    // which reads it whatever its protection. False (caller falls back to
+    // mprotect + memcpy) when the fd is not open or the read is short.
+    bool readPageViaMem([[maybe_unused]] const void* page_addr, [[maybe_unused]] void* dst) {
+#ifdef __linux__
+        if (self_mem_fd_ < 0) return false;
+        const auto off = static_cast<off_t>(reinterpret_cast<uintptr_t>(page_addr));
+        size_t done = 0;
+        while (done < kPageSize) {
+            const ssize_t n = syscall(SYS_pread64, self_mem_fd_, static_cast<char*>(dst) + done,
+                                      kPageSize - done, off + static_cast<off_t>(done));
+            if (n <= 0) return false;
+            done += static_cast<size_t>(n);
+        }
+        return true;
+#else
+        return false;
+#endif
+    }
+
+    // Escalate a batch of pages (ascending, from one phase-2 range) to
+    // PROT_NONE: every page is locked and checked (only ACTIVE_MONITORING
+    // pages are armed), each contiguous stretch of them gets ONE mprotect,
+    // then all are unlocked — escalateToDeepMonitoring's per-page lock and
+    // check, without its per-page call (half of phase 2's mprotects, each a
+    // TLB shootdown to every core, on a 128-core box: 611 s of one tick).
+    void escalateBatch(const size_t* pages, size_t n) {
+        if (n == 0) return;
+        for (size_t k = 0; k < n; ++k) locks_->lock(pages[k]);
+        size_t seg = 0;
+        bool open = false;
+        uintptr_t expect = 0;
+        auto arm = [&](size_t a, size_t b) {   // pages[a..b)
+            void* base = vm_->pageAddress(pages[a]);
+            if (!base) return;
+            pc_.p2_mprotect.fetch_add(1, std::memory_order_relaxed);
+            vm::protectPages(base, (b - a) * kPageSize, false, false);  // PROT_NONE
+        };
+        for (size_t k = 0; k < n; ++k) {
+            const bool ok = states_->get(pages[k]) == PageState::ACTIVE_MONITORING;
+            const auto addr = reinterpret_cast<uintptr_t>(vm_->pageAddress(pages[k]));
+            if (open && (!ok || addr == 0 || addr != expect || pages[k] != pages[k - 1] + 1)) {
+                arm(seg, k);
+                open = false;
+            }
+            if (!ok || addr == 0) continue;
+            if (!open) { seg = k; open = true; }
+            expect = addr + kPageSize;
+        }
+        if (open) arm(seg, n);
+        for (size_t k = 0; k < n; ++k) locks_->unlock(pages[k]);
     }
 
     // ── Compress one page using worker's contexts ─────────────────────────
@@ -2260,6 +2372,7 @@ private:
         }
 
         void* page_addr = vm_->pageAddress(page_idx);
+        bool snapshot_via_mem = false;
         // External pages may have been untracked between state check and here
         if (!page_addr) {
             states_->set(page_idx, PageState::EMPTY);
@@ -2284,8 +2397,20 @@ private:
             // the per-page lock; LOOSENING protection to PROT_RW cannot fault
             // an app thread, so there is no TLB-shootdown-vs-page-lock deadlock
             // (that hazard only applies to TIGHTENING protection).
-            vm::protectPages(page_addr, kPageSize, true, true);  // PROT_RW
-            __builtin_memcpy(worker.page_buf, page_addr, kPageSize);
+            // Read the page through /proc/self/mem when possible: the kernel
+            // reads it whatever its protection (PROT_READ from monitoring,
+            // PROT_NONE from escalation), so no mprotect is needed and the
+            // page keeps its protection through the shadow window — a write
+            // then faults and the handler drops the blob (the
+            // COMPRESSED_SHADOW case). One mprotect per compressed page was
+            // half of phase 2's calls, each a TLB shootdown to every core:
+            // 611 s of a tick on a 128-core box. Falls back to the mprotect.
+            snapshot_via_mem = readPageViaMem(page_addr, worker.page_buf);
+            if (!snapshot_via_mem) {
+                pc_.p2_mprotect.fetch_add(1, std::memory_order_relaxed);
+                vm::protectPages(page_addr, kPageSize, true, true);  // PROT_RW
+                __builtin_memcpy(worker.page_buf, page_addr, kPageSize);
+            }
             // Snapshot verification for deferred mode. Without PROT_READ
             // protection during the snapshot, a concurrent write can land
             // between our memcpy and the eventual PROT_NONE — the blob
@@ -2293,7 +2418,15 @@ private:
             // the writer's update. Re-read and compare; abort on mismatch.
             if (fixavEnabled()) {
                 alignas(64) uint8_t verify_buf[kPageSize];
-                __builtin_memcpy(verify_buf, page_addr, kPageSize);
+                if (!readPageViaMem(page_addr, verify_buf)) {
+                    // The page must be readable here; the fallback above made it so.
+                    if (!vm::protectPages(page_addr, kPageSize, true, true)) {
+                        states_->set(page_idx, PageState::ACTIVE);
+                        locks_->unlock(page_idx);
+                        return false;
+                    }
+                    __builtin_memcpy(verify_buf, page_addr, kPageSize);
+                }
                 if (__builtin_memcmp(verify_buf, worker.page_buf, kPageSize) != 0) {
                     snapshot_verify_fails_.fetch_add(1, std::memory_order_relaxed);
                     states_->set(page_idx, PageState::ACTIVE);
@@ -2618,6 +2751,11 @@ private:
         if (deferred) {
             shadow_tick_[page_idx] = tick_counter_;
             states_->set(page_idx, PageState::COMPRESSED_SHADOW);
+            // Still PROT_NONE (escalated): made readable in a batch by the
+            // caller's flush. If the list is full the page just stays
+            // PROT_NONE — a read then faults and drops the blob, which is safe.
+            if (snapshot_via_mem && worker.pending_ro_count < CompressWorker::kPendingProtCap)
+                worker.pending_ro_pages[worker.pending_ro_count++] = page_idx;
         } else {
             // P2 chunking: batch the mprotect(PROT_NONE) of just-compressed
             // pages over coalesced contiguous runs (up to kProtectChunkPages
@@ -3560,7 +3698,11 @@ private:
     }
 
     // Compress the pages other workers handed to this node. Each thread takes
-    // every n-th entry, so the group shares the queue without a lock.
+    // a contiguous slice of the queue, so the group shares it without a lock.
+    // Contiguous, not every n-th entry: the queue is filled in page order, and
+    // a slice keeps a thread's pages adjacent, so the pages it leaves in
+    // COMPRESSED_SHADOW are made readable one stretch per mprotect
+    // (flushShadowReadable). Strided, no two were adjacent: one call per page.
     void drainNodeQueue(NodeWorker& nw) {
         const NodeGroup& g = *nw.group;
         if (!g.queue || g.threads_running <= 0) return;
@@ -3568,10 +3710,13 @@ private:
         if (n > g.queue_capacity) n = g.queue_capacity;
         const int cpu_before = sched_getcpu();
         uint32_t done = 0;
-        for (size_t k = static_cast<size_t>(nw.index); k < n;
-             k += static_cast<size_t>(g.threads_running)) {
+        const size_t threads = static_cast<size_t>(g.threads_running);
+        const size_t me = static_cast<size_t>(nw.index);
+        const size_t from = n * me / threads, to = n * (me + 1) / threads;
+        for (size_t k = from; k < to; ++k) {
             if (compressPage(g.queue[k], *nw.worker)) ++done;
-            if (nw.worker->pending_pn_count >= CompressWorker::kPendingProtCap / 2)
+            if (nw.worker->pending_pn_count >= CompressWorker::kPendingProtCap / 2 ||
+                nw.worker->pending_ro_count >= CompressWorker::kPendingProtCap / 2)
                 flushPhase2PendingProt(*nw.worker);
         }
         flushPhase2PendingProt(*nw.worker);
@@ -6164,14 +6309,15 @@ public:
                 " stored=%llu gate_fail=%llu | release checked=%llu released=%llu"
                 " changed=%llu vma_stop=%llu | faults monitor=%llu shadow=%llu"
                 " compressed=%llu active=%llu | phase_ms=%llu/%llu/%llu/%llu"
-                " p3 armed=%llu calls=%llu\n",
+                " p3 armed=%llu calls=%llu p2 mprotect=%llu\n",
                 v(pc.ticks), v(pc.tick_ms_last), v(pc.tick_ms_max), v(pc.deferred_ticks),
                 v(pc.p1_accessed), v(pc.p1_idle), v(pc.p2_at_floor), v(pc.p2_escalated),
                 v(pc.p2_eligible), v(pc.p2_routed), v(pc.p2_hint_skip), v(pc.cp_attempts),
                 v(pc.cp_stored), v(pc.cp_gate_fail), v(pc.rc_checked), v(pc.rc_released),
                 v(pc.rc_changed), v(pc.rc_vma_stop), v(pc.f_monitor), v(pc.f_shadow),
                 v(pc.f_compressed), v(pc.f_active), v(pc.phase_ms[1]), v(pc.phase_ms[2]),
-                v(pc.phase_ms[3]), v(pc.phase_ms[4]), v(pc.p3_pages), v(pc.p3_calls));
+                v(pc.phase_ms[3]), v(pc.phase_ms[4]), v(pc.p3_pages), v(pc.p3_calls),
+                v(pc.p2_mprotect));
             if (n >= static_cast<int>(sizeof(buf))) n = static_cast<int>(sizeof(buf)) - 1;
         }
         // The per-CPU run cache (SMASH_RUN_CACHE_MIB), when on: whether it is

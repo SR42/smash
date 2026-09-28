@@ -616,7 +616,7 @@ if(NOT APPLE)
   add_test(NAME test_phase3_batch COMMAND ${CMAKE_COMMAND} -E env
     "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=1" "SMASH_SOFTDIRTY=0"
     "SMASH_STATS_SIGNAL=1" "SMASH_DEFER_PHASES_MS=0" $<TARGET_FILE:phase3_batch_test>)
-  set_tests_properties(test_phase3_batch PROPERTIES TIMEOUT 90)
+  set_tests_properties(test_phase3_batch PROPERTIES TIMEOUT 150)
 endif()
 
 # An idle 1 GiB must actually leave RSS with default timings, in each

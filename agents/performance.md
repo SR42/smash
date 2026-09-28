@@ -649,3 +649,29 @@ stretch with one `mprotect`; the run cap is 256 pages (the
 `SMASH_PROTECT_CHUNK_PAGES` knob, which nothing had read). Same workload:
 2M pages armed in 7708 calls and 26 ms; steady-state phase 3 66-75 ms (the
 single pages re-armed after scattered writes — one call each, inherent).
+
+## Phase 2 also protected every page on its own (2026-09-28)
+
+With Phase 3 batched, the arm64 application's ticks were still 80-170 s, now
+`phase_ms=1694/611220/16184/150`: phase 2. Per page it made two `mprotect`
+calls — escalation to PROT_NONE (read detection before compressing) and,
+in `compressPage`'s default deferred path, an unconditional PROT_RW so the
+snapshot could read the page. Now:
+
+- escalations are collected per range and armed by `escalateBatch`: every
+  page locked and checked, one `mprotect` per contiguous stretch (the idle-bit
+  path under root stays per page — it makes no `mprotect`);
+- the snapshot reads the page through `/proc/self/mem` (already open for
+  `restorePageContents`), which works whatever the page's protection, and
+  falls back to the old `mprotect` + `memcpy`;
+- the pages left in COMPRESSED_SHADOW that way are made PROT_READ in batches
+  (`flushShadowReadable`, one call per contiguous stretch) — shadow pages stay
+  readable, as `test_prefetch` requires, and a write now faults and drops the
+  blob at once instead of being caught by Phase B's content compare;
+- node-group threads take contiguous slices of their queue, not every n-th
+  entry, so their pages are adjacent and batch too.
+
+256 MiB idle: phase-2 `mprotect` calls 131072 -> 768. 8 GiB with 16k scattered
+writes/s: ~37k calls for ~2.07M pages, all released by tick 32. Shadow-write
+stress (writes landing in the shadow window, every value read back): 0 stale
+of ~85k checks.
