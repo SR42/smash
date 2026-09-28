@@ -341,16 +341,22 @@ private:
         // Flag cached at install time; getenv() here would not be
         // async-signal-safe (see sigtrace_enabled_ declaration).
         if (sigtrace_enabled_) {
-            char buf[160];
+            char buf[480];
             const char* kind = "?";
             if (old->sa_flags & SA_SIGINFO) kind = "SA_SIGINFO";
             else if (old->sa_handler == SIG_DFL) kind = "SIG_DFL";
             else if (old->sa_handler == SIG_IGN) kind = "SIG_IGN";
             else kind = "OTHER";
+            // What smash thinks the address is, as the fatal line says: the
+            // one thing needed when the application's own handler takes the
+            // fault next and smash's fatal line never prints.
+            char what[288];
+            what[0] = '\0';
+            if (describe_hook_) describe_hook_(info->si_addr, what, sizeof(what));
             int n = smash::safe_snprintf(buf, sizeof(buf),
-                "[smash sig] sig=%d si_code=%d si_addr=%p chain_kind=%s flags=0x%x\n",
+                "[smash sig] sig=%d si_code=%d si_addr=%p chain_kind=%s flags=0x%x %s\n",
                 sig, info->si_code, info->si_addr, kind,
-                (unsigned)old->sa_flags);
+                (unsigned)old->sa_flags, what[0] ? what : "address not classified");
             if (n > 0) (void)!write(2, buf, (size_t)n);
         }
 
@@ -359,10 +365,10 @@ private:
         // no message" cannot tell a smash bug from its own, and the faulting
         // address plus what smash thinks that address is settles it.
         if (old->sa_handler == SIG_DFL && !(old->sa_flags & SA_SIGINFO)) {
-            char what[160];
+            char what[288];
             what[0] = '\0';
             if (describe_hook_) describe_hook_(info->si_addr, what, sizeof(what));
-            char buf[288];
+            char buf[448];
             const int n = smash::safe_snprintf(buf, sizeof(buf),
                 "[smash FATAL] unhandled sig=%d si_code=%d at addr=%p — the process is "
                 "about to die. %s\n",

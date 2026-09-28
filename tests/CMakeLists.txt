@@ -608,6 +608,18 @@ if(NOT APPLE)
     test_run_cache_on_softdirty0 PROPERTIES TIMEOUT 180)
 endif()
 
+# SMASH_SIGTRACE=1 classifies the address of a fault smash passes on to the
+# application's own SIGSEGV handler (sigtrace_classify_test.cpp).
+if(NOT APPLE)
+  add_executable(sigtrace_classify_test sigtrace_classify_test.cpp)
+  target_link_libraries(sigtrace_classify_test PRIVATE ${CMAKE_DL_LIBS})
+  add_test(NAME test_sigtrace_classify COMMAND ${CMAKE_COMMAND} -E env
+    "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=1" "SMASH_SIGTRACE=1"
+    "SMASH_DEFER_PHASES_MS=0" $<TARGET_FILE:sigtrace_classify_test>)
+  set_tests_properties(test_sigtrace_classify PROPERTIES TIMEOUT 60
+    PASS_REGULAR_EXPRESSION "\\[smash sig\\] sig=11 .* Inside the compressible arena")
+endif()
+
 # When auto-selection finds no write tracking (arm64 before Linux 6.7), smash
 # must warn (write_track_fallback_test.cpp). Simulated old kernel, the same
 # with SMASH_WRITE_TRACK=none (quiet), and the host as it is.
