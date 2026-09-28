@@ -3854,8 +3854,20 @@ private:
     // (soft-dirty replaces it), and paid a whole-process page-table walk each
     // tick for nothing. So: write a scratch page, clear, the bit must read 0;
     // write again, it must read 1.
+    // SMASH_WRITE_TRACK_SIMULATE_OLD_KERNEL=1 (tests): report soft-dirty and
+    // async userfaultfd write-protect as missing, as on an arm64 kernel older
+    // than 6.7, so auto-selection's fallback can be exercised on any host.
+    static bool simulateOldKernel() {
+        static const bool on = [] {
+            const char* v = std::getenv("SMASH_WRITE_TRACK_SIMULATE_OLD_KERNEL");
+            return v && v[0] == '1';
+        }();
+        return on;
+    }
+
     bool softDirtyWorks() {
 #ifdef __linux__
+        if (simulateOldKernel()) return false;
         if (!ensureSoftDirtyFds()) return false;
         const size_t ps = runtimePageSize();
         void* m = reinterpret_cast<void*>(syscall(SYS_mmap, nullptr, ps,
@@ -3931,6 +3943,7 @@ private:
     // is resolved in the kernel either way, with no signal. A scratch page is
     // checked end to end before the arena is trusted to it.
     bool setupUffd() {
+        if (simulateOldKernel()) return false;
         if (!vm_ || vm_->contigPages() == 0 || !ensureSoftDirtyFds()) return false;
         int fd = static_cast<int>(syscall(__NR_userfaultfd,
                                           O_CLOEXEC | O_NONBLOCK | UFFD_USER_MODE_ONLY));
@@ -3998,6 +4011,18 @@ private:
             return WriteTracker::kSoftDirty;
         if ((any || std::strcmp(v, "uffd") == 0) && setupUffd())
             return WriteTracker::kUffd;
+        // No write signal at all, and nothing said so: on a 6.6 arm64 kernel
+        // this left 103 of 144 GiB of an application's arena uncompressed
+        // while every smash stat looked healthy. SMASH_WRITE_TRACK=none (an
+        // explicit choice) stays quiet.
+        static const char kWarn[] =
+            "[smash WARN] no write tracking on this kernel: soft-dirty is not available "
+            "(arm64 has none) and asynchronous userfaultfd write-protect needs Linux 6.7+. "
+            "Hot and cold pages look alike, so cold memory is found only by compressing it "
+            "and re-checking its contents, and much of the heap may stay uncompressed. "
+            "SMASH_SOFTDIRTY=0 selects page-protection write tracking (more CPU, works "
+            "everywhere); SMASH_WRITE_TRACK=none keeps this mode without the warning.\n";
+        (void)!::write(2, kWarn, sizeof(kWarn) - 1);
         return WriteTracker::kNone;
 #else
         return WriteTracker::kProtRead;

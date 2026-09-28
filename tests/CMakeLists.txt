@@ -608,6 +608,25 @@ if(NOT APPLE)
     test_run_cache_on_softdirty0 PROPERTIES TIMEOUT 180)
 endif()
 
+# When auto-selection finds no write tracking (arm64 before Linux 6.7), smash
+# must warn (write_track_fallback_test.cpp). Simulated old kernel, the same
+# with SMASH_WRITE_TRACK=none (quiet), and the host as it is.
+if(NOT APPLE)
+  add_executable(write_track_fallback_test write_track_fallback_test.cpp)
+  target_link_libraries(write_track_fallback_test PRIVATE ${CMAKE_DL_LIBS})
+  set(_wt_env "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=1" "SMASH_STATS_SIGNAL=1"
+              "SMASH_DEFER_PHASES_MS=0" "SMASH_COLD_TIMEOUT_SEC=1")
+  add_test(NAME test_write_track_fallback_old_kernel COMMAND ${CMAKE_COMMAND} -E env ${_wt_env}
+    "SMASH_WRITE_TRACK_SIMULATE_OLD_KERNEL=1" $<TARGET_FILE:write_track_fallback_test>)
+  add_test(NAME test_write_track_fallback_explicit_none COMMAND ${CMAKE_COMMAND} -E env ${_wt_env}
+    "SMASH_WRITE_TRACK_SIMULATE_OLD_KERNEL=1" "SMASH_WRITE_TRACK=none"
+    $<TARGET_FILE:write_track_fallback_test>)
+  add_test(NAME test_write_track_fallback_host COMMAND ${CMAKE_COMMAND} -E env ${_wt_env}
+    $<TARGET_FILE:write_track_fallback_test>)
+  set_tests_properties(test_write_track_fallback_old_kernel test_write_track_fallback_explicit_none
+    test_write_track_fallback_host PROPERTIES TIMEOUT 60)
+endif()
+
 # A large free must not leave a stale entry in free()'s per-thread span
 # cache: large spans never enter it, so large frees need not bump the global
 # page-map generation (large_free_span_cache_test.cpp).
