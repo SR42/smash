@@ -213,3 +213,34 @@ arenas' own (node n uses owner n+1, which was sub-arena 0's dirty or clean
 owner), so node 2's free pages were counted twice (free > carved); fixed by
 numbering sub-arena owners after every node's. The pre-purge check was added
 after a planted misrouted free passed the post-purge one.
+
+## 128-core aarch64 box after the page-map and drain fixes (2026-09-28)
+
+`b58974d`, `--nodes 4 --arena-gib 512 --no-check --os-call-ns 3000`,
+allocate+free per second (sub-arenas: `--subarenas 0`, one per CPU; run
+cache: `--run-cache-mib 128`):
+
+| config | t=8 | t=16 | t=32 | t=64 | t=128 |
+|---|---|---|---|---|---|
+| sub-arenas, numa 1, pinned | 820k | 1622k | 3174k | 6248k | 7901k |
+| sub-arenas, numa 0, pinned | 754k | 1539k | 2710k | 5456k | 6863k |
+| sub-arenas, numa 1 | 750k | 1508k | 3117k | 5184k | 6558k |
+| sub-arenas, numa 0 | 629k | 1352k | 2886k | 3957k | 4635k |
+| run cache, numa 1, pinned | 800k | 1601k | 3157k | 4051k | 1622k |
+| run cache, numa 1 | 782k | 1543k | 3116k | 2612k | 782k |
+| run cache, numa 0 | 400k | 332k | 285k | 127k | 84k |
+| run cache, numa 0, pinned | 355k | 344k | 227k | 123k | 86k |
+
+Sub-arenas scale at ~95% efficiency to 64 threads pinned and still gain at
+128; the run cache peaks at 32 (node path) or never scales (shared path, one
+free map and queue). Before sub-arenas the best on this box was 2.4M at 32
+threads and 1.08M at 128. Two fixes got here after sub-arenas alone did not:
+the simulator's own global block-id counter (`2d4852a`) and, the real one,
+`g_pagemap_generation` bumped by every large free (`5527e88`: 49% of time in
+`PageMap::set` with 1.8% lock waiting — contention on an atomic, invisible to
+the lock report).
+
+Open: per thread this box does ~100k ops/s at 8 threads against ~900k on the
+8-CPU x86 host. Linear scaling rules out shared state; it is a per-operation
+cost. Unmeasured candidate: the release walks every page of a freed block
+(~1150 for the default 1-8 MiB mix) under a per-page lock.
