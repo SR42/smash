@@ -2063,17 +2063,48 @@ private:
         const size_t need = num_pages + (align_pages > 1 ? align_pages - 1 : 0);
         const size_t pages = (need + kNodeChunkPages - 1) / kNodeChunkPages * kNodeChunkPages;
         auto* owners = chunk_sub_.load(std::memory_order_acquire);
-        LockGuard guard(na.chunk_lock);
         // Consecutive pooled chunks first: a freed big block returns its
         // chunks to the pool, and carving fresh ones instead walked the whole
         // region (64 GiB in 2 s of 70 MiB churn, then everything fell out).
-        size_t start = takePooledRunLocked(na, pages / kNodeChunkPages);
-        if (start == kNoChunk) {
-            start = carveBoundChunks(node, pages);
-            if (start == kNoChunk) return nullptr;
+        auto takeOrCarve = [&]() -> size_t {
+            size_t st = takePooledRunLocked(na, pages / kNodeChunkPages);
+            if (st != kNoChunk) return st;
+            st = carveBoundChunks(node, pages);
+            if (st == kNoChunk) return kNoChunk;
             LockGuard carved_guard(na.lock);
             na.carved += pages;
+            return st;
+        };
+        auto takePooled = [&]() {
+            LockGuard guard(na.chunk_lock);
+            return takePooledRunLocked(na, pages / kNodeChunkPages);
+        };
+        // A big block just freed may still be in the decommit queue on its
+        // way back to the pool. Wait for it (as every other allocation path
+        // waits for in-flight frees) BEFORE carving: carving instead grew the
+        // set by fresh chunks each time a free lagged — a malloc_numa churn
+        // took a whole 1 GiB region into node 0's pool and left plain malloc
+        // nothing — and once the region was out, blocks fell out of it (1-7
+        // of 100 rounds on the 2-CPU claudepc). The queue's processing takes
+        // na.chunk_lock, so the wait runs with it released.
+        auto waitForInFlight = [&](size_t st) {
+            uint64_t deadline = 0;
+            for (int attempt = 0; st == kNoChunk && inFlight(subQueue(na)) &&
+                                  drainWaitMore(attempt, deadline); ++attempt) {
+                drainQueueNow(subQueue(na));
+                st = takePooled();
+                if (st == kNoChunk) sched_yield();
+            }
+            return st;
+        };
+        size_t start = waitForInFlight(takePooled());
+        if (start == kNoChunk) {
+            LockGuard guard(na.chunk_lock);
+            start = takeOrCarve();
         }
+        if (start == kNoChunk) start = waitForInFlight(kNoChunk);   // freed while we carved
+        if (start == kNoChunk) return nullptr;
+        LockGuard guard(na.chunk_lock);
         // The free returns the chunks the block touches; any the alignment
         // gap (or the rounding) leaves untouched go to the pool now.
         const size_t blk = start + alignGap(start, align_pages, phase);

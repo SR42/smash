@@ -251,6 +251,10 @@ memory freed by one sub-arena is not stranded there.
   old chunk wholly free but only in this sub-arena's clean runs, and the
   request is served from the fresh dirty run instead (`smash_sim` now checks
   that no wholly free chunk is left unpooled after a full purge).
+- **Blocks larger than a chunk wait for freed chunks in flight** (2026-09-28)
+  before carving new ones: a lagging decommit queue otherwise made every
+  free-then-allocate carve fresh chunks until a node's pool held the whole
+  region (`test_subarena_exhaust_big`, now 300 rounds on one CPU).
 - **Blocks larger than a chunk reuse pooled chunks** (`takePooledRunLocked`:
   consecutive indices in the sorted pool) before carving fresh ones. Phase 1
   always carved, so freed big blocks only fed the pool and 70 MiB churn walked

@@ -29,7 +29,10 @@
 //   block must reuse them rather than carve fresh ones. 100 rounds of
 //   allocate/free of a 100 MiB block, through malloc_numa and through plain
 //   malloc, must all stay in the 1 GiB region. With fresh chunks every time,
-//   the region runs out after a handful of rounds.
+//   the region runs out after a handful of rounds. 300 rounds, the process on
+//   one CPU: a freed block's chunks reach the pool through the decommit queue,
+//   and when the queue lags the next block must wait for them rather than
+//   fall out (1-7 of 100 fell out on the 2-CPU claudepc before it did).
 
 #include <cerrno>
 #include <cstdint>
@@ -172,9 +175,14 @@ int phaseC() {
     const std::vector<int> nodes = numa_test::memoryNodes();
     const int node = nodes.empty() ? 0 : nodes[0];
     constexpr size_t kBig = 100u << 20;
+    constexpr int kRounds = 300;
+    cpu_set_t allowed;
+    sched_getaffinity(0, sizeof(allowed), &allowed);
+    for (int c = 0; c < CPU_SETSIZE; ++c)
+        if (CPU_ISSET(c, &allowed)) { pinTo(c); break; }   // before smash's queue thread starts
     for (int plain = 0; plain < 2; ++plain) {
         long in = 0, out = 0, nulls = 0;
-        for (int i = 0; i < 100; ++i) {
+        for (int i = 0; i < kRounds; ++i) {
             errno = 0;
             auto* p = static_cast<unsigned char*>(
                 plain ? malloc(kBig) : g_numa(static_cast<uint32_t>(node), kBig));
@@ -188,8 +196,8 @@ int phaseC() {
             if (g_in_arena(p)) ++in; else ++out;
             free(p);
         }
-        std::printf("phase C: %s: 100 rounds of a 100 MiB block, %ld in the arena, %ld out, "
-                    "%ld NULL\n", plain ? "malloc" : "malloc_numa", in, out, nulls);
+        std::printf("phase C: %s: %d rounds of a 100 MiB block, %ld in the arena, %ld out, "
+                    "%ld NULL\n", plain ? "malloc" : "malloc_numa", kRounds, in, out, nulls);
         if (out || nulls) {
             std::printf("FAIL: phase C: %s blocks larger than a chunk left the 1 GiB region: "
                         "freed chunks are not being reused\n", plain ? "plain" : "node");
