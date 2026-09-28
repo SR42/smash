@@ -434,6 +434,26 @@ class CompressorThread {
     std::atomic<uint32_t> vma_read_cost_ms_{0};
     std::atomic<bool> vma_syncing_{false};
 
+    // Where pages go in the pipeline, printed as the [smash pipeline] line of
+    // the SIGUSR2 stats dump. Cumulative since start. Per-page counts are
+    // summed per range and added once, so the hot loops pay no shared write.
+    // Added when an application on a 128-core arm64 box kept 115 GiB watched
+    // and compressed nothing under SMASH_SOFTDIRTY=0, and nothing said which
+    // step the pages stopped at.
+    struct PipelineCounters {
+        std::atomic<uint64_t> ticks{0}, tick_ms_last{0}, tick_ms_max{0}, deferred_ticks{0};
+        std::atomic<uint64_t> p1_accessed{0}, p1_idle{0};          // page-ticks
+        std::atomic<uint64_t> p2_at_floor{0}, p2_escalated{0}, p2_eligible{0},
+                              p2_hint_skip{0}, p2_routed{0};
+        std::atomic<uint64_t> cp_attempts{0}, cp_stored{0}, cp_gate_fail{0};
+        std::atomic<uint64_t> rc_checked{0}, rc_released{0}, rc_changed{0}, rc_vma_stop{0};
+        std::atomic<uint64_t> f_monitor{0}, f_shadow{0}, f_compressed{0}, f_active{0};
+    };
+    PipelineCounters pc_;
+    static void pcAdd(std::atomic<uint64_t>& c, uint64_t n) {
+        if (n) c.fetch_add(n, std::memory_order_relaxed);
+    }
+
     // ── Time-budget machinery (SMASH_TIME_BUDGET_PCT) ────────────────────
     // start_steady_time_ is captured at start() and used to compute the
     // available compress budget as elapsed × pct/100. budget_recompute_period_
@@ -1350,6 +1370,7 @@ private:
     // Phase 1: Process access bits and update cold counts
     __attribute__((cold)) void phase1Range(size_t start, size_t end) {
         const bool sd_roi = write_clean_streak_ != nullptr;  // gate on
+        uint64_t n_accessed = 0, n_idle = 0;
         forEachLivePage(start, end, [&](size_t i) {
             PageState st = states_->get(i);
             if (st == PageState::ACTIVE || st == PageState::ACTIVE_MONITORING) {
@@ -1385,12 +1406,14 @@ private:
                 }
 #endif
                 if (accessed) {
+                    ++n_accessed;
                     cold_count_[i] = 0;
                     // Access can change contents — the incompressibility
                     // verdict behind the ratio-gate backoff is stale.
                     compress_fail_count_[i] = 0;
                     accessed_[i].store(false, std::memory_order_relaxed);
                 } else {
+                    ++n_idle;
                     if (cold_count_[i] < 255) cold_count_[i]++;
                     decayRecompressCount(i);
                 }
@@ -1400,6 +1423,8 @@ private:
                 decayRecompressCount(i);
             }
         });
+        pcAdd(pc_.p1_accessed, n_accessed);
+        pcAdd(pc_.p1_idle, n_idle);
     }
 
     // Slowly decay the per-page recompression count once a page settles into
@@ -1438,6 +1463,7 @@ private:
         const ROIConfig& cfg = ROIConfig::instance();
         uint32_t floor = cfg.cold_ticks_floor;
         bool backoff_enabled = cfg.recompress_backoff;
+        uint64_t n_at_floor = 0, n_escalated = 0, n_eligible = 0, n_hint_skip = 0, n_routed = 0;
 
         // No CPU-pressure multiplier and no per-tick compression budget.
         // The right signal for "don't compress this page yet" isn't
@@ -1520,6 +1546,7 @@ private:
             }
             if (st != PageState::ACTIVE && st != PageState::ACTIVE_MONITORING)
                 return;
+            ++n_at_floor;
 
             // P3: persisted profile fast-path skip. If a prior run marked
             // this (arena, size_class) bucket as ALWAYS_SKIP (mean ratio
@@ -1548,9 +1575,11 @@ private:
                         if (bidx_p < kBucketTableLen) {
                             auto& bs = worker.sc_stats[bidx_p];
                             if (bs.budget_decision_hint == SizeClassStats::kBudgetSkip) {
+                                ++n_hint_skip;
                                 return;
                             }
                             if (bs.persist_hint == 1) {
+                                ++n_hint_skip;
                                 return;
                             }
                         }
@@ -1669,13 +1698,17 @@ private:
                 // the compressor more accurate access info for thrashy
                 // pages (which we won't compress anyway until eff_floor).
                 escalateToDeepMonitoring(i);
+                ++n_escalated;
             } else if (cold_count_[i] > profile_floor && cold_count_[i] >= eff_floor) {
                 // Page is eligible for compression — count it
                 pages_eligible.fetch_add(1, std::memory_order_relaxed);
+                ++n_eligible;
                 // Hand the page to its own node's group when that is not this
                 // worker. routeByNode also defers pages whose node is still
                 // unknown to the end-of-range batch below.
-                if (!routeByNode(worker, i, pages_compressed) && compressPage(i, worker)) {
+                const bool routed = routeByNode(worker, i, pages_compressed);
+                if (routed) ++n_routed;
+                if (!routed && compressPage(i, worker)) {
                     pages_compressed.fetch_add(1, std::memory_order_relaxed);
                     // Periodic mid-range flush so the pending list
                     // doesn't get too long and so the cap is never hit
@@ -1690,6 +1723,11 @@ private:
         // End-of-range flush.
         flushPhase2PendingProt(worker);
         flushNodeQueries(worker, pages_compressed);
+        pcAdd(pc_.p2_at_floor, n_at_floor);
+        pcAdd(pc_.p2_escalated, n_escalated);
+        pcAdd(pc_.p2_eligible, n_eligible);
+        pcAdd(pc_.p2_hint_skip, n_hint_skip);
+        pcAdd(pc_.p2_routed, n_routed);
     }
 
     // Which worker should compress page `i`? True means this one must not:
@@ -2029,6 +2067,7 @@ private:
             locks_->lock(page_idx);
         }
 
+        pc_.cp_attempts.fetch_add(1, std::memory_order_relaxed);
         // Verify still eligible
         PageState st = states_->get(page_idx);
         if (st != PageState::ACTIVE && st != PageState::ACTIVE_MONITORING) {
@@ -2469,6 +2508,7 @@ private:
             cold_count_[page_idx] = 0;
             states_->set(page_idx, PageState::ACTIVE);
             locks_->unlock(page_idx);
+            pc_.cp_gate_fail.fetch_add(1, std::memory_order_relaxed);
             return false;
         }
 
@@ -2532,6 +2572,7 @@ private:
         } else {
             compressed_[page_idx].set(stored, comp_size, alloc_size, algo);
         }
+        pc_.cp_stored.fetch_add(1, std::memory_order_relaxed);
         if (page_tier_) {
             page_tier_[page_idx] = is_fast_tier ? kTierFast : kTierDeep;
         }
@@ -3615,6 +3656,7 @@ private:
         long vma_now = vmaEstimate();
         const long vma_cap = vmaMaxMapCount() - cfg_vma_margin_;
         long reclaimed_since_resync = 0;
+        uint64_t n_checked = 0, n_released = 0, n_changed = 0, n_vma_stop = 0;
         constexpr long kVmaResyncReclaims = 256;
 
         // Coalesce the reclaim syscalls. Each reclaimed page used to cost its
@@ -3657,6 +3699,7 @@ private:
                 states_->set(rrun[k], PageState::COMPRESSED);
                 locks_->unlock(rrun[k]);
             }
+            n_released += rrun_n;
             ++vma_now;                       // one PROT_NONE split per run
             noteVmas(1);
             reclaimed_since_resync += static_cast<long>(rrun_n);
@@ -3670,7 +3713,7 @@ private:
         };
 
         for (size_t c = 0; c < num_chunks_range; ++c) {
-            if (vma_cap > 0 && vma_now >= vma_cap) { flushReclaimRun(); break; }
+            if (vma_cap > 0 && vma_now >= vma_cap) { ++n_vma_stop; flushReclaimRun(); break; }
             size_t ci = chunk_base + c;
             if (ci >= num_chunks_) break;
             uint64_t mask = live_chunks_[ci];
@@ -3679,7 +3722,7 @@ private:
             if (ownedByRunningNodeGroup(page_base)) continue;
 
             while (mask) {
-                if (vma_cap > 0 && vma_now >= vma_cap) { flushReclaimRun(); break; }
+                if (vma_cap > 0 && vma_now >= vma_cap) { ++n_vma_stop; flushReclaimRun(); break; }
                 int bit = __builtin_ctzll(mask);
                 mask &= mask - 1;
                 size_t i = page_base + bit;
@@ -3747,6 +3790,7 @@ private:
                 }
 
                 // Verify page content matches the compressed blob.
+                ++n_checked;
                 int slot = acquireFaultSlot();
                 if (slot < 0) {
                     vm::protectPages(page_addr, kPageSize, true, true);
@@ -3767,6 +3811,7 @@ private:
                 releaseFaultSlot(slot);
 
                 if (!content_matches) {
+                    ++n_changed;
                     // Page was modified before we set PROT_READ — discard
                     releaseBlob(i);
                     compressed_[i] = {};
@@ -3802,6 +3847,10 @@ private:
         }
         // Any partial run still holds its pages' locks: flush before returning.
         flushReclaimRun();
+        pcAdd(pc_.rc_checked, n_checked);
+        pcAdd(pc_.rc_released, n_released);
+        pcAdd(pc_.rc_changed, n_changed);
+        pcAdd(pc_.rc_vma_stop, n_vma_stop);
     }
 
     // ── Soft-dirty access tracking (Linux only) ───────────────────────────
@@ -4952,6 +5001,7 @@ private:
             // still runs so when VMA budget recovers (via in-flight
             // fault handlers reclaiming pages) we resume.
             defer_phases = true;
+            pc_.deferred_ticks.fetch_add(1, std::memory_order_relaxed);
         }
         // Re-claim SIGUSR2 each tick so Firefox / other runtimes that
         // also install a SIGUSR2 handler can't permanently displace ours.
@@ -5424,7 +5474,17 @@ private:
                 self->in_tick_.store(false, std::memory_order_release);
                 continue;
             }
+            const auto tick_t0 = std::chrono::steady_clock::now();
             self->tick();
+            {
+                const auto ms = static_cast<uint64_t>(std::chrono::duration_cast<
+                    std::chrono::milliseconds>(std::chrono::steady_clock::now() - tick_t0).count());
+                auto& pc = self->pc_;
+                pc.ticks.fetch_add(1, std::memory_order_relaxed);
+                pc.tick_ms_last.store(ms, std::memory_order_relaxed);
+                if (ms > pc.tick_ms_max.load(std::memory_order_relaxed))
+                    pc.tick_ms_max.store(ms, std::memory_order_relaxed);
+            }
             self->in_tick_.store(false, std::memory_order_release);
         }
         return nullptr;
@@ -6031,7 +6091,7 @@ public:
         // there, and it is what runs out on a very large heap.
         size_t boot_used = 0, boot_cap = 0, boot_regions = 0;
         BootstrapAlloc::instance().usage(&boot_used, &boot_cap, &boot_regions);
-        char buf[768];
+        char buf[1536];
         int n = smash::safe_snprintf(buf, sizeof(buf),
             "[smash stats] [%s] pid=%d committed=%zu  active=%zu  monitor=%zu"
             "  compressing=%zu  compressed=%zu  shadow=%zu  empty=%zu"
@@ -6047,6 +6107,27 @@ public:
             (unsigned long long)g_reheat_events.load(std::memory_order_relaxed),
             writeTrackerName(self->write_tracker_),
             boot_used >> 20, boot_cap >> 20, boot_regions);
+        // Where pages go in the pipeline (see PipelineCounters).
+        if (n > 0 && static_cast<size_t>(n) < sizeof(buf)) {
+            const auto& pc = self->pc_;
+            auto v = [](const std::atomic<uint64_t>& a) {
+                return static_cast<unsigned long long>(a.load(std::memory_order_relaxed));
+            };
+            n += smash::safe_snprintf(buf + n, sizeof(buf) - static_cast<size_t>(n),
+                "[smash pipeline] ticks=%llu tick_ms=%llu/%llu deferred=%llu"
+                " | p1 accessed=%llu idle=%llu | p2 at_floor=%llu escalated=%llu"
+                " eligible=%llu routed=%llu hint_skip=%llu | compress tried=%llu"
+                " stored=%llu gate_fail=%llu | release checked=%llu released=%llu"
+                " changed=%llu vma_stop=%llu | faults monitor=%llu shadow=%llu"
+                " compressed=%llu active=%llu\n",
+                v(pc.ticks), v(pc.tick_ms_last), v(pc.tick_ms_max), v(pc.deferred_ticks),
+                v(pc.p1_accessed), v(pc.p1_idle), v(pc.p2_at_floor), v(pc.p2_escalated),
+                v(pc.p2_eligible), v(pc.p2_routed), v(pc.p2_hint_skip), v(pc.cp_attempts),
+                v(pc.cp_stored), v(pc.cp_gate_fail), v(pc.rc_checked), v(pc.rc_released),
+                v(pc.rc_changed), v(pc.rc_vma_stop), v(pc.f_monitor), v(pc.f_shadow),
+                v(pc.f_compressed), v(pc.f_active));
+            if (n >= static_cast<int>(sizeof(buf))) n = static_cast<int>(sizeof(buf)) - 1;
+        }
         // The per-CPU run cache (SMASH_RUN_CACHE_MIB), when on: whether it is
         // actually absorbing the large-block churn, or evicting as fast as it
         // parks (a free that evicts still goes through releasePages).
@@ -6373,6 +6454,7 @@ public:
 
         switch (st) {
         case PageState::COMPRESSED: {
+            pc_.f_compressed.fetch_add(1, std::memory_order_relaxed);
             // Clear deferred-madvise pending BEFORE the state transitions
             // out of COMPRESSED. The per-page lock is held; the sweeper
             // tryLock+recheck will observe the cleared bit (or skip the
@@ -6537,6 +6619,7 @@ public:
         }
 
         case PageState::ACTIVE_MONITORING: {
+            pc_.f_monitor.fetch_add(1, std::memory_order_relaxed);
             void* page_addr = vm_->pageAddress(page_idx);
             if (!vm::protectPages(page_addr, kPageSize, true, true)) {
                 vm::remapPages(page_addr, kPageSize, true, true);
@@ -6548,6 +6631,7 @@ public:
         }
 
         case PageState::ACTIVE: {
+            pc_.f_active.fetch_add(1, std::memory_order_relaxed);
             // Race: Phase 3's batched mprotect(PROT_READ) can overwrite a
             // per-page PROT_RW restoration done by a concurrent fault handler.
             void* page_addr = vm_->pageAddress(page_idx);
@@ -6559,6 +6643,7 @@ public:
         }
 
         case PageState::COMPRESSED_SHADOW: {
+            pc_.f_shadow.fetch_add(1, std::memory_order_relaxed);
             // Page was still accessible (PROT_RW or PROT_READ from Phase 3).
             // Fault means Phase 3 set PROT_READ and a write occurred.
             // Discard the shadow blob, restore to ACTIVE.
