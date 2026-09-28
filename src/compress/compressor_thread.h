@@ -56,6 +56,7 @@ inline std::atomic<bool> g_smash_skip_external_tracking{false};
 #if defined(__linux__)
 #include <sys/uio.h>          // process_vm_readv
 #include <fcntl.h>
+#include <sys/resource.h>   // getrusage(RUSAGE_THREAD) for the phase-1 counters
 #include <sys/stat.h>
 #include <sys/mman.h>         // mmap/munmap for the spill mapping
 #include <sys/vfs.h>          // statfs — reject tmpfs/ramfs spill dirs
@@ -452,6 +453,13 @@ class CompressorThread {
         // and compress, 3 arm PROT_READ, 4 release shadows), and phase 3's
         // pages armed and the mprotect system calls it took, cumulative.
         std::atomic<uint64_t> phase_ms[5]{};
+        std::atomic<uint64_t> phase_ms_max[5]{};
+        // Phase 1 detail: minor page faults the compressor's threads took
+        // inside phase1Range (cumulative), the slowest single range, and the
+        // worker count of the last tick. Phase 1 makes no syscalls, so a slow
+        // tick with many faults is waiting on the process's mmap_lock.
+        std::atomic<uint64_t> p1_minflt{0}, p1_range_ms_max{0};
+        std::atomic<uint64_t> workers_last{0};
         std::atomic<uint64_t> p3_pages{0}, p3_calls{0};
         // mprotect calls made by phase 2: escalation to PROT_NONE and the
         // compression snapshot.
@@ -1384,6 +1392,11 @@ private:
     __attribute__((cold)) void phase1Range(size_t start, size_t end) {
         const bool sd_roi = write_clean_streak_ != nullptr;  // gate on
         uint64_t n_accessed = 0, n_idle = 0;
+#ifdef __linux__
+        struct rusage ru0{};
+        getrusage(RUSAGE_THREAD, &ru0);
+#endif
+        const auto range_t0 = std::chrono::steady_clock::now();
         forEachLivePage(start, end, [&](size_t i) {
             PageState st = states_->get(i);
             if (st == PageState::ACTIVE || st == PageState::ACTIVE_MONITORING) {
@@ -1438,6 +1451,16 @@ private:
         });
         pcAdd(pc_.p1_accessed, n_accessed);
         pcAdd(pc_.p1_idle, n_idle);
+#ifdef __linux__
+        struct rusage ru1{};
+        getrusage(RUSAGE_THREAD, &ru1);
+        if (ru1.ru_minflt > ru0.ru_minflt)
+            pcAdd(pc_.p1_minflt, static_cast<uint64_t>(ru1.ru_minflt - ru0.ru_minflt));
+#endif
+        const auto range_ms = static_cast<uint64_t>(std::chrono::duration_cast<
+            std::chrono::milliseconds>(std::chrono::steady_clock::now() - range_t0).count());
+        if (range_ms > pc_.p1_range_ms_max.load(std::memory_order_relaxed))
+            pc_.p1_range_ms_max.store(range_ms, std::memory_order_relaxed);
     }
 
     // Slowly decay the per-page recompression count once a page settles into
@@ -3234,9 +3257,14 @@ private:
             CompressorThread* self; int phase; std::chrono::steady_clock::time_point t0;
             ~PhaseTimer() {
                 if (phase < 1 || phase > 4) return;
-                self->pc_.phase_ms[phase].store(static_cast<uint64_t>(
-                    std::chrono::duration_cast<std::chrono::milliseconds>(
-                        std::chrono::steady_clock::now() - t0).count()), std::memory_order_relaxed);
+                const auto ms = static_cast<uint64_t>(std::chrono::duration_cast<
+                    std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count());
+                self->pc_.phase_ms[phase].store(ms, std::memory_order_relaxed);
+                if (ms > self->pc_.phase_ms_max[phase].load(std::memory_order_relaxed))
+                    self->pc_.phase_ms_max[phase].store(ms, std::memory_order_relaxed);
+                if (phase == 1)
+                    self->pc_.workers_last.store(static_cast<uint64_t>(self->active_workers_),
+                                                 std::memory_order_relaxed);
             }
         } phase_timer{this, phase, phase_t0};
 #if defined(__linux__)
@@ -6309,15 +6337,18 @@ public:
                 " stored=%llu gate_fail=%llu | release checked=%llu released=%llu"
                 " changed=%llu vma_stop=%llu | faults monitor=%llu shadow=%llu"
                 " compressed=%llu active=%llu | phase_ms=%llu/%llu/%llu/%llu"
-                " p3 armed=%llu calls=%llu p2 mprotect=%llu\n",
+                " max=%llu/%llu/%llu/%llu | p1 minflt=%llu range_ms_max=%llu workers=%llu"
+                " | p3 armed=%llu calls=%llu p2 mprotect=%llu\n",
                 v(pc.ticks), v(pc.tick_ms_last), v(pc.tick_ms_max), v(pc.deferred_ticks),
                 v(pc.p1_accessed), v(pc.p1_idle), v(pc.p2_at_floor), v(pc.p2_escalated),
                 v(pc.p2_eligible), v(pc.p2_routed), v(pc.p2_hint_skip), v(pc.cp_attempts),
                 v(pc.cp_stored), v(pc.cp_gate_fail), v(pc.rc_checked), v(pc.rc_released),
                 v(pc.rc_changed), v(pc.rc_vma_stop), v(pc.f_monitor), v(pc.f_shadow),
                 v(pc.f_compressed), v(pc.f_active), v(pc.phase_ms[1]), v(pc.phase_ms[2]),
-                v(pc.phase_ms[3]), v(pc.phase_ms[4]), v(pc.p3_pages), v(pc.p3_calls),
-                v(pc.p2_mprotect));
+                v(pc.phase_ms[3]), v(pc.phase_ms[4]), v(pc.phase_ms_max[1]),
+                v(pc.phase_ms_max[2]), v(pc.phase_ms_max[3]), v(pc.phase_ms_max[4]),
+                v(pc.p1_minflt), v(pc.p1_range_ms_max), v(pc.workers_last),
+                v(pc.p3_pages), v(pc.p3_calls), v(pc.p2_mprotect));
             if (n >= static_cast<int>(sizeof(buf))) n = static_cast<int>(sizeof(buf)) - 1;
         }
         // The per-CPU run cache (SMASH_RUN_CACHE_MIB), when on: whether it is
