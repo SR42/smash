@@ -448,6 +448,11 @@ class CompressorThread {
         std::atomic<uint64_t> cp_attempts{0}, cp_stored{0}, cp_gate_fail{0};
         std::atomic<uint64_t> rc_checked{0}, rc_released{0}, rc_changed{0}, rc_vma_stop{0};
         std::atomic<uint64_t> f_monitor{0}, f_shadow{0}, f_compressed{0}, f_active{0};
+        // Wall time of each phase of the last tick (1 access scan, 2 select
+        // and compress, 3 arm PROT_READ, 4 release shadows), and phase 3's
+        // pages armed and the mprotect system calls it took, cumulative.
+        std::atomic<uint64_t> phase_ms[5]{};
+        std::atomic<uint64_t> p3_pages{0}, p3_calls{0};
     };
     PipelineCounters pc_;
     static void pcAdd(std::atomic<uint64_t>& c, uint64_t n) {
@@ -1935,20 +1940,19 @@ private:
     // pages compressed) blows past 65530 boundaries and starts failing
     // mprotect() with ENOMEM.
     //
-    // Chunk cap (kProtectChunkPages) is the max pages per mprotect call.
-    // Larger = fewer VMAs but more lock contention. 64 is a good default:
-    // 64 × 4 KiB = 256 KiB per chunk, ~16K chunks for 1M pages, well
-    // under the VMA cap.
+    // Run cap (protectChunkPages(), default 256) bounds how many pages one
+    // flush covers; flushPhase3Run arms each contiguous stretch of it with
+    // a single mprotect.
     //
     // Syscalls touching a transiently PROT_READ page get EFAULT instead of
     // a SIGSEGV; the wrapper's retryWithDecompress loop catches that, walks
     // the buffer pages (which DOES go through the fault handler), and
     // retries. The bounded retry budget (8) outlasts a compressor tick.
-    // Maximum pages per chunked mprotect call. Larger = fewer TLB-shootdown
-    // IPIs and VMA splits, but longer per-chunk lock-hold (more contention
-    // with handleFault). Default 16 (= 64 KiB). Runtime-tunable via
-    // SMASH_PROTECT_CHUNK_PAGES so the IPI/lock-hold tradeoff can be swept
-    // without a rebuild; clamped to [1, kPendingProtCap].
+    // Maximum pages per Phase 3 run (and so per mprotect call). Larger =
+    // fewer TLB-shootdown IPIs and VMA splits. Runtime-tunable via
+    // SMASH_PROTECT_CHUNK_PAGES, clamped to [1, kPendingProtCap]. (Until the
+    // Phase 3 batching fix this knob was read nowhere: the run cap was a
+    // fixed 16 and every page was protected on its own anyway.)
     static size_t protectChunkPages() {
         static const size_t v = []() -> size_t {
             const char* e = std::getenv("SMASH_PROTECT_CHUNK_PAGES");
@@ -1961,38 +1965,61 @@ private:
         }();
         return v;
     }
-    static constexpr size_t kProtectChunkPagesDefault = 16;
+    // 256 (1 MiB): with the run now armed by one mprotect per contiguous
+    // stretch (flushPhase3Run), a longer run costs no lock hold — each page is
+    // checked and unlocked before the call — and saves syscalls. At 16 pages
+    // per call, arming 30M pages was still ~1.9M TLB shootdowns per pass.
+    static constexpr size_t kProtectChunkPagesDefault = 256;
     static constexpr size_t kProtectChunkPages = 16;  // legacy alias (escalate path)
 
     // Apply mprotect(PROT_READ) to pages that successfully CAS'd to
     // ACTIVE_MONITORING. Unlock before mprotect to avoid deadlock:
     // mprotect(PROT_READ) can trigger a write-fault on an app thread that
     // then blocks in handleFault on the same per-page lock.
-    void flushPhase3Run(size_t run_start, size_t run_end) {
+    // Arm [run_start, run_end) PROT_READ. Each page is checked under its lock
+    // (only pages still ACTIVE_MONITORING are armed), and every contiguous
+    // stretch of checked pages gets ONE mprotect. It used to be one mprotect
+    // per page even here: on a 128-core, 4-node arm64 box with 30M watched
+    // pages and 500k mappings that was ~30M calls per pass, each a TLB
+    // shootdown to every core, and compressor ticks took 68-142 s. A page
+    // whose state changes between its check and the mprotect (freed and
+    // reused) is left PROT_READ with its new state — the fault handler's
+    // ACTIVE case restores it on the first write, as for any Phase 3 race.
+    void flushPhase3Run(size_t run_start, size_t run_end, uint64_t* syscalls = nullptr) {
         if (run_end <= run_start) return;
         bool any_ok = false;
-        for (size_t k = run_start; k < run_end; ++k) {
-            locks_->lock(k);
-            if (states_->get(k) != PageState::ACTIVE_MONITORING) {
-                locks_->unlock(k);
-                continue;
+        auto armSegment = [&](size_t a, size_t b) {
+            void* base = vm_->pageAddress(a);
+            if (!base) return;
+            if (syscalls) ++*syscalls;
+            if (vm::protectPages(base, (b - a) * kPageSize, true, false)) {
+                any_ok = true;
+                return;
             }
-            // State is ACTIVE_MONITORING — unlock before mprotect.
-            // If mprotect triggers a write-fault on another thread,
-            // handleFault sees ACTIVE_MONITORING and restores PROT_RW.
-            locks_->unlock(k);
-
-            void* page_addr = vm_->pageAddress(k);
-            if (!page_addr || !vm::protectPages(page_addr, kPageSize, true, false)) {
-                // mprotect failed — revert state under lock
+            // mprotect failed (ENOMEM near vm.max_map_count) — revert state.
+            for (size_t k = a; k < b; ++k) {
                 locks_->lock(k);
                 if (states_->get(k) == PageState::ACTIVE_MONITORING)
                     states_->set(k, PageState::ACTIVE);
                 locks_->unlock(k);
-            } else {
-                any_ok = true;
             }
+        };
+        size_t seg = ~size_t{0};
+        uintptr_t expect = 0;
+        for (size_t k = run_start; k < run_end; ++k) {
+            locks_->lock(k);
+            const bool ok = states_->get(k) == PageState::ACTIVE_MONITORING;
+            locks_->unlock(k);
+            const auto addr = reinterpret_cast<uintptr_t>(vm_->pageAddress(k));
+            if (seg != ~size_t{0} && (!ok || addr == 0 || addr != expect)) {
+                armSegment(seg, k);
+                seg = ~size_t{0};
+            }
+            if (!ok || addr == 0) continue;
+            if (seg == ~size_t{0}) seg = k;
+            expect = addr + kPageSize;
         }
+        if (seg != ~size_t{0}) armSegment(seg, run_end);
         if (any_ok) protReadBarrier();
     }
 
@@ -2003,6 +2030,11 @@ private:
         // (non-contiguous page index, CAS failure, or chunk size cap).
         size_t run_start = ~size_t{0};
         size_t run_end = 0;
+        uint64_t n_pages = 0, n_calls = 0;
+        auto flushPhase3Run = [&](size_t a, size_t b) {
+            n_pages += b - a;
+            this->flushPhase3Run(a, b, &n_calls);
+        };
         // Get contig_pages count to identify external pages
         const size_t contig_pages = vm_->contigPages();
         forEachLivePage(start, end, [&](size_t i) {
@@ -2041,7 +2073,7 @@ private:
                 run_start = i;
                 run_end = i + 1;
             } else if (i == run_end &&
-                       (run_end - run_start) < kProtectChunkPages) {
+                       (run_end - run_start) < protectChunkPages()) {
                 run_end = i + 1;
             } else {
                 // Discontinuity or cap reached. Flush previous run then
@@ -2054,6 +2086,8 @@ private:
         if (run_end > run_start && run_start != ~size_t{0}) {
             flushPhase3Run(run_start, run_end);
         }
+        pcAdd(pc_.p3_pages, n_pages);
+        pcAdd(pc_.p3_calls, n_calls);
     }
 
     // ── Compress one page using worker's contexts ─────────────────────────
@@ -3057,6 +3091,16 @@ private:
     // ── Parallel dispatch ─────────────────────────────────────────────────
 
     void dispatch(int phase) {
+        const auto phase_t0 = std::chrono::steady_clock::now();
+        struct PhaseTimer {
+            CompressorThread* self; int phase; std::chrono::steady_clock::time_point t0;
+            ~PhaseTimer() {
+                if (phase < 1 || phase > 4) return;
+                self->pc_.phase_ms[phase].store(static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - t0).count()), std::memory_order_relaxed);
+            }
+        } phase_timer{this, phase, phase_t0};
 #if defined(__linux__)
         // Node groups work their nodes' chunks on their own threads while the
         // default workers below take everything else.
@@ -6119,13 +6163,15 @@ public:
                 " eligible=%llu routed=%llu hint_skip=%llu | compress tried=%llu"
                 " stored=%llu gate_fail=%llu | release checked=%llu released=%llu"
                 " changed=%llu vma_stop=%llu | faults monitor=%llu shadow=%llu"
-                " compressed=%llu active=%llu\n",
+                " compressed=%llu active=%llu | phase_ms=%llu/%llu/%llu/%llu"
+                " p3 armed=%llu calls=%llu\n",
                 v(pc.ticks), v(pc.tick_ms_last), v(pc.tick_ms_max), v(pc.deferred_ticks),
                 v(pc.p1_accessed), v(pc.p1_idle), v(pc.p2_at_floor), v(pc.p2_escalated),
                 v(pc.p2_eligible), v(pc.p2_routed), v(pc.p2_hint_skip), v(pc.cp_attempts),
                 v(pc.cp_stored), v(pc.cp_gate_fail), v(pc.rc_checked), v(pc.rc_released),
                 v(pc.rc_changed), v(pc.rc_vma_stop), v(pc.f_monitor), v(pc.f_shadow),
-                v(pc.f_compressed), v(pc.f_active));
+                v(pc.f_compressed), v(pc.f_active), v(pc.phase_ms[1]), v(pc.phase_ms[2]),
+                v(pc.phase_ms[3]), v(pc.phase_ms[4]), v(pc.p3_pages), v(pc.p3_calls));
             if (n >= static_cast<int>(sizeof(buf))) n = static_cast<int>(sizeof(buf)) - 1;
         }
         // The per-CPU run cache (SMASH_RUN_CACHE_MIB), when on: whether it is

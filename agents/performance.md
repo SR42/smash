@@ -633,3 +633,19 @@ idle 1 GiB next to 1M mappings: 28% compressed after 120 s, against 100% after
 thread; the real count is re-read at most every 20x the last read's cost (at
 least 1 s), or every second within a quarter of the cap. 600k mappings: 100%
 after 17 s; 900k: 92.8% after 20 s. `test_idle_compress_protread_many_vmas`.
+
+## Phase 3 protected every page with its own mprotect (2026-09-28)
+
+After the `/proc/self/maps` fix the arm64 application still compressed at
+~1 MB/s. The new `[smash pipeline]` line showed why: 11 ticks in 9 minutes,
+the last 68 s and the slowest 142 s — and everything in the pipeline counts
+idle time in ticks. Phase 3 (arm live pages PROT_READ) grouped pages into runs
+of 16 but called `mprotect` once per page inside the run: ~30M calls per full
+pass there, each a TLB shootdown to every core of a 128-core box in a process
+with 500k mappings. Locally (8 GiB, 8 threads writing 16k scattered pages/s)
+phase 3 was 2732 of a 2752 ms tick, arming 1.8M pages in 113k runs.
+`flushPhase3Run` now checks each page under its lock and arms each contiguous
+stretch with one `mprotect`; the run cap is 256 pages (the
+`SMASH_PROTECT_CHUNK_PAGES` knob, which nothing had read). Same workload:
+2M pages armed in 7708 calls and 26 ms; steady-state phase 3 66-75 ms (the
+single pages re-armed after scattered writes — one call each, inherent).

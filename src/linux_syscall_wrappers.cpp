@@ -2685,8 +2685,9 @@ __sighandler_t installSignalHandler(int sig, __sighandler_t handler, int flags, 
     sa.sa_flags = flags;
     struct sigaction old{};
     if (smash::vm::FaultHandler::interposedSigaction(sig, &sa, &old) != 0) return SIG_ERR;
-    return (old.sa_flags & SA_SIGINFO) ? reinterpret_cast<__sighandler_t>(old.sa_sigaction)
-                                       : old.sa_handler;
+    // sa_handler and sa_sigaction share storage: reading sa_handler returns
+    // the SA_SIGINFO handler's address too, which is what signal() reports.
+    return old.sa_handler;
 }
 }  // namespace
 
