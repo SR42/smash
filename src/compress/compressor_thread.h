@@ -420,6 +420,20 @@ class CompressorThread {
     size_t environ_page_idx_ = kNoEnvironPage;
     long vma_count_cached_ = 0;   // VMA-cap guard: refreshed every N ticks
 
+    // The process's mapping (VMA) count, shared by every compressor thread:
+    // the last /proc/self/maps count plus the runs smash has split since.
+    // Reading /proc/self/maps costs time linear in the mappings and holds the
+    // process's mmap_lock while the kernel formats it; the reclaim and sweep
+    // paths used to read it at the start of every range and again every 256
+    // pages. With 500k-1M mappings (a large application under page-protection
+    // tracking had 503842) one read took 193-341 ms, compression of an idle
+    // 1 GiB crawled at ~3 MiB/s (28% in 120 s instead of 100% in 16 s), and
+    // on a 128-core box it stopped outright. Re-synced by syncVmaEstimate().
+    std::atomic<long> vma_estimate_{0};
+    std::atomic<uint64_t> vma_synced_ms_{0};
+    std::atomic<uint32_t> vma_read_cost_ms_{0};
+    std::atomic<bool> vma_syncing_{false};
+
     // ── Time-budget machinery (SMASH_TIME_BUDGET_PCT) ────────────────────
     // start_steady_time_ is captured at start() and used to compute the
     // available compress budget as elapsed × pct/100. budget_recompute_period_
@@ -3598,7 +3612,7 @@ private:
         // within cfg_vma_margin_ of the cap. Un-reclaimed pages stay
         // COMPRESSED_SHADOW (still accessible, no fault) and are reclaimed a
         // later tick once fault-driven decompression has merged VMAs back.
-        long vma_now = readVmaCount();
+        long vma_now = vmaEstimate();
         const long vma_cap = vmaMaxMapCount() - cfg_vma_margin_;
         long reclaimed_since_resync = 0;
         constexpr long kVmaResyncReclaims = 256;
@@ -3644,9 +3658,11 @@ private:
                 locks_->unlock(rrun[k]);
             }
             ++vma_now;                       // one PROT_NONE split per run
+            noteVmas(1);
             reclaimed_since_resync += static_cast<long>(rrun_n);
             if (reclaimed_since_resync >= kVmaResyncReclaims) {
-                vma_now = readVmaCount();
+                syncVmaEstimate();           // rate-limited, shared
+                vma_now = vmaEstimate();
                 reclaimed_since_resync = 0;
             }
             rrun_n = 0;
@@ -4537,8 +4553,41 @@ private:
         return cap;
     }
 
+    long vmaEstimate() const { return vma_estimate_.load(std::memory_order_relaxed); }
+    void noteVmas(long n) { vma_estimate_.fetch_add(n, std::memory_order_relaxed); }
+    // Re-read the real count when it is due: every second once the estimate
+    // is within a quarter of the cap, otherwise at most every 20x the last
+    // read's cost (and at least a second). One thread reads; the others keep
+    // using the estimate. Merges (decompression) are not tracked, so the
+    // estimate only errs high between reads — the safe direction.
+    void syncVmaEstimate(bool force = false) {
+        const auto now_ms = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+        const long cap = vmaMaxMapCount();
+        const bool near_cap = vmaEstimate() >= cap - cap / 4;
+        uint64_t interval = 1000;
+        if (!near_cap) {
+            const uint64_t by_cost = 20ull * vma_read_cost_ms_.load(std::memory_order_relaxed);
+            if (by_cost > interval) interval = by_cost;
+        }
+        const uint64_t last = vma_synced_ms_.load(std::memory_order_relaxed);
+        if (!force && last != 0 && now_ms - last < interval) return;
+        bool expected = false;
+        if (!vma_syncing_.compare_exchange_strong(expected, true, std::memory_order_acquire))
+            return;
+        const auto t0 = std::chrono::steady_clock::now();
+        const long n = readVmaCount();
+        const auto cost = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t0).count();
+        vma_estimate_.store(n, std::memory_order_relaxed);
+        vma_read_cost_ms_.store(static_cast<uint32_t>(cost), std::memory_order_relaxed);
+        vma_synced_ms_.store(now_ms, std::memory_order_relaxed);
+        vma_syncing_.store(false, std::memory_order_release);
+    }
+
     // Current VMA count for this process (lines in /proc/self/maps). Linux
     // only; returns 0 elsewhere so callers treat the budget as unbounded.
+    // Costly with many mappings: callers go through syncVmaEstimate().
     static long readVmaCount() {
 #ifdef __linux__
         FILE* f = fopen("/proc/self/maps", "r");
@@ -4739,7 +4788,7 @@ private:
         // fault-driven decompression (which mprotect(PROT_RW)s pages and MERGES
         // their VMAs back) has freed headroom. Re-sync the real count every
         // kVmaResyncRuns runs to correct estimate drift (merges/other mmaps).
-        long vma_now = readVmaCount();
+        long vma_now = vmaEstimate();
         const long vma_cap = vmaMaxMapCount() - cfg_vma_margin_;
         long applied_since_resync = 0;
         constexpr long kVmaResyncRuns = 256;
@@ -4822,8 +4871,10 @@ private:
                 // out of the middle of a larger RW region). Charge 2 to stay
                 // conservative; resync to the real count periodically.
                 vma_now += 2;
+                noteVmas(2);
                 if (++applied_since_resync >= kVmaResyncRuns) {
-                    vma_now = readVmaCount();
+                    syncVmaEstimate();       // rate-limited, shared
+                    vma_now = vmaEstimate();
                     applied_since_resync = 0;
                 }
             }
@@ -4893,7 +4944,8 @@ private:
         // on the per-tick path.
         const long max_map_count = vmaMaxMapCount();
         const long kVmaSafetyMargin = cfg_vma_margin_;
-        vma_count_cached_ = readVmaCount();
+        syncVmaEstimate();
+        vma_count_cached_ = vmaEstimate();
         if (vma_count_cached_ + kVmaSafetyMargin >= max_map_count) {
             // Can't safely fragment more VMAs — defer compression for
             // the remainder of this tick. Phase 1 (access tracking)

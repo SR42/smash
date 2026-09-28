@@ -621,8 +621,14 @@ if(NOT APPLE)
     $<TARGET_FILE:idle_compress_test>)
   add_test(NAME test_idle_compress_protread_subarenas COMMAND ${CMAKE_COMMAND} -E env ${_ic_env}
     "SMASH_SOFTDIRTY=0" "SMASH_SUBARENAS=1" $<TARGET_FILE:idle_compress_test>)
+  # With ~600000 mappings, as a large application under page protection has
+  # (503842 seen): smash must not re-read /proc/self/maps per 256 pages.
+  # Skips where vm.max_map_count is too low (the default 65530).
+  add_test(NAME test_idle_compress_protread_many_vmas COMMAND ${CMAKE_COMMAND} -E env ${_ic_env}
+    "SMASH_SOFTDIRTY=0" "IDLE_COMPRESS_EXTRA_VMAS=600000" $<TARGET_FILE:idle_compress_test>)
   set_tests_properties(test_idle_compress_protread test_idle_compress_auto
-    test_idle_compress_protread_subarenas PROPERTIES TIMEOUT 240)
+    test_idle_compress_protread_subarenas test_idle_compress_protread_many_vmas
+    PROPERTIES TIMEOUT 240)
 endif()
 
 # An application's own SIGSEGV handler must never displace smash's: smash

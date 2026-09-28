@@ -616,3 +616,20 @@ for a run to be processed. Two things made that wait fail:
 Phase A: 0 of 160000 out, idle and with three copies at once (was 188-264 and
 466-548), and the phase takes half the time (1.1-1.3 s vs 2.3-2.5 s). The
 timed wait alone also reaches 0; the `mprotect` skip alone 23-85.
+
+## Counting mappings cost more than the compression (2026-09-28)
+
+An application on the 128-core arm64 box under `SMASH_SOFTDIRTY=0` had 503842
+mappings, 115 GiB watched, nothing compressed and RSS at 194 GB. Page
+protection splits mappings — a write to one page of a read-only run makes that
+page writable on its own — and smash counted them by reading
+`/proc/self/maps`: once per tick, at the start of every reclaim and sweep range
+(every worker, every node group) and again every 256 pages reclaimed. The read
+is linear in the mappings (193 ms at 600k, 341 ms at 1M on the 8-CPU host) and
+holds the process's `mmap_lock` while the kernel formats it. Reproduced with an
+idle 1 GiB next to 1M mappings: 28% compressed after 120 s, against 100% after
+16 s without them, a rate matching one read per 256 pages. A shared estimate
+(last count plus the runs smash split since, erring high) now serves every
+thread; the real count is re-read at most every 20x the last read's cost (at
+least 1 s), or every second within a quarter of the cap. 600k mappings: 100%
+after 17 s; 900k: 92.8% after 20 s. `test_idle_compress_protread_many_vmas`.
