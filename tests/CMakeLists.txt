@@ -608,6 +608,23 @@ if(NOT APPLE)
     test_run_cache_on_softdirty0 PROPERTIES TIMEOUT 180)
 endif()
 
+# An idle 1 GiB must actually leave RSS with default timings, in each
+# write-tracking mode: page protection (SMASH_SOFTDIRTY=0), the default
+# auto-selection, and page protection with sub-arenas (idle_compress_test.cpp).
+if(NOT APPLE)
+  add_executable(idle_compress_test idle_compress_test.cpp)
+  target_link_libraries(idle_compress_test PRIVATE ${CMAKE_DL_LIBS})
+  set(_ic_env "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=1")
+  add_test(NAME test_idle_compress_protread COMMAND ${CMAKE_COMMAND} -E env ${_ic_env}
+    "SMASH_SOFTDIRTY=0" $<TARGET_FILE:idle_compress_test>)
+  add_test(NAME test_idle_compress_auto COMMAND ${CMAKE_COMMAND} -E env ${_ic_env}
+    $<TARGET_FILE:idle_compress_test>)
+  add_test(NAME test_idle_compress_protread_subarenas COMMAND ${CMAKE_COMMAND} -E env ${_ic_env}
+    "SMASH_SOFTDIRTY=0" "SMASH_SUBARENAS=1" $<TARGET_FILE:idle_compress_test>)
+  set_tests_properties(test_idle_compress_protread test_idle_compress_auto
+    test_idle_compress_protread_subarenas PROPERTIES TIMEOUT 240)
+endif()
+
 # An application's own SIGSEGV handler must never displace smash's: smash
 # interposes sigaction()/signal() and chains to it (signal_chain_test.cpp).
 if(NOT APPLE)
