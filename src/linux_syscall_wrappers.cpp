@@ -177,9 +177,9 @@ SMASH_VISIBLE ssize_t read(int fd, void* buf, size_t count) {
     SMASH_LAZY_RESOLVE(fn_t, read);
     if (!real_read) return syscall(SYS_read, fd, buf, count);
     SMASH_PASSTHROUGH_IF_DISABLED(read, fd, buf, count);
-    return smash::vm::retryWith1Buf(
-        [&] { return real_read(fd, buf, count); },
-        buf, count);
+    return smash::vm::fileIoWith1Buf(fd, buf, count, [&](size_t d) {
+        return real_read(fd, static_cast<char*>(buf) + d, count - d);
+    });
 }
 
 // ── _FORTIFY_SOURCE variants ────────────────────────────────────────────────
@@ -273,9 +273,9 @@ static void smash_resolve_fortified_syscalls() {
 SMASH_VISIBLE ssize_t __read_chk(int fd, void* buf, size_t count, size_t buflen) {
     if (!g_real_read_chk) return read(fd, buf, count);
     if (g_syscall_wrap_disabled) return g_real_read_chk(fd, buf, count, buflen);
-    return smash::vm::retryWith1Buf(
-        [&] { return g_real_read_chk(fd, buf, count, buflen); },
-        buf, count);
+    return smash::vm::fileIoWith1Buf(fd, buf, count, [&](size_t d) {
+        return g_real_read_chk(fd, static_cast<char*>(buf) + d, count - d, buflen - d);
+    });
 }
 SMASH_VISIBLE ssize_t __read_chk_24(int fd, void* buf, size_t count, size_t buflen) {
     return __read_chk(fd, buf, count, buflen);
@@ -286,9 +286,10 @@ SMASH_VISIBLE ssize_t __pread_chk(int fd, void* buf, size_t count, off_t offset,
                                   size_t buflen) {
     if (!g_real_pread_chk) return pread(fd, buf, count, offset);
     if (g_syscall_wrap_disabled) return g_real_pread_chk(fd, buf, count, offset, buflen);
-    return smash::vm::retryWith1Buf(
-        [&] { return g_real_pread_chk(fd, buf, count, offset, buflen); },
-        buf, count);
+    return smash::vm::fileIoWith1Buf(fd, buf, count, [&](size_t d) {
+        return g_real_pread_chk(fd, static_cast<char*>(buf) + d, count - d,
+                                offset + static_cast<off_t>(d), buflen - d);
+    });
 }
 SMASH_VISIBLE ssize_t __pread_chk_24(int fd, void* buf, size_t count, off_t offset,
                                      size_t buflen) {
@@ -300,9 +301,10 @@ SMASH_VISIBLE ssize_t __pread64_chk(int fd, void* buf, size_t count, off64_t off
                                     size_t buflen) {
     if (!g_real_pread64_chk) return pread(fd, buf, count, static_cast<off_t>(offset));
     if (g_syscall_wrap_disabled) return g_real_pread64_chk(fd, buf, count, offset, buflen);
-    return smash::vm::retryWith1Buf(
-        [&] { return g_real_pread64_chk(fd, buf, count, offset, buflen); },
-        buf, count);
+    return smash::vm::fileIoWith1Buf(fd, buf, count, [&](size_t d) {
+        return g_real_pread64_chk(fd, static_cast<char*>(buf) + d, count - d,
+                                  offset + static_cast<off64_t>(d), buflen - d);
+    });
 }
 SMASH_VISIBLE ssize_t __pread64_chk_24(int fd, void* buf, size_t count,
                                        off64_t offset, size_t buflen) {
@@ -404,45 +406,45 @@ SMASH_VISIBLE ssize_t write(int fd, const void* buf, size_t count) {
     SMASH_LAZY_RESOLVE(fn_t, write);
     if (!real_write) return syscall(SYS_write, fd, buf, count);
     SMASH_PASSTHROUGH_IF_DISABLED(write, fd, buf, count);
-    return smash::vm::retryWith1Buf(
-        [&] { return real_write(fd, buf, count); },
-        buf, count);
+    return smash::vm::fileIoWith1Buf(fd, buf, count, [&](size_t d) {
+        return real_write(fd, static_cast<const char*>(buf) + d, count - d);
+    });
 }
 
 SMASH_VISIBLE ssize_t pread(int fd, void* buf, size_t count, off_t offset) {
     using fn_t = ssize_t(*)(int, void*, size_t, off_t);
     SMASH_LAZY_RESOLVE(fn_t, pread);
     if (!real_pread) return syscall(SYS_pread64, fd, buf, count, offset);
-    return smash::vm::retryWith1Buf(
-        [&] { return real_pread(fd, buf, count, offset); },
-        buf, count);
+    return smash::vm::fileIoWith1Buf(fd, buf, count, [&](size_t d) {
+        return real_pread(fd, static_cast<char*>(buf) + d, count - d,
+                          offset + static_cast<off_t>(d));
+    });
 }
 
 SMASH_VISIBLE ssize_t pwrite(int fd, const void* buf, size_t count, off_t offset) {
     using fn_t = ssize_t(*)(int, const void*, size_t, off_t);
     SMASH_LAZY_RESOLVE(fn_t, pwrite);
     if (!real_pwrite) return syscall(SYS_pwrite64, fd, buf, count, offset);
-    return smash::vm::retryWith1Buf(
-        [&] { return real_pwrite(fd, buf, count, offset); },
-        buf, count);
+    return smash::vm::fileIoWith1Buf(fd, buf, count, [&](size_t d) {
+        return real_pwrite(fd, static_cast<const char*>(buf) + d, count - d,
+                           offset + static_cast<off_t>(d));
+    });
 }
 
 SMASH_VISIBLE ssize_t readv(int fd, const struct iovec* iov, int iovcnt) {
     using fn_t = ssize_t(*)(int, const struct iovec*, int);
     SMASH_LAZY_RESOLVE(fn_t, readv);
     if (!real_readv) return syscall(SYS_readv, fd, iov, iovcnt);
-    return smash::vm::retryWithIovec(
-        [&] { return real_readv(fd, iov, iovcnt); },
-        iov, iovcnt);
+    return smash::vm::fileIoWithIovec(fd, iov, iovcnt,
+        [&](const struct iovec* v, int n, size_t) { return real_readv(fd, v, n); });
 }
 
 SMASH_VISIBLE ssize_t writev(int fd, const struct iovec* iov, int iovcnt) {
     using fn_t = ssize_t(*)(int, const struct iovec*, int);
     SMASH_LAZY_RESOLVE(fn_t, writev);
     if (!real_writev) return syscall(SYS_writev, fd, iov, iovcnt);
-    return smash::vm::retryWithIovec(
-        [&] { return real_writev(fd, iov, iovcnt); },
-        iov, iovcnt);
+    return smash::vm::fileIoWithIovec(fd, iov, iovcnt,
+        [&](const struct iovec* v, int n, size_t) { return real_writev(fd, v, n); });
 }
 
 SMASH_VISIBLE ssize_t recv(int s, void* buf, size_t len, int flags) {
@@ -957,18 +959,20 @@ SMASH_VISIBLE ssize_t preadv(int fd, const struct iovec* iov, int iovcnt, off_t 
     using fn_t = ssize_t(*)(int, const struct iovec*, int, off_t);
     SMASH_LAZY_RESOLVE(fn_t, preadv);
     if (!real_preadv) return syscall(SYS_preadv, fd, iov, iovcnt, offset);
-    return smash::vm::retryWithIovec(
-        [&] { return real_preadv(fd, iov, iovcnt, offset); },
-        iov, iovcnt);
+    return smash::vm::fileIoWithIovec(fd, iov, iovcnt,
+        [&](const struct iovec* v, int n, size_t d) {
+            return real_preadv(fd, v, n, offset + static_cast<off_t>(d));
+        });
 }
 
 SMASH_VISIBLE ssize_t pwritev(int fd, const struct iovec* iov, int iovcnt, off_t offset) {
     using fn_t = ssize_t(*)(int, const struct iovec*, int, off_t);
     SMASH_LAZY_RESOLVE(fn_t, pwritev);
     if (!real_pwritev) return syscall(SYS_pwritev, fd, iov, iovcnt, offset);
-    return smash::vm::retryWithIovec(
-        [&] { return real_pwritev(fd, iov, iovcnt, offset); },
-        iov, iovcnt);
+    return smash::vm::fileIoWithIovec(fd, iov, iovcnt,
+        [&](const struct iovec* v, int n, size_t d) {
+            return real_pwritev(fd, v, n, offset + static_cast<off_t>(d));
+        });
 }
 
 SMASH_VISIBLE ssize_t preadv2(int fd, const struct iovec* iov, int iovcnt,
@@ -976,9 +980,16 @@ SMASH_VISIBLE ssize_t preadv2(int fd, const struct iovec* iov, int iovcnt,
     using fn_t = ssize_t(*)(int, const struct iovec*, int, off_t, int);
     SMASH_LAZY_RESOLVE(fn_t, preadv2);
     if (!real_preadv2) return syscall(SYS_preadv2, fd, iov, iovcnt, offset, flags);
-    return smash::vm::retryWithIovec(
-        [&] { return real_preadv2(fd, iov, iovcnt, offset, flags); },
-        iov, iovcnt);
+    if (flags & RWF_NOWAIT)   // a short count is the point of RWF_NOWAIT
+        return smash::vm::retryWithIovec(
+            [&] { return real_preadv2(fd, iov, iovcnt, offset, flags); },
+            iov, iovcnt);
+    // offset -1 means the file position, which the kernel advances.
+    return smash::vm::fileIoWithIovec(fd, iov, iovcnt,
+        [&](const struct iovec* v, int n, size_t d) {
+            return real_preadv2(fd, v, n, offset == -1 ? -1 : offset + static_cast<off_t>(d),
+                                flags);
+        });
 }
 
 SMASH_VISIBLE ssize_t pwritev2(int fd, const struct iovec* iov, int iovcnt,
@@ -986,9 +997,15 @@ SMASH_VISIBLE ssize_t pwritev2(int fd, const struct iovec* iov, int iovcnt,
     using fn_t = ssize_t(*)(int, const struct iovec*, int, off_t, int);
     SMASH_LAZY_RESOLVE(fn_t, pwritev2);
     if (!real_pwritev2) return syscall(SYS_pwritev2, fd, iov, iovcnt, offset, flags);
-    return smash::vm::retryWithIovec(
-        [&] { return real_pwritev2(fd, iov, iovcnt, offset, flags); },
-        iov, iovcnt);
+    if (flags & RWF_NOWAIT)
+        return smash::vm::retryWithIovec(
+            [&] { return real_pwritev2(fd, iov, iovcnt, offset, flags); },
+            iov, iovcnt);
+    return smash::vm::fileIoWithIovec(fd, iov, iovcnt,
+        [&](const struct iovec* v, int n, size_t d) {
+            return real_pwritev2(fd, v, n, offset == -1 ? -1 : offset + static_cast<off_t>(d),
+                                 flags);
+        });
 }
 
 // ── waitid / wait4 (process management) ─────────────────────────────────────

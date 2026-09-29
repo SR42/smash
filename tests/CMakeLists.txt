@@ -654,6 +654,19 @@ if(NOT APPLE)
   set_tests_properties(test_restore_granule PROPERTIES TIMEOUT 120)
 endif()
 
+# File I/O into / out of a partly accessible buffer (a watched read-only page
+# after a writable one, a PROT_NONE page after a readable one) must transfer
+# everything, not stop at a short count (short_io_test.cpp).
+if(NOT APPLE)
+  add_executable(short_io_test short_io_test.cpp)
+  target_link_libraries(short_io_test PRIVATE ${CMAKE_DL_LIBS})
+  add_test(NAME test_short_io COMMAND ${CMAKE_COMMAND} -E env
+    "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=1" "SMASH_SOFTDIRTY=0"
+    "SMASH_DEFER_PHASES_MS=0" "SMASH_COLD_TIMEOUT_SEC=1"
+    $<TARGET_FILE:short_io_test>)
+  set_tests_properties(test_short_io PROPERTIES TIMEOUT 400)
+endif()
+
 # An idle 1 GiB must actually leave RSS with default timings, in each
 # write-tracking mode: page protection (SMASH_SOFTDIRTY=0), the default
 # auto-selection, and page protection with sub-arenas (idle_compress_test.cpp).

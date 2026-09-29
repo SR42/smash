@@ -162,18 +162,36 @@ passing through (`SMASH_NO_SYSCALL_WRAP=1`) and 458–462 ns wrapped. So
 interposition itself costs ~15 ns per syscall and the retry logic ~5 ns on top
 — about 1% of a syscall, paid only by the syscalls listed above.
 
-## Short transfers when a buffer is only partly compressed (open gap, 2026-09-29)
+## Short transfers when a buffer is only partly accessible (fixed 2026-09-29)
 
 The EFAULT retry (`retryWithDecompress`) only fires when the syscall returns
--1/`EFAULT`. When a buffer's first pages are accessible and a later one is
-compressed, the kernel copies up to that page and returns a **short count**
-instead — a successful return the wrappers pass straight to the application.
-For a regular file (`read`, `pread`, `preadv`, ...) callers commonly treat a
-short count as EOF. Found with `SMASH_RESTORE_GRANULE_PAGES=16` forced on the
-suite: `test_syscall_efault`'s `preadv` returned 16384 of 131072 bytes — group
-restore compresses a freshly written buffer unevenly (neighbours' cold counts
-are frozen for a tick), but a buffer straddling an ACTIVE page and a
-COMPRESSED one hits the same path with default settings. Not fixed: a fix
-would pre-fault (walk) a buffer's compressed pages before the call, or retry
-the remainder after a short count when the page after it is compressed.
+-1/`EFAULT`. When a buffer's first page is accessible and a later one is not —
+a PROT_READ watched page for a read *into* it, a PROT_NONE compressed or
+escalated page for a write *out of* it — the kernel copies up to that page
+and returns a **short count**, a success the wrappers used to hand straight
+back. For a regular file a short read looks like end of file. Under
+`SMASH_SOFTDIRTY=0` every watched page is read-only, so this needed no
+compression at all: a 2 MiB `read` into a heap buffer whose first page had
+just been written returned **4096 bytes**, through every libc entry
+(`test_short_io`, 10 of 10 calls short before the fix). First seen with
+`SMASH_RESTORE_GRANULE_PAGES=16` forced on `test_syscall_efault` (`preadv`:
+16384 of 131072).
 
+`fileIoWith1Buf` / `fileIoWithIovec` (`syscall_compat.h`) now back `read`,
+`__read_chk`, `pread`, `__pread_chk`, `__pread64_chk`, `write`, `pwrite`,
+`readv`, `writev`, `preadv`, `pwritev`, `preadv2`, `pwritev2`: after a short
+count whose next byte is on a smash page, and only for a regular file or block
+device (`fstat`), they carry on with the remainder (offset advanced for the
+positioned calls, `-1` kept for `preadv2`/`pwritev2`'s file position), each
+continuation through the usual EFAULT retry, until it is complete, returns 0
+(end of file) or fails (the bytes done so far are returned, `errno` as before
+the continuation). Continuing on a file never blocks. Left alone: sockets and
+pipes (short transfers are normal there, callers loop, stream data is not
+lost; continuing would block — `test_short_io`'s pipe case, guarded by
+`alarm`), and `RWF_NOWAIT` (a short count is its point).
+
+Still open: the macOS wrappers still use `retryWith1Buf`/`retryWithIovec` for these calls (the continuation is Linux only); `pread64` / `pwrite64` / `preadv64` / `pwritev64` called by those
+names are not wrapped at all (64-bit builds do not rename `pread` to them, so
+most callers never use them); datagram receives (`recv`/`recvmsg` on UDP) that
+fault may drop the datagram in the kernel before any retry; `fread` and the
+other buffered calls go through `warmPages` as before.

@@ -27,6 +27,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <ctime>
+#include <sys/stat.h>
 #include <sys/uio.h>
 
 #ifdef __APPLE__
@@ -190,6 +191,104 @@ inline auto retryWithIovec(Syscall syscall,
     return retryWithDecompress(
         syscall,
         [&] { if (vm && iov && iovcnt > 0) walkIovecForFault(iov, iovcnt, vm); });
+}
+
+// ── Short transfers on files ─────────────────────────────────────────────
+// When a buffer's first page is accessible and a later one is not (a
+// PROT_READ watched page for a read into it, a PROT_NONE compressed or
+// escalated page for a write out of it), the kernel copies up to that page
+// and returns a SHORT COUNT, not -1/EFAULT, so retryWithDecompress never
+// fires. For a regular file or block device a short read looks like end of
+// file: under SMASH_SOFTDIRTY=0 a 2 MiB read into a heap buffer whose first
+// page had just been written returned 4096 bytes (short_io_test). For those
+// descriptors the wrappers below carry on with the rest of the buffer
+// (continuing on a file never blocks; at a real end of file the next call
+// returns 0). Sockets and pipes keep the kernel's short count: short
+// transfers are normal there, callers loop, and nothing is lost. Only a
+// short count whose next byte is on a smash page costs the fstat.
+inline bool fdIsFile(int fd) {
+    struct stat st;
+    return ::fstat(fd, &st) == 0 && (S_ISREG(st.st_mode) || S_ISBLK(st.st_mode));
+}
+
+// Upper bound on continuations: each makes progress.
+inline constexpr int kMaxShortContinuations = 1 << 16;
+
+// One buffer. call(done) issues the syscall for [done, total) of it.
+template <typename Call>
+inline ssize_t fileIoWith1Buf(int fd, const void* buf, size_t total, Call call) {
+    auto* vm = ::smash::g_smash_vm_region;
+    const auto base = reinterpret_cast<uintptr_t>(buf);
+    auto attempt = [&](size_t done) {
+        return retryWithDecompress(
+            [&] { return call(done); },
+            [&] {
+                if (vm && buf && total > done)
+                    walkPagesForFault(reinterpret_cast<const void*>(base + done), total - done, vm);
+            });
+    };
+    const ssize_t r = attempt(0);
+    if (r <= 0 || static_cast<size_t>(r) >= total || !vm || !buf ||
+        !vm->contains(base + static_cast<size_t>(r)))
+        return r;
+    const int saved_errno = errno;
+    if (!fdIsFile(fd)) { errno = saved_errno; return r; }
+    size_t done = static_cast<size_t>(r);
+    for (int i = 0; i < kMaxShortContinuations && done < total; ++i) {
+        const ssize_t n = attempt(done);
+        if (n <= 0) break;
+        done += static_cast<size_t>(n);
+    }
+    errno = saved_errno;
+    return static_cast<ssize_t>(done);
+}
+
+// An iovec array. call(iov, iovcnt, done) issues the syscall for the part
+// of the vector from byte `done` on; past the first call it gets a copy
+// trimmed to the remainder (at most kIovRemainder entries at a time).
+template <typename Call>
+inline ssize_t fileIoWithIovec(int fd, const struct iovec* iov, int iovcnt, Call call) {
+    auto* vm = ::smash::g_smash_vm_region;
+    constexpr int kIovRemainder = 64;
+    struct iovec rem[kIovRemainder];
+    // The remainder of the vector from byte `done`; nullptr past its end.
+    auto remainder = [&](size_t done, int* cnt) -> const struct iovec* {
+        int k = 0;
+        while (k < iovcnt && done >= iov[k].iov_len) done -= iov[k++].iov_len;
+        if (k >= iovcnt) return nullptr;
+        int n = 0;
+        for (; k < iovcnt && n < kIovRemainder; ++k, ++n) {
+            rem[n] = iov[k];
+            if (n == 0) {
+                rem[0].iov_base = static_cast<char*>(iov[k].iov_base) + done;
+                rem[0].iov_len -= done;
+            }
+        }
+        *cnt = n;
+        return rem;
+    };
+    auto attempt = [&](const struct iovec* v, int cnt, size_t done) {
+        return retryWithDecompress(
+            [&] { return call(v, cnt, done); },
+            [&] { if (vm && v && cnt > 0) walkIovecForFault(v, cnt, vm); });
+    };
+    const ssize_t r = attempt(iov, iovcnt, 0);
+    if (r <= 0 || !vm || !iov || iovcnt <= 0) return r;
+    int cnt = 0;
+    const struct iovec* next = remainder(static_cast<size_t>(r), &cnt);
+    if (!next || !vm->contains(reinterpret_cast<uintptr_t>(next[0].iov_base))) return r;
+    const int saved_errno = errno;
+    if (!fdIsFile(fd)) { errno = saved_errno; return r; }
+    size_t done = static_cast<size_t>(r);
+    for (int i = 0; i < kMaxShortContinuations; ++i) {
+        next = remainder(done, &cnt);
+        if (!next) break;
+        const ssize_t n = attempt(next, cnt, done);
+        if (n <= 0) break;
+        done += static_cast<size_t>(n);
+    }
+    errno = saved_errno;
+    return static_cast<ssize_t>(done);
 }
 
 } // namespace smash::vm
