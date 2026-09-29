@@ -619,6 +619,20 @@ if(NOT APPLE)
   set_tests_properties(test_phase3_batch PROPERTIES TIMEOUT 150)
 endif()
 
+# Under page-protection write tracking, a page the application keeps writing
+# must not be re-armed (and fault) every tick, must not be compressed while it
+# waits, and must still go cold once it stops being written
+# (rearm_backoff_test.cpp).
+if(NOT APPLE)
+  add_executable(rearm_backoff_test rearm_backoff_test.cpp)
+  target_link_libraries(rearm_backoff_test PRIVATE ${CMAKE_DL_LIBS} Threads::Threads)
+  add_test(NAME test_rearm_backoff COMMAND ${CMAKE_COMMAND} -E env
+    "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=1" "SMASH_SOFTDIRTY=0"
+    "SMASH_STATS_SIGNAL=1" "SMASH_DEFER_PHASES_MS=0" "SMASH_COLD_TIMEOUT_SEC=2"
+    "SMASH_REARM_BACKOFF_MAX=4" $<TARGET_FILE:rearm_backoff_test>)
+  set_tests_properties(test_rearm_backoff PROPERTIES TIMEOUT 200)
+endif()
+
 # An idle 1 GiB must actually leave RSS with default timings, in each
 # write-tracking mode: page protection (SMASH_SOFTDIRTY=0), the default
 # auto-selection, and page protection with sub-arenas (idle_compress_test.cpp).

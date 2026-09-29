@@ -675,3 +675,41 @@ snapshot could read the page. Now:
 writes/s: ~37k calls for ~2.07M pages, all released by tick 32. Shadow-write
 stress (writes landing in the shadow window, every value read back): 0 stale
 of ~85k checks.
+
+## Hot pages were re-armed every tick (2026-09-29)
+
+With phases 2 and 3 batched, the arm64 application still had 140 s ticks and
+per-phase maxima of minutes (`max=184400/304810/18509/20927`). The
+`[smash phase time]` split (17 ticks, one worker) showed the compressor was
+not computing:
+
+| phase | usr | sys | runq | blocked (s) |
+|---|---|---|---|---|
+| 1 scan | 2.1 | 42.6 | 13.4 | 66.7 |
+| 2 select/compress | 11.0 | 111.4 | 27.6 | 96.0 |
+| 3 arm | 2.1 | 49.0 | 22.0 | 147.4 |
+
+Phase 1 makes no system calls, yet spent 109 s in the kernel or blocked
+across 39.6k minor faults (~3 ms each): waiting on the `mmap_lock`. The
+writers were the application's own threads: `faults monitor=8161544` in 17
+ticks, each a SIGSEGV plus an `mprotect(PROT_RW)` of one page (splitting a
+mapping), against the compressor's ~1.7M calls. Phase 3 re-armed every ACTIVE
+page every tick, so a page the application kept writing cost two `mprotect`
+calls and a fault per tick, forever. Raising the worker count
+(`SMASH_CPU_PRESSURE_CAP=0`, 4 workers) did not change the maxima.
+
+Now a write fault on a watched page within a tick of its arming
+(`cold_count_` <= 1) raises the page's exponent and makes it wait 2^exp ticks
+unarmed (`rearm_wait_`, counted down by Phase 3; cap `SMASH_REARM_BACKOFF_MAX`,
+default 6 = 64 ticks); a fault after >= 8 quiet ticks clears it. While it waits
+Phase 1 holds its cold count at 0: it is unwatched, and the next fault must see
+how long it stayed unwritten *after* re-arming. 8 MiB written continuously:
+1.00 -> 0.16 write faults per hot page per tick over 19 ticks (and ~1/64 at the
+default cap in steady state); idle memory beside it and the hot block once its
+writer stops still leave RSS. Counters: `rearm hot= waits=` on the pipeline
+line.
+
+Separately, the CPU-pressure cap (`cpuPressureWorkerCap`) subtracts **every**
+thread of the process from `nproc`, busy or not, so a process with >= nproc
+threads always gets one worker. Not changed yet: on this workload more workers
+did not help.

@@ -198,6 +198,11 @@ static void testIncompressibleData() {
 }
 
 static void testAccessTracking() {
+    // Walks the tick-by-tick schedule of a page written once right after it
+    // was armed. The re-arm backoff (testRearmBackoff) would hold that page
+    // unarmed for two ticks; this test is about the fault resetting the cold
+    // count, so it runs without it. Read by init().
+    setenv("SMASH_REARM_BACKOFF_MAX", "0", 1);
     VmRegion vm;
     vm.init(64 * kPageSize);
 
@@ -273,6 +278,64 @@ static void testAccessTracking() {
     CHECK(ok, "data mismatch after access tracking round-trip");
 }
 
+// Re-arm backoff (page-protection write tracking): a page written within a
+// tick of being armed waits 2^exp ticks unarmed, exp rising per hot fault up
+// to SMASH_REARM_BACKOFF_MAX, and is never counted idle (so never compressed)
+// while it waits.
+static void testRearmBackoff() {
+    setenv("SMASH_REARM_BACKOFF_MAX", "2", 1);
+    VmRegion vm;
+    vm.init(64 * kPageSize);
+    PageStateTable states;
+    states.init(vm.totalPages());
+    PageLockTable locks;
+    locks.init(vm.totalPages());
+    CompressStore store;
+    store.init();
+    CompressEngine engine;
+    engine.init();
+    CompressorThread compressor;
+    compressor.init(&vm, &states, &locks, &store, &engine);
+
+    void* page = vm.allocatePages(1);
+    CHECK(page != nullptr, "page alloc failed");
+    const size_t page_idx = vm.pageIndex(reinterpret_cast<uintptr_t>(page));
+    states.set(page_idx, PageState::ACTIVE);
+    memset(page, 0x42, kPageSize);
+
+    compressor.compressTick();
+    CHECK(states.get(page_idx) == PageState::ACTIVE_MONITORING, "backoff: first arm");
+
+    // Hot fault #1 -> wait 2 ticks; hot fault #2 -> 4; #3 stays at the cap, 4.
+    const int waits[] = {2, 4, 4};
+    for (int round = 0; round < 3; ++round) {
+        CHECK(compressor.handleFault(reinterpret_cast<uintptr_t>(page)),
+              "backoff: write fault %d not handled", round);
+        for (int t = 0; t < waits[round]; ++t) {
+            compressor.compressTick();
+            CHECK(states.get(page_idx) == PageState::ACTIVE,
+                  "backoff round %d tick %d: expected ACTIVE (waiting), got %d", round, t,
+                  static_cast<int>(states.get(page_idx)));
+        }
+        compressor.compressTick();
+        CHECK(states.get(page_idx) == PageState::ACTIVE_MONITORING,
+              "backoff round %d: expected re-armed after %d ticks, got %d", round,
+              waits[round], static_cast<int>(states.get(page_idx)));
+    }
+
+    // Left alone, the page still goes cold and is compressed.
+    bool compressed = false;
+    for (int t = 0; t < 12 && !compressed; ++t) {
+        compressor.compressTick();
+        const PageState st = states.get(page_idx);
+        compressed = st == PageState::COMPRESSED || st == PageState::COMPRESSED_SHADOW;
+    }
+    CHECK(compressed, "backoff: page never compressed after its writes stopped");
+    CHECK(compressor.handleFault(reinterpret_cast<uintptr_t>(page)), "backoff: restore fault");
+    CHECK(static_cast<uint8_t*>(page)[kPageSize - 1] == 0x42, "backoff: data mismatch");
+    unsetenv("SMASH_REARM_BACKOFF_MAX");
+}
+
 static void testReleaseCompressedPages() {
     VmRegion vm;
     vm.init(64 * kPageSize);
@@ -320,6 +383,8 @@ int main() {
     testCompressorRoundtrip();
     testIncompressibleData();
     testAccessTracking();
+    unsetenv("SMASH_REARM_BACKOFF_MAX");
+    testRearmBackoff();
     testReleaseCompressedPages();
 
     if (failures == 0) {

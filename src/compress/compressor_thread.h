@@ -385,6 +385,43 @@ class CompressorThread {
     // cannot change, so cold-streak decay must not re-arm eager retries.
     uint8_t* compress_fail_count_ = nullptr;
 
+    // Re-arm backoff under page-protection write tracking (Phase 3). A page
+    // written within a tick of being armed is hot: its exponent rises and it
+    // waits 2^exp ticks (rearm_wait_, counted down by Phase 3) before being
+    // armed again; a page that stayed unwritten for a while lowers or clears
+    // it. Without it every hot page cost two mprotect calls and a SIGSEGV per
+    // tick, all under the mmap_lock: 8.2M write faults in 17 ticks on a
+    // 128-core arm64 box, with 140 s ticks. Null when
+    // SMASH_REARM_BACKOFF_MAX=0.
+    uint8_t* rearm_exp_ = nullptr;
+    uint8_t* rearm_wait_ = nullptr;
+    uint8_t rearm_exp_max_ = 0;
+
+    static int rearmBackoffMaxFromEnv() {
+        const char* v = std::getenv("SMASH_REARM_BACKOFF_MAX");
+        if (!v || !*v) return 6;
+        const int n = std::atoi(v);
+        return n < 0 ? 0 : (n > 7 ? 7 : n);
+    }
+
+    // A write fault on a watched page (fault handler, page lock held). The
+    // page's cold count is still what Phase 1 last saw: the ticks it stayed
+    // unwritten since it was armed.
+    void noteMonitorWrite(size_t i) {
+        const uint8_t cc = cold_count_[i];
+        uint8_t e = rearm_exp_[i];
+        if (cc <= 1) {
+            if (e < rearm_exp_max_) ++e;
+            pc_.f_monitor_hot.fetch_add(1, std::memory_order_relaxed);
+        } else if (cc >= 8) {
+            e = 0;
+        } else if (e) {
+            --e;
+        }
+        rearm_exp_[i] = e;
+        rearm_wait_[i] = e ? static_cast<uint8_t>(1u << e) : 0;
+    }
+
     // ── Soft-dirty ROI per-page state (SMASH_SOFTDIRTY_ROI) ─────────────────
     // write_clean_streak_: consecutive ticks a page's soft-dirty (write) bit
     // stayed UNSET. Distinct from cold_count_ (which also resets on reads under
@@ -449,6 +486,9 @@ class CompressorThread {
         std::atomic<uint64_t> cp_attempts{0}, cp_stored{0}, cp_gate_fail{0};
         std::atomic<uint64_t> rc_checked{0}, rc_released{0}, rc_changed{0}, rc_vma_stop{0};
         std::atomic<uint64_t> f_monitor{0}, f_shadow{0}, f_compressed{0}, f_active{0};
+        // Re-arm backoff: write faults on watched pages classified hot, and
+        // page-ticks Phase 3 left a page unarmed while it waited.
+        std::atomic<uint64_t> f_monitor_hot{0}, p3_backoff{0};
         // Wall time of each phase of the last tick (1 access scan, 2 select
         // and compress, 3 arm PROT_READ, 4 release shadows, 5 node groups
         // drain their queues), and the slowest so far.
@@ -1501,6 +1541,16 @@ private:
                     // verdict behind the ratio-gate backoff is stale.
                     compress_fail_count_[i] = 0;
                     accessed_[i].store(false, std::memory_order_relaxed);
+                } else if (st == PageState::ACTIVE && rearm_wait_ && rearm_wait_[i]) {
+                    // Waiting out its re-arm backoff: unwatched, so its
+                    // writes are invisible. Never count it idle: once armed
+                    // again, its cold count must say how long it then stayed
+                    // unwritten (noteMonitorWrite reads it to tell a hot
+                    // page; counted through the wait, every page looked cold
+                    // and lost its backoff: 0.53 faults per hot page per tick
+                    // instead of 0.16), and an idle-looking page is a
+                    // compression candidate nobody is watching.
+                    cold_count_[i] = 0;
                 } else {
                     ++n_idle;
                     if (cold_count_[i] < 255) cold_count_[i]++;
@@ -2175,7 +2225,7 @@ private:
         // (non-contiguous page index, CAS failure, or chunk size cap).
         size_t run_start = ~size_t{0};
         size_t run_end = 0;
-        uint64_t n_pages = 0, n_calls = 0;
+        uint64_t n_pages = 0, n_calls = 0, n_backoff = 0;
         auto flushPhase3Run = [&](size_t a, size_t b) {
             n_pages += b - a;
             this->flushPhase3Run(a, b, &n_calls);
@@ -2200,6 +2250,18 @@ private:
                 return;
             }
 
+            // A hot page waiting out its re-arm backoff stays PROT_RW.
+            if (rearm_wait_ && rearm_wait_[i] &&
+                states_->get(i) == PageState::ACTIVE) {
+                --rearm_wait_[i];
+                ++n_backoff;
+                if (run_end > run_start && run_start != ~size_t{0}) {
+                    flushPhase3Run(run_start, run_end);
+                }
+                run_start = ~size_t{0};
+                run_end = 0;
+                return;
+            }
             if (states_->transition(i, PageState::ACTIVE,
                                        PageState::ACTIVE_MONITORING)) {
                 // Fresh monitoring cycle: no idle arm until escalation sets one.
@@ -2233,6 +2295,7 @@ private:
         }
         pcAdd(pc_.p3_pages, n_pages);
         pcAdd(pc_.p3_calls, n_calls);
+        pcAdd(pc_.p3_backoff, n_backoff);
     }
 
     // A copy of the page at `page_addr` into `dst` through /proc/self/mem,
@@ -5831,6 +5894,11 @@ public:
         cold_count_ = bootstrapArray<uint8_t>(max_pages);
         recompress_count_ = bootstrapArray<uint8_t>(max_pages);
         compress_fail_count_ = bootstrapArray<uint8_t>(max_pages);
+        rearm_exp_max_ = static_cast<uint8_t>(rearmBackoffMaxFromEnv());
+        if (rearm_exp_max_ > 0) {
+            rearm_exp_ = bootstrapArray<uint8_t>(max_pages);
+            rearm_wait_ = bootstrapArray<uint8_t>(max_pages);
+        }
         // Soft-dirty ROI per-page arrays: only allocate when the gate is on
         // (~2 bytes/page = ~32 MiB at full VM otherwise wasted). Read the env
         // directly here — ROIConfig::init() runs later in this function, so the
@@ -6404,7 +6472,7 @@ public:
                 " compressed=%llu active=%llu | phase_ms=%llu/%llu/%llu/%llu"
                 " max=%llu/%llu/%llu/%llu | p1 minflt=%llu range_ms_max=%llu workers=%llu"
                 " | p3 armed=%llu calls=%llu p2 mprotect=%llu"
-                " | p5 ms=%llu max=%llu\n",
+                " | p5 ms=%llu max=%llu | rearm hot=%llu waits=%llu\n",
                 v(pc.ticks), v(pc.tick_ms_last), v(pc.tick_ms_max), v(pc.deferred_ticks),
                 v(pc.p1_accessed), v(pc.p1_idle), v(pc.p2_at_floor), v(pc.p2_escalated),
                 v(pc.p2_eligible), v(pc.p2_routed), v(pc.p2_hint_skip), v(pc.cp_attempts),
@@ -6415,7 +6483,8 @@ public:
                 v(pc.phase_ms_max[2]), v(pc.phase_ms_max[3]), v(pc.phase_ms_max[4]),
                 v(pc.p1_minflt), v(pc.p1_range_ms_max), v(pc.workers_last),
                 v(pc.p3_pages), v(pc.p3_calls), v(pc.p2_mprotect),
-                v(pc.phase_ms[5]), v(pc.phase_ms_max[5]));
+                v(pc.phase_ms[5]), v(pc.phase_ms_max[5]), v(pc.f_monitor_hot),
+                v(pc.p3_backoff));
             if (n >= static_cast<int>(sizeof(buf))) n = static_cast<int>(sizeof(buf)) - 1;
             // Thread time per phase in ms: usr/sys/runq/blocked, where blocked
             // is the wall time left over (see PipelineCounters::pt_*).
@@ -6935,6 +7004,7 @@ public:
                 vm::remapPages(page_addr, kPageSize, true, true);
             }
             accessed_[page_idx].store(true, std::memory_order_relaxed);
+            if (rearm_exp_) noteMonitorWrite(page_idx);
             states_->set(page_idx, PageState::ACTIVE);
             locks_->unlock(page_idx);
             return true;
@@ -7002,6 +7072,7 @@ public:
                 compressed_[i] = {};
             }
             if (shadow_tick_) shadow_tick_[i] = 0;
+            if (rearm_exp_) { rearm_exp_[i] = 0; rearm_wait_[i] = 0; }
             // The page is going back to the allocator; whoever takes it next
             // decides its node.
             if (page_node_) page_node_[i] = 0;
