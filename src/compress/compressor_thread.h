@@ -450,10 +450,19 @@ class CompressorThread {
         std::atomic<uint64_t> rc_checked{0}, rc_released{0}, rc_changed{0}, rc_vma_stop{0};
         std::atomic<uint64_t> f_monitor{0}, f_shadow{0}, f_compressed{0}, f_active{0};
         // Wall time of each phase of the last tick (1 access scan, 2 select
-        // and compress, 3 arm PROT_READ, 4 release shadows), and phase 3's
-        // pages armed and the mprotect system calls it took, cumulative.
-        std::atomic<uint64_t> phase_ms[5]{};
-        std::atomic<uint64_t> phase_ms_max[5]{};
+        // and compress, 3 arm PROT_READ, 4 release shadows, 5 node groups
+        // drain their queues), and the slowest so far.
+        std::atomic<uint64_t> phase_ms[6]{};
+        std::atomic<uint64_t> phase_ms_max[6]{};
+        // Where each phase's thread time went, summed over every thread that
+        // ran the phase, cumulative, in microseconds: user CPU, kernel CPU,
+        // runnable but waiting for a CPU (schedstat), and the rest of the
+        // wall time (blocked: a lock such as mmap_lock, a futex, I/O). Only
+        // sampled with SMASH_STATS_SIGNAL=1. Added when every phase on a
+        // 128-core box had a multi-second tick and nothing said whether the
+        // threads were computing, in the kernel, starved or blocked.
+        std::atomic<uint64_t> pt_wall_us[6]{}, pt_usr_us[6]{}, pt_sys_us[6]{},
+                              pt_wait_us[6]{};
         // Phase 1 detail: minor page faults the compressor's threads took
         // inside phase1Range (cumulative), the slowest single range, and the
         // worker count of the last tick. Phase 1 makes no syscalls, so a slow
@@ -466,6 +475,60 @@ class CompressorThread {
         std::atomic<uint64_t> p2_mprotect{0};
     };
     PipelineCounters pc_;
+
+    // One thread's clocks, for PipelineCounters' per-phase time split.
+    struct ThreadClocks {
+        uint64_t wall_us = 0, usr_us = 0, sys_us = 0, wait_us = 0;
+        static ThreadClocks now() {
+            ThreadClocks c;
+            c.wall_us = static_cast<uint64_t>(std::chrono::duration_cast<
+                std::chrono::microseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count());
+#ifdef __linux__
+            struct rusage ru{};
+            if (getrusage(RUSAGE_THREAD, &ru) == 0) {
+                c.usr_us = static_cast<uint64_t>(ru.ru_utime.tv_sec) * 1000000u +
+                           static_cast<uint64_t>(ru.ru_utime.tv_usec);
+                c.sys_us = static_cast<uint64_t>(ru.ru_stime.tv_sec) * 1000000u +
+                           static_cast<uint64_t>(ru.ru_stime.tv_usec);
+            }
+            // "run_ns wait_ns timeslices": the second field is time spent
+            // runnable on a run queue.
+            const int fd = ::open("/proc/thread-self/schedstat", O_RDONLY | O_CLOEXEC);
+            if (fd >= 0) {
+                char b[96];
+                const ssize_t r = ::read(fd, b, sizeof(b) - 1);
+                ::close(fd);
+                if (r > 0) {
+                    b[r] = '\0';
+                    const char* q = b;
+                    while (*q && *q != ' ') ++q;
+                    if (*q == ' ') c.wait_us = std::strtoull(q + 1, nullptr, 10) / 1000u;
+                }
+            }
+#endif
+            return c;
+        }
+    };
+    // Adds the calling thread's time in one phase to PipelineCounters.
+    struct PhaseClocks {
+        PipelineCounters* pc; int phase; ThreadClocks t0;
+        PhaseClocks(PipelineCounters& c, int p)
+            : pc(statsSignalEnabled() && p >= 1 && p <= 5 ? &c : nullptr), phase(p) {
+            if (pc) t0 = ThreadClocks::now();
+        }
+        ~PhaseClocks() {
+            if (!pc) return;
+            const ThreadClocks t1 = ThreadClocks::now();
+            auto d = [](uint64_t a, uint64_t b) { return a > b ? a - b : 0; };
+            pcAdd(pc->pt_wall_us[phase], d(t1.wall_us, t0.wall_us));
+            pcAdd(pc->pt_usr_us[phase], d(t1.usr_us, t0.usr_us));
+            pcAdd(pc->pt_sys_us[phase], d(t1.sys_us, t0.sys_us));
+            pcAdd(pc->pt_wait_us[phase], d(t1.wait_us, t0.wait_us));
+        }
+        PhaseClocks(const PhaseClocks&) = delete;
+        PhaseClocks& operator=(const PhaseClocks&) = delete;
+    };
     static void pcAdd(std::atomic<uint64_t>& c, uint64_t n) {
         if (n) c.fetch_add(n, std::memory_order_relaxed);
     }
@@ -3256,7 +3319,7 @@ private:
         struct PhaseTimer {
             CompressorThread* self; int phase; std::chrono::steady_clock::time_point t0;
             ~PhaseTimer() {
-                if (phase < 1 || phase > 4) return;
+                if (phase < 1 || phase > 5) return;
                 const auto ms = static_cast<uint64_t>(std::chrono::duration_cast<
                     std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count());
                 self->pc_.phase_ms[phase].store(ms, std::memory_order_relaxed);
@@ -3301,6 +3364,7 @@ private:
     }
 
     void executePhase(int phase, int worker_id) {
+        PhaseClocks clocks(pc_, phase);
         auto& w = workers_[worker_id];
         if (phase == 1) {
             phase1Range(w.range_start, w.range_end);
@@ -3692,6 +3756,7 @@ private:
     }
 
     void executeNodePhase(NodeWorker& nw, int phase) {
+        PhaseClocks clocks(pc_, phase);
         const NodeGroup& g = *nw.group;
         // Phase 5 is the queue of pages other workers handed to this node; the
         // other phases are this node's own arena chunks.
@@ -6338,7 +6403,8 @@ public:
                 " changed=%llu vma_stop=%llu | faults monitor=%llu shadow=%llu"
                 " compressed=%llu active=%llu | phase_ms=%llu/%llu/%llu/%llu"
                 " max=%llu/%llu/%llu/%llu | p1 minflt=%llu range_ms_max=%llu workers=%llu"
-                " | p3 armed=%llu calls=%llu p2 mprotect=%llu\n",
+                " | p3 armed=%llu calls=%llu p2 mprotect=%llu"
+                " | p5 ms=%llu max=%llu\n",
                 v(pc.ticks), v(pc.tick_ms_last), v(pc.tick_ms_max), v(pc.deferred_ticks),
                 v(pc.p1_accessed), v(pc.p1_idle), v(pc.p2_at_floor), v(pc.p2_escalated),
                 v(pc.p2_eligible), v(pc.p2_routed), v(pc.p2_hint_skip), v(pc.cp_attempts),
@@ -6348,8 +6414,29 @@ public:
                 v(pc.phase_ms[3]), v(pc.phase_ms[4]), v(pc.phase_ms_max[1]),
                 v(pc.phase_ms_max[2]), v(pc.phase_ms_max[3]), v(pc.phase_ms_max[4]),
                 v(pc.p1_minflt), v(pc.p1_range_ms_max), v(pc.workers_last),
-                v(pc.p3_pages), v(pc.p3_calls), v(pc.p2_mprotect));
+                v(pc.p3_pages), v(pc.p3_calls), v(pc.p2_mprotect),
+                v(pc.phase_ms[5]), v(pc.phase_ms_max[5]));
             if (n >= static_cast<int>(sizeof(buf))) n = static_cast<int>(sizeof(buf)) - 1;
+            // Thread time per phase in ms: usr/sys/runq/blocked, where blocked
+            // is the wall time left over (see PipelineCounters::pt_*).
+            if (static_cast<size_t>(n) < sizeof(buf)) {
+                auto ms = [](uint64_t us) { return static_cast<unsigned long long>(us / 1000u); };
+                n += smash::safe_snprintf(buf + n, sizeof(buf) - static_cast<size_t>(n),
+                    "[smash phase time] thread ms usr/sys/runq/blocked:");
+                for (int p = 1; p <= 5 && n > 0 && static_cast<size_t>(n) < sizeof(buf); ++p) {
+                    const uint64_t wall = pc.pt_wall_us[p].load(std::memory_order_relaxed);
+                    const uint64_t usr = pc.pt_usr_us[p].load(std::memory_order_relaxed);
+                    const uint64_t sys = pc.pt_sys_us[p].load(std::memory_order_relaxed);
+                    const uint64_t wait = pc.pt_wait_us[p].load(std::memory_order_relaxed);
+                    const uint64_t used = usr + sys + wait;
+                    n += smash::safe_snprintf(buf + n, sizeof(buf) - static_cast<size_t>(n),
+                        " p%d=%llu/%llu/%llu/%llu", p, ms(usr), ms(sys), ms(wait),
+                        ms(wall > used ? wall - used : 0));
+                }
+                if (n > 0 && static_cast<size_t>(n) < sizeof(buf))
+                    n += smash::safe_snprintf(buf + n, sizeof(buf) - static_cast<size_t>(n), "\n");
+                if (n >= static_cast<int>(sizeof(buf))) n = static_cast<int>(sizeof(buf)) - 1;
+            }
         }
         // The per-CPU run cache (SMASH_RUN_CACHE_MIB), when on: whether it is
         // actually absorbing the large-block churn, or evicting as fast as it
