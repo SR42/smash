@@ -503,6 +503,11 @@ class CompressorThread {
         // threads were computing, in the kernel, starved or blocked.
         std::atomic<uint64_t> pt_wall_us[6]{}, pt_usr_us[6]{}, pt_sys_us[6]{},
                               pt_wait_us[6]{};
+        // Coordinator wall time in each tick step outside the phases,
+        // cumulative ms (TickStep indices), and all tick time outside phases.
+        // Added when a 97 s tick had phases summing to ~22 s.
+        std::atomic<uint64_t> step_ms[7]{};
+        std::atomic<uint64_t> phases_ms_total{0}, tick_ms_total{0};
         // Phase 1 detail: minor page faults the compressor's threads took
         // inside phase1Range (cumulative), the slowest single range, and the
         // worker count of the last tick. Phase 1 makes no syscalls, so a slow
@@ -515,6 +520,17 @@ class CompressorThread {
         std::atomic<uint64_t> p2_mprotect{0};
     };
     PipelineCounters pc_;
+    enum TickStep { kStepEfficiency, kStepVmaSync, kStepBitmap, kStepNodeChunks,
+                    kStepAdapt, kStepDict, kStepSweep, kNumTickSteps };
+    // Times one tick step (coordinator wall clock) into pc_.step_ms.
+    struct StepTimer {
+        PipelineCounters& pc; int step; std::chrono::steady_clock::time_point t0;
+        StepTimer(PipelineCounters& c, int s) : pc(c), step(s), t0(std::chrono::steady_clock::now()) {}
+        ~StepTimer() {
+            pcAdd(pc.step_ms[step], static_cast<uint64_t>(std::chrono::duration_cast<
+                std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count()));
+        }
+    };
 
     // One thread's clocks, for PipelineCounters' per-phase time split.
     struct ThreadClocks {
@@ -3386,6 +3402,7 @@ private:
                 const auto ms = static_cast<uint64_t>(std::chrono::duration_cast<
                     std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count());
                 self->pc_.phase_ms[phase].store(ms, std::memory_order_relaxed);
+                pcAdd(self->pc_.phases_ms_total, ms);
                 if (ms > self->pc_.phase_ms_max[phase].load(std::memory_order_relaxed))
                     self->pc_.phase_ms_max[phase].store(ms, std::memory_order_relaxed);
                 if (phase == 1)
@@ -5290,6 +5307,7 @@ private:
         // is unset this still runs but the inner loop short-circuits to the
         // legacy "all buckets COMPRESS" branch — so cost stays negligible.
         if ((tick_counter_ % kBudgetRecomputeEveryTicks) == 0) {
+            StepTimer st(pc_, kStepEfficiency);
             recomputeMarginalEfficiency();
         }
         // SMASH_DEFER_PHASES_MS=NNN: skip Phase 2 (compress) and Phase 3
@@ -5338,7 +5356,7 @@ private:
         // on the per-tick path.
         const long max_map_count = vmaMaxMapCount();
         const long kVmaSafetyMargin = cfg_vma_margin_;
-        syncVmaEstimate();
+        { StepTimer st(pc_, kStepVmaSync); syncVmaEstimate(); }
         vma_count_cached_ = vmaEstimate();
         if (vma_count_cached_ + kVmaSafetyMargin >= max_map_count) {
             // Can't safely fragment more VMAs — defer compression for
@@ -5408,7 +5426,7 @@ private:
         }
 
         // Rebuild chunk bitmap
-        rebuildChunkBitmap(committed);
+        { StepTimer st(pc_, kStepBitmap); rebuildChunkBitmap(committed); }
 
         // Reset per-worker tick counters
         int nw = active_workers_;
@@ -5432,7 +5450,7 @@ private:
             workers_[0].range_end = committed;
         }
 #if defined(__linux__)
-        assignNodeChunks(committed);
+        { StepTimer st(pc_, kStepNodeChunks); assignNodeChunks(committed); }
 #endif
 
         // Kernel write tracking: bulk-read which pages were written into
@@ -5517,16 +5535,16 @@ private:
         // ── Adaptive worker scaling ──────────────────────────────────────
         // Measure this tick's workload and throughput, update EMAs, and
         // compute the number of workers needed for next tick.
-        adaptWorkerCount(nw);
+        { StepTimer st(pc_, kStepAdapt); adaptWorkerCount(nw); }
 
         if constexpr (kMeasureCohorts) tallyCohorts(committed);
 
-        trainDictionaries();
+        { StepTimer st(pc_, kStepDict); trainDictionaries(); }
 
         // Drain any deferred-madvise queue entries whose TTL has elapsed.
         // Runs after all phase work so the sweeper observes the freshly
         // queued pages from this tick at full TTL on the next pass.
-        sweepDeferredMadvise();
+        { StepTimer st(pc_, kStepSweep); sweepDeferredMadvise(); }
     }
 
     // Adapt active worker count using Little's Law (see class comment above).
@@ -5827,6 +5845,7 @@ private:
                 auto& pc = self->pc_;
                 pc.ticks.fetch_add(1, std::memory_order_relaxed);
                 pc.tick_ms_last.store(ms, std::memory_order_relaxed);
+                pcAdd(pc.tick_ms_total, ms);
                 if (ms > pc.tick_ms_max.load(std::memory_order_relaxed))
                     pc.tick_ms_max.store(ms, std::memory_order_relaxed);
             }
@@ -6503,7 +6522,13 @@ public:
                         ms(wall > used ? wall - used : 0));
                 }
                 if (n > 0 && static_cast<size_t>(n) < sizeof(buf))
-                    n += smash::safe_snprintf(buf + n, sizeof(buf) - static_cast<size_t>(n), "\n");
+                    n += smash::safe_snprintf(buf + n, sizeof(buf) - static_cast<size_t>(n),
+                        " | tick ms total=%llu phases=%llu efficiency=%llu vma_sync=%llu"
+                        " bitmap=%llu node_chunks=%llu adapt=%llu dict=%llu sweep=%llu\n",
+                        v(pc.tick_ms_total), v(pc.phases_ms_total), v(pc.step_ms[kStepEfficiency]),
+                        v(pc.step_ms[kStepVmaSync]), v(pc.step_ms[kStepBitmap]),
+                        v(pc.step_ms[kStepNodeChunks]), v(pc.step_ms[kStepAdapt]),
+                        v(pc.step_ms[kStepDict]), v(pc.step_ms[kStepSweep]));
                 if (n >= static_cast<int>(sizeof(buf))) n = static_cast<int>(sizeof(buf)) - 1;
             }
         }
