@@ -409,6 +409,8 @@ GLIBC_2.29 {
 # clock_nanosleep is the one case where the version x86-64 glibc uses is also
 # aarch64's base version, so the node would be defined twice there. CMake
 # leaves this empty on aarch64, where the base node already carries the name.
+@SMASH_GLIBC_212_214_NODES@
+
 @SMASH_GLIBC_217_NODE@
 
 # glibc 2.34 re-versioned fstat / fstat64 to GLIBC_2.33 for y2038-safe

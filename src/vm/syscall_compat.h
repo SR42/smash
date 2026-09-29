@@ -27,6 +27,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <ctime>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/uio.h>
 
@@ -289,6 +290,81 @@ inline ssize_t fileIoWithIovec(int fd, const struct iovec* iov, int iovcnt, Call
     }
     errno = saved_errno;
     return static_cast<ssize_t>(done);
+}
+
+// ── Datagram receives ─────────────────────────────────────────────────────
+// On a message socket (UDP, AF_UNIX SOCK_DGRAM / SOCK_SEQPACKET, raw) the
+// kernel takes the datagram off the queue before copying it out, and frees
+// it if the copy faults: the EFAULT retry then received the NEXT datagram
+// and the first was lost, silently (dgram_recv_test: every libc receive
+// into a watched page under SMASH_SOFTDIRTY=0). Touching the buffer first is
+// not enough: a blocking receive can wait longer than a tick, and Phase 3
+// re-arms the pages meanwhile. So when a data buffer is on a smash page and
+// the socket carries messages, the receive is first issued with MSG_PEEK:
+// it waits exactly as the real call would (blocking, timeouts, signals) and
+// leaves the datagram queued, so the usual EFAULT retry can make the buffer
+// writable; the real receive follows at once, into a buffer the kernel just
+// wrote. The peek asks for no address and no control data (a peeked
+// SCM_RIGHTS message must not install descriptors); those small buffers are
+// touched just before the real call instead. Not covered: SO_PEEK_OFF
+// sockets (a peek moves their peek offset), and recvmmsg, which gets its
+// buffers touched first and can still lose a datagram when its wait outlasts
+// a compressor tick.
+inline bool fdIsMessageSocket(int fd) {
+    const int saved_errno = errno;
+    int type = 0;
+    socklen_t len = sizeof(type);
+    const bool ok = ::getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &len) == 0;
+    errno = saved_errno;
+    return ok && (type == SOCK_DGRAM || type == SOCK_SEQPACKET || type == SOCK_RAW ||
+                  type == SOCK_RDM);
+}
+
+// True when any byte of [p, p + len) is in smash's region.
+inline bool inSmashRegion(const void* p, size_t len) {
+    auto* vm = ::smash::g_smash_vm_region;
+    if (!vm || !p || !len) return false;
+    const auto a = reinterpret_cast<uintptr_t>(p);
+    return vm->contains(a) || vm->contains(a + len - 1);
+}
+inline bool iovecInSmashRegion(const struct iovec* iov, size_t n) {
+    for (size_t i = 0; iov && i < n; ++i)
+        if (inSmashRegion(iov[i].iov_base, iov[i].iov_len)) return true;
+    return false;
+}
+
+// Makes [p, p + len) writable, touching only bytes inside it (one per
+// page): unlike warmPages, never a byte of a neighbouring object.
+inline void touchRangeWritable(void* p, size_t len) {
+    auto* vm = ::smash::g_smash_vm_region;
+    if (!vm || !p || !len) return;
+    const auto a = reinterpret_cast<uintptr_t>(p), end = a + len;
+    for (uintptr_t q = a; q < end; q = (q & ~(uintptr_t{kPageSize} - 1)) + kPageSize) {
+        if (!vm->contains(q)) continue;
+        volatile char* v = reinterpret_cast<volatile char*>(q);
+        const char c = *v;
+        *v = c;
+    }
+}
+
+// Whether a receive of `flags` on fd with its data buffer in smash's region
+// (in_region) takes the peek path. A caller's own MSG_PEEK (nothing is
+// consumed) and MSG_ERRQUEUE keep the plain retry.
+inline bool wantsPeekedRecv(int fd, int flags, bool in_region) {
+    return in_region && !(flags & (MSG_PEEK | MSG_ERRQUEUE)) && fdIsMessageSocket(fd);
+}
+
+// peek(): the receive with MSG_PEEK and only the data buffers; walk():
+// make them writable after an EFAULT; prep(): make the address / control
+// buffers writable; real(): the receive as asked, not retried (an EFAULT
+// there means the kernel dropped the datagram; retrying would hand the
+// caller the next one as if it were this one).
+template <typename Peek, typename Walk, typename Prep, typename Real>
+inline auto peekedRecv(Peek peek, Walk walk, Prep prep, Real real) -> decltype(real()) {
+    const auto p = retryWithDecompress(peek, walk);
+    if (p < 0) return p;
+    prep();
+    return real();
 }
 
 } // namespace smash::vm

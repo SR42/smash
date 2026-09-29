@@ -192,6 +192,45 @@ lost; continuing would block — `test_short_io`'s pipe case, guarded by
 
 Still open: the macOS wrappers still use `retryWith1Buf`/`retryWithIovec` for these calls (the continuation is Linux only); `pread64` / `pwrite64` / `preadv64` / `pwritev64` called by those
 names are not wrapped at all (64-bit builds do not rename `pread` to them, so
-most callers never use them); datagram receives (`recv`/`recvmsg` on UDP) that
-fault may drop the datagram in the kernel before any retry; `fread` and the
+most callers never use them); `fread` and the
 other buffered calls go through `warmPages` as before.
+
+## Datagram receives lost a datagram on a fault (fixed 2026-09-29)
+
+On a message socket (UDP, AF_UNIX `SOCK_DGRAM` / `SOCK_SEQPACKET`, raw) the
+kernel dequeues the datagram before copying it out and **frees it** when the
+copy faults, returning `EFAULT` — whether the first page or a later one
+faulted (no short count here). The EFAULT retry then received the *next*
+datagram: the first was lost, silently, and a receive expecting exactly one
+blocked forever. Under `SMASH_SOFTDIRTY=0` any receive into a watched heap
+page did it (`test_dgram_recv`: `recv`, `recvfrom`, `recvmsg`, `read`,
+`readv`, `__recv_chk` on UDP, AF_UNIX dgram and seqpacket, all returned
+datagram 2; the raw `recvfrom` proves the kernel drops it).
+
+Pre-touching the buffer is not enough: a blocking receive can wait longer
+than a compressor tick and Phase 3 re-arms the pages meanwhile. When a data
+buffer is on a smash page and `SO_TYPE` says the socket carries messages
+(one `getsockopt` per such call), the wrappers (`peekedRecv`,
+`syscall_compat.h`) issue the receive with `MSG_PEEK` first — same blocking,
+timeout and signal behaviour, and the datagram stays queued, so the EFAULT
+retry is safe — then the real receive at once, into a buffer the kernel just
+wrote, not retried (an EFAULT there means the kernel dropped it; retrying
+would pass the next datagram off as this one). The peek asks for no address
+and no control data: a peeked `SCM_RIGHTS` message must not install
+descriptors (mutation peeking with the caller's `msghdr`: the real receive got
+no descriptor). Address and control buffers are made writable just before the
+real call by `touchRangeWritable`, which touches only bytes inside the range —
+`warmPages` touches each page's first byte, which can belong to a neighbouring
+object. A caller's own `MSG_PEEK`, and `MSG_ERRQUEUE`, keep the plain retry.
+Cost: a second receive syscall and copy per datagram, only into smash memory.
+
+`recvmmsg` / `sendmmsg` **never ran**: glibc versions them at `GLIBC_2.12` /
+`GLIBC_2.14` on x86-64 and callers bind those, while smash exported them at the
+base version only (a `recvmmsg` into a watched buffer returned `EFAULT`). They
+now have `_212`/`_214` aliases in their own nodes (`SMASH_GLIBC_212_214_NODES`,
+x86-64 only; aarch64's base `GLIBC_2.17` is what callers bind);
+`test_dgram_recv` checks both resolve to libsmash with `dlvsym`. `recvmmsg`
+cannot peek (a peek covers one datagram): its buffers are touched first, so a
+wait that outlasts a tick can still lose one. Also not covered: `SO_PEEK_OFF`
+sockets (a peek advances their peek offset).
+

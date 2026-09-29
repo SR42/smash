@@ -177,6 +177,12 @@ SMASH_VISIBLE ssize_t read(int fd, void* buf, size_t count) {
     SMASH_LAZY_RESOLVE(fn_t, read);
     if (!real_read) return syscall(SYS_read, fd, buf, count);
     SMASH_PASSTHROUGH_IF_DISABLED(read, fd, buf, count);
+    // read() on a message socket is a receive (see peekedRecv).
+    if (smash::vm::wantsPeekedRecv(fd, 0, smash::vm::inSmashRegion(buf, count)))
+        return smash::vm::peekedRecv(
+            [&] { return static_cast<ssize_t>(syscall(SYS_recvfrom, fd, buf, count, MSG_PEEK, nullptr, nullptr)); },
+            [&] { smash::vm::walkPagesForFault(buf, count, smash::g_smash_vm_region); }, [] {},
+            [&] { return real_read(fd, buf, count); });
     return smash::vm::fileIoWith1Buf(fd, buf, count, [&](size_t d) {
         return real_read(fd, static_cast<char*>(buf) + d, count - d);
     });
@@ -273,6 +279,11 @@ static void smash_resolve_fortified_syscalls() {
 SMASH_VISIBLE ssize_t __read_chk(int fd, void* buf, size_t count, size_t buflen) {
     if (!g_real_read_chk) return read(fd, buf, count);
     if (g_syscall_wrap_disabled) return g_real_read_chk(fd, buf, count, buflen);
+    if (smash::vm::wantsPeekedRecv(fd, 0, smash::vm::inSmashRegion(buf, count)))
+        return smash::vm::peekedRecv(
+            [&] { return static_cast<ssize_t>(syscall(SYS_recvfrom, fd, buf, count, MSG_PEEK, nullptr, nullptr)); },
+            [&] { smash::vm::walkPagesForFault(buf, count, smash::g_smash_vm_region); }, [] {},
+            [&] { return g_real_read_chk(fd, buf, count, buflen); });
     return smash::vm::fileIoWith1Buf(fd, buf, count, [&](size_t d) {
         return g_real_read_chk(fd, static_cast<char*>(buf) + d, count - d, buflen - d);
     });
@@ -316,6 +327,11 @@ __asm__(".symver __pread64_chk_24,__pread64_chk@GLIBC_2.4");
 SMASH_VISIBLE ssize_t __recv_chk(int s, void* buf, size_t len, size_t buflen, int flags) {
     if (!g_real_recv_chk) return recv(s, buf, len, flags);
     if (g_syscall_wrap_disabled) return g_real_recv_chk(s, buf, len, buflen, flags);
+    if (smash::vm::wantsPeekedRecv(s, flags, smash::vm::inSmashRegion(buf, len)))
+        return smash::vm::peekedRecv(
+            [&] { return g_real_recv_chk(s, buf, len, buflen, flags | MSG_PEEK); },
+            [&] { smash::vm::walkPagesForFault(buf, len, smash::g_smash_vm_region); }, [] {},
+            [&] { return g_real_recv_chk(s, buf, len, buflen, flags); });
     return smash::vm::retryWith1Buf(
         [&] { return g_real_recv_chk(s, buf, len, buflen, flags); },
         buf, len);
@@ -332,6 +348,17 @@ SMASH_VISIBLE ssize_t __recvfrom_chk(int s, void* buf, size_t len, size_t buflen
     if (!g_real_recvfrom_chk) return recvfrom(s, buf, len, flags, addr, addr_len);
     if (g_syscall_wrap_disabled)
         return g_real_recvfrom_chk(s, buf, len, buflen, flags, addr, addr_len);
+    if (smash::vm::wantsPeekedRecv(s, flags, smash::vm::inSmashRegion(buf, len)))
+        return smash::vm::peekedRecv(
+            [&] { return g_real_recvfrom_chk(s, buf, len, buflen, flags | MSG_PEEK, nullptr, nullptr); },
+            [&] { smash::vm::walkPagesForFault(buf, len, smash::g_smash_vm_region); },
+            [&] {
+                if (addr_len) {
+                    smash::vm::touchRangeWritable(addr_len, sizeof(*addr_len));
+                    if (addr) smash::vm::touchRangeWritable(addr, *addr_len);
+                }
+            },
+            [&] { return g_real_recvfrom_chk(s, buf, len, buflen, flags, addr, addr_len); });
     return smash::vm::retryWith1Buf(
         [&] { return g_real_recvfrom_chk(s, buf, len, buflen, flags, addr, addr_len); },
         buf, len);
@@ -435,6 +462,17 @@ SMASH_VISIBLE ssize_t readv(int fd, const struct iovec* iov, int iovcnt) {
     using fn_t = ssize_t(*)(int, const struct iovec*, int);
     SMASH_LAZY_RESOLVE(fn_t, readv);
     if (!real_readv) return syscall(SYS_readv, fd, iov, iovcnt);
+    if (iovcnt > 0 && smash::vm::wantsPeekedRecv(
+                          fd, 0, smash::vm::iovecInSmashRegion(iov, static_cast<size_t>(iovcnt))))
+        return smash::vm::peekedRecv(
+            [&] {
+                struct msghdr peek{};
+                peek.msg_iov = const_cast<struct iovec*>(iov);
+                peek.msg_iovlen = static_cast<size_t>(iovcnt);
+                return static_cast<ssize_t>(syscall(SYS_recvmsg, fd, &peek, MSG_PEEK));
+            },
+            [&] { smash::vm::walkIovecForFault(iov, iovcnt, smash::g_smash_vm_region); }, [] {},
+            [&] { return real_readv(fd, iov, iovcnt); });
     return smash::vm::fileIoWithIovec(fd, iov, iovcnt,
         [&](const struct iovec* v, int n, size_t) { return real_readv(fd, v, n); });
 }
@@ -451,6 +489,12 @@ SMASH_VISIBLE ssize_t recv(int s, void* buf, size_t len, int flags) {
     using fn_t = ssize_t(*)(int, void*, size_t, int);
     SMASH_LAZY_RESOLVE(fn_t, recv);
     if (!real_recv) return syscall(SYS_recvfrom, s, buf, len, flags, nullptr, nullptr);
+    auto* vm = smash::g_smash_vm_region;
+    if (smash::vm::wantsPeekedRecv(s, flags, smash::vm::inSmashRegion(buf, len)))
+        return smash::vm::peekedRecv(
+            [&] { return real_recv(s, buf, len, flags | MSG_PEEK); },
+            [&] { smash::vm::walkPagesForFault(buf, len, vm); }, [] {},
+            [&] { return real_recv(s, buf, len, flags); });
     return smash::vm::retryWith1Buf(
         [&] { return real_recv(s, buf, len, flags); },
         buf, len);
@@ -470,6 +514,18 @@ SMASH_VISIBLE ssize_t recvfrom(int s, void* buf, size_t len, int flags,
     using fn_t = ssize_t(*)(int, void*, size_t, int, struct sockaddr*, socklen_t*);
     SMASH_LAZY_RESOLVE(fn_t, recvfrom);
     if (!real_recvfrom) return syscall(SYS_recvfrom, s, buf, len, flags, from, fromlen);
+    auto* vm = smash::g_smash_vm_region;
+    if (smash::vm::wantsPeekedRecv(s, flags, smash::vm::inSmashRegion(buf, len)))
+        return smash::vm::peekedRecv(
+            [&] { return real_recvfrom(s, buf, len, flags | MSG_PEEK, nullptr, nullptr); },
+            [&] { smash::vm::walkPagesForFault(buf, len, vm); },
+            [&] {
+                if (fromlen) {
+                    smash::vm::touchRangeWritable(fromlen, sizeof(*fromlen));
+                    if (from) smash::vm::touchRangeWritable(from, *fromlen);
+                }
+            },
+            [&] { return real_recvfrom(s, buf, len, flags, from, fromlen); });
     return smash::vm::retryWith1Buf(
         [&] { return real_recvfrom(s, buf, len, flags, from, fromlen); },
         buf, len);
@@ -491,6 +547,22 @@ SMASH_VISIBLE ssize_t recvmsg(int s, struct msghdr* msg, int flags) {
     if (!real_recvmsg) return syscall(SYS_recvmsg, s, msg, flags);
     auto* vm = smash::g_smash_vm_region;
     bool in_heap = msg && iovecInHeap(msg->msg_iov, static_cast<int>(msg->msg_iovlen), vm);
+    if (msg && smash::vm::wantsPeekedRecv(
+                   s, flags, smash::vm::iovecInSmashRegion(msg->msg_iov, msg->msg_iovlen)))
+        return smash::vm::peekedRecv(
+            [&] {
+                struct msghdr peek{};
+                peek.msg_iov = msg->msg_iov;
+                peek.msg_iovlen = msg->msg_iovlen;
+                return real_recvmsg(s, &peek, flags | MSG_PEEK);
+            },
+            [&] { smash::vm::walkIovecForFault(msg->msg_iov, static_cast<int>(msg->msg_iovlen), vm); },
+            [&] {
+                smash::vm::touchRangeWritable(msg, sizeof(*msg));
+                smash::vm::touchRangeWritable(msg->msg_name, msg->msg_namelen);
+                smash::vm::touchRangeWritable(msg->msg_control, msg->msg_controllen);
+            },
+            [&] { return real_recvmsg(s, msg, flags); });
     ssize_t ret = smash::vm::retryWithDecompress(
         [&] { return real_recvmsg(s, msg, flags); },
         [&] { if (in_heap) smash::vm::walkIovecForFault(msg->msg_iov, static_cast<int>(msg->msg_iovlen), vm); });
@@ -647,6 +719,24 @@ SMASH_VISIBLE int recvmmsg(int sockfd, struct mmsghdr* msgvec, unsigned int vlen
     SMASH_LAZY_RESOLVE(fn_t, recvmmsg);
     if (!real_recvmmsg) return syscall(SYS_recvmmsg, sockfd, msgvec, vlen, flags, timeout);
     auto* vm = smash::g_smash_vm_region;
+    // A datagram whose copy faults is dropped by the kernel (see peekedRecv),
+    // and a peek covers only one: make every buffer writable first. A wait
+    // that outlasts a compressor tick can still lose one.
+    if (msgvec && !(flags & (MSG_PEEK | MSG_ERRQUEUE))) {
+        bool any = false;
+        for (unsigned i = 0; i < vlen && !any; ++i)
+            any = smash::vm::iovecInSmashRegion(msgvec[i].msg_hdr.msg_iov, msgvec[i].msg_hdr.msg_iovlen);
+        if (any && smash::vm::fdIsMessageSocket(sockfd)) {
+            for (unsigned i = 0; i < vlen; ++i) {
+                struct msghdr* m = &msgvec[i].msg_hdr;
+                for (size_t k = 0; m->msg_iov && k < m->msg_iovlen; ++k)
+                    smash::vm::touchRangeWritable(m->msg_iov[k].iov_base, m->msg_iov[k].iov_len);
+                smash::vm::touchRangeWritable(m->msg_name, m->msg_namelen);
+                smash::vm::touchRangeWritable(m->msg_control, m->msg_controllen);
+                smash::vm::touchRangeWritable(&msgvec[i], sizeof(msgvec[i]));
+            }
+        }
+    }
     int ret = smash::vm::retryWithDecompress(
         [&] { return real_recvmmsg(sockfd, msgvec, vlen, flags, timeout); },
         [&] {
@@ -676,6 +766,21 @@ SMASH_VISIBLE int sendmmsg(int sockfd, struct mmsghdr* msgvec, unsigned int vlen
         });
     return ret;
 }
+
+// Callers bind recvmmsg@GLIBC_2.12 and sendmmsg@GLIBC_2.14 on x86-64 (see
+// SMASH_GLIBC_212_214_NODES in CMakeLists.txt).
+SMASH_VISIBLE int recvmmsg_212(int sockfd, struct mmsghdr* msgvec, unsigned int vlen,
+                               int flags, struct timespec* timeout) {
+    return recvmmsg(sockfd, msgvec, vlen, flags, timeout);
+}
+SMASH_VISIBLE int sendmmsg_214(int sockfd, struct mmsghdr* msgvec, unsigned int vlen,
+                               int flags) {
+    return sendmmsg(sockfd, msgvec, vlen, flags);
+}
+#if !defined(__aarch64__)   // there GLIBC_2.17 is the base version already
+__asm__(".symver recvmmsg_212,recvmmsg@GLIBC_2.12");
+__asm__(".symver sendmmsg_214,sendmmsg@GLIBC_2.14");
+#endif
 
 // ── Socket address query syscalls ───────────────────────────────────────────
 // getsockopt writes into a heap-allocated buffer; getsockname/getpeername

@@ -224,6 +224,27 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 } ${SMASH_GLIBC_BASE_VERSION};")
   endif()
 
+  # recvmmsg / sendmmsg: glibc versions them at GLIBC_2.12 / 2.14 on x86-64,
+  # and callers bind those, so base-node-only exports never ran (a
+  # recvmmsg into a watched buffer returned EFAULT: dgram_recv_test). Only the
+  # _212/_214 aliases go in these nodes: the bare name at the same version
+  # too is the self-jump trap documented in the map. On aarch64 the base
+  # (GLIBC_2.17) is what callers bind already.
+  if(SMASH_GLIBC_BASE_VERSION STREQUAL "GLIBC_2.17")
+    set(SMASH_GLIBC_212_214_NODES "")
+  else()
+    set(SMASH_GLIBC_212_214_NODES
+"GLIBC_2.12 {
+  global:
+    recvmmsg_212;
+} ${SMASH_GLIBC_BASE_VERSION};
+
+GLIBC_2.14 {
+  global:
+    sendmmsg_214;
+} GLIBC_2.12;")
+  endif()
+
   configure_file(
     ${CMAKE_CURRENT_SOURCE_DIR}/src/smash_version_script.map.in
     ${CMAKE_CURRENT_BINARY_DIR}/smash_version_script.map

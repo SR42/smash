@@ -667,6 +667,19 @@ if(NOT APPLE)
   set_tests_properties(test_short_io PROPERTIES TIMEOUT 400)
 endif()
 
+# Receiving a datagram into a buffer smash made inaccessible must not lose it:
+# the kernel dequeues before copying and frees the datagram on EFAULT
+# (dgram_recv_test.cpp).
+if(NOT APPLE)
+  add_executable(dgram_recv_test dgram_recv_test.cpp)
+  target_link_libraries(dgram_recv_test PRIVATE ${CMAKE_DL_LIBS})
+  add_test(NAME test_dgram_recv COMMAND ${CMAKE_COMMAND} -E env
+    "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=1" "SMASH_SOFTDIRTY=0"
+    "SMASH_DEFER_PHASES_MS=0" "SMASH_COLD_TIMEOUT_SEC=1"
+    $<TARGET_FILE:dgram_recv_test>)
+  set_tests_properties(test_dgram_recv PROPERTIES TIMEOUT 400)
+endif()
+
 # An idle 1 GiB must actually leave RSS with default timings, in each
 # write-tracking mode: page protection (SMASH_SOFTDIRTY=0), the default
 # auto-selection, and page protection with sub-arenas (idle_compress_test.cpp).
