@@ -160,6 +160,18 @@ int main() {
         std::atomic<bool> stop{false};
         std::atomic<long> resolved{0}, delivered{0}, misrouted{0};
         std::vector<std::thread> th;
+        // E left SIGSEGV at SIG_DFL (its one-shot handler reset itself).
+        // Install a handler before any thread starts: a faulting thread
+        // that reached its own page before the swappers' first sigaction
+        // got the default action and killed the process (once, UBSan, root,
+        // 2 CPUs; every time with a 200 ms delay before the first swap).
+        {
+            struct sigaction a0{};
+            a0.sa_sigaction = stressA;
+            a0.sa_flags = SA_SIGINFO;
+            sigemptyset(&a0.sa_mask);
+            sigaction(SIGSEGV, &a0, nullptr);
+        }
         for (int t = 0; t < 4; ++t) {
             th.emplace_back([&, t] {
                 struct sigaction a{}, b{};
