@@ -161,3 +161,19 @@ syscall loop as this gets): 419–438 ns per syscall with no preload, 453 ns
 passing through (`SMASH_NO_SYSCALL_WRAP=1`) and 458–462 ns wrapped. So
 interposition itself costs ~15 ns per syscall and the retry logic ~5 ns on top
 — about 1% of a syscall, paid only by the syscalls listed above.
+
+## Short transfers when a buffer is only partly compressed (open gap, 2026-09-29)
+
+The EFAULT retry (`retryWithDecompress`) only fires when the syscall returns
+-1/`EFAULT`. When a buffer's first pages are accessible and a later one is
+compressed, the kernel copies up to that page and returns a **short count**
+instead — a successful return the wrappers pass straight to the application.
+For a regular file (`read`, `pread`, `preadv`, ...) callers commonly treat a
+short count as EOF. Found with `SMASH_RESTORE_GRANULE_PAGES=16` forced on the
+suite: `test_syscall_efault`'s `preadv` returned 16384 of 131072 bytes — group
+restore compresses a freshly written buffer unevenly (neighbours' cold counts
+are frozen for a tick), but a buffer straddling an ACTIVE page and a
+COMPRESSED one hits the same path with default settings. Not fixed: a fix
+would pre-fault (walk) a buffer's compressed pages before the call, or retry
+the remainder after a short count when the page after it is compressed.
+

@@ -336,6 +336,101 @@ static void testRearmBackoff() {
     unsetenv("SMASH_REARM_BACKOFF_MAX");
 }
 
+// Group restore (SMASH_RESTORE_GRANULE_PAGES): a write fault on a watched
+// page makes its whole aligned group writable in one mprotect per contiguous
+// stretch of ACTIVE / ACTIVE_MONITORING pages — and never touches a
+// compressed or shadow neighbour, whose page must stay unwritable.
+static bool mapsPerms(const void* addr, char out[5]) {
+    FILE* f = fopen("/proc/self/maps", "r");
+    if (!f) return false;
+    const auto a = reinterpret_cast<uintptr_t>(addr);
+    char line[512];
+    bool found = false;
+    while (fgets(line, sizeof(line), f)) {
+        unsigned long lo = 0, hi = 0;
+        char perms[5] = {};
+        if (sscanf(line, "%lx-%lx %4s", &lo, &hi, perms) == 3 && a >= lo && a < hi) {
+            memcpy(out, perms, 5);
+            found = true;
+            break;
+        }
+    }
+    fclose(f);
+    return found;
+}
+
+static void testRestoreGranule() {
+    setenv("SMASH_REARM_BACKOFF_MAX", "0", 1);
+    VmRegion vm;
+    vm.init(64 * kPageSize);
+    PageStateTable states;
+    states.init(vm.totalPages());
+    PageLockTable locks;
+    locks.init(vm.totalPages());
+    CompressStore store;
+    store.init();
+    CompressEngine engine;
+    engine.init();
+    CompressorThread compressor;
+    compressor.init(&vm, &states, &locks, &store, &engine);
+    unsetenv("SMASH_REARM_BACKOFF_MAX");
+    compressor.setRestoreGranulePages(1);   // one page per fault while setting up
+
+    auto* mem = static_cast<uint8_t*>(vm.allocatePages(8));
+    CHECK(mem != nullptr, "granule: alloc failed");
+    const size_t idx0 = vm.pageIndex(reinterpret_cast<uintptr_t>(mem));
+    const size_t base = (idx0 + 3) & ~size_t{3};          // a 4-aligned group inside
+    auto pg = [&](size_t k) { return static_cast<uint8_t*>(vm.pageAddress(base + k)); };
+    for (size_t i = 0; i < 8; ++i) {
+        states.set(idx0 + i, PageState::ACTIVE);
+        memset(mem + i * kPageSize, 0x40 + static_cast<int>(i), kPageSize);
+    }
+    const uint8_t v1 = pg(1)[0];
+    compressor.compressTick();
+    CHECK(states.get(base) == PageState::ACTIVE_MONITORING, "granule: first arm");
+
+    // Page 1 goes cold and is compressed while 0, 2, 3 keep being written
+    // (group restore off: one page per fault).
+    PageState s1 = PageState::ACTIVE_MONITORING;
+    for (int t = 0; t < 16; ++t) {
+        for (size_t k : {0u, 2u, 3u})
+            if (states.get(base + k) == PageState::ACTIVE_MONITORING)
+                compressor.handleFault(reinterpret_cast<uintptr_t>(pg(k)));
+        compressor.compressTick();
+        s1 = states.get(base + 1);
+        if (s1 == PageState::COMPRESSED || s1 == PageState::COMPRESSED_SHADOW) break;
+    }
+    CHECK(s1 == PageState::COMPRESSED || s1 == PageState::COMPRESSED_SHADOW,
+          "granule: page 1 never compressed (state %d)", static_cast<int>(s1));
+    compressor.compressTick();   // re-arm 0, 2, 3
+    for (size_t k : {0u, 2u, 3u})
+        CHECK(states.get(base + k) == PageState::ACTIVE_MONITORING,
+              "granule: page %zu not re-armed (state %d)", k,
+              static_cast<int>(states.get(base + k)));
+    s1 = states.get(base + 1);
+
+    compressor.setRestoreGranulePages(4);
+    CHECK(compressor.handleFault(reinterpret_cast<uintptr_t>(pg(2))), "granule: fault on 2");
+    for (size_t k : {0u, 2u, 3u}) {
+        CHECK(states.get(base + k) == PageState::ACTIVE,
+              "granule: page %zu not restored with its group (state %d)", k,
+              static_cast<int>(states.get(base + k)));
+        char perms[5] = {};
+        CHECK(mapsPerms(pg(k), perms) && perms[1] == 'w',
+              "granule: page %zu not writable after the group restore (%s)", k, perms);
+    }
+    CHECK(states.get(base + 1) == s1, "granule: compressed neighbour's state changed (%d -> %d)",
+          static_cast<int>(s1), static_cast<int>(states.get(base + 1)));
+    char perms1[5] = {};
+    CHECK(mapsPerms(pg(1), perms1) && perms1[1] != 'w',
+          "granule: compressed neighbour made writable (%s)", perms1);
+    // Its contents come back through its own fault.
+    if (states.get(base + 1) == PageState::COMPRESSED)
+        compressor.handleFault(reinterpret_cast<uintptr_t>(pg(1)));
+    CHECK(pg(1)[0] == v1 && pg(1)[kPageSize - 1] == v1, "granule: page 1 data mismatch");
+    compressor.setRestoreGranulePages(1);
+}
+
 static void testReleaseCompressedPages() {
     VmRegion vm;
     vm.init(64 * kPageSize);
@@ -385,6 +480,7 @@ int main() {
     testAccessTracking();
     unsetenv("SMASH_REARM_BACKOFF_MAX");
     testRearmBackoff();
+    testRestoreGranule();
     testReleaseCompressedPages();
 
     if (failures == 0) {

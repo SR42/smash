@@ -396,12 +396,98 @@ class CompressorThread {
     uint8_t* rearm_exp_ = nullptr;
     uint8_t* rearm_wait_ = nullptr;
     uint8_t rearm_exp_max_ = 0;
+    size_t restore_granule_ = 1;
+    // Set by a group restore on each neighbour it made writable: the page
+    // was unwatched for part of the interval Phase 1 is about to judge, so
+    // Phase 1 neither counts it idle (it may have been written — counted
+    // idle, hot neighbours were compressed while still being written: 3072
+    // shadow/compressed faults in test_rearm_backoff with 16-page groups)
+    // nor resets it (it may be cold — reset, one hot page would keep its
+    // cold neighbours from ever being compressed). Cleared by Phase 1.
+    uint8_t* group_unwatched_ = nullptr;
 
     static int rearmBackoffMaxFromEnv() {
         const char* v = std::getenv("SMASH_REARM_BACKOFF_MAX");
         if (!v || !*v) return 6;
         const int n = std::atoi(v);
         return n < 0 ? 0 : (n > 7 ? 7 : n);
+    }
+
+    // Diagnostic (fault handler): how many other pages of the faulting page's
+    // aligned 16-page group are already ACTIVE. Unlocked reads; a hint.
+    void noteFaultLocality(size_t i) {
+        const size_t contig = vm_->contigPages();
+        if (i >= contig) return;
+        const size_t base = i & ~size_t{15};
+        const size_t end = base + 16 < contig ? base + 16 : contig;
+        uint64_t n = 0;
+        for (size_t q = base; q < end; ++q)
+            if (q != i && states_->get(q) == PageState::ACTIVE) ++n;
+        if (n) pc_.f_nbr_active.fetch_add(n, std::memory_order_relaxed);
+    }
+
+    // Group restore (SMASH_RESTORE_GRANULE_PAGES): make page i's aligned
+    // group writable, one mprotect per contiguous stretch of pages that are
+    // ACTIVE or ACTIVE_MONITORING — both backed, so PROT_RW is safe on them.
+    // Compressed, compressing, shadow and empty pages break the stretch and
+    // are never touched. Neighbours are taken with tryLock only (the caller
+    // holds page i; a blocking lock could deadlock against a compressor
+    // locking upward) and held until their protection has changed. A
+    // neighbour moved from ACTIVE_MONITORING to ACTIVE is re-armed by the
+    // next Phase 3 like any written page; it does not inherit i's backoff,
+    // or one hot page would keep its cold neighbours from ever being
+    // watched. False (caller restores page i alone) when page i's stretch
+    // could not be made writable.
+    bool restoreGroup(size_t i) {
+        const size_t contig = vm_->contigPages();
+        if (i >= contig) return false;
+        const size_t g = restore_granule_;           // power of two, <= 512
+        const size_t base = i & ~(g - 1);
+        const size_t end = base + g < contig ? base + g : contig;
+        // Bits by offset from base: neighbours locked here, and pages whose
+        // stretch was made writable. 128 bytes, not 4 KiB, on the faulting
+        // thread's stack.
+        uint64_t held[8] = {}, done[8] = {};
+        auto set = [](uint64_t* b, size_t k) { b[k >> 6] |= uint64_t{1} << (k & 63); };
+        auto has = [](const uint64_t* b, size_t k) { return (b[k >> 6] >> (k & 63)) & 1; };
+        size_t run = ~size_t{0};
+        auto flush = [&](size_t a, size_t b) {       // pages [a, b)
+            void* addr = vm_->pageAddress(a);
+            if (!addr || !vm::protectPages(addr, (b - a) * kPageSize, true, true)) return;
+            for (size_t q = a; q < b; ++q) set(done, q - base);
+        };
+        for (size_t q = base; q < end; ++q) {
+            bool take = q == i;
+            if (!take && locks_->tryLock(q)) {
+                const PageState st = states_->get(q);
+                if (st == PageState::ACTIVE || st == PageState::ACTIVE_MONITORING) {
+                    take = true;
+                    set(held, q - base);
+                } else {
+                    locks_->unlock(q);
+                }
+            }
+            if (take) {
+                if (run == ~size_t{0}) run = q;
+            } else if (run != ~size_t{0}) {
+                flush(run, q);
+                run = ~size_t{0};
+            }
+        }
+        if (run != ~size_t{0}) flush(run, end);
+        uint64_t restored = 0;
+        for (size_t q = base; q < end; ++q) {
+            if (!has(held, q - base)) continue;
+            // Only a page whose stretch was made writable changes state.
+            if (has(done, q - base) && states_->get(q) == PageState::ACTIVE_MONITORING) {
+                states_->set(q, PageState::ACTIVE);
+                group_unwatched_[q] = 1;
+                ++restored;
+            }
+            locks_->unlock(q);
+        }
+        if (restored) pc_.f_group_restored.fetch_add(restored, std::memory_order_relaxed);
+        return has(done, i - base);
     }
 
     // A write fault on a watched page (fault handler, page lock held). The
@@ -489,6 +575,12 @@ class CompressorThread {
         // Re-arm backoff: write faults on watched pages classified hot, and
         // page-ticks Phase 3 left a page unarmed while it waited.
         std::atomic<uint64_t> f_monitor_hot{0}, p3_backoff{0};
+        // Write-fault locality: for each write fault on a watched page, the
+        // other pages of its aligned 16-page group that were already ACTIVE
+        // (written this tick, or waiting out a backoff), summed. Divided by
+        // faults monitor=, it says whether restoring whole groups would save
+        // faults. And the neighbours a group restore made writable.
+        std::atomic<uint64_t> f_nbr_active{0}, f_group_restored{0};
         // Wall time of each phase of the last tick (1 access scan, 2 select
         // and compress, 3 arm PROT_READ, 4 release shadows, 5 node groups
         // drain their queues), and the slowest so far.
@@ -1557,6 +1649,12 @@ private:
                     // verdict behind the ratio-gate backoff is stale.
                     compress_fail_count_[i] = 0;
                     accessed_[i].store(false, std::memory_order_relaxed);
+                    if (group_unwatched_) group_unwatched_[i] = 0;
+                } else if (group_unwatched_ && group_unwatched_[i]) {
+                    // Made writable by a neighbour's group restore since the
+                    // last scan: its cold count stays as it is (see
+                    // group_unwatched_).
+                    group_unwatched_[i] = 0;
                 } else if (st == PageState::ACTIVE && rearm_wait_ && rearm_wait_[i]) {
                     // Waiting out its re-arm backoff: unwatched, so its
                     // writes are invisible. Never count it idle: once armed
@@ -5914,6 +6012,13 @@ public:
         recompress_count_ = bootstrapArray<uint8_t>(max_pages);
         compress_fail_count_ = bootstrapArray<uint8_t>(max_pages);
         rearm_exp_max_ = static_cast<uint8_t>(rearmBackoffMaxFromEnv());
+        group_unwatched_ = bootstrapArray<uint8_t>(max_pages);
+        if (const char* g = std::getenv("SMASH_RESTORE_GRANULE_PAGES"); g && *g) {
+            const long n = std::atol(g);
+            size_t p2 = 1;
+            while (p2 * 2 <= static_cast<size_t>(n > 512 ? 512 : n)) p2 *= 2;
+            restore_granule_ = n > 1 ? p2 : 1;
+        }
         if (rearm_exp_max_ > 0) {
             rearm_exp_ = bootstrapArray<uint8_t>(max_pages);
             rearm_wait_ = bootstrapArray<uint8_t>(max_pages);
@@ -6491,7 +6596,8 @@ public:
                 " compressed=%llu active=%llu | phase_ms=%llu/%llu/%llu/%llu"
                 " max=%llu/%llu/%llu/%llu | p1 minflt=%llu range_ms_max=%llu workers=%llu"
                 " | p3 armed=%llu calls=%llu p2 mprotect=%llu"
-                " | p5 ms=%llu max=%llu | rearm hot=%llu waits=%llu\n",
+                " | p5 ms=%llu max=%llu | rearm hot=%llu waits=%llu"
+                " | group nbr_active=%llu restored=%llu\n",
                 v(pc.ticks), v(pc.tick_ms_last), v(pc.tick_ms_max), v(pc.deferred_ticks),
                 v(pc.p1_accessed), v(pc.p1_idle), v(pc.p2_at_floor), v(pc.p2_escalated),
                 v(pc.p2_eligible), v(pc.p2_routed), v(pc.p2_hint_skip), v(pc.cp_attempts),
@@ -6503,7 +6609,7 @@ public:
                 v(pc.p1_minflt), v(pc.p1_range_ms_max), v(pc.workers_last),
                 v(pc.p3_pages), v(pc.p3_calls), v(pc.p2_mprotect),
                 v(pc.phase_ms[5]), v(pc.phase_ms_max[5]), v(pc.f_monitor_hot),
-                v(pc.p3_backoff));
+                v(pc.p3_backoff), v(pc.f_nbr_active), v(pc.f_group_restored));
             if (n >= static_cast<int>(sizeof(buf))) n = static_cast<int>(sizeof(buf)) - 1;
             // Thread time per phase in ms: usr/sys/runq/blocked, where blocked
             // is the wall time left over (see PipelineCounters::pt_*).
@@ -6817,6 +6923,9 @@ public:
 
     // Manually trigger one compression tick (for testing/manual control)
     void compressTick() { tick(); }
+    // Group size (pages, power of two) a write fault on a watched page makes
+    // writable; 1 = the page alone. Set from SMASH_RESTORE_GRANULE_PAGES.
+    void setRestoreGranulePages(size_t g) { restore_granule_ = g; }
 
     // Dict experiment counters (try-both)
     uint64_t dictWinCount() const { return dict_win_count_.load(std::memory_order_relaxed); }
@@ -7024,9 +7133,12 @@ public:
 
         case PageState::ACTIVE_MONITORING: {
             pc_.f_monitor.fetch_add(1, std::memory_order_relaxed);
+            noteFaultLocality(page_idx);
             void* page_addr = vm_->pageAddress(page_idx);
-            if (!vm::protectPages(page_addr, kPageSize, true, true)) {
-                vm::remapPages(page_addr, kPageSize, true, true);
+            if (restore_granule_ <= 1 || !restoreGroup(page_idx)) {
+                if (!vm::protectPages(page_addr, kPageSize, true, true)) {
+                    vm::remapPages(page_addr, kPageSize, true, true);
+                }
             }
             accessed_[page_idx].store(true, std::memory_order_relaxed);
             if (rearm_exp_) noteMonitorWrite(page_idx);
@@ -7098,6 +7210,7 @@ public:
             }
             if (shadow_tick_) shadow_tick_[i] = 0;
             if (rearm_exp_) { rearm_exp_[i] = 0; rearm_wait_[i] = 0; }
+            if (group_unwatched_) group_unwatched_[i] = 0;
             // The page is going back to the allocator; whoever takes it next
             // decides its node.
             if (page_node_) page_node_[i] = 0;

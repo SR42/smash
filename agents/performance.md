@@ -709,6 +709,14 @@ default cap in steady state); idle memory beside it and the hot block once its
 writer stops still leave RSS. Counters: `rearm hot= waits=` on the pipeline
 line.
 
+First run on the box (tick 17, same workload): write faults 8.16M -> 4.37M,
+compressed + shadow 1.55M -> 2.87M, released 684k -> 1.65M; ticks still
+97-135 s. Only 46% of faults counted hot: "rewritten within a tick" is a
+100 s window when ticks are that long. `/proc/<pid>/maps`: 481k lines, 181k
+`---p` and 216k `r--p` anonymous — smash's own protection runs, the process
+itself would have a few hundred. Next: `SMASH_RESTORE_GRANULE_PAGES`
+(config.md), opt-in until `group nbr_active=` shows the writes cluster.
+
 Separately, the CPU-pressure cap (`cpuPressureWorkerCap`) subtracts **every**
 thread of the process from `nproc`, busy or not, so a process with >= nproc
 threads always gets one worker. Not changed yet: on this workload more workers

@@ -630,7 +630,28 @@ if(NOT APPLE)
     "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=1" "SMASH_SOFTDIRTY=0"
     "SMASH_STATS_SIGNAL=1" "SMASH_DEFER_PHASES_MS=0" "SMASH_COLD_TIMEOUT_SEC=2"
     "SMASH_REARM_BACKOFF_MAX=4" $<TARGET_FILE:rearm_backoff_test>)
-  set_tests_properties(test_rearm_backoff PROPERTIES TIMEOUT 200)
+  # The same with 16-page group restore: neighbours a fault makes writable
+  # are unwatched for part of a tick and must not be counted idle.
+  add_test(NAME test_rearm_backoff_group COMMAND ${CMAKE_COMMAND} -E env
+    "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=1" "SMASH_SOFTDIRTY=0"
+    "SMASH_STATS_SIGNAL=1" "SMASH_DEFER_PHASES_MS=0" "SMASH_COLD_TIMEOUT_SEC=2"
+    "SMASH_REARM_BACKOFF_MAX=4" "SMASH_RESTORE_GRANULE_PAGES=16"
+    $<TARGET_FILE:rearm_backoff_test>)
+  set_tests_properties(test_rearm_backoff test_rearm_backoff_group PROPERTIES TIMEOUT 200)
+endif()
+
+# Group restore: a write fault on a watched page makes its aligned 16-page
+# group writable, so clustered writes cost one fault per group and the region
+# splits into far fewer mappings (restore_granule_test.cpp).
+if(NOT APPLE)
+  add_executable(restore_granule_test restore_granule_test.cpp)
+  target_link_libraries(restore_granule_test PRIVATE ${CMAKE_DL_LIBS} Threads::Threads)
+  add_test(NAME test_restore_granule COMMAND ${CMAKE_COMMAND} -E env
+    "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=1" "SMASH_SOFTDIRTY=0"
+    "SMASH_STATS_SIGNAL=1" "SMASH_DEFER_PHASES_MS=0" "SMASH_COLD_TIMEOUT_SEC=2"
+    "SMASH_REARM_BACKOFF_MAX=0" "SMASH_RESTORE_GRANULE_PAGES=16"
+    $<TARGET_FILE:restore_granule_test>)
+  set_tests_properties(test_restore_granule PROPERTIES TIMEOUT 120)
 endif()
 
 # An idle 1 GiB must actually leave RSS with default timings, in each
