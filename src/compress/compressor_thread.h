@@ -599,6 +599,14 @@ class CompressorThread {
         // cumulative ms (TickStep indices), and all tick time outside phases.
         // Added when a 97 s tick had phases summing to ~22 s.
         std::atomic<uint64_t> step_ms[7]{};
+        // Wall time inside the system calls of phases 2-4, cumulative us:
+        // phase 2's page snapshots through /proc/self/mem (and their count),
+        // its mprotect calls (escalation, shadow arming, snapshot fallback),
+        // phase 3's arming, phase 4's release (madvise + mprotect) and
+        // look-ahead arming. Says which calls the "blocked" time of
+        // [smash phase time] waits in.
+        std::atomic<uint64_t> sc_memread_us{0}, sc_memread_n{0}, sc_p2_mprotect_us{0},
+                              sc_p3_mprotect_us{0}, sc_p4_us{0};
         std::atomic<uint64_t> phases_ms_total{0}, tick_ms_total{0};
         // Phase 1 detail: minor page faults the compressor's threads took
         // inside phase1Range (cumulative), the slowest single range, and the
@@ -606,12 +614,23 @@ class CompressorThread {
         // tick with many faults is waiting on the process's mmap_lock.
         std::atomic<uint64_t> p1_minflt{0}, p1_range_ms_max{0};
         std::atomic<uint64_t> workers_last{0};
+        // The CPU-pressure cap last computed (0 = none).
+        std::atomic<uint64_t> worker_cap{0};
         std::atomic<uint64_t> p3_pages{0}, p3_calls{0};
         // mprotect calls made by phase 2: escalation to PROT_NONE and the
         // compression snapshot.
         std::atomic<uint64_t> p2_mprotect{0};
     };
     PipelineCounters pc_;
+    // Adds the wall time of its scope, in us, to one PipelineCounters::sc_*.
+    struct SyscallTimer {
+        std::atomic<uint64_t>& acc; std::chrono::steady_clock::time_point t0;
+        explicit SyscallTimer(std::atomic<uint64_t>& a) : acc(a), t0(std::chrono::steady_clock::now()) {}
+        ~SyscallTimer() {
+            pcAdd(acc, static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - t0).count()));
+        }
+    };
     enum TickStep { kStepEfficiency, kStepVmaSync, kStepBitmap, kStepNodeChunks,
                     kStepAdapt, kStepDict, kStepSweep, kNumTickSteps };
     // Times one tick step (coordinator wall clock) into pc_.step_ms.
@@ -2136,6 +2155,7 @@ private:
             if (!breaks) continue;
             if (void* base = vm_->pageAddress(pg[seg])) {
                 pc_.p2_mprotect.fetch_add(1, std::memory_order_relaxed);
+                SyscallTimer t(pc_.sc_p2_mprotect_us);
                 vm::protectPages(base, (k - seg) * kPageSize, true, false);  // PROT_READ
             }
             seg = k;
@@ -2233,6 +2253,7 @@ private:
         if (states_->get(page_idx) == PageState::ACTIVE_MONITORING) {
             void* page_addr = vm_->pageAddress(page_idx);
             pc_.p2_mprotect.fetch_add(1, std::memory_order_relaxed);
+            SyscallTimer t(pc_.sc_p2_mprotect_us);
             vm::protectPages(page_addr, kPageSize, false, false);  // PROT_NONE
         }
         locks_->unlock(page_idx);
@@ -2301,7 +2322,12 @@ private:
             void* base = vm_->pageAddress(a);
             if (!base) return;
             if (syscalls) ++*syscalls;
-            if (vm::protectPages(base, (b - a) * kPageSize, true, false)) {
+            bool armed;
+            {
+                SyscallTimer t(pc_.sc_p3_mprotect_us);
+                armed = vm::protectPages(base, (b - a) * kPageSize, true, false);
+            }
+            if (armed) {
                 any_ok = true;
                 return;
             }
@@ -2418,6 +2444,8 @@ private:
     bool readPageViaMem([[maybe_unused]] const void* page_addr, [[maybe_unused]] void* dst) {
 #ifdef __linux__
         if (self_mem_fd_ < 0) return false;
+        pc_.sc_memread_n.fetch_add(1, std::memory_order_relaxed);
+        SyscallTimer t(pc_.sc_memread_us);
         const auto off = static_cast<off_t>(reinterpret_cast<uintptr_t>(page_addr));
         size_t done = 0;
         while (done < kPageSize) {
@@ -2448,6 +2476,7 @@ private:
             void* base = vm_->pageAddress(pages[a]);
             if (!base) return;
             pc_.p2_mprotect.fetch_add(1, std::memory_order_relaxed);
+            SyscallTimer t(pc_.sc_p2_mprotect_us);
             vm::protectPages(base, (b - a) * kPageSize, false, false);  // PROT_NONE
         };
         for (size_t k = 0; k < n; ++k) {
@@ -2671,7 +2700,10 @@ private:
             snapshot_via_mem = readPageViaMem(page_addr, worker.page_buf);
             if (!snapshot_via_mem) {
                 pc_.p2_mprotect.fetch_add(1, std::memory_order_relaxed);
-                vm::protectPages(page_addr, kPageSize, true, true);  // PROT_RW
+                {
+                    SyscallTimer t(pc_.sc_p2_mprotect_us);
+                    vm::protectPages(page_addr, kPageSize, true, true);  // PROT_RW
+                }
                 __builtin_memcpy(worker.page_buf, page_addr, kPageSize);
             }
             // Snapshot verification for deferred mode. Without PROT_READ
@@ -4145,6 +4177,7 @@ private:
             void* rbase = vm_->pageAddress(rrun[0]);
             const size_t rbytes = rrun_n * kPageSize;
             if (rbase) {
+                SyscallTimer t(pc_.sc_p4_us);
                 if (fixavEnabled()) {
                     vm::protectPages(rbase, rbytes, false, false);   // PROT_NONE
                     membarrierSyncCore();                            // once per run
@@ -4237,7 +4270,10 @@ private:
                         ++n;
                         ++j;
                     }
-                    vm::protectPages(page_addr, n * kPageSize, true, false);  // PROT_READ
+                    {
+                        SyscallTimer t(pc_.sc_p4_us);
+                        vm::protectPages(page_addr, n * kPageSize, true, false);  // PROT_READ
+                    }
                     armed_hi = i + n;
                 }
 
@@ -5647,25 +5683,25 @@ private:
 
     // Adapt active worker count using Little's Law (see class comment above).
     // CPU-pressure cap on compressor workers. Returns the maximum number of
-    // workers we should run given current system load and our own process's
-    // thread count, or 0 to mean "no cap."
+    // workers we should run given current system load, or 0 to mean "no
+    // cap."
     //
     // The compressor is background work: every worker that runs competes
-    // with the application for cores. The right answer depends on what the
-    // application is doing — a single-threaded app on an 8-core box can
-    // afford many compressor workers; a 16-threaded app on a 4-core box
-    // cannot afford any.
+    // with the application for cores.
     //
-    // Method: read the live thread count for *our process* (/proc/self/stat
-    // num_threads field, or task-dir count on macOS), subtract our known
-    // compressor workers to get an estimate of app threads, and reserve
-    // enough cores for them. Then add a safety floor based on system-wide
-    // 1-minute load average to back off when *other* processes are also
-    // saturating the box.
+    //   busy = round(1-minute load average)        // runnable, system-wide
+    //   floor = nproc >= 4 ? clamp(nproc / 16, 2, kMaxCompressorWorkers) : 1
+    //   cap = max(floor, nproc - busy)
     //
-    //   app_threads = max(1, process_threads - (helpers_created_ + 1))
-    //   sys_pressure = max(0, ceil(loadavg) - app_threads)  // outside contention
-    //   cap = max(1, nproc - app_threads - sys_pressure)
+    // It used to subtract every thread of our own process, busy or asleep:
+    // a process with nproc threads or more always got one worker. On a
+    // 128-thread, 128-core arm64 application that left phases 1-4 of a
+    // 145 GB heap on one thread, which then spent most of its time waiting
+    // for a CPU (phase 2: 2527 s runq against 236 s user); test_worker_cap
+    // (32 sleeping threads on 8 CPUs) saw 1 worker in every sample. The
+    // floor keeps the compressor from starving outright on a saturated box:
+    // a few extra runnable threads next to nproc busy ones cost the
+    // application a few percent while phases run.
     //
     // Cheap, cached: re-evaluated at most every kCpuPressureSampleTicks
     // ticks. Behind SMASH_CPU_PRESSURE_CAP=0 to allow ablation.
@@ -5688,64 +5724,22 @@ private:
         }
         cpu_pressure_sample_age_ = 0;
 
-        // Live thread count of our own process. /proc/self/stat field 20 is
-        // num_threads, but stat parsing is finicky (the comm field can
-        // contain spaces); easier to count entries in /proc/self/task.
-        // On macOS, /proc isn't available → fall back to process-info.
-        int proc_threads = countOwnThreads();
-        if (proc_threads <= 0) {
-            cpu_pressure_cached_cap_ = 0;  // can't read → no cap
-            return 0;
+        const int nproc = static_cast<int>(nproc_cached);
+        int floor = 1;
+        if (nproc >= 4) {
+            floor = nproc / 16;
+            if (floor < 2) floor = 2;
+            if (floor > kMaxCompressorWorkers) floor = kMaxCompressorWorkers;
         }
-
-        // App threads = total minus our own compressor workers.
-        int our_workers = helpers_created_ + 1;  // helpers + coordinator
-        int app_threads = proc_threads - our_workers;
-        if (app_threads < 1) app_threads = 1;
-
-        // System-wide pressure not attributable to our own app.
         double loads[3] = {0.0, 0.0, 0.0};
-        int sys_pressure = 0;
-        int load_int = 0;
-        if (getloadavg(loads, 1) >= 1) {
-            load_int = static_cast<int>(loads[0] + 0.5);
-            sys_pressure = load_int - app_threads;
-            if (sys_pressure < 0) sys_pressure = 0;
-        }
+        int busy = 0;
+        if (getloadavg(loads, 1) >= 1) busy = static_cast<int>(loads[0] + 0.5);
 
-        int cap = static_cast<int>(nproc_cached) - app_threads - sys_pressure;
-        if (cap < 1) cap = 1;
+        int cap = nproc - busy;
+        if (cap < floor) cap = floor;
         cpu_pressure_cached_cap_ = cap;
+        pc_.worker_cap.store(static_cast<uint64_t>(cap), std::memory_order_relaxed);
         return cap;
-    }
-
-    // /proc/self/task/ entry count (Linux) or task_threads() (macOS).
-    // Returns -1 on error.
-    int countOwnThreads() {
-#if defined(__linux__)
-        DIR* d = opendir("/proc/self/task");
-        if (!d) return -1;
-        int count = 0;
-        while (struct dirent* e = readdir(d)) {
-            if (e->d_name[0] != '.') count++;
-        }
-        closedir(d);
-        return count > 0 ? count : -1;
-#elif defined(__APPLE__)
-        thread_array_t threads;
-        mach_msg_type_number_t n = 0;
-        if (task_threads(mach_task_self(), &threads, &n) != KERN_SUCCESS)
-            return -1;
-        // Free the port rights we just received.
-        for (mach_msg_type_number_t i = 0; i < n; ++i)
-            mach_port_deallocate(mach_task_self(), threads[i]);
-        vm_deallocate(mach_task_self(),
-                      reinterpret_cast<vm_address_t>(threads),
-                      n * sizeof(thread_t));
-        return static_cast<int>(n);
-#else
-        return -1;
-#endif
     }
 
     int cpu_pressure_cached_cap_ = 0;
@@ -6565,7 +6559,7 @@ public:
         // there, and it is what runs out on a very large heap.
         size_t boot_used = 0, boot_cap = 0, boot_regions = 0;
         BootstrapAlloc::instance().usage(&boot_used, &boot_cap, &boot_regions);
-        char buf[1536];
+        char buf[4096];   // stats + pipeline + phase time lines; ~1.6 KB on a 145 GB heap
         int n = smash::safe_snprintf(buf, sizeof(buf),
             "[smash stats] [%s] pid=%d committed=%zu  active=%zu  monitor=%zu"
             "  compressing=%zu  compressed=%zu  shadow=%zu  empty=%zu"
@@ -6594,7 +6588,7 @@ public:
                 " stored=%llu gate_fail=%llu | release checked=%llu released=%llu"
                 " changed=%llu vma_stop=%llu | faults monitor=%llu shadow=%llu"
                 " compressed=%llu active=%llu | phase_ms=%llu/%llu/%llu/%llu"
-                " max=%llu/%llu/%llu/%llu | p1 minflt=%llu range_ms_max=%llu workers=%llu"
+                " max=%llu/%llu/%llu/%llu | p1 minflt=%llu range_ms_max=%llu workers=%llu cap=%llu"
                 " | p3 armed=%llu calls=%llu p2 mprotect=%llu"
                 " | p5 ms=%llu max=%llu | rearm hot=%llu waits=%llu"
                 " | group nbr_active=%llu restored=%llu\n",
@@ -6606,7 +6600,7 @@ public:
                 v(pc.f_compressed), v(pc.f_active), v(pc.phase_ms[1]), v(pc.phase_ms[2]),
                 v(pc.phase_ms[3]), v(pc.phase_ms[4]), v(pc.phase_ms_max[1]),
                 v(pc.phase_ms_max[2]), v(pc.phase_ms_max[3]), v(pc.phase_ms_max[4]),
-                v(pc.p1_minflt), v(pc.p1_range_ms_max), v(pc.workers_last),
+                v(pc.p1_minflt), v(pc.p1_range_ms_max), v(pc.workers_last), v(pc.worker_cap),
                 v(pc.p3_pages), v(pc.p3_calls), v(pc.p2_mprotect),
                 v(pc.phase_ms[5]), v(pc.phase_ms_max[5]), v(pc.f_monitor_hot),
                 v(pc.p3_backoff), v(pc.f_nbr_active), v(pc.f_group_restored));
@@ -6630,11 +6624,16 @@ public:
                 if (n > 0 && static_cast<size_t>(n) < sizeof(buf))
                     n += smash::safe_snprintf(buf + n, sizeof(buf) - static_cast<size_t>(n),
                         " | tick ms total=%llu phases=%llu efficiency=%llu vma_sync=%llu"
-                        " bitmap=%llu node_chunks=%llu adapt=%llu dict=%llu sweep=%llu\n",
+                        " bitmap=%llu node_chunks=%llu adapt=%llu dict=%llu sweep=%llu"
+                        " | syscall ms memread=%llu (%llu calls) p2_mprotect=%llu p3_mprotect=%llu"
+                        " p4_release=%llu\n",
                         v(pc.tick_ms_total), v(pc.phases_ms_total), v(pc.step_ms[kStepEfficiency]),
                         v(pc.step_ms[kStepVmaSync]), v(pc.step_ms[kStepBitmap]),
                         v(pc.step_ms[kStepNodeChunks]), v(pc.step_ms[kStepAdapt]),
-                        v(pc.step_ms[kStepDict]), v(pc.step_ms[kStepSweep]));
+                        v(pc.step_ms[kStepDict]), v(pc.step_ms[kStepSweep]),
+                        v(pc.sc_memread_us) / 1000, v(pc.sc_memread_n),
+                        v(pc.sc_p2_mprotect_us) / 1000, v(pc.sc_p3_mprotect_us) / 1000,
+                        v(pc.sc_p4_us) / 1000);
                 if (n >= static_cast<int>(sizeof(buf))) n = static_cast<int>(sizeof(buf)) - 1;
             }
         }

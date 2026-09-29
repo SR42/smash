@@ -717,7 +717,18 @@ compressed + shadow 1.55M -> 2.87M, released 684k -> 1.65M; ticks still
 itself would have a few hundred. Next: `SMASH_RESTORE_GRANULE_PAGES`
 (config.md), opt-in until `group nbr_active=` shows the writes cluster.
 
-Separately, the CPU-pressure cap (`cpuPressureWorkerCap`) subtracts **every**
+Second run (2026-09-30, tick 26, 16-page group restore on): compression at
+scale at last — 24.4M pages stored, 4.58M compressed and dropped, 7.05M zero
+pages, 19.45M still in shadow (released two ticks after compression,
+`SMASH_DEFERRED_RECLAIM_DELAY`). But ticks of 724 s: phases 316/386 s, 99% of
+tick time in phases (the "75 s outside the phases" earlier was a dump mixing
+two ticks). The split had moved: p2 usr/sys/runq/blocked = 236/1228/2527/3307
+s, p1 11/508/663/1484 s — waiting for a CPU was now a third of it, with one
+worker. Phase 1's 74k minor faults cost ~20 ms each in `blocked`.
+
+The CPU-pressure cap (`cpuPressureWorkerCap`) subtracted **every**
 thread of the process from `nproc`, busy or not, so a process with >= nproc
-threads always gets one worker. Not changed yet: on this workload more workers
-did not help.
+threads always gets one worker. Fixed now (load average, floor
+`clamp(nproc/16, 2, 8)`; see config.md) — earlier more workers did not help
+because everything was lock-bound, but with a third of phase time in the run
+queue they now should.

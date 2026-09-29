@@ -680,6 +680,18 @@ if(NOT APPLE)
   set_tests_properties(test_dgram_recv PROPERTIES TIMEOUT 400)
 endif()
 
+# Sleeping application threads must not pin the compressor to one worker
+# (worker_cap_test.cpp).
+if(NOT APPLE)
+  add_executable(worker_cap_test worker_cap_test.cpp)
+  target_link_libraries(worker_cap_test PRIVATE ${CMAKE_DL_LIBS} Threads::Threads)
+  add_test(NAME test_worker_cap COMMAND ${CMAKE_COMMAND} -E env
+    "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=1" "SMASH_STATS_SIGNAL=1"
+    "SMASH_DEFER_PHASES_MS=0" "SMASH_COLD_TIMEOUT_SEC=2"
+    $<TARGET_FILE:worker_cap_test>)
+  set_tests_properties(test_worker_cap PROPERTIES TIMEOUT 120)
+endif()
+
 # An idle 1 GiB must actually leave RSS with default timings, in each
 # write-tracking mode: page protection (SMASH_SOFTDIRTY=0), the default
 # auto-selection, and page protection with sub-arenas (idle_compress_test.cpp).
