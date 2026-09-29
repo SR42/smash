@@ -431,6 +431,59 @@ static void testRestoreGranule() {
     compressor.setRestoreGranulePages(1);
 }
 
+// Idle time in nominal ticks: a tick that took 5 s advances the cold count
+// by 5, but stops at the cold floor so the page is still escalated (watched
+// for reads) before it is compressed; and a shadow page 5 nominal ticks old
+// is released at the next tick instead of after two.
+static void testNominalTicks() {
+    setenv("SMASH_REARM_BACKOFF_MAX", "0", 1);
+    VmRegion vm;
+    vm.init(64 * kPageSize);
+    PageStateTable states;
+    states.init(vm.totalPages());
+    PageLockTable locks;
+    locks.init(vm.totalPages());
+    CompressStore store;
+    store.init();
+    CompressEngine engine;
+    engine.init();
+    CompressorThread compressor;
+    compressor.init(&vm, &states, &locks, &store, &engine);
+    unsetenv("SMASH_REARM_BACKOFF_MAX");
+    compressor.setRestoreGranulePages(1);
+
+    auto* page = static_cast<uint8_t*>(vm.allocatePages(1));
+    CHECK(page != nullptr, "nominal: alloc failed");
+    const size_t idx = vm.pageIndex(reinterpret_cast<uintptr_t>(page));
+    states.set(idx, PageState::ACTIVE);
+    memset(page, 0x5c, kPageSize);
+
+    compressor.compressTick();                       // armed
+    CHECK(states.get(idx) == PageState::ACTIVE_MONITORING, "nominal: not armed");
+    compressor.pretendNextTickAfterMs(5000);
+    compressor.compressTick();                       // cold count jumps: stops at the floor
+    char perms[5] = {};
+    CHECK(states.get(idx) == PageState::ACTIVE_MONITORING,
+          "nominal: after a 5 s tick the page was compressed (state %d) without the read watch",
+          static_cast<int>(states.get(idx)));
+    CHECK(mapsPerms(page, perms) && perms[0] == '-',
+          "nominal: after a 5 s tick the page is not escalated to PROT_NONE (%s)", perms);
+    compressor.pretendNextTickAfterMs(5000);
+    compressor.compressTick();                       // survived the read watch: compressed
+    const PageState s3 = states.get(idx);
+    CHECK(s3 == PageState::COMPRESSED_SHADOW || s3 == PageState::COMPRESSED,
+          "nominal: not compressed after the read-watch tick (state %d)", static_cast<int>(s3));
+    if (s3 == PageState::COMPRESSED_SHADOW) {
+        compressor.pretendNextTickAfterMs(5000);
+        compressor.compressTick();                   // 5 nominal ticks in shadow >= delay 2
+        CHECK(states.get(idx) == PageState::COMPRESSED,
+              "nominal: shadow 5 nominal ticks old not released (state %d)",
+              static_cast<int>(states.get(idx)));
+    }
+    CHECK(compressor.handleFault(reinterpret_cast<uintptr_t>(page)), "nominal: restore fault");
+    CHECK(page[0] == 0x5c && page[kPageSize - 1] == 0x5c, "nominal: data mismatch");
+}
+
 static void testReleaseCompressedPages() {
     VmRegion vm;
     vm.init(64 * kPageSize);
@@ -481,6 +534,7 @@ int main() {
     unsetenv("SMASH_REARM_BACKOFF_MAX");
     testRearmBackoff();
     testRestoreGranule();
+    testNominalTicks();
     testReleaseCompressedPages();
 
     if (failures == 0) {

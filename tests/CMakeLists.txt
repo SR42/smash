@@ -692,6 +692,18 @@ if(NOT APPLE)
   set_tests_properties(test_worker_cap PROPERTIES TIMEOUT 120)
 endif()
 
+# How soon idle memory leaves RSS must not scale with tick length: ticks
+# stretched to ~4 s, default cold timeout (slow_tick_test.cpp).
+if(NOT APPLE)
+  add_executable(slow_tick_test slow_tick_test.cpp)
+  target_link_libraries(slow_tick_test PRIVATE ${CMAKE_DL_LIBS} Threads::Threads)
+  add_test(NAME test_slow_tick COMMAND ${CMAKE_COMMAND} -E env
+    "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=1" "SMASH_SOFTDIRTY=0"
+    "SMASH_DEFER_PHASES_MS=0" "SMASH_TEST_TICK_DELAY_MS=4000"
+    $<TARGET_FILE:slow_tick_test>)
+  set_tests_properties(test_slow_tick PROPERTIES TIMEOUT 120)
+endif()
+
 # An idle 1 GiB must actually leave RSS with default timings, in each
 # write-tracking mode: page protection (SMASH_SOFTDIRTY=0), the default
 # auto-selection, and page protection with sub-arenas (idle_compress_test.cpp).

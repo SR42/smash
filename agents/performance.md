@@ -726,6 +726,15 @@ two ticks). The split had moved: p2 usr/sys/runq/blocked = 236/1228/2527/3307
 s, p1 11/508/663/1484 s — waiting for a CPU was now a third of it, with one
 worker. Phase 1's 74k minor faults cost ~20 ms each in `blocked`.
 
+The user then pointed out that compression did work at scale, but only
+after at least 30 minutes. Every stage counted ticks — cold after 10, one
+PROT_NONE read-watch tick, two ticks in shadow: ~14 ticks from arming to
+release, 14 s at 1 s ticks and 30 min to hours at 2-12 min ones. Idle time now
+advances by the tick's length in nominal seconds (`tick_inc_`,
+`nominal_clock_`), stopping at the cold floor; `test_slow_tick` with ~4 s
+ticks: idle 64 MiB out of RSS after 21 s instead of still resident after 40.
+Under ~700 s ticks the same pipeline takes ~4-5 ticks.
+
 The CPU-pressure cap (`cpuPressureWorkerCap`) subtracted **every**
 thread of the process from `nproc`, busy or not, so a process with >= nproc
 threads always gets one worker. Fixed now (load average, floor

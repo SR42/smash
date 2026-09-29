@@ -534,6 +534,17 @@ class CompressorThread {
     uint32_t* deferred_queue_tick_ = nullptr;
 
     uint32_t tick_counter_ = 0;
+    // Idle time is counted in nominal ticks of kCompressIntervalMs, not in
+    // ticks: a tick that took 700 s advances cold counts, shadow ages and
+    // re-arm waits by 700 (tick_inc_, at least 1, cold counts saturating at
+    // 255). Every stage counted ticks — cold after 10, one read-watch tick,
+    // two in shadow — so on a 128-core arm64 application with 100-724 s
+    // ticks compression "kicked in after at least 30 minutes"
+    // (slow_tick_test). nominal_clock_ is the running total.
+    uint32_t tick_inc_ = 1;
+    uint32_t nominal_clock_ = 0;
+    std::chrono::steady_clock::time_point last_tick_start_{};
+    uint32_t test_next_tick_ms_ = 0;   // pretendNextTickAfterMs (unit tests)
     int phase3_idle_ticks_ = 0;  // P2.1 selective Phase 3 skip
 
     // Page index of the C `environ` array within smash's contiguous arena, or
@@ -1627,6 +1638,7 @@ private:
         getrusage(RUSAGE_THREAD, &ru0);
 #endif
         const auto range_t0 = std::chrono::steady_clock::now();
+        const uint32_t cold_floor = ROIConfig::instance().cold_ticks_floor;
         forEachLivePage(start, end, [&](size_t i) {
             PageState st = states_->get(i);
             if (st == PageState::ACTIVE || st == PageState::ACTIVE_MONITORING) {
@@ -1686,13 +1698,15 @@ private:
                     cold_count_[i] = 0;
                 } else {
                     ++n_idle;
-                    if (cold_count_[i] < 255) cold_count_[i]++;
-                    decayRecompressCount(i);
+                    const uint8_t prev = cold_count_[i];
+                    cold_count_[i] = advanceCold(prev, cold_floor);
+                    decayRecompressCount(i, prev);
                 }
             } else if (st == PageState::COMPRESSED) {
                 // Keep counting for compressed pages so zstd upgrade can trigger
-                if (cold_count_[i] < 255) cold_count_[i]++;
-                decayRecompressCount(i);
+                const uint8_t prev = cold_count_[i];
+                cold_count_[i] = advanceCold(prev, 0);
+                decayRecompressCount(i, prev);
             }
         });
         pcAdd(pc_.p1_accessed, n_accessed);
@@ -1714,15 +1728,31 @@ private:
     // ticks of inactivity (edge-detect on cold_count_), and a hard reset
     // when cold_count_ saturates — by that point the page has been quiet
     // for ~255 ticks and any prior thrash history is stale.
-    inline void decayRecompressCount(size_t i) {
-        uint8_t cc = cold_count_[i];
+    // cold_count_ advanced by this tick's nominal ticks, saturating at 255.
+    // A count below `floor` stops AT it: Phase 2 escalates a watched page to
+    // PROT_NONE only when its count equals the floor, so a jump past it
+    // would compress the page without the tick that watches for reads.
+    inline uint8_t advanceCold(uint8_t cc, uint32_t floor) const {
+        uint32_t n = static_cast<uint32_t>(cc) + tick_inc_;
+        if (n > 255) n = 255;
+        if (cc < floor && n > floor) n = floor;
+        return static_cast<uint8_t>(n);
+    }
+
+    // One recompress_count_ decrement per multiple of kRcDecayColdTicks the
+    // cold count crossed on its way from `prev` (a count now advances by
+    // several per tick), and a reset once it saturates.
+    inline void decayRecompressCount(size_t i, uint8_t prev) {
+        const uint8_t cc = cold_count_[i];
         if (cc == 255) {
             recompress_count_[i] = 0;
-        } else if (cc >= kRcDecayColdTicks
-                   && cc % kRcDecayColdTicks == 0
-                   && recompress_count_[i] > 0) {
-            recompress_count_[i]--;
+            return;
         }
+        if (cc < kRcDecayColdTicks || cc <= prev) return;
+        const unsigned crossed = cc / kRcDecayColdTicks - prev / kRcDecayColdTicks;
+        uint8_t rc = recompress_count_[i];
+        rc = rc > crossed ? static_cast<uint8_t>(rc - crossed) : 0;
+        recompress_count_[i] = rc;
     }
 
     // Phase 2: Compress cold pages
@@ -2393,7 +2423,8 @@ private:
             // A hot page waiting out its re-arm backoff stays PROT_RW.
             if (rearm_wait_ && rearm_wait_[i] &&
                 states_->get(i) == PageState::ACTIVE) {
-                --rearm_wait_[i];
+                rearm_wait_[i] = rearm_wait_[i] > tick_inc_
+                    ? static_cast<uint8_t>(rearm_wait_[i] - tick_inc_) : 0;
                 ++n_backoff;
                 if (run_end > run_start && run_start != ~size_t{0}) {
                     flushPhase3Run(run_start, run_end);
@@ -3044,7 +3075,7 @@ private:
         }
 
         if (deferred) {
-            shadow_tick_[page_idx] = tick_counter_;
+            shadow_tick_[page_idx] = nominal_clock_;
             states_->set(page_idx, PageState::COMPRESSED_SHADOW);
             // Still PROT_NONE (escalated): made readable in a batch by the
             // caller's flush. If the list is full the page just stays
@@ -4222,7 +4253,7 @@ private:
                 if (i >= end) break;
 
                 if (states_->get(i) != PageState::COMPRESSED_SHADOW) continue;
-                uint32_t age = tick_counter_ - shadow_tick_[i];
+                uint32_t age = nominal_clock_ - shadow_tick_[i];
                 if (age < static_cast<uint32_t>(delay)) continue;
 
                 if (!locks_->tryLock(i)) continue;
@@ -4263,7 +4294,7 @@ private:
                     uintptr_t expect = reinterpret_cast<uintptr_t>(page_addr) + kPageSize;
                     while (n < kReclaimCoalesceMax && j < end && j < chunk_end) {
                         if (states_->get(j) != PageState::COMPRESSED_SHADOW) break;
-                        if (tick_counter_ - shadow_tick_[j] < static_cast<uint32_t>(delay)) break;
+                        if (nominal_clock_ - shadow_tick_[j] < static_cast<uint32_t>(delay)) break;
                         void* aj = vm_->pageAddress(j);
                         if (!aj || reinterpret_cast<uintptr_t>(aj) != expect) break;
                         expect = reinterpret_cast<uintptr_t>(aj) + kPageSize;
@@ -5434,6 +5465,23 @@ private:
 
     __attribute__((cold)) void tick() {
         ++tick_counter_;
+        {
+            const auto now = std::chrono::steady_clock::now();
+            uint64_t ms = kCompressIntervalMs;
+            if (test_next_tick_ms_) {
+                ms = test_next_tick_ms_;
+                test_next_tick_ms_ = 0;
+            } else if (last_tick_start_.time_since_epoch().count() != 0) {
+                ms = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                    now - last_tick_start_).count());
+            }
+            last_tick_start_ = now;
+            uint64_t inc = (ms + kCompressIntervalMs / 2) / kCompressIntervalMs;
+            if (inc < 1) inc = 1;
+            if (inc > 255) inc = 255;
+            tick_inc_ = static_cast<uint32_t>(inc);
+            nominal_clock_ += tick_inc_;
+        }
         if (pre_tick_fn_) pre_tick_fn_();
         if (fault_handler_) fault_handler_->ensureInstalled();
         // Time-budget recompute is cheap (~144-4600 buckets sorted) and only
@@ -5679,6 +5727,12 @@ private:
         // Runs after all phase work so the sweeper observes the freshly
         // queued pages from this tick at full TTL on the next pass.
         { StepTimer st(pc_, kStepSweep); sweepDeferredMadvise(); }
+
+        if (cfg_test_tick_delay_ms_ > 0) {
+            struct timespec ts{cfg_test_tick_delay_ms_ / 1000,
+                               static_cast<long>(cfg_test_tick_delay_ms_ % 1000) * 1000000L};
+            while (nanosleep(&ts, &ts) != 0 && errno == EINTR) {}
+        }
     }
 
     // Adapt active worker count using Little's Law (see class comment above).
@@ -6340,6 +6394,10 @@ public:
     bool cfg_no_monitor_ = false;
     int cfg_phase3_skip_thresh_ = 20;
     int cfg_defer_phases_ms_ = 0;
+    // SMASH_TEST_TICK_DELAY_MS: test-only; sleeps this long at the end of
+    // every tick, to reproduce the multi-minute ticks of a large, contended
+    // host (slow_tick_test).
+    int cfg_test_tick_delay_ms_ = 0;
     long cfg_vma_margin_ = 8192;   // SMASH_VMA_MARGIN; see VMA-cap guard in tick()
     bool cfg_spill_ = false;       // SMASH_SPILL: file-back very-cold blobs
     bool cfg_spill_pageout_ = false; // SMASH_SPILL_PAGEOUT: MADV_PAGEOUT accelerant
@@ -6358,6 +6416,8 @@ public:
         cfg_phase3_skip_thresh_ = v ? std::atoi(v) : 20;
         v = std::getenv("SMASH_DEFER_PHASES_MS");
         cfg_defer_phases_ms_ = v ? std::atoi(v) : 0;
+        v = std::getenv("SMASH_TEST_TICK_DELAY_MS");
+        cfg_test_tick_delay_ms_ = v ? std::atoi(v) : 0;
         v = std::getenv("SMASH_VMA_MARGIN");
         cfg_vma_margin_ = v ? std::atol(v) : 8192L;
         v = std::getenv("SMASH_SPILL");
@@ -6925,6 +6985,8 @@ public:
     // Group size (pages, power of two) a write fault on a watched page makes
     // writable; 1 = the page alone. Set from SMASH_RESTORE_GRANULE_PAGES.
     void setRestoreGranulePages(size_t g) { restore_granule_ = g; }
+    // Unit tests: count the next tick as having come `ms` after the last.
+    void pretendNextTickAfterMs(uint32_t ms) { test_next_tick_ms_ = ms; }
 
     // Dict experiment counters (try-both)
     uint64_t dictWinCount() const { return dict_win_count_.load(std::memory_order_relaxed); }
