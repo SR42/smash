@@ -237,25 +237,74 @@ static void runLinux(numa_fn numa, arena_fn arena_for) {
         }
     }
 
-    // free() returns a block's pages to its node arena: once the decommit
-    // thread has run, the next same-size request on that node gets them back.
+    // free() returns a block's pages to their node's own arena. Checked as
+    // what that promises, not as "the same address comes back": frees reach
+    // the arena through the node's decommit queue asynchronously, and while
+    // one is still queued the allocator correctly takes the next free run of
+    // the same arena. The address check failed that way 4 times in 100 root
+    // runs on a 2-CPU host (the queue lagged the 20 ms sleep by several
+    // rounds: each miss one block further on, the node's free pages one
+    // block short per round, every block still smash-owned and bound to the
+    // node, nothing carved). So, over 16 allocate/free rounds:
+    //   - every block is smash-owned and bound to the node;
+    //   - the node's arena carves nothing new (freed pages are reused);
+    //   - once the queue has drained, the node's free pages are back at the
+    //     count they had before the rounds (nothing leaked, nothing handed
+    //     to the shared lists).
+    using arena_info_fn = int (*)(uint32_t, size_t*, size_t*);
+    auto arena_info =
+        reinterpret_cast<arena_info_fn>(dlsym(RTLD_DEFAULT, "smash_numa_arena_info"));
+    auto info = [&](int node, long* carved, long* free_pages) {
+        size_t c = 0, f = 0;
+        const bool ok = arena_info && arena_info(static_cast<uint32_t>(node), &c, &f) == 0;
+        *carved = ok ? static_cast<long>(c) : -1;
+        *free_pages = ok ? static_cast<long>(f) : -1;
+        return ok;
+    };
+    // The node's free pages once its decommit queue has gone quiet: two equal
+    // readings 50 ms apart, within 5 s.
+    auto settledFree = [&](int node) {
+        long c = 0, f = -1, prev = -2;
+        for (int i = 0; i < 100 && f != prev; ++i) {
+            prev = f;
+            usleep(50 * 1000);
+            info(node, &c, &f);
+        }
+        return f;
+    };
     for (int node : nodes) {
-        void* a = numa(static_cast<uint32_t>(node), kMiB);
-        if (!a) {
-            fail("malloc_numa(%d, 1 MiB) returned NULL", node);
+        long carved0 = 0, dummy = 0;
+        if (!info(node, &carved0, &dummy)) {
+            fail("smash_numa_arena_info(%d) failed", node);
             continue;
         }
-        free(a);
-        int reused = 0;
+        const long free0 = settledFree(node);
+        int bad_blocks = 0;
         for (int i = 0; i < 16; ++i) {
             usleep(20 * 1000);
             void* b = numa(static_cast<uint32_t>(node), kMiB);
-            reused += (b == a);
+            if (!b) {
+                fail("malloc_numa(%d, 1 MiB) returned NULL in round %d", node, i);
+                continue;
+            }
+            Policy bp;
+            if (arena_for(b) < 0 || !isBoundTo(b, node, &bp)) ++bad_blocks;
             free(b);
         }
-        if (reused < 16)
-            fail("node %d: only %d of 16 frees came back at the same address, so "
-                 "freed pages are not returning to the node arena", node, reused);
+        long carved1 = 0;
+        info(node, &carved1, &dummy);
+        const long free1 = settledFree(node);
+        printf("node %d: 16 rounds of 1 MiB: carved %+ld pages, free pages %ld -> %ld after "
+               "the queue drained\n", node, carved1 - carved0, free0, free1);
+        if (bad_blocks)
+            fail("node %d: %d of 16 blocks were not smash-owned and bound to the node",
+                 node, bad_blocks);
+        if (carved1 != carved0)
+            fail("node %d: the arena carved %ld new pages for 16 rounds of a 1 MiB block: "
+                 "freed pages are not being reused", node, carved1 - carved0);
+        if (free1 != free0)
+            fail("node %d: %ld free pages before the rounds, %ld after the queue drained: "
+                 "freed pages are not returning to the node arena", node, free0, free1);
     }
 
     // Ordinary allocations, including one of a just-freed NUMA block's size,
