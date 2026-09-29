@@ -735,6 +735,21 @@ advances by the tick's length in nominal seconds (`tick_inc_`,
 ticks: idle 64 MiB out of RSS after 21 s instead of still resident after 40.
 Under ~700 s ticks the same pipeline takes ~4-5 ticks.
 
+Third run (2026-09-30, `cc8bf50`, `SMASH_CPU_PRESSURE_CAP=0`): compression
+from the first minutes (tick 9: 11.8M pages stored, 4.9M released), ticks
+166-207 s. Phase 2 thread time 54/273/652/200 s (usr/sys/runq/blocked), and
+the new syscall timing named the biggest item: `memread=709400 ms (23584400
+calls)` — the snapshot read every page through `/proc/self/mem`, twice with
+FixAv (snapshot + verify), ~30 us each under that load. Phase 2's `mprotect`s
+were 84 s, phase 3's 90 s, phase 4's 105 s. Now compression candidates are
+batched (`makeReadableForSnapshot`): the still-watched ones (PROT_READ or
+escalated PROT_NONE — not writable, so nothing can land during the copy)
+get one `mprotect(PROT_READ)` per contiguous stretch under their locks and a
+plain `memcpy`, no verify; anything else takes the old path. 256 MiB idle:
+131072 reads -> 0, phase-2 `mprotect` calls 768 -> 512 (the shadow arming is
+no longer needed for them). Writes racing compression (16 threads, compressible
+pages, 3 x 40 s): 0 stale of 509952 checks.
+
 The CPU-pressure cap (`cpuPressureWorkerCap`) subtracted **every**
 thread of the process from `nproc`, busy or not, so a process with >= nproc
 threads always gets one worker. Fixed now (load average, floor

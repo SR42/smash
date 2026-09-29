@@ -18,6 +18,11 @@
 // snapshot's mprotect(PROT_RW), one call per page each — 611 s of a tick on
 // the same box. Once 90% of the 256 MiB has been released, "p2 mprotect=M"
 // must be at most one call per 32 pages released.
+//
+// And the compression snapshot: it read each page through /proc/self/mem,
+// twice with FixAv (snapshot and verify) — 23.6M reads, 709 s of phase 2 on
+// the same box. The [smash phase time] line's "memread=T (N calls)" must
+// show at most one read per 8 pages released.
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
@@ -54,7 +59,7 @@ int main() {
     }
     const unsigned long long want = (256ull << 20) / ps * 3 / 4;
     const unsigned long long want_released = (256ull << 20) / ps * 9 / 10;
-    unsigned long long armed = 0, calls = 0, p2 = 0, released = 0;
+    unsigned long long armed = 0, calls = 0, p2 = 0, released = 0, mr_ms = 0, mr_calls = 0;
     for (int i = 0; i < 240 && (armed < want || released < want_released); ++i) {
         raise(SIGUSR2);
         usleep(250 * 1000);
@@ -68,6 +73,9 @@ int main() {
                         &calls, &p2);
         const size_t r = line.find("released=");
         if (r != std::string::npos) std::sscanf(line.c_str() + r, "released=%llu", &released);
+        const size_t m = log.find("memread=", at);
+        if (m != std::string::npos)
+            std::sscanf(log.c_str() + m, "memread=%llu (%llu calls)", &mr_ms, &mr_calls);
     }
     dup2(saved, 2);
     for (char* p : blocks) free(p);
@@ -94,6 +102,14 @@ int main() {
     if (p2 * 32 > released) {
         std::printf("FAIL: phase 2 (escalation and compression snapshot) used an mprotect call "
                     "per %.1f pages\n", static_cast<double>(released) / static_cast<double>(p2));
+        return 1;
+    }
+    std::printf("phase 2 snapshot: %llu /proc/self/mem reads (%llu ms) for %llu pages released\n",
+                mr_calls, mr_ms, released);
+    if (mr_calls * 8 > released) {
+        std::printf("FAIL: the compression snapshot read %.2f pages per page released through "
+                    "/proc/self/mem, one system call each\n",
+                    static_cast<double>(mr_calls) / static_cast<double>(released));
         return 1;
     }
     std::printf("phase3_batch_test: all checks passed\n");

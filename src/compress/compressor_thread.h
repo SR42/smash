@@ -1786,6 +1786,27 @@ private:
         constexpr size_t kEscalateBatch = 256;
         size_t esc[kEscalateBatch];
         size_t n_esc = 0;
+        // Compression candidates, compressed in batches so each batch's
+        // snapshots need no system call (makeReadableForSnapshot).
+        size_t cmp[kCompressBatch];
+        size_t n_cmp = 0;
+        const bool deferred_mode = isDeferredReclaimMode();
+        auto flushCompress = [&] {
+            if (n_cmp == 0) return;
+            bool readable[kCompressBatch] = {};
+            if (deferred_mode) makeReadableForSnapshot(cmp, n_cmp, readable);
+            for (size_t k = 0; k < n_cmp; ++k) {
+                if (!compressPage(cmp[k], worker, readable[k])) continue;
+                pages_compressed.fetch_add(1, std::memory_order_relaxed);
+                // Periodic flush so the pending list doesn't get too long
+                // and so the cap is never hit inside a hot inner loop.
+                if (worker.pending_pn_count >= CompressWorker::kPendingProtCap / 2 ||
+                    worker.pending_ro_count >= CompressWorker::kPendingProtCap / 2) {
+                    flushPhase2PendingProt(worker);
+                }
+            }
+            n_cmp = 0;
+        };
 
         // No CPU-pressure multiplier and no per-tick compression budget.
         // The right signal for "don't compress this page yet" isn't
@@ -2034,21 +2055,17 @@ private:
                 // worker. routeByNode also defers pages whose node is still
                 // unknown to the end-of-range batch below.
                 const bool routed = routeByNode(worker, i, pages_compressed);
-                if (routed) ++n_routed;
-                if (!routed && compressPage(i, worker)) {
-                    pages_compressed.fetch_add(1, std::memory_order_relaxed);
-                    // Periodic mid-range flush so the pending list
-                    // doesn't get too long and so the cap is never hit
-                    // inside a hot inner loop.
-                    if (worker.pending_pn_count >= CompressWorker::kPendingProtCap / 2 ||
-                        worker.pending_ro_count >= CompressWorker::kPendingProtCap / 2) {
-                        flushPhase2PendingProt(worker);
-                    }
+                if (routed) {
+                    ++n_routed;
+                } else {
+                    cmp[n_cmp++] = i;
+                    if (n_cmp == kCompressBatch) flushCompress();
                 }
             }
         });
         // End-of-range flush.
         escalateBatch(esc, n_esc);
+        flushCompress();
         flushPhase2PendingProt(worker);
         flushNodeQueries(worker, pages_compressed);
         pcAdd(pc_.p2_at_floor, n_at_floor);
@@ -2491,6 +2508,60 @@ private:
 #endif
     }
 
+    // Make a batch of compression candidates readable before compressPage
+    // snapshots them (deferred mode). Each page is taken with tryLock and
+    // kept only while ACTIVE_MONITORING — PROT_READ, or PROT_NONE after
+    // escalation: not writable either way; every stretch of consecutive kept
+    // pages gets ONE mprotect(PROT_READ), a loosening, safe under the locks;
+    // then all are unlocked. readable[k] is set when page k's stretch was
+    // made readable, and compressPage copies it directly instead of reading
+    // it through /proc/self/mem — twice with FixAv (snapshot and verify):
+    // 23.6M reads, 709 s of phase 2 on a 128-core arm64 box. A page written
+    // in between is ACTIVE by the time compressPage locks it and takes the
+    // old path. Pages end PROT_READ, as the shadow window wants them.
+    static constexpr size_t kCompressBatch = 256;
+    void makeReadableForSnapshot(const size_t* pages, size_t n, bool* readable) {
+        bool held[kCompressBatch];
+        for (size_t k = 0; k < n; ++k) {
+            readable[k] = false;
+            held[k] = locks_->tryLock(pages[k]);
+            if (held[k] && states_->get(pages[k]) != PageState::ACTIVE_MONITORING) {
+                locks_->unlock(pages[k]);
+                held[k] = false;
+            }
+        }
+        size_t seg = 0;
+        bool open = false;
+        auto flush = [&](size_t a, size_t b) {   // pages[a..b)
+            void* base = vm_->pageAddress(pages[a]);
+            if (!base) return;
+            pc_.p2_mprotect.fetch_add(1, std::memory_order_relaxed);
+            bool ok;
+            {
+                SyscallTimer t(pc_.sc_p2_mprotect_us);
+                ok = vm::protectPages(base, (b - a) * kPageSize, true, false);  // PROT_READ
+            }
+            if (ok)
+                for (size_t k = a; k < b; ++k) readable[k] = true;
+        };
+        for (size_t k = 0; k < n; ++k) {
+            const bool joins = open && held[k] && pages[k] == pages[k - 1] + 1 &&
+                reinterpret_cast<uintptr_t>(vm_->pageAddress(pages[k])) ==
+                    reinterpret_cast<uintptr_t>(vm_->pageAddress(pages[k - 1])) + kPageSize;
+            if (open && !joins) {
+                flush(seg, k);
+                open = false;
+            }
+            if (held[k] && !open) {
+                seg = k;
+                open = true;
+            }
+        }
+        if (open) flush(seg, n);
+        for (size_t k = 0; k < n; ++k)
+            if (held[k]) locks_->unlock(pages[k]);
+    }
+
     // Escalate a batch of pages (ascending, from one phase-2 range) to
     // PROT_NONE: every page is locked and checked (only ACTIVE_MONITORING
     // pages are armed), each contiguous stretch of them gets ONE mprotect,
@@ -2527,7 +2598,8 @@ private:
 
     // ── Compress one page using worker's contexts ─────────────────────────
 
-    __attribute__((cold)) bool compressPage(size_t page_idx, CompressWorker& worker) {
+    __attribute__((cold)) bool compressPage(size_t page_idx, CompressWorker& worker,
+                                            bool readable = false) {
         const bool deferred = isDeferredReclaimMode();
 
         if (deferred) {
@@ -2728,8 +2800,17 @@ private:
             // COMPRESSED_SHADOW case). One mprotect per compressed page was
             // half of phase 2's calls, each a TLB shootdown to every core:
             // 611 s of a tick on a 128-core box. Falls back to the mprotect.
-            snapshot_via_mem = readPageViaMem(page_addr, worker.page_buf);
-            if (!snapshot_via_mem) {
+            // A watched page the caller made readable (makeReadableForSnapshot)
+            // is copied directly: it is not writable, so a write faults and
+            // waits on the lock held here, and nothing can land during the
+            // copy — no /proc/self/mem read and no verify.
+            const bool direct = readable && st == PageState::ACTIVE_MONITORING;
+            if (direct) {
+                __builtin_memcpy(worker.page_buf, page_addr, kPageSize);
+            } else {
+                snapshot_via_mem = readPageViaMem(page_addr, worker.page_buf);
+            }
+            if (!direct && !snapshot_via_mem) {
                 pc_.p2_mprotect.fetch_add(1, std::memory_order_relaxed);
                 {
                     SyscallTimer t(pc_.sc_p2_mprotect_us);
@@ -2742,7 +2823,7 @@ private:
             // between our memcpy and the eventual PROT_NONE — the blob
             // would be stale and decompress-on-fault would silently revert
             // the writer's update. Re-read and compare; abort on mismatch.
-            if (fixavEnabled()) {
+            if (!direct && fixavEnabled()) {
                 alignas(64) uint8_t verify_buf[kPageSize];
                 if (!readPageViaMem(page_addr, verify_buf)) {
                     // The page must be readable here; the fallback above made it so.
@@ -4047,11 +4128,19 @@ private:
         const size_t threads = static_cast<size_t>(g.threads_running);
         const size_t me = static_cast<size_t>(nw.index);
         const size_t from = n * me / threads, to = n * (me + 1) / threads;
-        for (size_t k = from; k < to; ++k) {
-            if (compressPage(g.queue[k], *nw.worker)) ++done;
-            if (nw.worker->pending_pn_count >= CompressWorker::kPendingProtCap / 2 ||
-                nw.worker->pending_ro_count >= CompressWorker::kPendingProtCap / 2)
-                flushPhase2PendingProt(*nw.worker);
+        const bool deferred_mode = isDeferredReclaimMode();
+        for (size_t b = from; b < to; b += kCompressBatch) {
+            const size_t cnt = std::min(kCompressBatch, to - b);
+            size_t pages[kCompressBatch];
+            for (size_t k = 0; k < cnt; ++k) pages[k] = g.queue[b + k];
+            bool readable[kCompressBatch] = {};
+            if (deferred_mode) makeReadableForSnapshot(pages, cnt, readable);
+            for (size_t k = 0; k < cnt; ++k) {
+                if (compressPage(pages[k], *nw.worker, readable[k])) ++done;
+                if (nw.worker->pending_pn_count >= CompressWorker::kPendingProtCap / 2 ||
+                    nw.worker->pending_ro_count >= CompressWorker::kPendingProtCap / 2)
+                    flushPhase2PendingProt(*nw.worker);
+            }
         }
         flushPhase2PendingProt(*nw.worker);
         if (done == 0) return;
