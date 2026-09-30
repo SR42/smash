@@ -750,6 +750,18 @@ plain `memcpy`, no verify; anything else takes the old path. 256 MiB idle:
 no longer needed for them). Writes racing compression (16 threads, compressible
 pages, 3 x 40 s): 0 stale of 509952 checks.
 
+Fourth run (`6d96149`, tick 10): 26M pages compressed and released plus 9.5M
+zero pages — but one tick of 1448 s, phase 2 1359 s of it, with 2474 s of
+*user* CPU for 28.2M compressions (88 us/page; LZ4 is ~5). Nearly every page
+took the deep tier (zstd-9): it is eligible at `kVeryColdTicks` (60) cold
+ticks, and with idle time in nominal seconds a page reaches that before it is
+compressed whenever ticks are long — before, it was compressed a tick or two
+after the floor of 10 and got the fast tier. `SMASH_VERY_COLD_TICKS=9999`
+removes the deep tier. Also still 16.9M snapshot reads: pages compressed
+locally by `flushNodeQueries` (node unknown, own, or its 64K-page queue full
+during the backlog) bypassed the readable batches; fixed. Phase 4's releases
+took 928 s of syscall time for 26.5M pages (runs capped at 32).
+
 The CPU-pressure cap (`cpuPressureWorkerCap`) subtracted **every**
 thread of the process from `nproc`, busy or not, so a process with >= nproc
 threads always gets one worker. Fixed now (load average, floor

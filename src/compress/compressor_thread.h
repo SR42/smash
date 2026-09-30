@@ -2125,13 +2125,28 @@ private:
         }
         const bool queried =
             syscall(SYS_move_pages, 0, n, addrs, nullptr, status, 0) == 0;
+        size_t local[CompressWorker::kPendingNodeCap];
+        size_t n_local = 0;
         for (size_t k = 0; k < n; ++k) {
             const size_t page = worker.pending_node_pages[k];
             const int node = queried ? status[k] : -1;
             if (node >= 0 && static_cast<uint32_t>(node) < vm::kMaxNumaNodes && page_node_)
                 page_node_[page] = static_cast<uint8_t>(node + 1);
-            if (node < 0 || node == worker.node || !enqueueForNode(node, page)) {
-                if (compressPage(page, worker))
+            if (node < 0 || node == worker.node || !enqueueForNode(node, page))
+                local[n_local++] = page;
+        }
+        // The pages this worker compresses itself (node unknown, its own, or
+        // that node's queue full — common while a large backlog drains) go
+        // through the same readable batches as phase 2's: compressed one by
+        // one here they each took two /proc/self/mem reads, 8.4M of the
+        // 28.2M compressions in one tick on a 128-core arm64 box.
+        const bool deferred_mode = isDeferredReclaimMode();
+        for (size_t b = 0; b < n_local; b += kCompressBatch) {
+            const size_t cnt = std::min(kCompressBatch, n_local - b);
+            bool readable[kCompressBatch] = {};
+            if (deferred_mode) makeReadableForSnapshot(&local[b], cnt, readable);
+            for (size_t k = 0; k < cnt; ++k) {
+                if (compressPage(local[b + k], worker, readable[k]))
                     pages_compressed.fetch_add(1, std::memory_order_relaxed);
                 if (worker.pending_pn_count >= CompressWorker::kPendingProtCap / 2 ||
                     worker.pending_ro_count >= CompressWorker::kPendingProtCap / 2)

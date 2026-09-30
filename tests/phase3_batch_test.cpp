@@ -51,16 +51,22 @@ int main() {
     dup2(fd, 2);
 
     const size_t ps = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    // PHASE3_TEST_MIB (default 256): test_phase3_batch_big uses 2048, more
+    // than four nodes' compressor queues (64K pages each) hold, so pages go
+    // through flushNodeQueries' local compression too.
+    const char* mib_env = std::getenv("PHASE3_TEST_MIB");
+    const int mib = mib_env && std::atoi(mib_env) >= 4 ? std::atoi(mib_env) : 256;
     std::vector<char*> blocks;
-    for (int i = 0; i < 64; ++i) {            // 64 x 4 MiB
+    for (int i = 0; i < mib / 4; ++i) {       // 4 MiB blocks
         auto* p = static_cast<char*>(malloc(4u << 20));
         std::memset(p, i + 1, 4u << 20);
         blocks.push_back(p);
     }
-    const unsigned long long want = (256ull << 20) / ps * 3 / 4;
-    const unsigned long long want_released = (256ull << 20) / ps * 9 / 10;
+    const unsigned long long total = (static_cast<unsigned long long>(mib) << 20) / ps;
+    const unsigned long long want = total * 3 / 4;
+    const unsigned long long want_released = total * 9 / 10;
     unsigned long long armed = 0, calls = 0, p2 = 0, released = 0, mr_ms = 0, mr_calls = 0;
-    for (int i = 0; i < 240 && (armed < want || released < want_released); ++i) {
+    for (int i = 0; i < 480 && (armed < want || released < want_released); ++i) {
         raise(SIGUSR2);
         usleep(250 * 1000);
         const std::string log = slurp(fd);
