@@ -484,6 +484,86 @@ static void testNominalTicks() {
     CHECK(page[0] == 0x5c && page[kPageSize - 1] == 0x5c, "nominal: data mismatch");
 }
 
+// Coarse watching (SMASH_WATCH_GROUP_PAGES): a group is idle only when all
+// its pages are, so it is escalated and compressed in one tick; a fault on
+// a compressed page restores the whole group; a group is not armed while one
+// of its pages waits out a re-arm backoff.
+static void testWatchGroup() {
+    setenv("SMASH_REARM_BACKOFF_MAX", "2", 1);
+    VmRegion vm;
+    vm.init(64 * kPageSize);
+    PageStateTable states;
+    states.init(vm.totalPages());
+    PageLockTable locks;
+    locks.init(vm.totalPages());
+    CompressStore store;
+    store.init();
+    CompressEngine engine;
+    engine.init();
+    CompressorThread compressor;
+    compressor.init(&vm, &states, &locks, &store, &engine);
+    unsetenv("SMASH_REARM_BACKOFF_MAX");
+    compressor.setRestoreGranulePages(1);
+    compressor.setWatchGroupPages(4);
+
+    auto* mem = static_cast<uint8_t*>(vm.allocatePages(12));
+    CHECK(mem != nullptr, "group: alloc failed");
+    const size_t idx0 = vm.pageIndex(reinterpret_cast<uintptr_t>(mem));
+    const size_t base = (idx0 + 3) & ~size_t{3};               // a 4-aligned group
+    auto pg = [&](size_t k) { return static_cast<uint8_t*>(vm.pageAddress(base + k)); };
+    auto st = [&](size_t k) { return states.get(base + k); };
+    auto compressed = [&](size_t k) {
+        return st(k) == PageState::COMPRESSED || st(k) == PageState::COMPRESSED_SHADOW;
+    };
+    for (size_t i = 0; i < 12; ++i) {
+        states.set(idx0 + i, PageState::ACTIVE);
+        memset(mem + i * kPageSize, 0x30 + static_cast<int>(i), kPageSize);
+    }
+
+    // Page 2 is written every tick (after the first arming): none of the
+    // group may be compressed, though pages 0, 1 and 3 are idle.
+    compressor.compressTick();
+    for (int t = 0; t < 8; ++t) {
+        if (st(2) == PageState::ACTIVE_MONITORING)
+            compressor.handleFault(reinterpret_cast<uintptr_t>(pg(2)));
+        compressor.compressTick();
+        for (size_t k : {0u, 1u, 3u})
+            CHECK(!compressed(k), "group: page %zu compressed at tick %d while page 2 is "
+                  "written every tick", k, t);
+        // While page 2 waits out its backoff (ACTIVE), its group is not armed.
+        if (st(2) == PageState::ACTIVE)
+            for (size_t k : {0u, 1u, 3u})
+                CHECK(st(k) != PageState::ACTIVE_MONITORING,
+                      "group: page %zu armed while page 2 waits out its backoff", k);
+    }
+    // Page 2 stops: the group compresses, all four in the same tick.
+    int first = -1, last = -1;
+    for (int t = 0; t < 40 && last < 0; ++t) {
+        compressor.compressTick();
+        int n = 0;
+        for (size_t k = 0; k < 4; ++k) n += compressed(k);
+        if (n > 0 && first < 0) first = t;
+        if (n == 4) last = t;
+    }
+    CHECK(last >= 0, "group: never fully compressed after its writes stopped");
+    CHECK(first == last, "group: pages compressed in different ticks (%d .. %d)", first, last);
+
+    // A fault on one compressed page restores the whole group.
+    if (st(1) == PageState::COMPRESSED_SHADOW) {
+        compressor.pretendNextTickAfterMs(5000);
+        compressor.compressTick();                           // release the shadows
+    }
+    CHECK(st(1) == PageState::COMPRESSED, "group: page 1 not released (state %d)",
+          static_cast<int>(st(1)));
+    CHECK(compressor.handleFault(reinterpret_cast<uintptr_t>(pg(1))), "group: restore fault");
+    for (size_t k = 0; k < 4; ++k)
+        CHECK(st(k) == PageState::ACTIVE, "group: page %zu not restored with its group "
+              "(state %d)", k, static_cast<int>(st(k)));
+    for (size_t k = 0; k < 4; ++k)
+        CHECK(pg(k)[0] == 0x30 + (base + k - idx0) && pg(k)[kPageSize - 1] == 0x30 + (base + k - idx0),
+              "group: page %zu data mismatch", k);
+}
+
 static void testReleaseCompressedPages() {
     VmRegion vm;
     vm.init(64 * kPageSize);
@@ -535,6 +615,7 @@ int main() {
     testRearmBackoff();
     testRestoreGranule();
     testNominalTicks();
+    testWatchGroup();
     testReleaseCompressedPages();
 
     if (failures == 0) {

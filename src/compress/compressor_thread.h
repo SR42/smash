@@ -397,6 +397,17 @@ class CompressorThread {
     uint8_t* rearm_wait_ = nullptr;
     uint8_t rearm_exp_max_ = 0;
     size_t restore_granule_ = 1;
+    // Coarse watching (SMASH_WATCH_GROUP_PAGES, power of two <= 64; 1 =
+    // off): an aligned group of pages is idle only when all of its pages
+    // are — Phase 1 gives every uncompressed page of a group the group's
+    // lowest cold count — so a group is armed, escalated, compressed and
+    // released as one, and a write fault restores it whole. Per-page
+    // watching changed protection on a scattered subset of pages every
+    // tick: 64 MiB written in random page order split into ~9400 mappings
+    // and took ~40800 protection calls (watch_group_test); a 128-core arm64
+    // application had 481k mappings, 397k of them smash's.
+    size_t watch_group_ = 1;
+    static constexpr size_t kMaxWatchGroup = 64;
     // Set by a group restore on each neighbour it made writable: the page
     // was unwatched for part of the interval Phase 1 is about to judge, so
     // Phase 1 neither counts it idle (it may have been written — counted
@@ -1639,7 +1650,25 @@ private:
 #endif
         const auto range_t0 = std::chrono::steady_clock::now();
         const uint32_t cold_floor = ROIConfig::instance().cold_ticks_floor;
+        // Coarse watching: each group's uncompressed pages end the scan with
+        // the group's lowest cold count (see watch_group_).
+        const size_t wg = watch_group_;
+        size_t grp = ~size_t{0};
+        size_t gbuf[kMaxWatchGroup];
+        size_t gn = 0;
+        auto finishGroup = [&] {
+            if (gn > 1) {
+                uint8_t m = 255;
+                for (size_t k = 0; k < gn; ++k) m = std::min(m, cold_count_[gbuf[k]]);
+                for (size_t k = 0; k < gn; ++k) cold_count_[gbuf[k]] = m;
+            }
+            gn = 0;
+        };
         forEachLivePage(start, end, [&](size_t i) {
+            if (wg > 1 && i / wg != grp) {
+                finishGroup();
+                grp = i / wg;
+            }
             PageState st = states_->get(i);
             if (st == PageState::ACTIVE || st == PageState::ACTIVE_MONITORING) {
                 // Raw WRITE signal (soft-dirty) BEFORE the idle-read augmentation
@@ -1702,6 +1731,7 @@ private:
                     cold_count_[i] = advanceCold(prev, cold_floor);
                     decayRecompressCount(i, prev);
                 }
+                if (wg > 1 && gn < kMaxWatchGroup) gbuf[gn++] = i;
             } else if (st == PageState::COMPRESSED) {
                 // Keep counting for compressed pages so zstd upgrade can trigger
                 const uint8_t prev = cold_count_[i];
@@ -1709,6 +1739,7 @@ private:
                 decayRecompressCount(i, prev);
             }
         });
+        finishGroup();
         pcAdd(pc_.p1_accessed, n_accessed);
         pcAdd(pc_.p1_idle, n_idle);
 #ifdef __linux__
@@ -2428,6 +2459,8 @@ private:
         size_t run_start = ~size_t{0};
         size_t run_end = 0;
         uint64_t n_pages = 0, n_calls = 0, n_backoff = 0;
+        size_t hold_grp = ~size_t{0};
+        bool hold = false;
         auto flushPhase3Run = [&](size_t a, size_t b) {
             n_pages += b - a;
             this->flushPhase3Run(a, b, &n_calls);
@@ -2452,6 +2485,26 @@ private:
                 return;
             }
 
+            // Coarse watching: a group with a page waiting out its re-arm
+            // backoff is not armed at all, so the backoff cannot split it.
+            if (watch_group_ > 1 && rearm_wait_ && i / watch_group_ != hold_grp) {
+                hold_grp = i / watch_group_;
+                hold = false;
+                const size_t g0 = hold_grp * watch_group_;
+                const size_t g1 = std::min(g0 + watch_group_, contig_pages);
+                for (size_t q = g0; q < g1 && !hold; ++q)
+                    hold = rearm_wait_[q] && states_->get(q) == PageState::ACTIVE;
+            }
+            if (hold && !(rearm_wait_[i] && states_->get(i) == PageState::ACTIVE) &&
+                states_->get(i) == PageState::ACTIVE) {
+                ++n_backoff;
+                if (run_end > run_start && run_start != ~size_t{0}) {
+                    flushPhase3Run(run_start, run_end);
+                }
+                run_start = ~size_t{0};
+                run_end = 0;
+                return;
+            }
             // A hot page waiting out its re-arm backoff stays PROT_RW.
             if (rearm_wait_ && rearm_wait_[i] &&
                 states_->get(i) == PageState::ACTIVE) {
@@ -3549,15 +3602,23 @@ private:
     void prefetchAdjacent(size_t page_idx) {
         size_t committed = vm_->committedPages();
 
-        for (int delta = -kPrefetchWindow; delta <= kPrefetchWindow; ++delta) {
+        // Coarse watching restores the faulting page's whole group, so the
+        // group comes back as one instead of one page inside it.
+        const long lo = watch_group_ > 1
+            ? -static_cast<long>(page_idx % watch_group_) : -kPrefetchWindow;
+        const long hi = watch_group_ > 1
+            ? static_cast<long>(watch_group_ - 1 - page_idx % watch_group_) : kPrefetchWindow;
+        for (long delta = lo; delta <= hi; ++delta) {
             if (delta == 0) continue;
 
             size_t adj = page_idx + static_cast<size_t>(delta);
             if (delta < 0 && static_cast<size_t>(-delta) > page_idx) continue;
             if (adj >= committed) continue;
 
-            // Only prefetch pages in the same span
-            if (!sameSpan(page_idx, adj)) continue;
+            // Only prefetch pages in the same span — except under coarse
+            // watching, where the group is the unit even across two blocks
+            // (prefetch only ever restores live compressed pages).
+            if (watch_group_ <= 1 && !sameSpan(page_idx, adj)) continue;
 
             // Non-blocking lock to avoid deadlock
             if (!locks_->tryLock(adj)) continue;
@@ -4104,9 +4165,13 @@ private:
         const size_t slice = static_cast<size_t>(nw.index);
         for (size_t k = 0; k < g.chunk_count; ++k) {
             const size_t base = static_cast<size_t>(g.chunks[k]) * chunk_pages;
-            const size_t start = base + chunk_pages * slice / slices;
-            const size_t end =
-                std::min(base + chunk_pages * (slice + 1) / slices, numa_committed_);
+            // Slice edges on kMaxWatchGroup pages, so a coarse-watching group
+            // is never split between two threads (chunks are 64-page
+            // multiples, so the last slice still ends at the chunk's end).
+            const size_t align = watch_group_ > 1 ? kMaxWatchGroup : 1;
+            const size_t start = base + (chunk_pages * slice / slices) / align * align;
+            const size_t end = std::min(
+                base + (chunk_pages * (slice + 1) / slices) / align * align, numa_committed_);
             if (start >= end) continue;
             if (phase == 1) {
                 phase1Range(start, end);
@@ -5726,10 +5791,13 @@ private:
         bool helpers_active = running_.load(std::memory_order_relaxed) && nw > 1;
         if (helpers_active) {
             size_t per_worker = committed / nw;
+            // Coarse watching needs every group inside one worker's range.
+            if (watch_group_ > 1) per_worker = (per_worker + kMaxWatchGroup - 1) & ~(kMaxWatchGroup - 1);
             for (int w = 0; w < nw; ++w) {
-                workers_[w].range_start = w * per_worker;
-                workers_[w].range_end = (w == nw - 1)
-                    ? committed : (w + 1) * per_worker;
+                const size_t a = std::min(committed, w * per_worker);
+                const size_t b = std::min(committed, (w + 1) * per_worker);
+                workers_[w].range_start = a;
+                workers_[w].range_end = (w == nw - 1) ? committed : b;
             }
         } else {
             workers_[0].range_start = 0;
@@ -6170,6 +6238,15 @@ public:
             size_t p2 = 1;
             while (p2 * 2 <= static_cast<size_t>(n > 512 ? 512 : n)) p2 *= 2;
             restore_granule_ = n > 1 ? p2 : 1;
+        }
+        if (const char* g = std::getenv("SMASH_WATCH_GROUP_PAGES"); g && *g) {
+            const long n = std::atol(g);
+            size_t p2 = 1;
+            while (p2 * 2 <= static_cast<size_t>(n > static_cast<long>(kMaxWatchGroup)
+                                                     ? static_cast<long>(kMaxWatchGroup) : n))
+                p2 *= 2;
+            watch_group_ = n > 1 ? p2 : 1;
+            if (watch_group_ > restore_granule_) restore_granule_ = watch_group_;
         }
         if (rearm_exp_max_ > 0) {
             rearm_exp_ = bootstrapArray<uint8_t>(max_pages);
@@ -7089,6 +7166,11 @@ public:
     // Group size (pages, power of two) a write fault on a watched page makes
     // writable; 1 = the page alone. Set from SMASH_RESTORE_GRANULE_PAGES.
     void setRestoreGranulePages(size_t g) { restore_granule_ = g; }
+    // Coarse watching group (unit tests); also restores whole groups.
+    void setWatchGroupPages(size_t g) {
+        watch_group_ = g;
+        if (g > restore_granule_) restore_granule_ = g;
+    }
     // Unit tests: count the next tick as having come `ms` after the last.
     void pretendNextTickAfterMs(uint32_t ms) { test_next_tick_ms_ = ms; }
 

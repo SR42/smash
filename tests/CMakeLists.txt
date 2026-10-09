@@ -712,6 +712,21 @@ if(NOT APPLE)
   set_tests_properties(test_slow_tick PROPERTIES TIMEOUT 120)
 endif()
 
+# Coarse watching: pages that go cold at slightly different times change
+# protection a 16-page group at a time (watch_group_test.cpp). Per page,
+# 64 MiB written in random order split into ~9400 mappings and took ~40800
+# protection calls; the bounds sit well below that.
+if(NOT APPLE)
+  add_executable(watch_group_test watch_group_test.cpp)
+  target_link_libraries(watch_group_test PRIVATE ${CMAKE_DL_LIBS})
+  add_test(NAME test_watch_group COMMAND ${CMAKE_COMMAND} -E env
+    "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=1" "SMASH_SOFTDIRTY=0"
+    "SMASH_STATS_SIGNAL=1" "SMASH_DEFER_PHASES_MS=0" "SMASH_COLD_TIMEOUT_SEC=2"
+    "SMASH_WATCH_GROUP_PAGES=16" "WATCH_TEST_MAX_MAPPINGS=2048" "WATCH_TEST_MAX_CALLS=20000"
+    $<TARGET_FILE:watch_group_test>)
+  set_tests_properties(test_watch_group PROPERTIES TIMEOUT 180)
+endif()
+
 # An idle 1 GiB must actually leave RSS with default timings, in each
 # write-tracking mode: page protection (SMASH_SOFTDIRTY=0), the default
 # auto-selection, and page protection with sub-arenas (idle_compress_test.cpp).

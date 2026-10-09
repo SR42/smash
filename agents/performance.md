@@ -762,6 +762,15 @@ locally by `flushNodeQueries` (node unknown, own, or its 64K-page queue full
 during the backlog) bypassed the readable batches; fixed. Phase 4's releases
 took 928 s of syscall time for 26.5M pages (runs capped at 32).
 
+Coarse watching (`SMASH_WATCH_GROUP_PAGES`, 2026-10-09): the other half of
+the mapping problem. Pages that go cold seconds apart were escalated,
+compressed and released in different ticks, so every tick's protection
+changes hit a scattered subset — 64 MiB written in random page order split
+into 9445 mappings (one boundary every 1.7 pages) and took 40880 protection
+calls. With 16-page groups that become idle together: 678 and 11141. Phase 2
+still averages ~10 calls per group (likely node-queue routing and batch
+edges splitting groups); not yet looked into.
+
 The CPU-pressure cap (`cpuPressureWorkerCap`) subtracted **every**
 thread of the process from `nproc`, busy or not, so a process with >= nproc
 threads always gets one worker. Fixed now (load average, floor
