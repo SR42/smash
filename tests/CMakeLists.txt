@@ -739,6 +739,24 @@ if(NOT APPLE)
   set_tests_properties(test_prefetch_large PROPERTIES TIMEOUT 180)
 endif()
 
+# Pages inside a large block are counted in the block's own bucket statistics
+# (large_bucket_stats_test.cpp).
+if(NOT APPLE)
+  add_executable(large_bucket_stats_test large_bucket_stats_test.cpp)
+  target_link_libraries(large_bucket_stats_test PRIVATE ${CMAKE_DL_LIBS})
+  add_test(NAME test_large_bucket_stats COMMAND ${CMAKE_COMMAND} -E env
+    "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=1" "SMASH_STATS_SIGNAL=1"
+    "SMASH_BUCKET_STATS=1" "SMASH_DEFER_PHASES_MS=0" "SMASH_COLD_TIMEOUT_SEC=1"
+    $<TARGET_FILE:large_bucket_stats_test>)
+  # The ROI decline path needs the default cold timeout (an override makes
+  # shouldCompress() return true at once) and LZ4, as an application runs.
+  add_test(NAME test_large_bucket_decline COMMAND ${CMAKE_COMMAND} -E env
+    "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=1" "SMASH_STATS_SIGNAL=1"
+    "SMASH_DEFER_PHASES_MS=0" "SMASH_USE_LZ4=1" "LBS_PART=decline"
+    $<TARGET_FILE:large_bucket_stats_test>)
+  set_tests_properties(test_large_bucket_stats test_large_bucket_decline PROPERTIES TIMEOUT 180)
+endif()
+
 # An idle 1 GiB must actually leave RSS with default timings, in each
 # write-tracking mode: page protection (SMASH_SOFTDIRTY=0), the default
 # auto-selection, and page protection with sub-arenas (idle_compress_test.cpp).

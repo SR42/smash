@@ -407,6 +407,9 @@ class CompressorThread {
     // and took ~40800 protection calls (watch_group_test); a 128-core arm64
     // application had 481k mappings, 397k of them smash's.
     size_t watch_group_ = 1;
+    // SMASH_LARGE_STATS=0: pages inside large blocks keep finding no span
+    // (no bucket statistics), as before spanOfPage().
+    bool large_stats_ = true;
     static constexpr size_t kMaxWatchGroup = 64;
     // Set by a group restore on each neighbour it made writable: the page
     // was unwatched for part of the interval Phase 1 is about to judge, so
@@ -592,6 +595,8 @@ class CompressorThread {
         std::atomic<uint64_t> p2_at_floor{0}, p2_escalated{0}, p2_eligible{0},
                               p2_hint_skip{0}, p2_routed{0};
         std::atomic<uint64_t> cp_attempts{0}, cp_stored{0}, cp_gate_fail{0};
+        // Compressions declined by the ROI model before any codec ran.
+        std::atomic<uint64_t> cp_roi_skip{0};
         std::atomic<uint64_t> rc_checked{0}, rc_released{0}, rc_changed{0}, rc_vma_stop{0};
         std::atomic<uint64_t> f_monitor{0}, f_shadow{0}, f_compressed{0}, f_active{0};
         // Re-arm backoff: write faults on watched pages classified hot, and
@@ -1142,7 +1147,15 @@ class CompressorThread {
     // ── Per-worker compression state ──────────────────────────────────────
     // Each worker has its own LZ4 state, ZSTD CCtx, and scratch buffers
     // so Phase 2 (compression) is embarrassingly parallel.
+    // Recently resolved large blocks, for spanOfPage() on compressor threads.
+    struct SpanCache {
+        struct Entry { Span* span = nullptr; size_t base = 0; size_t pages = 0; };
+        Entry e[4];
+        uint8_t next = 0;
+    };
+
     struct CompressWorker {
+        SpanCache span_cache;
         void* lz4_state = nullptr;
         ZSTD_CCtx* zstd_cctx = nullptr;
         void* page_buf = nullptr;
@@ -1474,11 +1487,20 @@ private:
     // [kNumClasses, kTotalBucketsPerArena) range. Returns false on unmapped
     // pages. Naming kept as `sc` so existing callers compile unchanged; the
     // value is "bucket" semantically, not raw size_class.
-    bool lookupSpanInfo(size_t page_idx, uint8_t& arena_id, uint8_t& sc) {
+    //
+    // `cache` (compressor threads only) also resolves a page INSIDE a large
+    // block, which the page map does not know: a large block registers only
+    // its first page (O(1) malloc/free). Without it every such page found no
+    // span, so in SMASH_LARGE_ONLY=1 the whole heap had no bucket statistics
+    // — no ratio samples, no per-bucket hints, and the ROI gate always took
+    // the optimistic no-data branch (large_bucket_stats_test). The fault
+    // handler passes none and stays O(1). Never use this for dictionary
+    // choice at decompression: lookupSizeClass() must keep its old answer.
+    bool lookupSpanInfo(size_t page_idx, uint8_t& arena_id, uint8_t& sc,
+                        SpanCache* cache = nullptr) {
         arena_id = 0; sc = 0;
         if (!page_map_) return false;
-        void* addr = vm_->pageAddress(page_idx);
-        Span* span = page_map_->get(reinterpret_cast<uintptr_t>(addr));
+        Span* span = spanOfPage(page_idx, cache);
         if (!span) return false;
         arena_id = span->arena_id;
         if (span->is_large) {
@@ -1487,6 +1509,35 @@ private:
             sc = span->size_class;
         }
         return true;
+    }
+
+    // The span owning contiguous page `page_idx`. The page map knows a slab
+    // span's every page but only a large block's first; with a cache, a page
+    // the map does not know is resolved through the cache, or by walking
+    // back to the nearest registered page and checking that its large block
+    // covers this one (once per block per worker, then cached).
+    // SMASH_LARGE_STATS=0 turns the resolution off.
+    Span* spanOfPage(size_t page_idx, SpanCache* cache) {
+        auto at = [&](size_t p) {
+            return page_map_->get(reinterpret_cast<uintptr_t>(vm_->pageAddress(p)));
+        };
+        Span* s = at(page_idx);
+        if (s || !cache || !large_stats_ || page_idx >= vm_->contigPages()) return s;
+        for (const auto& e : cache->e)
+            if (e.span && page_idx >= e.base && page_idx < e.base + e.pages && at(e.base) == e.span)
+                return e.span;
+        constexpr size_t kMaxWalk = size_t{1} << 20;   // 4 GiB of 4 KiB pages
+        for (size_t p = page_idx, n = 0; p-- > 0 && n < kMaxWalk; ++n) {
+            Span* c = at(p);
+            if (!c) continue;
+            if (!c->is_large || p + c->page_count <= page_idx) return nullptr;
+            auto& slot = cache->e[cache->next++ % 4];
+            slot.span = c;
+            slot.base = p;
+            slot.pages = c->page_count;
+            return c;
+        }
+        return nullptr;
     }
 
     // Index into the per-(arena, bucket) ROI stats array. `sc` is the
@@ -1952,7 +2003,8 @@ private:
             // rejected buckets cost ~zero.
             if (page_map_) {
                 void* page_addr_p = vm_->pageAddress(i);
-                Span* sp_p = page_map_->get(reinterpret_cast<uintptr_t>(page_addr_p));
+                (void)page_addr_p;
+                Span* sp_p = spanOfPage(i, &worker.span_cache);
                 if (sp_p) {
                     // Unified bucket: slab span uses size_class, large span
                     // uses log2(page_count) slot above kNumClasses. Drops the
@@ -2005,7 +2057,8 @@ private:
             uint32_t profile_floor = floor;
             if (page_map_) {
                 void* page_addr_pf = vm_->pageAddress(i);
-                Span* sp_pf = page_map_->get(reinterpret_cast<uintptr_t>(page_addr_pf));
+                (void)page_addr_pf;
+                Span* sp_pf = spanOfPage(i, &worker.span_cache);
                 if (sp_pf) {
                     uint8_t sc_pf = sp_pf->is_large
                         ? largeSizeClass(sp_pf->page_count)
@@ -2048,8 +2101,7 @@ private:
                 uint8_t rc = recompress_count_[i];
                 uint8_t bucket_bias = 0;
                 if (page_map_) {
-                    void* page_addr = vm_->pageAddress(i);
-                    Span* sp = page_map_->get(reinterpret_cast<uintptr_t>(page_addr));
+                    Span* sp = spanOfPage(i, &worker.span_cache);
                     if (sp) {
                         uint8_t sc_b = sp->is_large
                             ? largeSizeClass(sp->page_count)
@@ -2709,7 +2761,7 @@ private:
         // Stats are per (arena_id, size_class) so the ROI model sees the
         // per-origin compression ratio, consistent with the arena design.
         uint8_t arena_id = 0, sc = 0;
-        bool have_span = lookupSpanInfo(page_idx, arena_id, sc);
+        bool have_span = lookupSpanInfo(page_idx, arena_id, sc, &worker.span_cache);
         size_t stats_idx = statsIndex(arena_id, sc);
         uint8_t stats_count = (have_span && sc < kTotalBucketsPerArena)
             ? worker.sc_stats[stats_idx].count : 0;
@@ -2742,8 +2794,19 @@ private:
         if (!CompressionROI::shouldCompress(cold_count_[page_idx],
                                              stats_count, stats_sum,
                                              redirty_discount_x256)) {
+            // Declined by the bucket's statistics: back off exactly like a
+            // ratio-gate failure below (restart the cold streak, double the
+            // effective floor). Without it a declined page stays at the
+            // floor and is offered again every tick — and set ACTIVE, so
+            // Phase 3 re-arms it with an mprotect every tick too: random
+            // data in a 128 MiB large block took 393040 attempts in 23 s
+            // once large blocks had statistics, against 32768 without.
+            if (compress_fail_count_ && compress_fail_count_[page_idx] < 255)
+                compress_fail_count_[page_idx]++;
+            cold_count_[page_idx] = 0;
             states_->set(page_idx, PageState::ACTIVE);
             locks_->unlock(page_idx);
+            pc_.cp_roi_skip.fetch_add(1, std::memory_order_relaxed);
             return false;
         }
 
@@ -3407,7 +3470,7 @@ private:
 
         uint8_t sc = lookupSizeClass(page_idx);
         uint8_t arena_id = 0;
-        bool have_span = lookupSpanInfo(page_idx, arena_id, sc);
+        bool have_span = lookupSpanInfo(page_idx, arena_id, sc, &worker.span_cache);
         size_t stats_idx = statsIndex(arena_id, sc);
 
         // We own the blob now; mark state COMPRESSING so concurrent
@@ -6257,6 +6320,8 @@ public:
             while (p2 * 2 <= static_cast<size_t>(n > 512 ? 512 : n)) p2 *= 2;
             restore_granule_ = n > 1 ? p2 : 1;
         }
+        if (const char* ls = std::getenv("SMASH_LARGE_STATS"); ls && ls[0] == '0')
+            large_stats_ = false;
         if (const char* g = std::getenv("SMASH_WATCH_GROUP_PAGES"); g && *g) {
             const long n = std::atol(g);
             size_t p2 = 1;
@@ -6844,7 +6909,7 @@ public:
                 "[smash pipeline] ticks=%llu tick_ms=%llu/%llu deferred=%llu"
                 " | p1 accessed=%llu idle=%llu | p2 at_floor=%llu escalated=%llu"
                 " eligible=%llu routed=%llu hint_skip=%llu | compress tried=%llu"
-                " stored=%llu gate_fail=%llu | release checked=%llu released=%llu"
+                " stored=%llu gate_fail=%llu roi_skip=%llu | release checked=%llu released=%llu"
                 " changed=%llu vma_stop=%llu | faults monitor=%llu shadow=%llu"
                 " compressed=%llu active=%llu | phase_ms=%llu/%llu/%llu/%llu"
                 " max=%llu/%llu/%llu/%llu | p1 minflt=%llu range_ms_max=%llu workers=%llu cap=%llu"
@@ -6854,7 +6919,8 @@ public:
                 v(pc.ticks), v(pc.tick_ms_last), v(pc.tick_ms_max), v(pc.deferred_ticks),
                 v(pc.p1_accessed), v(pc.p1_idle), v(pc.p2_at_floor), v(pc.p2_escalated),
                 v(pc.p2_eligible), v(pc.p2_routed), v(pc.p2_hint_skip), v(pc.cp_attempts),
-                v(pc.cp_stored), v(pc.cp_gate_fail), v(pc.rc_checked), v(pc.rc_released),
+                v(pc.cp_stored), v(pc.cp_gate_fail), v(pc.cp_roi_skip), v(pc.rc_checked),
+                v(pc.rc_released),
                 v(pc.rc_changed), v(pc.rc_vma_stop), v(pc.f_monitor), v(pc.f_shadow),
                 v(pc.f_compressed), v(pc.f_active), v(pc.phase_ms[1]), v(pc.phase_ms[2]),
                 v(pc.phase_ms[3]), v(pc.phase_ms[4]), v(pc.phase_ms_max[1]),
@@ -6951,25 +7017,22 @@ public:
             for (int sc = 0; sc < static_cast<int>(kTotalBucketsPerArena); ++sc) {
                 size_t idx = statsIndex(static_cast<uint8_t>(arena),
                                         static_cast<uint8_t>(sc));
-                // Find worker with most samples
-                int best_w = 0;
-                for (int w = 1; w < kMaxCompressorWorkers; ++w) {
-                    if (self->workers_[w].sc_stats[idx].count >
-                        self->workers_[best_w].sc_stats[idx].count) {
-                        best_w = w;
-                    }
-                }
-                const auto& s = self->workers_[best_w].sc_stats[idx];
-                if (s.count == 0) continue;  // skip empty buckets
-
-                // Sum compress/decompress across all workers
+                // Find the worker with the most samples — default workers
+                // and NUMA node-group workers alike: on a multi-node host the
+                // groups compress most pages, and a dump of the default
+                // workers alone showed nothing for them.
+                const SizeClassStats* best = &self->workers_[0].sc_stats[idx];
                 uint32_t cc = 0, dc = 0;
-                for (int w = 0; w < kMaxCompressorWorkers; ++w) {
-                    cc += self->workers_[w].sc_stats[idx].compress_count
-                              .load(std::memory_order_relaxed);
-                    dc += self->workers_[w].sc_stats[idx].decompress_count
-                              .load(std::memory_order_relaxed);
-                }
+                auto visit = [&](const CompressWorker& wk) {
+                    const auto& st = wk.sc_stats[idx];
+                    if (st.count > best->count) best = &st;
+                    cc += st.compress_count.load(std::memory_order_relaxed);
+                    dc += st.decompress_count.load(std::memory_order_relaxed);
+                };
+                for (int w = 0; w < kMaxCompressorWorkers; ++w) visit(self->workers_[w]);
+                self->forEachNodeCompressWorker([&](CompressWorker& wk) { visit(wk); });
+                const auto& s = *best;
+                if (s.count == 0) continue;  // skip empty buckets
 
                 size_t obj_size = sc < kNumClasses
                     ? kSizeClasses[sc].size

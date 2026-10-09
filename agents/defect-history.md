@@ -231,8 +231,34 @@ when no span starts in between (no registered page in `(lo, hi]`); both
 registered still means the same slab span. After: 171 faults for the same
 read. `test_prefetch_large`.
 
-The same page-map blind spot remains in `lookupSpanInfo()`: a page inside a
-large block finds no span, so the compressor's per-(arena, bucket) ROI
-statistics pool those pages into bucket 0 of arena 0 instead of the block's
-own size bucket. Not fixed.
+The same page-map blind spot was in `lookupSpanInfo()` — fixed next.
+
+## Large blocks had no bucket statistics (fixed 2026-10-09)
+
+`lookupSpanInfo()` (the compressor's (arena, bucket) lookup) had the same
+blind spot: a page inside a large block found no span, so `compressPage`
+recorded **no** statistics for it — no ratio samples, no compression counts
+(`SMASH_BUCKET_STATS=1` printed no rows for a compressed 64 MiB block), the
+per-bucket profile/budget/thrash hints never applied, and with fewer than 8
+samples the ROI gate always took the optimistic "compress" branch. In
+`SMASH_LARGE_ONLY=1` that was the whole heap. Now `spanOfPage()` resolves a
+page the page map does not know through a 4-entry per-worker cache, or by
+walking back to the nearest registered page and checking its large block
+covers the page; compressor threads only (the fault handler stays O(1)).
+`lookupSizeClass()` — the dictionary choice at decompression — is unchanged on
+purpose: a large block's bucket is never a dictionary class, so its pages are
+compressed without one either way. `SMASH_LARGE_STATS=0` restores the old
+behaviour.
+
+Two things came with it. The bucket dump read only the default workers, but on
+a multi-node host the NUMA node-group workers compress most pages: it now
+includes them (without that, still no rows). And with statistics the ROI gate
+started declining incompressible buckets — and a declined page was set ACTIVE
+without backoff, so it was offered (and re-armed by Phase 3) every tick:
+128 MiB of random bytes took 458544 attempts in 25 s. It now backs off like a
+ratio-gate failure (cold streak restarted, effective floor doubled): one
+attempt per page, 32752 of 32768 declined before any codec ran
+(`roi_skip=`). Note `SMASH_COLD_TIMEOUT_SEC` sets `cold_ticks_overridden`,
+which makes `shouldCompress()` return true at once: tests that set it never
+reach the decline path.
 
