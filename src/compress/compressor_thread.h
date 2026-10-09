@@ -1513,11 +1513,29 @@ private:
             workers_[0].sc_stats[bidx].recordRedirty(rewritten);
     }
 
+    // Whether two nearby pages belong to the same allocation. A slab span
+    // registers every page in the page map, but a large block only its
+    // FIRST (O(1) malloc/free): a page inside one looks up as nothing. So
+    // when both are registered they must be the same span; otherwise they
+    // are in the same large block exactly when no span starts in between
+    // — (lo, hi] has no registered page. Looking both up and requiring a
+    // match made the fault prefetch skip every neighbour inside a large
+    // block: reading a compressed 2 MiB block took 512 faults
+    // (prefetch_large_test). Meant for the few pages of a prefetch window.
     bool sameSpan(size_t page_a, size_t page_b) {
         if (!page_map_) return false;
-        Span* sa = page_map_->get(reinterpret_cast<uintptr_t>(vm_->pageAddress(page_a)));
-        Span* sb = page_map_->get(reinterpret_cast<uintptr_t>(vm_->pageAddress(page_b)));
-        return sa && sb && sa == sb;
+        auto at = [&](size_t p) {
+            return page_map_->get(reinterpret_cast<uintptr_t>(vm_->pageAddress(p)));
+        };
+        Span* sa = at(page_a);
+        Span* sb = at(page_b);
+        if (sa && sb) return sa == sb;
+        const size_t lo = std::min(page_a, page_b), hi = std::max(page_a, page_b);
+        for (size_t p = lo + 1; p <= hi; ++p)
+            if (at(p)) return false;
+        // Pages past the contiguous arena are indexed by registration
+        // order, not address: no ordering to reason from.
+        return hi < vm_->contigPages();
     }
 
     // Non-temporal zero: avoids cache pollution when zeroing cold page data.

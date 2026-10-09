@@ -215,3 +215,24 @@ Measured: `test_signal_chain` phase F, 4 threads swapping SIGSEGV handlers
 against 8 threads taking smash faults and their own for 1.5 s — 0 misrouted
 (~46000 of each); with the old behaviour all 165228 smash faults went to the
 application's handler.
+
+## Fault prefetch never ran inside large blocks (fixed 2026-10-09)
+
+`prefetchAdjacent` restores up to `kPrefetchWindow` (2) compressed neighbours
+on each side of a faulting page, but only those `sameSpan()` says belong to the
+same allocation, and `sameSpan()` looked both pages up in the page map and
+required the same span. A large block registers only its **first** page there
+(O(1) malloc/free, `LargeAlloc`), so every page inside one looked up as
+nothing and the prefetch never ran — in every `SMASH_LARGE_ONLY=1` heap, the
+production mode. Found while measuring restore cost for whole huge pages:
+reading a compressed 2 MiB block in order took 512 faults, one per page, ~18 us
+each on an 8-vCPU x86 VM. Now two pages are in the same large block exactly
+when no span starts in between (no registered page in `(lo, hi]`); both
+registered still means the same slab span. After: 171 faults for the same
+read. `test_prefetch_large`.
+
+The same page-map blind spot remains in `lookupSpanInfo()`: a page inside a
+large block finds no span, so the compressor's per-(arena, bucket) ROI
+statistics pool those pages into bucket 0 of arena 0 instead of the block's
+own size bucket. Not fixed.
+
