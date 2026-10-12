@@ -92,6 +92,18 @@ void pinTo(int cpu) {
     CPU_SET(cpu, &set);
     sched_setaffinity(0, sizeof(set), &set);
 }
+// VmSwap of this process, KiB (0 when unreadable).
+long vmSwapKb() {
+    FILE* f = std::fopen("/proc/self/status", "r");
+    if (!f) return 0;
+    char line[256];
+    long kb = 0;
+    while (std::fgets(line, sizeof(line), f))
+        if (!std::strncmp(line, "VmSwap:", 7)) kb = std::atol(line + 7);
+    std::fclose(f);
+    return kb;
+}
+
 uint64_t dirtyBytes() {
     uint64_t d = 0, p = 0;
     if (g_info) g_info(&d, &p);
@@ -203,9 +215,32 @@ void phaseCold(int cpu) {
         free(p);
         return;
     }
-    const uint64_t d0 = dirtyBytes();
+    // "Out of RSS" proves compression only if nothing of ours was swapped
+    // out: a swapped page is non-resident with its state still ACTIVE, so
+    // the freed block is (rightly) kept dirty. Seen on the 2-CPU, 3.9 GB
+    // claudepc during a full ctest -j2 run, which swaps 270-380 MB whenever
+    // test_phase3_batch_big (2 GiB) runs.
+    const long swapped_kb = vmSwapKb();
+    // Let earlier phases' frees settle first: frees made on another CPU go
+    // home to their sub-arena asynchronously, and one landing between the
+    // two readings would be charged to this block. Two equal readings 50 ms
+    // apart, within 2 s.
+    uint64_t d0 = dirtyBytes(), prev = d0 + 1;
+    for (int i = 0; i < 40 && d0 != prev; ++i) {
+        prev = d0;
+        usleep(50 * 1000);
+        d0 = dirtyBytes();
+    }
     free(p);
-    if (dirtyBytes() > d0) fail("a block with compressed pages was kept as dirty");
+    const uint64_t d1 = dirtyBytes();
+    if (d1 > d0) {
+        if (swapped_kb > 0)
+            std::printf("  (dirty check skipped: %ld KiB of this process swapped out, so "
+                        "'out of RSS' does not prove compression)\n", swapped_kb);
+        else
+            fail("a block with compressed pages was kept as dirty (dirty +%llu bytes; the "
+                 "block is %zu)", static_cast<unsigned long long>(d1 - d0), kSize);
+    }
     auto* q = alloc(kSize);
     if (!q) { fail("reallocation failed"); return; }
     std::memset(q, 0xA5, kSize);

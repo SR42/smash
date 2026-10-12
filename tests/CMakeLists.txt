@@ -624,7 +624,10 @@ if(NOT APPLE)
     "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=1" "SMASH_SOFTDIRTY=0"
     "SMASH_STATS_SIGNAL=1" "SMASH_DEFER_PHASES_MS=0" "PHASE3_TEST_MIB=2048"
     $<TARGET_FILE:phase3_batch_test>)
-  set_tests_properties(test_phase3_batch_big PROPERTIES TIMEOUT 300)
+  # Alone: 2 GiB next to other large tests swaps a small host (claudepc, 3.9
+  # GB: 270-380 MB swapped out per run), and swapped pages look "compressed"
+  # to tests that judge compression by residency.
+  set_tests_properties(test_phase3_batch_big PROPERTIES TIMEOUT 300 RUN_SERIAL TRUE)
 endif()
 
 # Under page-protection write tracking, a page the application keeps writing
