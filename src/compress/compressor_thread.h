@@ -597,6 +597,15 @@ class CompressorThread {
         std::atomic<uint64_t> cp_attempts{0}, cp_stored{0}, cp_gate_fail{0};
         // Compressions declined by the ROI model before any codec ran.
         std::atomic<uint64_t> cp_roi_skip{0};
+        // Time inside the fault handler per fault kind (FaultKind), from
+        // entry — so waiting for the page lock counts — to return: count,
+        // total and worst in ns, and a log2 histogram in us (bucket 0:
+        // < 2 us, bucket b: [2^b, 2^(b+1)) us, the last open-ended). The
+        // kernel's signal delivery around the handler is not included.
+        static constexpr int kFaultKinds = 4;
+        static constexpr int kFaultBuckets = 16;
+        std::atomic<uint64_t> ft_count[kFaultKinds]{}, ft_ns[kFaultKinds]{}, ft_max_ns[kFaultKinds]{};
+        std::atomic<uint64_t> ft_hist[kFaultKinds][kFaultBuckets]{};
         std::atomic<uint64_t> rc_checked{0}, rc_released{0}, rc_changed{0}, rc_vma_stop{0};
         std::atomic<uint64_t> f_monitor{0}, f_shadow{0}, f_compressed{0}, f_active{0};
         // Re-arm backoff: write faults on watched pages classified hot, and
@@ -649,6 +658,32 @@ class CompressorThread {
         std::atomic<uint64_t> p2_mprotect{0};
     };
     PipelineCounters pc_;
+    enum FaultKind { kFaultCompressed, kFaultShadow, kFaultMonitor, kFaultActive };
+    static uint64_t monoNs() {   // async-signal-safe
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        return static_cast<uint64_t>(ts.tv_sec) * 1000000000u + static_cast<uint64_t>(ts.tv_nsec);
+    }
+    // Records one fault's handler time into pc_.ft_* when it goes out of
+    // scope, for the kind set on it (none: not a smash fault, nothing kept).
+    struct FaultTimer {
+        PipelineCounters& pc; uint64_t t0; int kind = -1;
+        explicit FaultTimer(PipelineCounters& c) : pc(c), t0(monoNs()) {}
+        ~FaultTimer() {
+            if (kind < 0) return;
+            const uint64_t ns = monoNs() - t0;
+            pc.ft_count[kind].fetch_add(1, std::memory_order_relaxed);
+            pc.ft_ns[kind].fetch_add(ns, std::memory_order_relaxed);
+            uint64_t m = pc.ft_max_ns[kind].load(std::memory_order_relaxed);
+            while (ns > m && !pc.ft_max_ns[kind].compare_exchange_weak(m, ns, std::memory_order_relaxed)) {}
+            const uint64_t us = ns / 1000;
+            int b = 0;
+            while (b < PipelineCounters::kFaultBuckets - 1 && (us >> (b + 1)) != 0) ++b;
+            pc.ft_hist[kind][b].fetch_add(1, std::memory_order_relaxed);
+        }
+        FaultTimer(const FaultTimer&) = delete;
+        FaultTimer& operator=(const FaultTimer&) = delete;
+    };
     // Adds the wall time of its scope, in us, to one PipelineCounters::sc_*.
     struct SyscallTimer {
         std::atomic<uint64_t>& acc; std::chrono::steady_clock::time_point t0;
@@ -6961,6 +6996,36 @@ public:
                         v(pc.sc_p4_us) / 1000);
                 if (n >= static_cast<int>(sizeof(buf))) n = static_cast<int>(sizeof(buf)) - 1;
             }
+            // Fault handler time per kind: count, mean, percentiles as the
+            // upper bound of the log2 bucket they fall in, and the worst.
+            if (n > 0 && static_cast<size_t>(n) < sizeof(buf)) {
+                static const char* const kNames[PipelineCounters::kFaultKinds] = {
+                    "compressed", "shadow", "monitor", "active"};
+                n += smash::safe_snprintf(buf + n, sizeof(buf) - static_cast<size_t>(n),
+                                          "[smash faults] handler us:");
+                for (int k = 0; k < PipelineCounters::kFaultKinds; ++k) {
+                    if (n <= 0 || static_cast<size_t>(n) >= sizeof(buf)) break;
+                    const uint64_t cnt = pc.ft_count[k].load(std::memory_order_relaxed);
+                    auto pct = [&](uint64_t num, uint64_t den) -> unsigned long long {
+                        if (cnt == 0) return 0;
+                        const uint64_t want = (cnt * num + den - 1) / den;
+                        uint64_t acc = 0;
+                        for (int b = 0; b < PipelineCounters::kFaultBuckets; ++b) {
+                            acc += pc.ft_hist[k][b].load(std::memory_order_relaxed);
+                            if (acc >= want) return 1ull << (b + 1);
+                        }
+                        return 1ull << PipelineCounters::kFaultBuckets;
+                    };
+                    n += smash::safe_snprintf(buf + n, sizeof(buf) - static_cast<size_t>(n),
+                        " %s n=%llu avg=%.1f p50<%llu p99<%llu p99.9<%llu max=%llu%s", kNames[k],
+                        static_cast<unsigned long long>(cnt),
+                        cnt ? static_cast<double>(pc.ft_ns[k].load(std::memory_order_relaxed)) / cnt / 1000.0 : 0.0,
+                        pct(50, 100), pct(99, 100), pct(999, 1000),
+                        static_cast<unsigned long long>(pc.ft_max_ns[k].load(std::memory_order_relaxed) / 1000),
+                        k + 1 < PipelineCounters::kFaultKinds ? " |" : "\n");
+                }
+                if (n >= static_cast<int>(sizeof(buf))) n = static_cast<int>(sizeof(buf)) - 1;
+            }
         }
         // The per-CPU run cache (SMASH_RUN_CACHE_MIB), when on: whether it is
         // actually absorbing the large-block churn, or evicting as fast as it
@@ -7272,6 +7337,7 @@ public:
     // Returns true if the fault was handled (page restored).
     bool handleFault(uintptr_t addr) {
         if (!vm_->contains(addr)) return false;
+        FaultTimer fault_timer(pc_);
 
         size_t page_idx = vm_->pageIndex(addr);
 
@@ -7296,6 +7362,7 @@ public:
         switch (st) {
         case PageState::COMPRESSED: {
             pc_.f_compressed.fetch_add(1, std::memory_order_relaxed);
+            fault_timer.kind = kFaultCompressed;
             // Clear deferred-madvise pending BEFORE the state transitions
             // out of COMPRESSED. The per-page lock is held; the sweeper
             // tryLock+recheck will observe the cleared bit (or skip the
@@ -7461,6 +7528,7 @@ public:
 
         case PageState::ACTIVE_MONITORING: {
             pc_.f_monitor.fetch_add(1, std::memory_order_relaxed);
+            fault_timer.kind = kFaultMonitor;
             noteFaultLocality(page_idx);
             void* page_addr = vm_->pageAddress(page_idx);
             if (restore_granule_ <= 1 || !restoreGroup(page_idx)) {
@@ -7477,6 +7545,7 @@ public:
 
         case PageState::ACTIVE: {
             pc_.f_active.fetch_add(1, std::memory_order_relaxed);
+            fault_timer.kind = kFaultActive;
             // Race: Phase 3's batched mprotect(PROT_READ) can overwrite a
             // per-page PROT_RW restoration done by a concurrent fault handler.
             void* page_addr = vm_->pageAddress(page_idx);
@@ -7489,6 +7558,7 @@ public:
 
         case PageState::COMPRESSED_SHADOW: {
             pc_.f_shadow.fetch_add(1, std::memory_order_relaxed);
+            fault_timer.kind = kFaultShadow;
             // Page was still accessible (PROT_RW or PROT_READ from Phase 3).
             // Fault means Phase 3 set PROT_READ and a write occurred.
             // Discard the shadow blob, restore to ACTIVE.

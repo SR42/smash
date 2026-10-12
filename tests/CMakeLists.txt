@@ -757,6 +757,18 @@ if(NOT APPLE)
   set_tests_properties(test_large_bucket_stats test_large_bucket_decline PROPERTIES TIMEOUT 180)
 endif()
 
+# The [smash faults] line reports fault-handler time per kind for exactly the
+# faults the pipeline line counts (fault_time_test.cpp).
+if(NOT APPLE)
+  add_executable(fault_time_test fault_time_test.cpp)
+  target_link_libraries(fault_time_test PRIVATE ${CMAKE_DL_LIBS})
+  add_test(NAME test_fault_time COMMAND ${CMAKE_COMMAND} -E env
+    "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=1" "SMASH_SOFTDIRTY=0"
+    "SMASH_STATS_SIGNAL=1" "SMASH_DEFER_PHASES_MS=0" "SMASH_COLD_TIMEOUT_SEC=1"
+    $<TARGET_FILE:fault_time_test>)
+  set_tests_properties(test_fault_time PROPERTIES TIMEOUT 180)
+endif()
+
 # An idle 1 GiB must actually leave RSS with default timings, in each
 # write-tracking mode: page protection (SMASH_SOFTDIRTY=0), the default
 # auto-selection, and page protection with sub-arenas (idle_compress_test.cpp).
