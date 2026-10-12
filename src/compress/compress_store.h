@@ -87,6 +87,12 @@ class CompressStore {
 
     Shard shards_[kCompressStoreShards];
 
+    // Makes r the head of shard's chain, release-ordered after r's fields and
+    // r->next are written: usage() walks the chain without the lock.
+    static void publish(Shard& shard, Region* r) {
+        if (r) __atomic_store_n(&shard.current, r, __ATOMIC_RELEASE);
+    }
+
     // Allocate a kRegionSize-aligned region so regionOf() can derive
     // the Region* from any interior pointer via address masking.
     Region* newRegion() {
@@ -266,11 +272,11 @@ class CompressStore {
         Region* nr = newRegion();
         if (!nr) return nullptr;
         nr->next = shard.current;
-        shard.current = nr;
         size_t off = nr->offset.load(std::memory_order_relaxed);
         size_t aligned = (off + 15) & ~15ULL;
         nr->offset.store(aligned + size, std::memory_order_relaxed);
         nr->live_bytes.store(size, std::memory_order_relaxed);
+        publish(shard, nr);
         *out_alloc_size = size;
         return nr->base + aligned;
     }
@@ -281,7 +287,27 @@ public:
         node_ = node;
         pin_mode_ = detectPinMode();
         for (int s = 0; s < kCompressStoreShards; ++s)
-            shards_[s].current = newRegion();
+            publish(shards_[s], newRegion());
+    }
+
+    // Memory held by this store's blobs, for the SIGUSR2 stats line. Takes no
+    // lock, so it is async-signal-safe: a region is only ever prepended to its
+    // shard's chain (publish(), after it is fully initialised) and never
+    // unlinked or unmapped, so a walk from an acquire load of the head sees
+    // initialised regions only. `live` is the bytes of the blobs stored now;
+    // `held` is the bytes below each region's bump pointer, which is what the
+    // region keeps resident: live plus free-list holes (a reset region,
+    // decommitted, holds only its header). The counts are racy by the blobs
+    // stored or released during the walk, which is fine for a dump.
+    void usage(size_t* live, size_t* held, size_t* regions) const {
+        for (const Shard& shard : shards_) {
+            for (const Region* r = __atomic_load_n(&shard.current, __ATOMIC_ACQUIRE); r;
+                 r = r->next) {
+                *live += r->live_bytes.load(std::memory_order_relaxed);
+                *held += r->offset.load(std::memory_order_relaxed);
+                ++*regions;
+            }
+        }
     }
 
     // Push a fresh region to the head of each shard's chain.
@@ -293,7 +319,7 @@ public:
             Region* nr = newRegion();
             if (nr) {
                 nr->next = shards_[s].current;
-                shards_[s].current = nr;
+                publish(shards_[s], nr);
             }
         }
     }

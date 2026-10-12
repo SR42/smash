@@ -772,6 +772,18 @@ if(NOT APPLE)
   set_tests_properties(test_fault_time PROPERTIES TIMEOUT 180)
 endif()
 
+# The [smash stats] line's rss= matches /proc/self/statm and blob= tracks the
+# compressed store as a block is compressed and freed (blob_rss_test.cpp).
+if(NOT APPLE)
+  add_executable(blob_rss_test blob_rss_test.cpp)
+  target_link_libraries(blob_rss_test PRIVATE ${CMAKE_DL_LIBS})
+  add_test(NAME test_blob_rss COMMAND ${CMAKE_COMMAND} -E env
+    "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=1"
+    "SMASH_STATS_SIGNAL=1" "SMASH_DEFER_PHASES_MS=0" "SMASH_COLD_TIMEOUT_SEC=1"
+    $<TARGET_FILE:blob_rss_test>)
+  set_tests_properties(test_blob_rss PROPERTIES TIMEOUT 180)
+endif()
+
 # An idle 1 GiB must actually leave RSS with default timings, in each
 # write-tracking mode: page protection (SMASH_SOFTDIRTY=0), the default
 # auto-selection, and page protection with sub-arenas (idle_compress_test.cpp).

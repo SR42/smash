@@ -6891,6 +6891,50 @@ public:
         return enabled;
     }
 
+    // Blob memory over every store: the shared one and each node group's.
+    // Lock-free (CompressStore::usage); node groups are created once in
+    // start() and never freed.
+    void blobUsage(size_t* live, size_t* held, size_t* regions) const {
+        if (store_) store_->usage(live, held, regions);
+#if defined(__linux__)
+        for (uint32_t n = 0; n < vm::kMaxNumaNodes; ++n)
+            if (const NodeGroup* g = __atomic_load_n(&node_groups_[n], __ATOMIC_ACQUIRE))
+                if (g->store) g->store->usage(live, held, regions);
+#endif
+    }
+
+    // Resident set size in bytes, 0 if unknown. Async-signal-safe: raw
+    // syscalls on Linux (never the interposed read), one Mach call on macOS.
+    static size_t processRssBytes() {
+#if defined(__linux__)
+        const int fd = static_cast<int>(::syscall(SYS_openat, AT_FDCWD, "/proc/self/statm",
+                                                  O_RDONLY | O_CLOEXEC));
+        if (fd < 0) return 0;
+        char text[128];
+        const ssize_t n = ::syscall(SYS_read, fd, text, sizeof(text) - 1);
+        ::syscall(SYS_close, fd);
+        if (n <= 0) return 0;
+        text[n] = '\0';
+        // "size resident shared ...", in pages.
+        const char* p = text;
+        while (*p && *p != ' ') ++p;
+        size_t pages = 0;
+        for (++p; *p >= '0' && *p <= '9'; ++p) pages = pages * 10 + static_cast<size_t>(*p - '0');
+        return pages * static_cast<size_t>(sysconf(_SC_PAGESIZE));
+#elif defined(__APPLE__)
+        // phys_footprint, not resident_size: on macOS a PROT_NONE page drops
+        // out of resident_size without being reclaimed (see CLAUDE.md).
+        task_vm_info_data_t info;
+        mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+        if (task_info(mach_task_self(), TASK_VM_INFO, reinterpret_cast<task_info_t>(&info),
+                      &count) != KERN_SUCCESS)
+            return 0;
+        return static_cast<size_t>(info.phys_footprint);
+#else
+        return 0;
+#endif
+    }
+
     static void sigusr1Handler(int) {
         auto* self = s_stats_instance_;
         if (!self || !self->states_ || !self->vm_) return;
@@ -6918,12 +6962,18 @@ public:
         // there, and it is what runs out on a very large heap.
         size_t boot_used = 0, boot_cap = 0, boot_regions = 0;
         BootstrapAlloc::instance().usage(&boot_used, &boot_cap, &boot_regions);
+        // What compression costs and what is left: blob memory across the
+        // shared store and every node group's, and the process's RSS.
+        size_t blob_live = 0, blob_held = 0, blob_regions = 0;
+        self->blobUsage(&blob_live, &blob_held, &blob_regions);
+        const size_t rss = processRssBytes();
         char buf[4096];   // stats + pipeline + phase time lines; ~1.6 KB on a 145 GB heap
         int n = smash::safe_snprintf(buf, sizeof(buf),
             "[smash stats] [%s] pid=%d committed=%zu  active=%zu  monitor=%zu"
             "  compressing=%zu  compressed=%zu  shadow=%zu  empty=%zu"
             "  tier_up=%llu/%llu  spilled=%zu  zero=%llu  bump=%zu"
-            "  reheat=%llu  track=%s  boot=%zu/%zuMiB(%zu regions)\n",
+            "  reheat=%llu  track=%s  boot=%zu/%zuMiB(%zu regions)"
+            "  rss=%zuMiB  blob=%zu/%zuMiB(%zu regions)\n",
             ts, (int)getpid(), total, active, monitor, compressing, compressed,
             shadow, empty,
             (unsigned long long)tier_success,
@@ -6933,7 +6983,8 @@ public:
             raw_bump,
             (unsigned long long)g_reheat_events.load(std::memory_order_relaxed),
             writeTrackerName(self->write_tracker_),
-            boot_used >> 20, boot_cap >> 20, boot_regions);
+            boot_used >> 20, boot_cap >> 20, boot_regions,
+            rss >> 20, blob_live >> 20, blob_held >> 20, blob_regions);
         // Where pages go in the pipeline (see PipelineCounters).
         if (n > 0 && static_cast<size_t>(n) < sizeof(buf)) {
             const auto& pc = self->pc_;
