@@ -9,6 +9,15 @@
 // macOS, MADV_DONTNEED on Linux), releasing physical memory back to the OS
 // while keeping the virtual mapping.  If the region is reused, the OS
 // zero-fills on access and the bump allocator is reset.
+//
+// Compaction: a region keeps its memory while any blob in it is live, and a
+// freed blob's hole is reused only by a blob that fits it, so churn leaves
+// regions mostly holes (measured on a 128-core application: 1.6 GiB of live
+// blobs holding 15.7 GiB). markDraining() marks each region whose live bytes
+// have fallen under a share of its used bytes; nothing new is stored in a
+// draining region, and the compressor moves its live blobs out (copy into
+// this store, repoint the page under its page lock, release the old one)
+// until the region is empty and decommitted.
 #pragma once
 
 #include "smash/config.h"
@@ -18,6 +27,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 
 namespace smash {
@@ -36,6 +46,7 @@ class CompressStore {
 
     PinMode pin_mode_ = PinMode::kOff;
     int node_ = -1;  // NUMA node every region is bound to, or -1 for none
+    unsigned drain_pct_ = 50;  // SMASH_STORE_DRAIN_PCT
 
     static PinMode detectPinMode() {
         const char* v = std::getenv("SMASH_MLOCK_STORE");
@@ -73,6 +84,10 @@ class CompressStore {
         uint32_t free_head;              // offset of first free slot, 0 = none
         Region* next;
         CompressStore* owner;            // the store that mapped this region
+        // Set by markDraining() under the shard lock, cleared when the region
+        // empties; read without it by draining() (a hint, rechecked by the
+        // caller under the page lock).
+        std::atomic<bool> draining;
     };
 
     static constexpr size_t kRegionSize = 16 * 1024 * 1024;  // 16MB per region
@@ -80,10 +95,19 @@ class CompressStore {
     static constexpr size_t kDataStart = (sizeof(Region) + 15) & ~15ULL;
 
     // Per-shard state: independent lock and region chain
+    // `current` heads the chain of every region the shard has mapped (only
+    // ever prepended to, so usage() can walk it without the lock); `bump` is
+    // the region new blobs are bumped into, or nullptr when the next store
+    // must pick one: a region that emptied, else a new one.
     struct Shard {
         Region* current = nullptr;
+        Region* bump = nullptr;
         Spinlock lock;
     };
+
+    // A region drains once it has used at least this much and its live bytes
+    // are under drain_pct_ of what it has used.
+    static constexpr size_t kDrainMinUsed = 1u << 20;
 
     Shard shards_[kCompressStoreShards];
 
@@ -128,6 +152,7 @@ class CompressStore {
         r->free_head = 0;
         r->next = nullptr;
         r->owner = this;
+        r->draining.store(false, std::memory_order_relaxed);
 
         if (pin_mode_ == PinMode::kMlock) {
             if (!vm::lockPages(r->base, kRegionSize)) {
@@ -159,7 +184,23 @@ class CompressStore {
         }
         r->offset.store(kDataStart, std::memory_order_relaxed);
         r->free_head = 0;
+        r->draining.store(false, std::memory_order_relaxed);
         // live_bytes is already 0
+    }
+
+    static bool isEmpty(const Region* r) {
+        return r->live_bytes.load(std::memory_order_relaxed) == 0 &&
+               r->offset.load(std::memory_order_relaxed) == kDataStart;
+    }
+
+    static void* bumpInto(Region* r, size_t size, size_t* out_alloc_size) {
+        const size_t off = r->offset.load(std::memory_order_relaxed);
+        const size_t aligned = (off + 15) & ~15ULL;  // 16-byte alignment
+        if (aligned + size > r->capacity) return nullptr;
+        r->offset.store(aligned + size, std::memory_order_relaxed);
+        r->live_bytes.fetch_add(size, std::memory_order_relaxed);
+        *out_alloc_size = size;
+        return r->base + aligned;
     }
 
     // Try to satisfy an allocation from a region's free list (LIFO,
@@ -223,62 +264,37 @@ class CompressStore {
         return nullptr;
     }
 
+    // Where a blob goes, in order: a hole in the bump region; the bump
+    // region's tail; a hole in any other region not draining; an emptied
+    // region, which becomes the bump region (refilled by bump, not handed one
+    // blob and passed over again); a new region. Draining regions get nothing.
     void* bumpAlloc(Shard& shard, size_t size, size_t* out_alloc_size)
             SMASH_REQUIRES(shard.lock) {
-        // Try current region's free list first.  In re-tier scenarios
-        // (release X's old blob, then immediately allocate X's new blob)
-        // this returns the just-freed slot, preventing the bump pointer
-        // from growing past kRegionSize.
-        Region* r = shard.current;
-        while (r) {
-            if (void* p = tryFreeList(r, size, out_alloc_size)) return p;
-            size_t off = r->offset.load(std::memory_order_relaxed);
-            size_t aligned = (off + 15) & ~15ULL;  // 16-byte alignment
-            if (aligned + size <= r->capacity) {
-                if (r->offset.compare_exchange_weak(off, aligned + size,
-                        std::memory_order_relaxed)) {
-                    r->live_bytes.fetch_add(size, std::memory_order_relaxed);
-                    *out_alloc_size = size;
-                    return r->base + aligned;
-                }
-                continue;  // retry
-            }
-            // Region full.  Check older regions for one that was reset OR
-            // has free-list slots we can reuse.
-            Region* scan = r->next;
-            while (scan) {
-                if (scan->free_head != 0) {
-                    if (void* p = tryFreeList(scan, size, out_alloc_size))
-                        return p;
-                }
-                if (scan->live_bytes.load(std::memory_order_relaxed) == 0 &&
-                    scan->offset.load(std::memory_order_relaxed) == kDataStart) {
-                    off = scan->offset.load(std::memory_order_relaxed);
-                    aligned = (off + 15) & ~15ULL;
-                    if (aligned + size <= scan->capacity) {
-                        if (scan->offset.compare_exchange_weak(off, aligned + size,
-                                std::memory_order_relaxed)) {
-                            scan->live_bytes.fetch_add(size, std::memory_order_relaxed);
-                            *out_alloc_size = size;
-                            return scan->base + aligned;
-                        }
-                    }
-                }
-                scan = scan->next;
-            }
-            break;
+        Region* b = shard.bump;
+        if (b) {
+            if (void* p = tryFreeList(b, size, out_alloc_size)) return p;
+            if (void* p = bumpInto(b, size, out_alloc_size)) return p;
         }
-        // Need new region
+        Region* empty = nullptr;
+        for (Region* scan = shard.current; scan; scan = scan->next) {
+            if (scan == b || scan->draining.load(std::memory_order_relaxed)) continue;
+            if (scan->free_head != 0) {
+                if (void* p = tryFreeList(scan, size, out_alloc_size)) return p;
+            } else if (!empty && isEmpty(scan)) {
+                empty = scan;
+            }
+        }
+        if (empty) {
+            shard.bump = empty;
+            return bumpInto(empty, size, out_alloc_size);
+        }
         Region* nr = newRegion();
         if (!nr) return nullptr;
         nr->next = shard.current;
-        size_t off = nr->offset.load(std::memory_order_relaxed);
-        size_t aligned = (off + 15) & ~15ULL;
-        nr->offset.store(aligned + size, std::memory_order_relaxed);
-        nr->live_bytes.store(size, std::memory_order_relaxed);
+        shard.bump = nr;
+        void* p = bumpInto(nr, size, out_alloc_size);
         publish(shard, nr);
-        *out_alloc_size = size;
-        return nr->base + aligned;
+        return p;
     }
 
 public:
@@ -286,8 +302,15 @@ public:
     void init(int node = -1) {
         node_ = node;
         pin_mode_ = detectPinMode();
-        for (int s = 0; s < kCompressStoreShards; ++s)
-            publish(shards_[s], newRegion());
+        if (const char* v = std::getenv("SMASH_STORE_DRAIN_PCT")) {
+            const int x = std::atoi(v);
+            drain_pct_ = x < 0 ? 0u : (x > 100 ? 100u : static_cast<unsigned>(x));
+        }
+        for (int s = 0; s < kCompressStoreShards; ++s) {
+            Region* r = newRegion();
+            shards_[s].bump = r;
+            publish(shards_[s], r);
+        }
     }
 
     // Memory held by this store's blobs, for the SIGUSR2 stats line. Takes no
@@ -299,15 +322,51 @@ public:
     // region keeps resident: live plus free-list holes (a reset region,
     // decommitted, holds only its header). The counts are racy by the blobs
     // stored or released during the walk, which is fine for a dump.
-    void usage(size_t* live, size_t* held, size_t* regions) const {
+    void usage(size_t* live, size_t* held, size_t* regions, size_t* draining = nullptr) const {
         for (const Shard& shard : shards_) {
             for (const Region* r = __atomic_load_n(&shard.current, __ATOMIC_ACQUIRE); r;
                  r = r->next) {
                 *live += r->live_bytes.load(std::memory_order_relaxed);
                 *held += r->offset.load(std::memory_order_relaxed);
                 ++*regions;
+                if (draining && r->draining.load(std::memory_order_relaxed)) ++*draining;
             }
         }
+    }
+
+    // Marks every region that has used at least kDrainMinUsed and holds less
+    // than `pct` percent of it live (SMASH_STORE_DRAIN_PCT, default 50; 0 =
+    // never). A draining bump region stops being one. Returns the number of
+    // regions draining now. The caller then moves their blobs out: for each
+    // page whose blob is in one (draining()), under the page lock, store a
+    // copy here, repoint the page, release the old blob.
+    size_t markDraining(unsigned pct) {
+        size_t n = 0;
+        for (Shard& shard : shards_) {
+            LockGuard guard(shard.lock);
+            for (Region* r = shard.current; r; r = r->next) {
+                if (r->draining.load(std::memory_order_relaxed)) { ++n; continue; }
+                const size_t used = r->offset.load(std::memory_order_relaxed) - kDataStart;
+                const size_t live = r->live_bytes.load(std::memory_order_relaxed);
+                if (pct == 0 || live == 0 || used < kDrainMinUsed || live * 100 >= used * pct)
+                    continue;
+                r->draining.store(true, std::memory_order_relaxed);
+                if (shard.bump == r) shard.bump = nullptr;
+                ++n;
+            }
+        }
+        return n;
+    }
+    size_t markDraining() { return markDraining(drain_pct_); }
+
+    // Whether the region holding `blob` (a pointer this store type returned)
+    // is draining. Lock-free; a hint until rechecked under the page lock.
+    static bool draining(const void* blob) {
+        return regionOf(const_cast<void*>(blob))->draining.load(std::memory_order_relaxed);
+    }
+    // The store that mapped the region holding `blob`.
+    static CompressStore* ownerOf(const void* blob) {
+        return regionOf(const_cast<void*>(blob))->owner;
     }
 
     // Push a fresh region to the head of each shard's chain.
@@ -319,6 +378,7 @@ public:
             Region* nr = newRegion();
             if (nr) {
                 nr->next = shards_[s].current;
+                shards_[s].bump = nr;
                 publish(shards_[s], nr);
             }
         }

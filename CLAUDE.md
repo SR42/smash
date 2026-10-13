@@ -42,7 +42,7 @@ codegen bug: [agents/sanitizers.md](agents/sanitizers.md).
 cd build && ctest --output-on-failure
 ```
 
-All 126 tests must pass; none are registered `DISABLED`. Run the suite **as root** too when touching the compressor: idle-page read tracking only exists with root (and `SMASH_WRITE_TRACK=yt` only with the youngtrace module loaded), and CI (`.github/workflows/ci.yml`, `ubuntu-latest` + `macos-latest`, every push and PR) runs unprivileged. After ctest, CI runs `bench/run_quick_ci.py` (`bench_rss` ≥30 %, `bench_sqlite --quick` ≥5 % RSS reduction).
+All 128 tests must pass; none are registered `DISABLED`. Run the suite **as root** too when touching the compressor: idle-page read tracking only exists with root (and `SMASH_WRITE_TRACK=yt` only with the youngtrace module loaded), and CI (`.github/workflows/ci.yml`, `ubuntu-latest` + `macos-latest`, every push and PR) runs unprivileged. After ctest, CI runs `bench/run_quick_ci.py` (`bench_rss` ≥30 %, `bench_sqlite --quick` ≥5 % RSS reduction).
 
 **Before changing a test or its threshold, read its entry in [agents/tests.md](agents/tests.md).** Thresholds encode measurements, several tests are probabilistic (one run is not a verdict), and some harness shapes (sharing a process between phases, `fork()` with smash threads running) reproduce the very symptom under test.
 
@@ -174,6 +174,7 @@ One line each; the incident and measurements behind each are in [agents/conventi
 - Fine-grained locking: per-slab and per-page spinlocks, no global heap lock. `PageLockTable::tryLock()` for prefetch, to avoid deadlock.
 - NUMA node arenas (`malloc_numa` → `VmRegion::allocatePagesOnNode`) grow in 64 MiB grid-aligned `mbind`-ed chunks off the shared bump pointer (no fixed per-node slices). Freed node pages go back to **their own** arena, never the shared free lists. Each node arena has its own free map and its own decommit queue and thread; nothing on one node touches another node's lock, queue or thread. Any `MAP_FIXED` over a node page must call `vm::g_after_remap_hook` to rebind it.
 - Blobs are stored via `workerStore(worker)` and released via `storeOfBlob(page_idx)`, which is only a performance hint: `CompressStore::release` forwards by region owner. Keep a wrong guess harmless — heap pages migrate between nodes.
+- Read or change `compressed_[i]` only under page `i`'s lock: store compaction moves blobs (`moveBlobOutOfDraining`), and the lock is all that keeps a reader off the old copy.
 - Double-free detection needs **both** the thread-cache lane scan (the common case) and the `Span::deallocate` bitmap check, and must **drop** the second free, or `--allocated_count` underflows.
 - Never export both `name@@VER` and `name@VER` for one interposed function (the forwarder jumps to itself). List only the `_NN` alias in the version script.
 - The generated version script must be a `LINK_DEPENDS` of `smash` and `smash_noopt`, or editing it relinks nothing.

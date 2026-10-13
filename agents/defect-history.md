@@ -265,3 +265,26 @@ attempt per page, 32752 of 32768 declined before any codec ran
 which makes `shouldCompress()` return true at once: tests that set it never
 reach the decline path.
 
+
+## The blob store kept regions of holes (fixed 2026-10-13)
+
+A 128-core application's `[smash stats]` showed `blob=1735/5208MiB(338 regions)`
+at one dump and `blob=1627/15717MiB(1078 regions)` three hours later: live
+blob bytes flat, the memory holding them tripled, 10 GiB of a 46 GiB RSS
+growth. The store packs blobs into 16 MiB regions with a bump pointer. A freed
+blob became a hole on its region's free list, reused only by a blob that fit
+it (no coalescing), and a region was decommitted only when its last blob went.
+Under compress/decompress churn every region ended up a few live blobs among
+holes. A second defect hid under it: a region that did empty was found by the
+next store once the shard's head region was full, took that one blob, and was
+then never bumped into again, so the next store mapped a new region.
+
+Now each shard has a bump region separate from its chain head (an emptied
+region becomes it and fills by bump), and `markDraining()` (each tick, before
+Phase 1) marks every region with at least 1 MiB used and less than
+`SMASH_STORE_DRAIN_PCT` (50) % of it live, the bump region included. Draining
+regions get no new blobs; Phase 1 moves the blob of each compressed or shadow
+page it finds in one into the same store under the page lock, and the region
+empties and is decommitted. Measurements and tests: `SMASH_STORE_DRAIN_PCT` in
+[config.md](config.md), `compress_store_test` and `test_blob_compact` in
+[tests.md](tests.md).

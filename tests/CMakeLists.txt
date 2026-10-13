@@ -782,6 +782,16 @@ if(NOT APPLE)
     "SMASH_STATS_SIGNAL=1" "SMASH_DEFER_PHASES_MS=0" "SMASH_COLD_TIMEOUT_SEC=1"
     $<TARGET_FILE:blob_rss_test>)
   set_tests_properties(test_blob_rss PROPERTIES TIMEOUT 180)
+
+  # Freed compressed data must give its blob memory back, and the blobs moved
+  # to do it must decompress correctly (blob_compact_test.cpp).
+  add_executable(blob_compact_test blob_compact_test.cpp)
+  target_link_libraries(blob_compact_test PRIVATE ${CMAKE_DL_LIBS})
+  add_test(NAME test_blob_compact COMMAND ${CMAKE_COMMAND} -E env
+    "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=1"
+    "SMASH_STATS_SIGNAL=1" "SMASH_DEFER_PHASES_MS=0" "SMASH_COLD_TIMEOUT_SEC=1"
+    $<TARGET_FILE:blob_compact_test>)
+  set_tests_properties(test_blob_compact PROPERTIES TIMEOUT 240)
 endif()
 
 # SMASH_WRITE_TRACK=idle|yt: the page_idle bitmap, or the youngtrace module's
@@ -823,6 +833,10 @@ endif()
 
 # The reader of youngtrace's scanner output, on hand-built streams.
 smash_add_test(yt_stream_test yt_stream_test.cpp)
+
+# The compressed-blob store: an emptied region is refilled, a sparse region
+# drains and goes back to the OS (compress_store_test.cpp).
+smash_add_test(compress_store_test compress_store_test.cpp)
 
 # An idle 1 GiB must actually leave RSS with default timings, in each
 # write-tracking mode: page protection (SMASH_SOFTDIRTY=0), the default

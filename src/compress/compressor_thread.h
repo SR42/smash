@@ -562,6 +562,9 @@ class CompressorThread {
     // their sum over the scan period: what a slice scanned this tick credits.
     uint32_t idle_inc_ring_[64] = {};
     uint32_t idle_scan_elapsed_ = 1;
+    // Store regions draining this tick (markDrainingRegions); phase 1 moves
+    // blobs only while it is non-zero.
+    size_t draining_regions_ = 0;
     std::chrono::steady_clock::time_point last_tick_start_{};
     uint32_t test_next_tick_ms_ = 0;   // pretendNextTickAfterMs (unit tests)
     int phase3_idle_ticks_ = 0;  // P2.1 selective Phase 3 skip
@@ -668,6 +671,9 @@ class CompressorThread {
         // SMASH_WRITE_TRACK=yt: phase 1's youngtrace requests, cumulative us,
         // requests, pages they covered, and requests that failed or were cut.
         std::atomic<uint64_t> sc_yt_us{0}, sc_yt_n{0}, yt_pages{0}, yt_cut{0};
+        // Blob store compaction: blobs moved out of draining regions, and
+        // their bytes.
+        std::atomic<uint64_t> blob_moved{0}, blob_moved_bytes{0};
     };
     PipelineCounters pc_;
     enum FaultKind { kFaultCompressed, kFaultShadow, kFaultMonitor, kFaultActive };
@@ -1872,6 +1878,9 @@ private:
                 const uint8_t prev = cold_count_[i];
                 cold_count_[i] = advanceCold(prev, 0);
                 decayRecompressCount(i, prev);
+                if (draining_regions_) moveBlobOutOfDraining(i);
+            } else if (st == PageState::COMPRESSED_SHADOW) {
+                if (draining_regions_) moveBlobOutOfDraining(i);
             }
         });
         finishGroup();
@@ -6081,6 +6090,51 @@ private:
         storeOfBlob(page_idx)->release(old_data, old_alloc, page_idx);
     }
 
+    // Blob store compaction. Each store marks its regions that are mostly
+    // holes (CompressStore::markDraining); returns how many are draining.
+    size_t markDrainingRegions() {
+        size_t n = store_ ? store_->markDraining() : 0;
+#if defined(__linux__)
+        for (uint32_t g = 0; g < vm::kMaxNumaNodes; ++g)
+            if (NodeGroup* ng = __atomic_load_n(&node_groups_[g], __ATOMIC_ACQUIRE))
+                if (ng->store) n += ng->store->markDraining();
+#endif
+        return n;
+    }
+
+    // Phase 1, for a compressed or shadow page while some region drains: if
+    // its blob is in a draining region, copy it into the same store (never
+    // into a draining region), repoint the page and release the old blob, so
+    // the region empties and is decommitted. Under the page lock, like every
+    // reader of compressed_[]; a contended page waits for a later tick. The
+    // owner store is kept, so a node store's blob stays on its node.
+    void moveBlobOutOfDraining(size_t i) {
+        void* old = compressed_[i].data;
+        if (!old || (page_tier_ && page_tier_[i] == kTierSpilled) || spill_.contains(old) ||
+            !CompressStore::draining(old))
+            return;
+        if (!locks_->tryLock(i)) return;
+        const PageState st = states_->get(i);
+        old = compressed_[i].data;
+        if ((st != PageState::COMPRESSED && st != PageState::COMPRESSED_SHADOW) || !old ||
+            (page_tier_ && page_tier_[i] == kTierSpilled) || spill_.contains(old) ||
+            !CompressStore::draining(old)) {
+            locks_->unlock(i);
+            return;
+        }
+        const size_t csz = compressed_[i].compressedSize();
+        const size_t old_alloc = compressed_[i].alloc_size;
+        CompressStore* const owner = CompressStore::ownerOf(old);
+        size_t new_alloc = 0;
+        void* moved = owner->store(old, csz, &new_alloc, i);
+        if (!moved) { locks_->unlock(i); return; }
+        compressed_[i].set(moved, csz, new_alloc, compressed_[i].algorithm());
+        locks_->unlock(i);
+        owner->release(old, old_alloc, i);
+        pcAdd(pc_.blob_moved, 1);
+        pcAdd(pc_.blob_moved_bytes, csz);
+    }
+
     void releaseBlob(size_t page_idx) {
         // Zero-page sentinel: no blob was ever stored.
         if (!compressed_[page_idx].data) return;
@@ -6417,6 +6471,10 @@ private:
         // idle bit for ACTIVE_MONITORING pages as the fault-free read signal.
         (void)ensureIdleReadFds();
 #endif
+
+        // Blob store compaction: mark the regions to empty; phase 1 moves
+        // the blobs it finds in them (moveBlobOutOfDraining).
+        draining_regions_ = markDrainingRegions();
 
         dispatch(1);  // Phase 1: access tracking
 
@@ -7371,12 +7429,12 @@ public:
     // Blob memory over every store: the shared one and each node group's.
     // Lock-free (CompressStore::usage); node groups are created once in
     // start() and never freed.
-    void blobUsage(size_t* live, size_t* held, size_t* regions) const {
-        if (store_) store_->usage(live, held, regions);
+    void blobUsage(size_t* live, size_t* held, size_t* regions, size_t* draining) const {
+        if (store_) store_->usage(live, held, regions, draining);
 #if defined(__linux__)
         for (uint32_t n = 0; n < vm::kMaxNumaNodes; ++n)
             if (const NodeGroup* g = __atomic_load_n(&node_groups_[n], __ATOMIC_ACQUIRE))
-                if (g->store) g->store->usage(live, held, regions);
+                if (g->store) g->store->usage(live, held, regions, draining);
 #endif
     }
 
@@ -7441,8 +7499,8 @@ public:
         BootstrapAlloc::instance().usage(&boot_used, &boot_cap, &boot_regions);
         // What compression costs and what is left: blob memory across the
         // shared store and every node group's, and the process's RSS.
-        size_t blob_live = 0, blob_held = 0, blob_regions = 0;
-        self->blobUsage(&blob_live, &blob_held, &blob_regions);
+        size_t blob_live = 0, blob_held = 0, blob_regions = 0, blob_draining = 0;
+        self->blobUsage(&blob_live, &blob_held, &blob_regions, &blob_draining);
         const size_t rss = processRssBytes();
         char buf[4096];   // stats + pipeline + phase time lines; ~1.6 KB on a 145 GB heap
         int n = smash::safe_snprintf(buf, sizeof(buf),
@@ -7450,7 +7508,7 @@ public:
             "  compressing=%zu  compressed=%zu  shadow=%zu  empty=%zu"
             "  tier_up=%llu/%llu  spilled=%zu  zero=%llu  bump=%zu"
             "  reheat=%llu  track=%s  boot=%zu/%zuMiB(%zu regions)"
-            "  rss=%zuMiB  blob=%zu/%zuMiB(%zu regions)\n",
+            "  rss=%zuMiB  blob=%zu/%zuMiB(%zu regions, %zu draining, %lluMiB moved)\n",
             ts, (int)getpid(), total, active, monitor, compressing, compressed,
             shadow, empty,
             (unsigned long long)tier_success,
@@ -7461,7 +7519,9 @@ public:
             (unsigned long long)g_reheat_events.load(std::memory_order_relaxed),
             writeTrackerName(self->write_tracker_),
             boot_used >> 20, boot_cap >> 20, boot_regions,
-            rss >> 20, blob_live >> 20, blob_held >> 20, blob_regions);
+            rss >> 20, blob_live >> 20, blob_held >> 20, blob_regions, blob_draining,
+            static_cast<unsigned long long>(
+                self->pc_.blob_moved_bytes.load(std::memory_order_relaxed) >> 20));
         // Where pages go in the pipeline (see PipelineCounters).
         if (n > 0 && static_cast<size_t>(n) < sizeof(buf)) {
             const auto& pc = self->pc_;
