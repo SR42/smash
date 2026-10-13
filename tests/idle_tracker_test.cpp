@@ -1,5 +1,6 @@
-// idle_tracker_test.cpp - SMASH_WRITE_TRACK=idle: the page_idle bitmap as the
-// only access signal, with nothing protected to watch a page.
+// idle_tracker_test.cpp - SMASH_WRITE_TRACK=idle|yt: the page_idle bitmap, or
+// the youngtrace module's page-table walk, as the only access signal, with
+// nothing protected to watch a page. The tracker comes from the environment.
 //
 // Added for a 128-core arm64 application on a 6.6 kernel, where the only
 // write tracking was page protection (SMASH_SOFTDIRTY=0): every first write
@@ -15,12 +16,21 @@
 // decompression, no shadow, no monitor fault: nothing watched, nothing hot
 // compressed), Phase 3 must arm nothing, the scan must have covered pages,
 // the arena must be MADV_NOHUGEPAGE (VmFlags nh), and every byte must read
-// back. Run with the default scan period (a slice every 4 ticks) and with
+// back. Run with the default scan period (a slice every 4 ticks), where the
+// scan must cover no more than its 1/4 share of the arena per tick, and with
 // SMASH_IDLE_SCAN_TICKS=1 (every tick).
 //
-// IDLE_PART=fallback (any user): with SMASH_THP=1 the tracker must refuse,
-// say why on stderr, and fall back to page protection, which still
-// compresses the idle block.
+// yt (the module loaded, root): the same, minus the MADV_NOHUGEPAGE check (a
+// huge page is one item there, which is conservative, so the arena keeps the
+// host's THP setting), plus no cut request: every request must fit the
+// module's buffer. And once with SMASH_THP=1 and 640-page requests
+// (SMASH_YT_REQ_PAGES), so request edges split huge pages: a huge page has
+// one accessed bit, which the first request covering it clears, so the part
+// the next request covers must have been marked by the first.
+//
+// IDLE_PART=fallback (any user): the tracker must refuse - idle with
+// SMASH_THP=1, yt with SMASH_YT_DEVICE naming no device - say why on stderr,
+// and fall back to page protection, which still compresses the idle block.
 #include <atomic>
 #include <chrono>
 #include <csignal>
@@ -107,10 +117,22 @@ std::string vmFlags(const void* p) {
     return out;
 }
 
-bool idleUsable() {
+bool yt() {
+    const char* t = std::getenv("SMASH_WRITE_TRACK");
+    return t && std::strcmp(t, "yt") == 0;
+}
+
+bool trackerUsable() {
     if (geteuid() != 0) return false;
-    if (access("/sys/kernel/mm/page_idle/bitmap", R_OK | W_OK) != 0) return false;
-    return true;
+    return access(yt() ? "/dev/youngtrace/scanner" : "/sys/kernel/mm/page_idle/bitmap", R_OK | W_OK) == 0;
+}
+
+// The "<key>N (C calls, P pages" counters of the syscall line.
+unsigned long long scanPages(const std::string& log, const char* key) {
+    const size_t at = log.rfind(key);
+    if (at == std::string::npos) return ~0ull;
+    const size_t c = log.find(" calls, ", at);
+    return c == std::string::npos ? ~0ull : std::strtoull(log.c_str() + c + 8, nullptr, 10);
 }
 
 }  // namespace
@@ -119,8 +141,9 @@ int main() {
     if (!dlsym(RTLD_DEFAULT, "smash_in_arena")) { std::printf("SKIP: not running under libsmash\n"); return 0; }
     const char* part_env = std::getenv("IDLE_PART");
     const std::string part = part_env ? part_env : "tracker";
-    if (part == "tracker" && !idleUsable()) {
-        std::printf("SKIP: needs root and /sys/kernel/mm/page_idle/bitmap\n");
+    if (part == "tracker" && !trackerUsable()) {
+        std::printf("SKIP: needs root and %s\n",
+                    yt() ? "the youngtrace module (/dev/youngtrace/scanner)" : "/sys/kernel/mm/page_idle/bitmap");
         return 0;
     }
     char path[] = "/tmp/smash_idletrack_XXXXXX";
@@ -172,8 +195,9 @@ int main() {
 
     if (part == "fallback") {
         if (track != "protread") fail("track=" + track + ", want protread after the refusal");
-        if (after.find("SMASH_WRITE_TRACK=idle unavailable: SMASH_THP=1") == std::string::npos)
-            fail("no warning naming SMASH_THP=1");
+        const char* why = yt() ? "SMASH_WRITE_TRACK=yt unavailable: /nonexistent/youngtrace/scanner cannot be opened"
+                               : "SMASH_WRITE_TRACK=idle unavailable: SMASH_THP=1";
+        if (after.find(why) == std::string::npos) fail(std::string("no warning: ") + why);
         if (failures) return 1;
         std::printf("idle_tracker_test (fallback): all checks passed\n");
         return 0;
@@ -188,18 +212,33 @@ int main() {
         return f == std::string::npos ? ~0ull : std::strtoull(log.c_str() + f + std::strlen(k), nullptr, 10);
     };
     const unsigned long long f_mon = faultField(after, "monitor="), armed = field(after, "p3 armed="),
-                             pages = field(after, " calls, ");
+                             pages = scanPages(after, yt() ? "yt_scan=" : "idle_scan="),
+                             cut = yt() ? field(after, " cut=") : 0;
     const unsigned long long d_shadow = faultField(after, " shadow=") - faultField(before, " shadow="),
                              d_comp = faultField(after, " compressed=") - faultField(before, " compressed=");
     std::printf("over 6 s of hot traffic: faults shadow=+%llu compressed=+%llu; total monitor=%llu, "
-                "p3 armed=%llu, idle-scanned pages=%llu; arena VmFlags:%s",
+                "p3 armed=%llu, scanned pages=%llu; arena VmFlags:%s",
                 d_shadow, d_comp, f_mon, armed, pages, flags.c_str());
-    if (track != "idle") fail("track=" + track + ", want idle");
+    const std::string want = yt() ? "yt" : "idle";
+    if (track != want) fail("track=" + track + ", want " + want);
     if (d_shadow != 0 || d_comp != 0) fail("hot pages were compressed (faults on shadow/compressed pages)");
     if (f_mon != 0) fail("monitor faults: pages were watched");
     if (armed != 0) fail("Phase 3 armed pages");
     if (pages == 0 || pages == ~0ull) fail("the idle scan covered no pages");
-    if (flags.find(" nh") == std::string::npos) fail("the arena is not MADV_NOHUGEPAGE");
+    if (!yt() && flags.find(" nh") == std::string::npos) fail("the arena is not MADV_NOHUGEPAGE");
+    if (cut != 0) fail("youngtrace requests failed or were cut: cut=" + std::to_string(cut));
+    // SMASH_IDLE_SCAN_TICKS=K scans 1/K of the arena per tick: over the
+    // window, at most ticks/K + 2 arenas' worth (the slices fall due in
+    // whole slices, so a tick can take more than its share).
+    const char* k_env = std::getenv("SMASH_IDLE_SCAN_TICKS");
+    const unsigned long long k = k_env ? std::strtoull(k_env, nullptr, 10) : 4,
+                             d_pages = pages - scanPages(before, yt() ? "yt_scan=" : "idle_scan="),
+                             d_ticks = field(after, "ticks=") - field(before, "ticks="),
+                             committed = field(after, "committed=");
+    std::printf("scan over the window: %llu pages in %llu ticks, %llu pages committed, K=%llu\n", d_pages,
+                d_ticks, committed, k);
+    if (k > 1 && d_pages > committed * (d_ticks / k + 2))
+        fail("the scan covered more than 1/K of the arena per tick");
     if (failures) return 1;
     std::printf("idle_tracker_test: all checks passed\n");
     return 0;

@@ -15,6 +15,7 @@
 #include "spill_store.h"
 #include "compress_engine.h"
 #include "compression_roi.h"
+#include "yt_stream.h"
 #include "../vm/vm_region.h"
 #include "../vm/page_state.h"
 #include "../vm/platform_mem.h"
@@ -664,6 +665,9 @@ class CompressorThread {
         // bitmap read and re-mark), cumulative us, system calls, and pages
         // scanned.
         std::atomic<uint64_t> sc_idle_us{0}, sc_idle_n{0}, idle_pages{0};
+        // SMASH_WRITE_TRACK=yt: phase 1's youngtrace requests, cumulative us,
+        // requests, pages they covered, and requests that failed or were cut.
+        std::atomic<uint64_t> sc_yt_us{0}, sc_yt_n{0}, yt_pages{0}, yt_cut{0};
     };
     PipelineCounters pc_;
     enum FaultKind { kFaultCompressed, kFaultShadow, kFaultMonitor, kFaultActive };
@@ -802,7 +806,11 @@ class CompressorThread {
     //               per-tick clear_refs/pagemap work that did nothing)
     //   kProtRead   Phase 3 mprotect(PROT_READ) monitoring (SMASH_SOFTDIRTY=0,
     //               or /proc unavailable — both as before)
-    enum class WriteTracker : int8_t { kUnprobed = -1, kSoftDirty, kUffd, kNone, kProtRead, kIdle };
+    //   kIdle       SMASH_WRITE_TRACK=idle: the page_idle bitmap, reads and
+    //               writes alike, nothing protected (needs CAP_SYS_ADMIN)
+    //   kYt         SMASH_WRITE_TRACK=yt: the same, read from the ACCESSED
+    //               bits by the youngtrace module's page-table walk
+    enum class WriteTracker : int8_t { kUnprobed = -1, kSoftDirty, kUffd, kNone, kProtRead, kIdle, kYt };
     WriteTracker write_tracker_ = WriteTracker::kUnprobed;
     // The userfaultfd behind kUffd. Static so the remapPages() hook — a plain
     // function pointer running in fault paths — can reach it.
@@ -1423,6 +1431,9 @@ public:
         // in the child since PFNs and privilege may differ; reset the cache.
         if (page_idle_fd_ >= 0)  { close(page_idle_fd_);  page_idle_fd_ = -1; }
         idle_read_ok_ = -1;
+        // The youngtrace descriptors' open files are shared with the parent,
+        // and each holds one scan's output: the child opens its own.
+        ytCloseAll();
         // The child inherits the userfaultfd but not the registration (no
         // UFFD_FEATURE_EVENT_FORK), so it must choose and register afresh.
         if (int ufd = s_uffd_fd_.exchange(-1); ufd >= 0) close(ufd);
@@ -1762,11 +1773,12 @@ private:
 #endif
         const auto range_t0 = std::chrono::steady_clock::now();
         const uint32_t cold_floor = ROIConfig::instance().cold_ticks_floor;
-        // SMASH_WRITE_TRACK=idle: the bitmap scan supplies accessed_ for the
+        // SMASH_WRITE_TRACK=idle|yt: the scan supplies accessed_ for the
         // slices due this tick; the others are left for their own tick.
-        const bool idle_track = write_tracker_ == WriteTracker::kIdle;
+        const bool idle_track = scanTracker();
 #ifdef __linux__
-        if (idle_track) idleScan(start, end);
+        if (write_tracker_ == WriteTracker::kIdle) idleScan(start, end);
+        else if (write_tracker_ == WriteTracker::kYt) ytScan(start, end);
 #endif
         // Coarse watching: each group's uncompressed pages end the scan with
         // the group's lowest cold count (see watch_group_). Watching is what
@@ -4914,6 +4926,10 @@ private:
         // probeIdleTracker() says why and page protection takes over.
         if (const char* t = std::getenv("SMASH_WRITE_TRACK"); t && std::strcmp(t, "idle") == 0)
             return probeIdleTracker() ? WriteTracker::kIdle : WriteTracker::kProtRead;
+        // SMASH_WRITE_TRACK=yt: the same, with the youngtrace module as the
+        // source (probeYtTracker() says why when it cannot be used).
+        if (const char* t = std::getenv("SMASH_WRITE_TRACK"); t && std::strcmp(t, "yt") == 0)
+            return probeYtTracker() ? WriteTracker::kYt : WriteTracker::kProtRead;
         // SMASH_SOFTDIRTY=0, and /proc being unavailable, keep their old
         // meaning: Phase 3 PROT_READ monitoring.
         if (!isSoftDirtyEnabled() || !ensureSoftDirtyFds()) return WriteTracker::kProtRead;
@@ -4956,6 +4972,7 @@ private:
             case WriteTracker::kNone:      return "none";
             case WriteTracker::kProtRead:  return "protread";
             case WriteTracker::kIdle:      return "idle";
+            case WriteTracker::kYt:        return "yt";
             default:                       return "unprobed";
         }
     }
@@ -5097,9 +5114,20 @@ private:
         }();
         return k;
     }
+    // Trackers that scan an access bit (idle, yt) instead of protecting pages.
+    bool scanTracker() const {
+        return write_tracker_ == WriteTracker::kIdle || write_tracker_ == WriteTracker::kYt;
+    }
+    // yt's slices are 64 MiB (a node arena chunk): every request costs the
+    // module a zeroing of its whole output buffer (~110 us at the default
+    // 8 MiB), so a request should cover as much as it can.
+    static constexpr size_t kYtSliceShift = 14;     // 16384 pages = 64 MiB
+    size_t sliceShift() const {
+        return write_tracker_ == WriteTracker::kYt ? kYtSliceShift : kIdleSliceShift;
+    }
     bool idleSliceDue(size_t page_idx) const {
         const uint32_t k = idleScanTicks();
-        return k == 1 || ((page_idx >> kIdleSliceShift) + tick_counter_) % k == 0;
+        return k == 1 || ((page_idx >> sliceShift()) + tick_counter_) % k == 0;
     }
 
     bool probeIdleTracker() {
@@ -5211,6 +5239,253 @@ private:
         pcAdd(pc_.sc_idle_us, (monoNs() - t0) / 1000);
         pcAdd(pc_.sc_idle_n, calls);
         pcAdd(pc_.idle_pages, pages);
+    }
+
+    // ── SMASH_WRITE_TRACK=yt ──────────────────────────────────────────────
+    //
+    // The youngtrace module (the `yt` tree) as the access source. A request
+    // written to /dev/youngtrace/scanner walks this process's page tables over
+    // [lo, hi) under mmap_read_lock, reports every present page whose ACCESSED
+    // bit is set and clears it (mode=1). Like the idle tracker it sees reads
+    // and writes alike and protects nothing, so the application takes no
+    // fault until a page is compressed; a write that races compression is
+    // caught by the snapshot verify (FixAv). Unlike the idle tracker it needs
+    // no PFNs and no rmap walk: measured as root on an x86 VM, 8-28 ns per
+    // 4 KiB page against the bitmap's 380-440, plus ~110 us per request, most
+    // of it the module zeroing its whole output buffer (scan_buf_cap, 8 MiB
+    // by default) after each scan. Hence 64 MiB slices, and requests as large
+    // as the buffer can always hold (yt::kMaxBytesPerPage).
+    //
+    // Needs the module loaded and the device openable: CAP_SYS_ADMIN (the
+    // module checks it at open) and access to the root-only node.
+    //
+    // A transparent huge page is one item: all 512 of its pages read
+    // accessed when any is touched, so a cold 4 KiB page inside a hot huge
+    // page is never compressed. Conservative, never wrong; the arena is left
+    // as the host's THP setting makes it.
+    //
+    // One mode=1 reader per process: the module keeps no state between
+    // requests, but a second reader of this process (yt's own daemon
+    // scanning it) clears the bits this tracker reads, and each would take
+    // the other's scans for idle time.
+    static constexpr int kYtSlots = 8;
+    static constexpr size_t kYtBufBytes = 32 * 1024;
+    // One open descriptor per concurrent phase-1 range: the module keeps the
+    // last scan's output per descriptor, so two threads must never share
+    // one. Each descriptor costs the module a scan_buf_cap buffer once it
+    // has scanned, hence a fixed pool, opened by the probe and not changed
+    // after it; a thread finding every slot busy waits for one.
+    struct YtSlot {
+        std::atomic<uint8_t> busy{0};
+        int fd = -1;
+        unsigned char* buf = nullptr;
+    };
+    YtSlot yt_slots_[kYtSlots];
+    size_t yt_req_pages_ = 0;        // pages per request: never cut by the module
+    std::atomic<bool> yt_warned_{false};
+
+    static const char* ytDevice() {
+        const char* d = std::getenv("SMASH_YT_DEVICE");
+        return d && *d ? d : "/dev/youngtrace/scanner";
+    }
+
+    struct YtResult { bool ok; uint64_t reached; };
+
+    // One scan of [lo, hi) through `slot`: on_young(addr, pages) for every
+    // page reported accessed. ok=false when the request failed or the output
+    // was cut or unreadable; `reached` is then where reporting stopped.
+    template <class F>
+    YtResult ytRequest(YtSlot& slot, uintptr_t lo, uintptr_t hi, F&& on_young) {
+        char req[96];
+        const int n = smash::safe_snprintf(req, sizeof(req), "pid=%d mode=1 lo=0x%lx hi=0x%lx",
+                                           static_cast<int>(getpid()), static_cast<unsigned long>(lo),
+                                           static_cast<unsigned long>(hi));
+        if (n <= 0 || static_cast<size_t>(n) >= sizeof(req) ||
+            ::write(slot.fd, req, static_cast<size_t>(n)) != n)
+            return {false, 0};
+        yt::StreamParser ps;
+        size_t have = 0;
+        off_t off = 0;
+        for (;;) {
+            const ssize_t got = ::pread(slot.fd, slot.buf + have, kYtBufBytes - have, off);
+            if (got < 0 && errno == EINTR) continue;
+            if (got < 0) return {false, ps.reached()};
+            if (got == 0) break;
+            off += got;
+            have += static_cast<size_t>(got);
+            const size_t used = ps.feed(slot.buf, have, on_young);
+            if (ps.malformed()) return {false, ps.reached()};
+            std::memmove(slot.buf, slot.buf + used, have - used);
+            have -= used;
+        }
+        return {have == 0 && ps.complete() && !ps.truncated(), ps.reached()};
+    }
+
+    YtSlot* ytAcquire() {
+        for (;;) {
+            bool any = false;
+            for (YtSlot& s : yt_slots_) {
+                if (s.fd < 0 || !s.buf) continue;
+                any = true;
+                uint8_t z = 0;
+                if (s.busy.load(std::memory_order_relaxed) == 0 &&
+                    s.busy.compare_exchange_strong(z, 1, std::memory_order_acquire))
+                    return &s;
+            }
+            if (!any) return nullptr;
+            sched_yield();
+        }
+    }
+    void ytRelease(YtSlot* s) { s->busy.store(0, std::memory_order_release); }
+
+    void ytCloseAll() {
+        for (YtSlot& s : yt_slots_) {
+            if (s.fd >= 0) close(s.fd);
+            s.fd = -1;
+            s.busy.store(0, std::memory_order_relaxed);
+        }
+    }
+
+    bool probeYtTracker() {
+        char why[300];
+        why[0] = 0;
+        const char* dev = ytDevice();
+        size_t cap = 64 * 1024;   // the module's minimum, if its parameter cannot be read
+        int fd = vm_ && !vm_->isTrackingMode() ? open(dev, O_RDWR | O_CLOEXEC) : -1;
+        if (!vm_ || vm_->isTrackingMode()) {
+            smash::safe_snprintf(why, sizeof(why), "the arena is not one contiguous range in this mode");
+        } else if (fd < 0) {
+            const int e = errno;
+            smash::safe_snprintf(why, sizeof(why), "%s cannot be opened: %s", dev,
+                e == ENOENT ? "no such device (is the youngtrace module loaded?)"
+                : e == EACCES ? "permission denied (the node is root-only; needs CAP_DAC_OVERRIDE or a udev rule)"
+                : e == EPERM ? "the module requires CAP_SYS_ADMIN"
+                : "open failed");
+        } else {
+            if (int cf = open("/sys/module/youngtrace/parameters/scan_buf_cap", O_RDONLY | O_CLOEXEC); cf >= 0) {
+                char num[32] = {};
+                if (read(cf, num, sizeof(num) - 1) > 0) {
+                    const unsigned long long v = std::strtoull(num, nullptr, 10);
+                    if (v >= 64 * 1024) cap = static_cast<size_t>(v);
+                }
+                close(cf);
+            }
+            yt_req_pages_ = std::min<size_t>((cap - yt::kStatusBytes) / yt::kMaxBytesPerPage,
+                                             size_t{1} << 16);
+            // Tests: smaller requests, so their edges split huge pages.
+            if (const char* q = std::getenv("SMASH_YT_REQ_PAGES"); q && std::atoi(q) > 0)
+                yt_req_pages_ = std::min(yt_req_pages_, static_cast<size_t>(std::atoi(q)));
+            for (YtSlot& s : yt_slots_) {
+                s.fd = -1;
+                s.busy.store(0, std::memory_order_relaxed);
+                if (!s.buf) s.buf = bootstrapArray<unsigned char>(kYtBufBytes);
+            }
+            yt_slots_[0].fd = fd;
+            for (int k = 1; k < kYtSlots; ++k) yt_slots_[k].fd = open(dev, O_RDWR | O_CLOEXEC);
+            // Two pages of our own: written, then scanned twice. The first
+            // scan must report them accessed and the second (nothing touched
+            // in between) must not, or the device is not what this reads.
+            void* scratch = ::mmap(nullptr, 2 * kPageSize, PROT_READ | PROT_WRITE,
+                                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (!yt_slots_[0].buf) {
+                smash::safe_snprintf(why, sizeof(why), "no memory for the read buffers");
+            } else if (scratch == MAP_FAILED) {
+                smash::safe_snprintf(why, sizeof(why), "no scratch page for the self-test");
+            } else {
+                static_cast<volatile char*>(scratch)[0] = 1;
+                static_cast<volatile char*>(scratch)[kPageSize] = 1;
+                const auto lo = reinterpret_cast<uintptr_t>(scratch), hi = lo + 2 * kPageSize;
+                uint64_t seen1 = 0, seen2 = 0;
+                const YtResult r1 = ytRequest(yt_slots_[0], lo, hi, [&](uint64_t, uint64_t p) { seen1 += p; });
+                const YtResult r2 = ytRequest(yt_slots_[0], lo, hi, [&](uint64_t, uint64_t p) { seen2 += p; });
+                ::munmap(scratch, 2 * kPageSize);
+                if (!r1.ok || !r2.ok)
+                    smash::safe_snprintf(why, sizeof(why), "a scan request failed or returned output "
+                                         "this smash cannot read (expects record magic YTV9)");
+                else if (seen1 < 2 || seen2 != 0)
+                    smash::safe_snprintf(why, sizeof(why), "the self-test saw %llu then %llu accessed "
+                                         "pages, expected 2 then 0",
+                                         static_cast<unsigned long long>(seen1),
+                                         static_cast<unsigned long long>(seen2));
+            }
+            if (why[0]) ytCloseAll();   // closes fd too: slot 0 owns it
+        }
+        if (!why[0]) return true;
+        char buf[420];
+        const int n = smash::safe_snprintf(buf, sizeof(buf),
+            "[smash WARN] SMASH_WRITE_TRACK=yt unavailable: %s; using page-protection "
+            "tracking (protread)\n", why);
+        if (n > 0) (void)!::write(2, buf, static_cast<size_t>(n) < sizeof(buf) ? static_cast<size_t>(n)
+                                                                                : sizeof(buf) - 1);
+        return false;
+    }
+
+    // Phase 1's scan of [start, end): sets accessed_ for every due ACTIVE
+    // page the module reports accessed, one request per run of due slices
+    // (split at yt_req_pages_). A failed or cut request counts every page it
+    // did not report on as accessed: in mode=1 their bits may already be
+    // cleared, so the next scan could not tell either.
+    void ytScan(size_t start, size_t end) {
+        if (end > vm_->contigPages()) end = vm_->contigPages();
+        if (start >= end) return;
+        const uint64_t t0 = monoNs();
+        uint64_t calls = 0, pages = 0, cut = 0;
+        const uintptr_t base = reinterpret_cast<uintptr_t>(vm_->pageAddress(0));
+        const uintptr_t arena_hi = base + vm_->contigPages() * kPageSize;
+        auto mark = [&](size_t i) {
+            const PageState st = states_->get(i);
+            if (st == PageState::ACTIVE || st == PageState::ACTIVE_MONITORING)
+                accessed_[i].store(true, std::memory_order_relaxed);
+        };
+        YtSlot* slot = ytAcquire();
+        size_t i = start;
+        while (i < end) {
+            auto next = [&](size_t x) { return std::min(end, ((x >> kYtSliceShift) + 1) << kYtSliceShift); };
+            if (!idleSliceDue(i)) { i = next(i); continue; }
+            size_t run_end = i;
+            while (run_end < end && idleSliceDue(run_end)) run_end = next(run_end);
+            for (size_t a = i; a < run_end;) {
+                const size_t b = std::min(run_end, a + yt_req_pages_);
+                const uintptr_t lo = base + a * kPageSize, hi = base + b * kPageSize;
+                ++calls;
+                pages += b - a;
+                YtResult r{false, 0};
+                if (slot) {
+                    r = ytRequest(*slot, lo, hi, [&](uint64_t addr, uint64_t n) {
+                        // Every arena page the item covers, inside this
+                        // request or not: a huge page straddling a request,
+                        // slice or worker-range edge has one accessed bit,
+                        // which this request has just cleared, so the
+                        // request that covers its other part would read it
+                        // idle. A mark outside the range persists in
+                        // accessed_ until that range's Phase 1 reads it.
+                        if (addr >= arena_hi || n > (arena_hi - base) / kPageSize) return;
+                        const uint64_t s = addr < base ? base : addr;
+                        const uint64_t e = addr + n * kPageSize < arena_hi ? addr + n * kPageSize : arena_hi;
+                        for (uint64_t x = s; x < e; x += kPageSize) mark((x - base) / kPageSize);
+                    });
+                }
+                if (!r.ok) {
+                    ++cut;
+                    const size_t from = r.reached > lo
+                        ? a + std::min<size_t>((r.reached - lo) / kPageSize, b - a) : a;
+                    for (size_t x = from; x < b; ++x) mark(x);
+                    if (!yt_warned_.exchange(true, std::memory_order_relaxed)) {
+                        static const char kWarn[] =
+                            "[smash WARN] SMASH_WRITE_TRACK=yt: a youngtrace scan failed or was cut; "
+                            "the pages it did not report on count as accessed (yt_scan cut= counts them)\n";
+                        (void)!::write(2, kWarn, sizeof(kWarn) - 1);
+                    }
+                }
+                a = b;
+            }
+            i = run_end;
+        }
+        if (slot) ytRelease(slot);
+        pcAdd(pc_.sc_yt_us, (monoNs() - t0) / 1000);
+        pcAdd(pc_.sc_yt_n, calls);
+        pcAdd(pc_.yt_pages, pages);
+        pcAdd(pc_.yt_cut, cut);
     }
 #endif
 
@@ -7239,7 +7514,8 @@ public:
                         " | tick ms total=%llu phases=%llu efficiency=%llu vma_sync=%llu"
                         " bitmap=%llu node_chunks=%llu adapt=%llu dict=%llu sweep=%llu"
                         " | syscall ms memread=%llu (%llu calls) p2_mprotect=%llu p3_mprotect=%llu"
-                        " p4_release=%llu idle_scan=%llu (%llu calls, %llu pages)\n",
+                        " p4_release=%llu idle_scan=%llu (%llu calls, %llu pages)"
+                        " yt_scan=%llu (%llu calls, %llu pages, cut=%llu)\n",
                         v(pc.tick_ms_total), v(pc.phases_ms_total), v(pc.step_ms[kStepEfficiency]),
                         v(pc.step_ms[kStepVmaSync]), v(pc.step_ms[kStepBitmap]),
                         v(pc.step_ms[kStepNodeChunks]), v(pc.step_ms[kStepAdapt]),
@@ -7247,7 +7523,8 @@ public:
                         v(pc.sc_memread_us) / 1000, v(pc.sc_memread_n),
                         v(pc.sc_p2_mprotect_us) / 1000, v(pc.sc_p3_mprotect_us) / 1000,
                         v(pc.sc_p4_us) / 1000, v(pc.sc_idle_us) / 1000, v(pc.sc_idle_n),
-                        v(pc.idle_pages));
+                        v(pc.idle_pages), v(pc.sc_yt_us) / 1000, v(pc.sc_yt_n), v(pc.yt_pages),
+                        v(pc.yt_cut));
                 if (n >= static_cast<int>(sizeof(buf))) n = static_cast<int>(sizeof(buf)) - 1;
             }
             // Fault handler time per kind: count, mean, percentiles as the

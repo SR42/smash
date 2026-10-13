@@ -784,29 +784,45 @@ if(NOT APPLE)
   set_tests_properties(test_blob_rss PROPERTIES TIMEOUT 180)
 endif()
 
-# SMASH_WRITE_TRACK=idle: the page_idle bitmap as the only access signal
-# (idle_tracker_test.cpp). The tracker cases need root and skip otherwise;
-# the fallback case runs as anyone.
+# SMASH_WRITE_TRACK=idle|yt: the page_idle bitmap, or the youngtrace module's
+# page-table walk, as the only access signal (idle_tracker_test.cpp). The
+# tracker cases need root (and, for yt, the module loaded) and skip otherwise;
+# the fallback cases run as anyone.
 if(NOT APPLE)
   add_executable(idle_tracker_test idle_tracker_test.cpp)
   target_link_libraries(idle_tracker_test PRIVATE ${CMAKE_DL_LIBS} Threads::Threads)
-  foreach(case tracker k1 fallback)
-    set(extra "")
-    set(part ${case})
-    if(case STREQUAL "k1")
-      set(extra "SMASH_IDLE_SCAN_TICKS=1")
-      set(part tracker)
-    elseif(case STREQUAL "fallback")
-      set(extra "SMASH_THP=1")
+  foreach(track idle yt)
+    set(cases tracker k1 fallback)
+    if(track STREQUAL "yt")
+      list(APPEND cases thp)
     endif()
-    add_test(NAME test_idle_tracker_${case} COMMAND ${CMAKE_COMMAND} -E env
-      "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=1" "SMASH_WRITE_TRACK=idle"
-      "SMASH_STATS_SIGNAL=1" "SMASH_DEFER_PHASES_MS=0" "SMASH_COLD_TIMEOUT_SEC=2"
-      "IDLE_PART=${part}" ${extra}
-      $<TARGET_FILE:idle_tracker_test>)
-    set_tests_properties(test_idle_tracker_${case} PROPERTIES TIMEOUT 180)
+    foreach(case ${cases})
+      set(extra "")
+      set(part ${case})
+      if(case STREQUAL "k1")
+        set(extra "SMASH_IDLE_SCAN_TICKS=1")
+        set(part tracker)
+      elseif(case STREQUAL "thp")
+        # Huge pages, and 640-page requests whose edges split them.
+        set(extra "SMASH_THP=1" "SMASH_IDLE_SCAN_TICKS=1" "SMASH_YT_REQ_PAGES=640")
+        set(part tracker)
+      elseif(case STREQUAL "fallback" AND track STREQUAL "idle")
+        set(extra "SMASH_THP=1")
+      elseif(case STREQUAL "fallback")
+        set(extra "SMASH_YT_DEVICE=/nonexistent/youngtrace/scanner")
+      endif()
+      add_test(NAME test_${track}_tracker_${case} COMMAND ${CMAKE_COMMAND} -E env
+        "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=1" "SMASH_WRITE_TRACK=${track}"
+        "SMASH_STATS_SIGNAL=1" "SMASH_DEFER_PHASES_MS=0" "SMASH_COLD_TIMEOUT_SEC=2"
+        "IDLE_PART=${part}" ${extra}
+        $<TARGET_FILE:idle_tracker_test>)
+      set_tests_properties(test_${track}_tracker_${case} PROPERTIES TIMEOUT 180)
+    endforeach()
   endforeach()
 endif()
+
+# The reader of youngtrace's scanner output, on hand-built streams.
+smash_add_test(yt_stream_test yt_stream_test.cpp)
 
 # An idle 1 GiB must actually leave RSS with default timings, in each
 # write-tracking mode: page protection (SMASH_SOFTDIRTY=0), the default
