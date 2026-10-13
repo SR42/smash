@@ -32,6 +32,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <thread>
 #if defined(SMASH_SIM)
 #include <algorithm>
@@ -548,8 +549,15 @@ public:
             // worth something only for pages that stay hot.
             {
                 const char* v = std::getenv("SMASH_THP");
-                if (v && v[0] == '1')
+                const char* t = std::getenv("SMASH_WRITE_TRACK");
+                if (v && v[0] == '1') {
                     (void)::madvise(base_, region_size, MADV_HUGEPAGE);
+                } else if (t && std::strcmp(t, "idle") == 0) {
+                    // The page_idle bitmap answers for a huge page through
+                    // its head PFN only; the idle tracker would see the other
+                    // 511 pages as accessed for ever (THP=always hosts).
+                    (void)::madvise(base_, region_size, MADV_NOHUGEPAGE);
+                }
             }
 #endif
             vm::setVmBounds(base_, region_size);

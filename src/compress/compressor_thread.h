@@ -557,6 +557,10 @@ class CompressorThread {
     // (slow_tick_test). nominal_clock_ is the running total.
     uint32_t tick_inc_ = 1;
     uint32_t nominal_clock_ = 0;
+    // SMASH_WRITE_TRACK=idle: nominal ticks of the last ticks (a ring), and
+    // their sum over the scan period: what a slice scanned this tick credits.
+    uint32_t idle_inc_ring_[64] = {};
+    uint32_t idle_scan_elapsed_ = 1;
     std::chrono::steady_clock::time_point last_tick_start_{};
     uint32_t test_next_tick_ms_ = 0;   // pretendNextTickAfterMs (unit tests)
     int phase3_idle_ticks_ = 0;  // P2.1 selective Phase 3 skip
@@ -656,6 +660,10 @@ class CompressorThread {
         // mprotect calls made by phase 2: escalation to PROT_NONE and the
         // compression snapshot.
         std::atomic<uint64_t> p2_mprotect{0};
+        // SMASH_WRITE_TRACK=idle: phase 1's page_idle scan (pagemap read,
+        // bitmap read and re-mark), cumulative us, system calls, and pages
+        // scanned.
+        std::atomic<uint64_t> sc_idle_us{0}, sc_idle_n{0}, idle_pages{0};
     };
     PipelineCounters pc_;
     enum FaultKind { kFaultCompressed, kFaultShadow, kFaultMonitor, kFaultActive };
@@ -794,7 +802,7 @@ class CompressorThread {
     //               per-tick clear_refs/pagemap work that did nothing)
     //   kProtRead   Phase 3 mprotect(PROT_READ) monitoring (SMASH_SOFTDIRTY=0,
     //               or /proc unavailable — both as before)
-    enum class WriteTracker : int8_t { kUnprobed = -1, kSoftDirty, kUffd, kNone, kProtRead };
+    enum class WriteTracker : int8_t { kUnprobed = -1, kSoftDirty, kUffd, kNone, kProtRead, kIdle };
     WriteTracker write_tracker_ = WriteTracker::kUnprobed;
     // The userfaultfd behind kUffd. Static so the remapPages() hook — a plain
     // function pointer running in fault paths — can reach it.
@@ -1754,9 +1762,16 @@ private:
 #endif
         const auto range_t0 = std::chrono::steady_clock::now();
         const uint32_t cold_floor = ROIConfig::instance().cold_ticks_floor;
+        // SMASH_WRITE_TRACK=idle: the bitmap scan supplies accessed_ for the
+        // slices due this tick; the others are left for their own tick.
+        const bool idle_track = write_tracker_ == WriteTracker::kIdle;
+#ifdef __linux__
+        if (idle_track) idleScan(start, end);
+#endif
         // Coarse watching: each group's uncompressed pages end the scan with
-        // the group's lowest cold count (see watch_group_).
-        const size_t wg = watch_group_;
+        // the group's lowest cold count (see watch_group_). Watching is what
+        // groups save; the idle tracker watches nothing.
+        const size_t wg = idle_track ? 1 : watch_group_;
         size_t grp = ~size_t{0};
         size_t gbuf[kMaxWatchGroup];
         size_t gn = 0;
@@ -1775,6 +1790,7 @@ private:
             }
             PageState st = states_->get(i);
             if (st == PageState::ACTIVE || st == PageState::ACTIVE_MONITORING) {
+                if (idle_track && !idleSliceDue(i)) return;
                 // Raw WRITE signal (soft-dirty) BEFORE the idle-read augmentation
                 // below folds reads in. The soft-dirty ROI machinery needs the
                 // write-only bit to track data stability independent of reads.
@@ -1832,7 +1848,10 @@ private:
                 } else {
                     ++n_idle;
                     const uint8_t prev = cold_count_[i];
-                    cold_count_[i] = advanceCold(prev, cold_floor);
+                    // The idle tracker sees reads too, so a page needs no
+                    // stop at the floor for a read check.
+                    cold_count_[i] = idle_track ? advanceColdBy(prev, idle_scan_elapsed_, 0)
+                                                : advanceCold(prev, cold_floor);
                     decayRecompressCount(i, prev);
                 }
                 if (wg > 1 && gn < kMaxWatchGroup) gbuf[gn++] = i;
@@ -1868,7 +1887,10 @@ private:
     // PROT_NONE only when its count equals the floor, so a jump past it
     // would compress the page without the tick that watches for reads.
     inline uint8_t advanceCold(uint8_t cc, uint32_t floor) const {
-        uint32_t n = static_cast<uint32_t>(cc) + tick_inc_;
+        return advanceColdBy(cc, tick_inc_, floor);
+    }
+    inline uint8_t advanceColdBy(uint8_t cc, uint32_t inc, uint32_t floor) const {
+        uint32_t n = static_cast<uint32_t>(cc) + inc;
         if (n > 255) n = 255;
         if (cc < floor && n > floor) n = floor;
         return static_cast<uint8_t>(n);
@@ -4714,11 +4736,20 @@ private:
             clear_refs_fd_ = open("/proc/self/clear_refs", O_WRONLY | O_CLOEXEC);
             if (clear_refs_fd_ < 0) return false;
         }
-        if (pagemap_fd_ < 0) {
-            pagemap_fd_ = open("/proc/self/pagemap", O_RDONLY | O_CLOEXEC);
-            if (pagemap_fd_ < 0) return false;
-        }
-        return true;
+        return ensurePagemapFd();
+#else
+        return false;
+#endif
+    }
+
+    // /proc/self/pagemap alone: what the idle-bitmap paths need (PFNs).
+    // Not clear_refs, which only soft-dirty writes: a process made
+    // non-dumpable by a file capability (setcap) has root-owned /proc/self
+    // files, and clear_refs then cannot be opened even when pagemap can.
+    bool ensurePagemapFd() {
+#ifdef __linux__
+        if (pagemap_fd_ < 0) pagemap_fd_ = open("/proc/self/pagemap", O_RDONLY | O_CLOEXEC);
+        return pagemap_fd_ >= 0;
 #else
         return false;
 #endif
@@ -4876,6 +4907,13 @@ private:
 
     WriteTracker selectWriteTracker() {
 #ifdef __linux__
+        // SMASH_WRITE_TRACK=idle: the page_idle bitmap is the only access
+        // signal, for reads and writes alike, and nothing is ever protected
+        // to watch a page. Asked for explicitly, so it is checked before
+        // SMASH_SOFTDIRTY=0, which it replaces; when it cannot work,
+        // probeIdleTracker() says why and page protection takes over.
+        if (const char* t = std::getenv("SMASH_WRITE_TRACK"); t && std::strcmp(t, "idle") == 0)
+            return probeIdleTracker() ? WriteTracker::kIdle : WriteTracker::kProtRead;
         // SMASH_SOFTDIRTY=0, and /proc being unavailable, keep their old
         // meaning: Phase 3 PROT_READ monitoring.
         if (!isSoftDirtyEnabled() || !ensureSoftDirtyFds()) return WriteTracker::kProtRead;
@@ -4917,6 +4955,7 @@ private:
             case WriteTracker::kUffd:      return "uffd";
             case WriteTracker::kNone:      return "none";
             case WriteTracker::kProtRead:  return "protread";
+            case WriteTracker::kIdle:      return "idle";
             default:                       return "unprobed";
         }
     }
@@ -4939,7 +4978,7 @@ private:
             return 1;                          // force on
         }();
         if (mode == -1) return false;
-        if (!ensureSoftDirtyFds()) return false;  // need pagemap for PFNs
+        if (!ensurePagemapFd()) return false;  // need pagemap for PFNs
 
         // (2) Can we read a real PFN? Probe our own region's first committed page.
         if (vm_) {
@@ -5017,6 +5056,161 @@ private:
         if (pread(page_idle_fd_, &word, sizeof(word), word_off) != (ssize_t)sizeof(word))
             return false;
         return (word >> (pfn % 64)) & 1;
+    }
+
+    // ── SMASH_WRITE_TRACK=idle ────────────────────────────────────────────
+    //
+    // The page_idle bitmap as the whole access signal. Each scan reads, for
+    // every resident ACTIVE page, whether the idle mark set at the previous
+    // scan survived (the hardware accessed bit sets on a read or a write, and
+    // the kernel clears the mark when it finds it), then marks the page again.
+    // Nothing is mprotected to watch a page, so writes and reads cost the
+    // application nothing until a page is compressed; a write that races
+    // compression is caught the way it is with soft-dirty, by the snapshot
+    // verify (FixAv). Needs real PFNs (CAP_SYS_ADMIN) and the bitmap
+    // read-write.
+    //
+    // A page whose mark did not take (not on the LRU yet, the shared zero
+    // page) reads "not idle" and counts as accessed: never compressed early,
+    // at worst a scan late. A transparent huge page answers only through its
+    // head PFN, so its other 511 pages would read accessed for ever: the
+    // arena is MADV_NOHUGEPAGE in this mode (VmRegion) and SMASH_THP=1
+    // refuses it.
+    //
+    // Cost, measured as root on an x86 VM (1 GiB of 4 KiB pages, bitmap words
+    // coalesced into runs): pagemap 14 ns, mark 80 ns, read 81 ns per page;
+    // in a running process, where a page's neighbours sit further apart in
+    // physical memory, 380-440 ns. SMASH_IDLE_SCAN_TICKS=K (default 4) scans
+    // each 16 MiB slice every K ticks, a 1/K share of the heap per tick, and
+    // credits the K ticks' nominal time at once. Every scan also clears the
+    // accessed bits, which the CPU then sets again on the next touch: K=1 cost
+    // a 256 MiB read pass 9.7 ms instead of 5.4 (K=4), and 22.4 s of system
+    // time instead of 13.6 over 150 s.
+    static constexpr size_t kIdleSliceShift = 12;   // 4096 pages = 16 MiB
+    static constexpr uint32_t kIdleScanMaxTicks = 64;
+    static uint32_t idleScanTicks() {
+        static const uint32_t k = [] {
+            const char* v = std::getenv("SMASH_IDLE_SCAN_TICKS");
+            const int x = v ? std::atoi(v) : 4;
+            return static_cast<uint32_t>(x < 1 ? 1 : (x > static_cast<int>(kIdleScanMaxTicks)
+                                                          ? static_cast<int>(kIdleScanMaxTicks) : x));
+        }();
+        return k;
+    }
+    bool idleSliceDue(size_t page_idx) const {
+        const uint32_t k = idleScanTicks();
+        return k == 1 || ((page_idx >> kIdleSliceShift) + tick_counter_) % k == 0;
+    }
+
+    bool probeIdleTracker() {
+        const char* why = nullptr;
+        if (const char* t = std::getenv("SMASH_THP"); t && t[0] == '1') {
+            why = "SMASH_THP=1 is set, and the bitmap reports a huge page through its first 4 KiB only";
+        } else if (!ensurePagemapFd()) {
+            why = "/proc/self/pagemap cannot be opened";
+        } else {
+            // A page of our own, written so it is resident: a PFN of 0 means
+            // pagemap hides them (no CAP_SYS_ADMIN).
+            uint64_t e = 0;
+            void* scratch = ::mmap(nullptr, kPageSize, PROT_READ | PROT_WRITE,
+                                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (scratch != MAP_FAILED) {
+                *static_cast<volatile char*>(scratch) = 1;
+                const off_t off = static_cast<off_t>(reinterpret_cast<uintptr_t>(scratch) / kPageSize *
+                                                     sizeof(uint64_t));
+                if (pread(pagemap_fd_, &e, sizeof(e), off) != static_cast<ssize_t>(sizeof(e))) e = 0;
+                ::munmap(scratch, kPageSize);
+            }
+            if ((e & ((1ULL << 55) - 1)) == 0) {
+                why = "/proc/self/pagemap hides page frame numbers (needs CAP_SYS_ADMIN)";
+            } else if (page_idle_fd_ < 0 &&
+                       (page_idle_fd_ = open("/sys/kernel/mm/page_idle/bitmap", O_RDWR | O_CLOEXEC)) < 0) {
+                why = "/sys/kernel/mm/page_idle/bitmap cannot be opened read-write (root-only by default; "
+                      "needs CONFIG_IDLE_PAGE_TRACKING)";
+            }
+        }
+        if (!why) return true;
+        char buf[400];
+        const int n = smash::safe_snprintf(buf, sizeof(buf),
+            "[smash WARN] SMASH_WRITE_TRACK=idle unavailable: %s; using page-protection "
+            "tracking (protread)\n", why);
+        if (n > 0) (void)!::write(2, buf, static_cast<size_t>(n) < sizeof(buf) ? static_cast<size_t>(n)
+                                                                                : sizeof(buf) - 1);
+        return false;
+    }
+
+    // Phase 1's scan of [start, end): sets accessed_ for every due, resident
+    // ACTIVE page whose idle mark is gone, then marks them all idle again.
+    // Batched: one pagemap read per kBatch pages, and one read and one write
+    // per run of nearby bitmap words (PFNs of neighbouring pages are often
+    // close). A failed bitmap read counts every page in the run as accessed.
+    void idleScan(size_t start, size_t end) {
+        constexpr size_t kBatch = 1024;
+        constexpr uint64_t kRunMax = 256;    // words per bitmap read/write
+        struct Ent { uint64_t pfn; uint32_t off; };
+        uint64_t pm[kBatch];
+        Ent ent[kBatch];
+        uint64_t words[kRunMax];
+        const uint64_t t0 = monoNs();
+        uint64_t calls = 0, pages = 0;
+        size_t i = start;
+        while (i < end) {
+            const size_t slice_end = std::min(end, ((i >> kIdleSliceShift) + 1) << kIdleSliceShift);
+            if (!idleSliceDue(i)) { i = slice_end; continue; }
+            const size_t n = std::min(kBatch, slice_end - i);
+            void* base = vm_->pageAddress(i);
+            const off_t off = static_cast<off_t>(reinterpret_cast<uintptr_t>(base) / kPageSize *
+                                                 sizeof(uint64_t));
+            ++calls;
+            const ssize_t got = pread(pagemap_fd_, pm, n * sizeof(uint64_t), off);
+            const size_t have = got > 0 ? static_cast<size_t>(got) / sizeof(uint64_t) : 0;
+            size_t ne = 0;
+            for (size_t k = 0; k < n; ++k) {
+                const PageState st = states_->get(i + k);
+                if (st != PageState::ACTIVE && st != PageState::ACTIVE_MONITORING) continue;
+                if (k >= have) {                       // pagemap failed: assume accessed
+                    accessed_[i + k].store(true, std::memory_order_relaxed);
+                    continue;
+                }
+                const uint64_t e = pm[k];
+                const uint64_t pfn = e & ((1ULL << 55) - 1);
+                if (!((e >> 63) & 1) || pfn == 0) continue;   // not resident: nothing to see
+                ent[ne++] = {pfn, static_cast<uint32_t>(k)};
+            }
+            pages += ne;
+            std::sort(ent, ent + ne, [](const Ent& a, const Ent& b) { return a.pfn < b.pfn; });
+            for (size_t r = 0; r < ne;) {
+                // A run: entries whose words lie within kRunMax words of the
+                // first, with at most one empty word between neighbours.
+                const uint64_t w0 = ent[r].pfn / 64;
+                size_t q = r + 1;
+                while (q < ne) {
+                    const uint64_t w = ent[q].pfn / 64, prev = ent[q - 1].pfn / 64;
+                    if (w > prev + 2 || w - w0 >= kRunMax) break;
+                    ++q;
+                }
+                const uint64_t nw = ent[q - 1].pfn / 64 - w0 + 1;
+                const off_t woff = static_cast<off_t>(w0 * sizeof(uint64_t));
+                ++calls;
+                const bool read_ok = pread(page_idle_fd_, words, nw * sizeof(uint64_t), woff) ==
+                                     static_cast<ssize_t>(nw * sizeof(uint64_t));
+                for (size_t x = r; x < q; ++x) {
+                    const uint64_t w = ent[x].pfn / 64 - w0;
+                    if (!read_ok || !((words[w] >> (ent[x].pfn % 64)) & 1))
+                        accessed_[i + ent[x].off].store(true, std::memory_order_relaxed);
+                }
+                // Mark: only our bits; a 0 bit leaves its page as it is.
+                std::memset(words, 0, nw * sizeof(uint64_t));
+                for (size_t x = r; x < q; ++x) words[ent[x].pfn / 64 - w0] |= 1ULL << (ent[x].pfn % 64);
+                ++calls;
+                (void)!pwrite(page_idle_fd_, words, nw * sizeof(uint64_t), woff);
+                r = q;
+            }
+            i += n;
+        }
+        pcAdd(pc_.sc_idle_us, (monoNs() - t0) / 1000);
+        pcAdd(pc_.sc_idle_n, calls);
+        pcAdd(pc_.idle_pages, pages);
     }
 #endif
 
@@ -5766,6 +5960,14 @@ private:
             if (inc > 255) inc = 255;
             tick_inc_ = static_cast<uint32_t>(inc);
             nominal_clock_ += tick_inc_;
+            // SMASH_WRITE_TRACK=idle scans a slice every K ticks: what it
+            // credits is the nominal time of the last K ticks.
+            idle_inc_ring_[tick_counter_ % kIdleScanMaxTicks] = tick_inc_;
+            const uint32_t k = idleScanTicks();
+            uint32_t sum = 0;
+            for (uint32_t j = 0; j < k; ++j)
+                sum += idle_inc_ring_[(tick_counter_ + kIdleScanMaxTicks - j) % kIdleScanMaxTicks];
+            idle_scan_elapsed_ = sum;
         }
         if (pre_tick_fn_) pre_tick_fn_();
         if (fault_handler_) fault_handler_->ensureInstalled();
@@ -7037,14 +7239,15 @@ public:
                         " | tick ms total=%llu phases=%llu efficiency=%llu vma_sync=%llu"
                         " bitmap=%llu node_chunks=%llu adapt=%llu dict=%llu sweep=%llu"
                         " | syscall ms memread=%llu (%llu calls) p2_mprotect=%llu p3_mprotect=%llu"
-                        " p4_release=%llu\n",
+                        " p4_release=%llu idle_scan=%llu (%llu calls, %llu pages)\n",
                         v(pc.tick_ms_total), v(pc.phases_ms_total), v(pc.step_ms[kStepEfficiency]),
                         v(pc.step_ms[kStepVmaSync]), v(pc.step_ms[kStepBitmap]),
                         v(pc.step_ms[kStepNodeChunks]), v(pc.step_ms[kStepAdapt]),
                         v(pc.step_ms[kStepDict]), v(pc.step_ms[kStepSweep]),
                         v(pc.sc_memread_us) / 1000, v(pc.sc_memread_n),
                         v(pc.sc_p2_mprotect_us) / 1000, v(pc.sc_p3_mprotect_us) / 1000,
-                        v(pc.sc_p4_us) / 1000);
+                        v(pc.sc_p4_us) / 1000, v(pc.sc_idle_us) / 1000, v(pc.sc_idle_n),
+                        v(pc.idle_pages));
                 if (n >= static_cast<int>(sizeof(buf))) n = static_cast<int>(sizeof(buf)) - 1;
             }
             // Fault handler time per kind: count, mean, percentiles as the

@@ -42,7 +42,7 @@ codegen bug: [agents/sanitizers.md](agents/sanitizers.md).
 cd build && ctest --output-on-failure
 ```
 
-All 118 tests must pass; none are registered `DISABLED`. Run the suite **as root** too when touching the compressor: idle-page read tracking only exists with root, and CI (`.github/workflows/ci.yml`, `ubuntu-latest` + `macos-latest`, every push and PR) runs unprivileged. After ctest, CI runs `bench/run_quick_ci.py` (`bench_rss` ≥30 %, `bench_sqlite --quick` ≥5 % RSS reduction).
+All 121 tests must pass; none are registered `DISABLED`. Run the suite **as root** too when touching the compressor: idle-page read tracking only exists with root, and CI (`.github/workflows/ci.yml`, `ubuntu-latest` + `macos-latest`, every push and PR) runs unprivileged. After ctest, CI runs `bench/run_quick_ci.py` (`bench_rss` ≥30 %, `bench_sqlite --quick` ≥5 % RSS reduction).
 
 **Before changing a test or its threshold, read its entry in [agents/tests.md](agents/tests.md).** Thresholds encode measurements, several tests are probabilistic (one run is not a verdict), and some harness shapes (sharing a process between phases, `fork()` with smash threads running) reproduce the very symptom under test.
 
@@ -236,6 +236,6 @@ Full list of constants and environment variables: [agents/config.md](agents/conf
 - `SMASH_VM_GIB=N` (default 16): compressible arena size. Costs address space, not memory; size it above the live set or large blocks silently fall back to uncompressed mappings.
 - `SMASH_LARGE_ALLOC_VM_THRESHOLD=N` (default 1 MiB): below it, a block is never compressed.
 - `SMASH_COLD_TIMEOUT_SEC=N`: cold timeout override (tests use 1–2). Idle time is counted in nominal seconds, so it stays seconds when ticks run long.
-- `SMASH_WRITE_TRACK=auto|softdirty|uffd|none`, `SMASH_SOFTDIRTY=0`: write detection.
+- `SMASH_WRITE_TRACK=auto|softdirty|uffd|none|idle`, `SMASH_SOFTDIRTY=0`: write detection. `idle` (opt-in, needs `CAP_SYS_ADMIN` and the page_idle bitmap read-write) tracks reads and writes with the kernel's accessed bit and protects nothing: zero monitor faults on the arm64 6.6 path where `SMASH_SOFTDIRTY=0` is the only alternative.
 - `SMASH_RUN_CACHE_MIB=N` (default off): per-CPU cache of freed large runs — about 2x large-block churn throughput one thread per core, at up to (CPUs) x N MiB of extra RSS. See [agents/design-run-cache.md](agents/design-run-cache.md).
 - `SMASH_STATS_SIGNAL=1`: enable the SIGUSR2 stats line (`compressed=`, `track=`, `boot=`, `reheat=`, `rss=`, `blob=`).
