@@ -783,6 +783,16 @@ if(NOT APPLE)
     $<TARGET_FILE:blob_rss_test>)
   set_tests_properties(test_blob_rss PROPERTIES TIMEOUT 180)
 
+  # zero_now= on the stats line: zero-sentinel pages compressed now, not
+  # since start (zero_now_test.cpp).
+  add_executable(zero_now_test zero_now_test.cpp)
+  target_link_libraries(zero_now_test PRIVATE ${CMAKE_DL_LIBS})
+  add_test(NAME test_zero_now COMMAND ${CMAKE_COMMAND} -E env
+    "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=1"
+    "SMASH_STATS_SIGNAL=1" "SMASH_DEFER_PHASES_MS=0" "SMASH_COLD_TIMEOUT_SEC=1"
+    $<TARGET_FILE:zero_now_test>)
+  set_tests_properties(test_zero_now PROPERTIES TIMEOUT 180)
+
   # Freed compressed data must give its blob memory back, and the blobs moved
   # to do it must decompress correctly (blob_compact_test.cpp).
   add_executable(blob_compact_test blob_compact_test.cpp)

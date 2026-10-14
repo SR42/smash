@@ -7509,6 +7509,10 @@ public:
         if (!self || !self->states_ || !self->vm_) return;
         size_t empty = 0, active = 0, monitor = 0, compressing = 0,
                compressed = 0, shadow = 0, total = self->vm_->committedPages();
+        // Of `compressed`, the pages stored as the all-zero sentinel (no blob):
+        // read without the page lock, so a page being restored that instant
+        // can be counted.
+        size_t zero_now = 0;
         size_t raw_bump = self->vm_->rawNextPage();
         for (size_t i = 0; i < total; ++i) {
             switch (self->states_->get(i)) {
@@ -7516,7 +7520,12 @@ public:
             case PageState::ACTIVE: ++active; break;
             case PageState::ACTIVE_MONITORING: ++monitor; break;
             case PageState::COMPRESSING: ++compressing; break;
-            case PageState::COMPRESSED: ++compressed; break;
+            case PageState::COMPRESSED:
+                ++compressed;
+                if (self->compressed_ && !self->compressed_[i].data &&
+                    self->compressed_[i].algorithm() == CompressAlgo::NONE)
+                    ++zero_now;
+                break;
             case PageState::COMPRESSED_SHADOW: ++shadow; break;
             }
         }
@@ -7540,7 +7549,7 @@ public:
         int n = smash::safe_snprintf(buf, sizeof(buf),
             "[smash stats] [%s] pid=%d committed=%zu  active=%zu  monitor=%zu"
             "  compressing=%zu  compressed=%zu  shadow=%zu  empty=%zu"
-            "  tier_up=%llu/%llu  spilled=%zu  zero=%llu  bump=%zu"
+            "  tier_up=%llu/%llu  spilled=%zu  zero=%llu  zero_now=%zu  bump=%zu"
             "  reheat=%llu  track=%s  boot=%zu/%zuMiB(%zu regions)"
             "  rss=%zuMiB  blob=%zu/%zuMiB(%zu regions, %zu draining, %lluMiB moved)\n",
             ts, (int)getpid(), total, active, monitor, compressing, compressed,
@@ -7549,7 +7558,7 @@ public:
             (unsigned long long)tier_attempts,
             spilled,
             (unsigned long long)self->zero_pages_.load(std::memory_order_relaxed),
-            raw_bump,
+            zero_now, raw_bump,
             (unsigned long long)g_reheat_events.load(std::memory_order_relaxed),
             writeTrackerName(self->write_tracker_),
             boot_used >> 20, boot_cap >> 20, boot_regions,
