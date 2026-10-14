@@ -812,6 +812,21 @@ if(NOT APPLE)
     "SMASH_DEFER_PHASES_MS=0" "SMASH_COLD_TIMEOUT_SEC=1"
     $<TARGET_FILE:helper_park_test>)
   set_tests_properties(test_helper_park PROPERTIES TIMEOUT 240)
+
+  # Idle decommit threads park instead of polling; frees and exit still reach
+  # them (decommit_park_test.cpp). Also with sub-arenas: a 1 MiB dirty cap and
+  # a 10 s purge epoch, so freed memory comes back in time only if going over
+  # the cap wakes the thread.
+  add_executable(decommit_park_test decommit_park_test.cpp)
+  target_link_libraries(decommit_park_test PRIVATE ${CMAKE_DL_LIBS})
+  add_test(NAME test_decommit_park COMMAND ${CMAKE_COMMAND} -E env
+    "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=1"
+    $<TARGET_FILE:decommit_park_test>)
+  add_test(NAME test_decommit_park_subarenas COMMAND ${CMAKE_COMMAND} -E env
+    "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=1" "SMASH_SUBARENAS=1"
+    "SMASH_DIRTY_MAX_MIB=1" "SMASH_PURGE_EPOCH_MS=10000"
+    $<TARGET_FILE:decommit_park_test>)
+  set_tests_properties(test_decommit_park test_decommit_park_subarenas PROPERTIES TIMEOUT 240)
 endif()
 
 # SMASH_WRITE_TRACK=idle|yt: the page_idle bitmap, or the youngtrace module's

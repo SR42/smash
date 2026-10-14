@@ -26,6 +26,7 @@
 #include "../util/spinlock.h"
 #include "../util/cpu_shard.h"
 #include "../util/exit_guard.h"
+#include "../util/park.h"
 
 #include <atomic>
 #include <cstddef>
@@ -153,6 +154,10 @@ class VmRegion {
         // A sub-arena of this queue's set went over its dirty cap: purge on
         // the thread's next pass instead of waiting for the epoch.
         std::atomic<bool> purge_now{false};
+        // Parking (util/park.h): the thread sleeps on `wake` while `sleeping`
+        // is set; whoever gives it work bumps `wake` and wakes it (kick()).
+        std::atomic<uint32_t> wake{0};
+        std::atomic<uint32_t> sleeping{0};
         pthread_t thread{};
         VmRegion* region = nullptr;
         int node = -1;              // -1: the shared arena's queue
@@ -224,7 +229,21 @@ class VmRegion {
         do {
             e->next = head;
         } while (!q.head.compare_exchange_weak(head, e,
-            std::memory_order_release, std::memory_order_relaxed));
+            std::memory_order_seq_cst, std::memory_order_relaxed));
+        // Onto an empty queue: the thread may be parked. Onto a non-empty one,
+        // whoever made it non-empty woke it, or it has not drained yet, and it
+        // drains everything before it parks again.
+        if (!head) kick(q);
+    }
+
+    // Wake the queue's thread if it is parked. Paired with the parking in
+    // decommitThreadEntry: either the thread sees the caller's work (the
+    // queue, purge_now, running) before it parks, or the caller sees it
+    // sleeping here (both sides seq_cst).
+    static void kick(DecommitQueue& q) {
+        if (q.sleeping.load(std::memory_order_seq_cst) == 0) return;
+        q.wake.fetch_add(1, std::memory_order_release);
+        unpark(q.wake, 1);
     }
 
     void processDecommitEntry(DecommitEntry* e) {
@@ -318,20 +337,26 @@ class VmRegion {
         auto* q = static_cast<DecommitQueue*>(arg);
         VmRegion* self = q->region;
         uint64_t last_trim_ms = 0, last_purge_ms = 0;
+        // An urgent purge that left a sub-arena over its cap (its lock was
+        // held by a free in progress: the purge only tries the lock) is
+        // retried 1 ms later rather than at the next epoch.
+        bool retry_urgent = false;
         while (q->running.load(std::memory_order_relaxed)) {
             // Return cached runs that have aged out (see cacheFreedRun). The
             // clock is the coarse vDSO one, so this costs a few ns per wake.
             // One thread does it: the shared queue's.
             if (subarenasEnabled()) {
                 const uint64_t now = nowMs();
-                const bool urgent = q->purge_now.load(std::memory_order_relaxed) &&
-                                    q->purge_now.exchange(false, std::memory_order_acq_rel);
+                const bool urgent = (q->purge_now.load(std::memory_order_relaxed) &&
+                                     q->purge_now.exchange(false, std::memory_order_acq_rel)) ||
+                                    retry_urgent;
                 if (urgent || now - last_purge_ms >= purgeEpochMs()) {
                     last_purge_ms = now;
                     if (q->node >= 0)
                         self->purgeNodeSubArenas(static_cast<uint32_t>(q->node), /*all=*/false);
                     else
                         self->purgeSharedSubArenas(/*all=*/false);
+                    retry_urgent = urgent && self->overDirtyCap(*q);
                 }
             }
             if (q->node < 0 && runCacheCapBytes() != 0) {
@@ -351,7 +376,27 @@ class VmRegion {
                     batch = next;
                 }
             } else {
-                usleep(100);  // 100µs - short sleep for responsiveness
+                // Nothing queued: park until a free queues work, a sub-arena
+                // goes over its dirty cap (purge_now), stop(), or the next
+                // periodic duty. It used to poll with usleep(100) here: ~6 300
+                // wakeups a second per queue thread, forever, once anything
+                // had been freed (31 600/s with a node queue on each of 4
+                // nodes).
+                uint64_t wait_ms = 0;   // no periodic duty: until woken
+                const uint64_t now = nowMs();
+                auto due = [&](uint64_t last, uint64_t every) {
+                    const uint64_t left = now - last >= every ? 1 : every - (now - last);
+                    if (wait_ms == 0 || left < wait_ms) wait_ms = left;
+                };
+                if (subarenasEnabled()) due(last_purge_ms, retry_urgent ? 1 : purgeEpochMs());
+                if (q->node < 0 && runCacheCapBytes() != 0) due(last_trim_ms, kRunCacheTrimIntervalMs);
+                const uint32_t seq = q->wake.load(std::memory_order_acquire);
+                q->sleeping.store(1, std::memory_order_seq_cst);
+                if (q->running.load(std::memory_order_seq_cst) &&
+                    !q->head.load(std::memory_order_seq_cst) &&
+                    !q->purge_now.load(std::memory_order_seq_cst))
+                    parkFor(q->wake, seq, wait_ms);
+                q->sleeping.store(0, std::memory_order_relaxed);
             }
         }
         return nullptr;
@@ -393,7 +438,8 @@ class VmRegion {
 
     void stopDecommitThread(DecommitQueue& q) {
         if (!q.running.load(std::memory_order_relaxed)) return;
-        q.running.store(false, std::memory_order_release);
+        q.running.store(false, std::memory_order_seq_cst);
+        kick(q);
         // Never join self — see the same guard in CompressorThread::stop().
         if (!pthread_equal(q.thread, pthread_self()))
             pthread_join(q.thread, nullptr);
@@ -613,7 +659,10 @@ public:
     // so ensureDecommitThreadStarted() will restart it on first releasePages().
     void resetDecommitThreadForFork() {
         // Threads don't exist in child - don't try to join them
-        forEachQueue([](DecommitQueue& q) { q.running.store(false, std::memory_order_relaxed); });
+        forEachQueue([](DecommitQueue& q) {
+            q.running.store(false, std::memory_order_relaxed);
+            q.sleeping.store(0, std::memory_order_relaxed);
+        });
         // A parent thread may have held a pool or run-cache shard lock at the
         // fork; that thread does not exist here. Each critical section is a
         // few pointer moves, so the lists themselves are consistent enough to
@@ -2224,6 +2273,20 @@ private:
         sa.purging.fetch_sub(1, std::memory_order_release);
     }
 
+    // Is any sub-arena of the set this queue's thread purges over its cap?
+    bool overDirtyCap(const DecommitQueue& q) {
+        NodeArena* na = nullptr;
+        if (q.node >= 0) {
+            if (NodeArena* arenas = node_arenas_.load(std::memory_order_acquire)) na = &arenas[q.node];
+        } else {
+            na = shared_set_.load(std::memory_order_acquire);
+        }
+        if (!na || !na->subs_ready.load(std::memory_order_acquire)) return false;
+        for (uint32_t s = 0; s < na->nsubs; ++s)
+            if (na->subs[s].dirty_published.load(std::memory_order_relaxed) > dirtyMaxPages()) return true;
+        return false;
+    }
+
     void purgeNodeSubArenas(uint32_t node, bool all) {
         NodeArena* arenas = node_arenas_.load(std::memory_order_acquire);
         if (!arenas || !arenas[node].subs_ready.load(std::memory_order_acquire)) return;
@@ -2254,6 +2317,7 @@ public:
         if (!set) return false;
         NodeArena& na = *set;
         const uint32_t s = static_cast<uint32_t>(o - 1);
+        bool over = false;
         {
             LockGuard guard(na.subs[s].lock);
             na.map.insertUnlocked(idx, num_pages, ownerDirty(s), kNodeChunkPages, stampNow());
@@ -2263,9 +2327,14 @@ public:
             // 50 ms epoch — between epochs a fast churn otherwise held 4-6x
             // the cap dirty (smash_sim, 8 sub-arenas: 7-13 GiB against 2).
             if (na.subs[s].dirty_pages > dirtyMaxPages() &&
-                !subQueue(na).purge_now.load(std::memory_order_relaxed))
-                subQueue(na).purge_now.store(true, std::memory_order_release);
+                !subQueue(na).purge_now.load(std::memory_order_relaxed)) {
+                subQueue(na).purge_now.store(true, std::memory_order_seq_cst);
+                over = true;
+            }
         }
+        // Woken after the lock is released: woken under it, the purger found
+        // the lock held (it only tries it) and slept until the next epoch.
+        if (over) kick(subQueue(na));
         ensureDecommitThreadStarted(subQueue(na));   // its thread purges this set
         return true;
     }

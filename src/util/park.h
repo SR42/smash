@@ -11,6 +11,7 @@
 // there is no futex (macOS), park() sleeps 100 us, which is the old polling.
 #include <atomic>
 #include <cstdint>
+#include <ctime>
 #include <unistd.h>
 #if defined(__linux__)
 #include <linux/futex.h>
@@ -25,6 +26,24 @@ inline void park(std::atomic<uint32_t>& word, uint32_t expected) {
     syscall(SYS_futex, &word, FUTEX_WAIT_PRIVATE, expected, nullptr, nullptr, 0);
 #else
     if (word.load(std::memory_order_acquire) == expected) usleep(100);
+#endif
+}
+
+// Sleeps while `word` holds `expected`, for at most `timeout_ms` (0: no
+// limit). Without a futex it sleeps 100 us, as park() does.
+inline void parkFor(std::atomic<uint32_t>& word, uint32_t expected, uint64_t timeout_ms) {
+#if defined(__linux__)
+    if (timeout_ms == 0) {
+        park(word, expected);
+        return;
+    }
+    struct timespec ts;
+    ts.tv_sec = static_cast<time_t>(timeout_ms / 1000);
+    ts.tv_nsec = static_cast<long>(timeout_ms % 1000) * 1000000L;
+    syscall(SYS_futex, &word, FUTEX_WAIT_PRIVATE, expected, &ts, nullptr, 0);
+#else
+    (void)timeout_ms;
+    park(word, expected);
 #endif
 }
 

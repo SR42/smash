@@ -555,8 +555,9 @@ attributes the remainder to a quadratic term that predicts a spurious collapse.
 The 128-core curve should be measured there with `smash_sim` (both builds, 8 to
 128 threads), which needs no memory.
 
-Cost: one more decommit thread per NUMA node in use, idle-polling every 100 us
-like the existing one.
+Cost: one more decommit thread per NUMA node in use. They polled every 100 us
+when idle until 2026-10-14 (31 600 wakeups/s with four nodes); they park now —
+see defect-history.md, "Idle decommit threads polled".
 
 ## 64 shards paired CPUs across sockets (2026-09-24)
 

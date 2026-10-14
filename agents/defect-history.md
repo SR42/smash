@@ -344,3 +344,46 @@ reader threads 137.7/131.7 -> 87.2/88.6 s, fault latency unchanged (p99
 0.61-0.90 ms both); 90 % of reads to 5 % of pages, 180 s, 78.6 -> 27.6 s. Bytes
 moved and held unchanged. Guarded by `test_helper_park`. The coordinator still
 sleeps in 10 ms steps between ticks (~100 wakeups a second).
+
+## Idle decommit threads polled (fixed 2026-10-14)
+
+Each decommit queue's thread (the shared arena's, and one per NUMA node whose
+arena has freed a block; started by the first free on that queue) waited for
+work with `usleep(100)` in a loop: ~6 300 wakeups a second per thread, for the
+rest of the process's life once anything had been freed. With a node queue on
+each of four nodes, 31 600 wakeups a second. Found while counting smash's
+threads for a report, after the helper fix above.
+
+The thread now parks on its queue's `wake` word (`util/park.h`, `parkFor`) when
+its queue is empty and nothing is urgent, for at most the time to its next
+periodic duty (the sub-arena purge epoch, the run-cache trim), or without limit
+when it has none. It is woken (`VmRegion::kick`) by a push onto an empty queue,
+by a free that takes a sub-arena over `SMASH_DIRTY_MAX_MIB`, and by
+`stopDecommitThread`. The handshake is Dekker-style: the thread sets
+`sleeping`, then rechecks the queue, `purge_now` and `running`; a waker
+publishes its work, then reads `sleeping` (all seq_cst).
+
+Two things came out of the change:
+
+- **Waking under the sub-arena lock lost the purge.** The first version woke
+  the purger from inside `freeRunDirty`'s critical section; the purger, now
+  woken at once instead of 100 us later, found the lock held, and its purge
+  only tries the lock. `purge_now` was consumed, so it slept until the epoch:
+  `test_subarena_plain_on` left 132 MiB dirty against a 32 MiB cap, 8 of 8
+  runs. The wake now comes after the lock is released.
+- **An urgent purge that leaves a sub-arena over its cap is retried 1 ms
+  later** instead of at the next epoch. The polling code lost such a purge the
+  same way whenever a free held the lock at that moment, which fits
+  `test_subarena_on_softdirty0`'s one failure earlier the same day (one run
+  purged, then nothing until the sweep). Not covered by a test: that needs a
+  free to hold the lock exactly when the purge tries it.
+
+Measured on the 8-CPU x86 VM (4 nodes), a process that freed blocks on every
+queue and then sat idle for 10 s: 1.71 s of CPU (17 % of a core) -> 0.04 s;
+with sub-arenas (`SMASH_DIRTY_MAX_MIB=64`) 2.06 s -> 0.06 s; idle context
+switches 31 600/s -> 126/s. 2 MiB churn on 8 threads unchanged (default
+3 833-4 088 -> 4 226-4 390 blocks/s; sub-arenas 332-359k -> 364-369k; run cache
+348-365k -> 338-354k). Guarded by `test_decommit_park{,_subarenas}`. With
+sub-arenas on, each queue's thread still wakes once per purge epoch (50 ms by
+default: 20/s per queue); with the run cache on, the shared queue's every 10 ms.
+macOS has no futex here and keeps the 100 us poll.

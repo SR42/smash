@@ -47,7 +47,8 @@ an exact page-count match for this node from the current CPU's shard (and,
 for an aligned request, only a run that already satisfies the alignment); mark
 its pages `ACTIVE` as today. On a miss, today's path.
 
-**Trim.** The decommit thread, which already wakes every 100 µs, sweeps the
+**Trim.** The decommit thread (parked between duties since 2026-10-14; it
+polled every 100 µs before) wakes to sweep the
 shards every ~10 ms with `tryLock` and sends runs older than a threshold
 (default ~50 ms) to today's path. So a burst leaves RSS behind for at most
 that long, and a workload that stops churning returns everything.
