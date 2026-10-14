@@ -25,6 +25,7 @@
 #include "../util/exit_guard.h"
 #include "../util/safe_printf.h"
 #include "../util/thread_stack.h"
+#include "../util/park.h"
 #include "../vm/uffd_uapi.h"  // signal-handler-safe snprintf for SIGUSR2 stats
 
 namespace smash {
@@ -1397,11 +1398,12 @@ public:
         coord_thread_ = pthread_t{};
         for (int i = 0; i < kMaxHelpers; ++i) {
             helper_threads_[i] = pthread_t{};
-            helper_done_gen_[i].store(0, std::memory_order_relaxed);
+            helper_go_[i].store(0, std::memory_order_relaxed);
         }
         helpers_created_ = 0;
         active_workers_ = kCompressorWorkers;
-        work_gen_.store(0, std::memory_order_release);
+        helpers_pending_.store(0, std::memory_order_relaxed);
+        helpers_exit_.store(false, std::memory_order_release);
         current_phase_ = 0;
 #if defined(__linux__)
         // Node group threads are gone too. Their memory and stores, holding
@@ -1491,11 +1493,16 @@ public:
     }
 private:
 
-    // Work dispatch: coordinator increments work_gen_ to signal helpers.
-    // Helpers compare against their last-seen gen to detect new work.
-    std::atomic<uint64_t> work_gen_{0};
+    // Work dispatch. Each helper parks on its own word in helper_go_ (a
+    // futex): dispatch() bumps and wakes the words of the active helpers
+    // only, so an inactive helper sleeps through every tick. The coordinator
+    // parks on helpers_pending_, which each active helper decrements when its
+    // range is done. helpers_exit_ ends the helpers (releaseHelpers()), never
+    // running_: stop() sets running_ while a tick may still dispatch.
+    std::atomic<uint32_t> helper_go_[kMaxHelpers]{};
+    std::atomic<uint32_t> helpers_pending_{0};
+    std::atomic<bool> helpers_exit_{false};
     int current_phase_ = 0;  // 1=access, 2=compress, 3=monitor
-    std::atomic<uint64_t> helper_done_gen_[kMaxHelpers]{};
 
     // ── Adaptive worker scaling (Little's Law) ─────────────────────────
     //
@@ -3899,18 +3906,21 @@ private:
         bool helpers_active = running_.load(std::memory_order_relaxed) && nw > 1;
         if (helpers_active) {
             current_phase_ = phase;
-            work_gen_.fetch_add(1, std::memory_order_release);
+            helpers_pending_.store(static_cast<uint32_t>(nw - 1), std::memory_order_relaxed);
+            // Wake the active helpers only (ids below nw - 1); the others
+            // stay parked. The release orders current_phase_, the ranges and
+            // helpers_pending_ before a helper's acquire of its word.
+            for (int i = 0; i < nw - 1; ++i) {
+                helper_go_[i].fetch_add(1, std::memory_order_release);
+                unpark(helper_go_[i], 1);
+            }
 
             // Coordinator does worker 0's range
             executePhase(phase, 0);
 
-            // Wait for active helpers only (helpers with id >= nw-1 are parked)
-            uint64_t target = work_gen_.load(std::memory_order_relaxed);
-            for (int i = 0; i < nw - 1; ++i) {
-                while (helper_done_gen_[i].load(std::memory_order_acquire) < target) {
-                    // spin
-                }
-            }
+            // Sleep until the last active helper is done (it wakes us).
+            for (uint32_t p; (p = helpers_pending_.load(std::memory_order_acquire)) != 0;)
+                park(helpers_pending_, p);
         } else {
             // Single-threaded: execute all work on worker 0
             executePhase(phase, 0);
@@ -6680,6 +6690,7 @@ private:
                 BootstrapAlloc::instance().allocate(sizeof(HelperArg), alignof(HelperArg)));
             ha->self = this;
             ha->id = helper_id;
+            ha->start_go = helper_go_[helper_id].load(std::memory_order_relaxed);
             // EAGAIN under thread exhaustion: stop scaling up rather than
             // counting a helper that does not exist (dispatch would wait
             // forever for its generation ack; stop() would join garbage).
@@ -6826,7 +6837,19 @@ private:
     struct HelperArg {
         CompressorThread* self;
         int id;  // 0-based helper index (worker index = id + 1)
+        uint32_t start_go;  // helper_go_[id] when created: later values are work
     };
+
+    // Ends every helper: they exit at their next wakeup, or before parking.
+    // Only with no dispatch in flight (stop() calls it after joining the
+    // coordinator), since a helper that exits never answers one.
+    void releaseHelpers() {
+        helpers_exit_.store(true, std::memory_order_release);
+        for (int i = 0; i < kMaxHelpers; ++i) {
+            helper_go_[i].fetch_add(1, std::memory_order_release);
+            unpark(helper_go_[i], 1);
+        }
+    }
 
     __attribute__((cold)) static void* helperEntry(void* arg) {
         g_compressor_thread = true;
@@ -6834,24 +6857,30 @@ private:
         exit_guard::ThreadRegistration exit_reg;  // not an application thread
         auto* ha = static_cast<HelperArg*>(arg);
         auto* self = ha->self;
-        int helper_id = ha->id;
-        int worker_id = helper_id + 1;
-        uint64_t last_gen = 0;
+        const int helper_id = ha->id;
+        const int worker_id = helper_id + 1;
+        std::atomic<uint32_t>& go = self->helper_go_[helper_id];
+        uint32_t last = ha->start_go;
 
-        while (self->running_.load(std::memory_order_relaxed)) {
-            uint64_t gen = self->work_gen_.load(std::memory_order_acquire);
-            if (gen == last_gen) {
-                usleep(100);  // brief sleep while waiting for work
+        for (;;) {
+            // The exit flag is checked before parking, not only after a
+            // wakeup. `last` comes from the creator (start_go), so a helper
+            // first scheduled after releaseHelpers() already sees its word
+            // changed; the check is the convention's second guard against
+            // the node-group hang (a worker that sampled its word at thread
+            // start parked for good).
+            if (self->helpers_exit_.load(std::memory_order_acquire)) break;
+            const uint32_t g = go.load(std::memory_order_acquire);
+            if (g == last) {
+                park(go, g);
                 continue;
             }
-            last_gen = gen;
-
-            // Only execute if this worker is active; otherwise just ACK
-            // so the coordinator's dispatch() doesn't block on parked helpers.
-            if (worker_id < self->active_workers_) {
-                self->executePhase(self->current_phase_, worker_id);
-            }
-            self->helper_done_gen_[helper_id].store(gen, std::memory_order_release);
+            last = g;
+            if (self->helpers_exit_.load(std::memory_order_acquire)) break;
+            // Woken by dispatch(): this helper is active for this phase.
+            self->executePhase(self->current_phase_, worker_id);
+            if (self->helpers_pending_.fetch_sub(1, std::memory_order_acq_rel) == 1)
+                unpark(self->helpers_pending_, 1);
         }
         return nullptr;
     }
@@ -7366,6 +7395,7 @@ public:
                 BootstrapAlloc::instance().allocate(sizeof(HelperArg), alignof(HelperArg)));
             ha->self = this;
             ha->id = i;
+            ha->start_go = helper_go_[i].load(std::memory_order_relaxed);
             // Under thread/memory exhaustion pthread_create returns EAGAIN.
             // Record only the helpers that actually exist: helpers_created_
             // drives both the adaptive worker cap and stop()'s joins, and
@@ -7376,6 +7406,9 @@ public:
             ++created;
         }
         helpers_created_ = created;
+        // dispatch() waits for nw - 1 helpers: never more than exist (the
+        // first tick runs before adaptWorkerCount() caps it).
+        if (active_workers_ > created + 1) active_workers_ = created + 1;
         if (created < kMaxHelpers) {
             char buf[160];
             int n = smash::safe_snprintf(buf, sizeof(buf),
@@ -7392,13 +7425,14 @@ public:
 #endif
 
         // Start coordinator thread (same small stack). Without it nothing
-        // ever ticks: roll back running_ so the helpers (which loop on it)
+        // ever ticks: roll back running_ and release the helpers so they
         // exit, stop() early-returns instead of joining a never-created
         // handle, and the library degrades to a plain allocator instead of
         // crashing at shutdown.
         if (int err = createSmashThread(&coord_thread_, kSmashThreadStack, coordEntry, this);
             err != 0) {
             running_.store(false, std::memory_order_release);
+            releaseHelpers();
             char buf[160];
             int n = smash::safe_snprintf(buf, sizeof(buf),
                 "[smash WARN] pthread_create(coordinator) failed (error %d: %s); "
@@ -7862,6 +7896,7 @@ public:
             pthread_join(coord_thread_, nullptr);
         trace_msg("coord_thread joined");
         trace_msg("joining helper threads...");
+        releaseHelpers();
         for (int i = 0; i < helpers_created_; ++i)
             if (!pthread_equal(helper_threads_[i], me))
                 pthread_join(helper_threads_[i], nullptr);

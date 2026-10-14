@@ -792,6 +792,16 @@ if(NOT APPLE)
     "SMASH_STATS_SIGNAL=1" "SMASH_DEFER_PHASES_MS=0" "SMASH_COLD_TIMEOUT_SEC=1"
     $<TARGET_FILE:blob_compact_test>)
   set_tests_properties(test_blob_compact PROPERTIES TIMEOUT 240)
+
+  # Idle compressor helpers park instead of polling, and still compress and
+  # exit cleanly (helper_park_test.cpp).
+  add_executable(helper_park_test helper_park_test.cpp)
+  target_link_libraries(helper_park_test PRIVATE ${CMAKE_DL_LIBS})
+  add_test(NAME test_helper_park COMMAND ${CMAKE_COMMAND} -E env
+    "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=1"
+    "SMASH_DEFER_PHASES_MS=0" "SMASH_COLD_TIMEOUT_SEC=1"
+    $<TARGET_FILE:helper_park_test>)
+  set_tests_properties(test_helper_park PROPERTIES TIMEOUT 240)
 endif()
 
 # SMASH_WRITE_TRACK=idle|yt: the page_idle bitmap, or the youngtrace module's

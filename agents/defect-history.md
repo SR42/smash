@@ -313,3 +313,34 @@ It costs one more partly filled region per shard. Kept because it is cheap and
 an application with long-lived blobs mixed among fast-churning ones is the case
 it exists for; measure before relying on it.
 
+
+## Idle compressor helpers polled (fixed 2026-10-14)
+
+The default compressor pool starts all 7 helpers (`kMaxCompressorWorkers` 8)
+at startup, and each waited for work with `usleep(100)` in a loop: ~6 400
+wakeups a second per helper, whether or not the tick used it (a 128-core
+application's dumps showed `workers=1`, so 7 helpers polled for nothing). The
+coordinator meanwhile spun on the helpers' acks at full speed during every
+phase. Found profiling store changes: 38 s of a 180 s run's kernel time was
+helpers in `nanosleep`, the largest single kernel cost of the process.
+
+Each helper now parks on its own futex word (`helper_go_`, `util/park.h`);
+`dispatch()` bumps and wakes the words of the active helpers only, and parks
+the coordinator on `helpers_pending_` until the last of them is done. Helpers
+exit on `helpers_exit_`, set by `releaseHelpers()` after `stop()` has joined
+the coordinator, never on `running_`: `stop()` clears `running_` while a tick
+may still dispatch, and a helper that left on it (as the polling helpers
+could) leaves the coordinator waiting forever. A helper's starting word value
+is recorded by its creator, so one first scheduled after the exit signal still
+sees its word changed. `start()` also caps the first tick's workers at the
+helpers that exist (a failed `pthread_create` used to leave dispatch waiting
+on a helper that was never made). macOS has no futex here and keeps the 100 us
+poll.
+
+Measured on the 8-CPU x86 VM against the previous commit, same flags:
+idle context switches 44 200-44 600/s -> 106/s; churn workload (1 GiB, 2000
+random reads every 0.5 s, 150 s) total CPU 114.7/113.9 -> 67.4/67.1 s; with 8
+reader threads 137.7/131.7 -> 87.2/88.6 s, fault latency unchanged (p99
+0.61-0.90 ms both); 90 % of reads to 5 % of pages, 180 s, 78.6 -> 27.6 s. Bytes
+moved and held unchanged. Guarded by `test_helper_park`. The coordinator still
+sleeps in 10 ms steps between ticks (~100 wakeups a second).
