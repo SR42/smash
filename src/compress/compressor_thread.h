@@ -6103,8 +6103,8 @@ private:
     }
 
     // Phase 1, for a compressed or shadow page while some region drains: if
-    // its blob is in a draining region, copy it into the same store (never
-    // into a draining region), repoint the page and release the old blob, so
+    // its blob is in a draining region, copy it into the same store's
+    // survivor region (storeMoved), repoint the page and release the old blob, so
     // the region empties and is decommitted. Under the page lock, like every
     // reader of compressed_[]; a contended page waits for a later tick. The
     // owner store is kept, so a node store's blob stays on its node.
@@ -6126,7 +6126,7 @@ private:
         const size_t old_alloc = compressed_[i].alloc_size;
         CompressStore* const owner = CompressStore::ownerOf(old);
         size_t new_alloc = 0;
-        void* moved = owner->store(old, csz, &new_alloc, i);
+        void* moved = owner->storeMoved(old, csz, &new_alloc, i);
         if (!moved) { locks_->unlock(i); return; }
         compressed_[i].set(moved, csz, new_alloc, compressed_[i].algorithm());
         locks_->unlock(i);

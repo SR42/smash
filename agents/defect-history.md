@@ -288,3 +288,28 @@ page it finds in one into the same store under the page lock, and the region
 empties and is decommitted. Measurements and tests: `SMASH_STORE_DRAIN_PCT` in
 [config.md](config.md), `compress_store_test` and `test_blob_compact` in
 [tests.md](tests.md).
+
+### Then the free list itself (2026-10-14)
+
+The free list the holes sat on was searched first-fit, one slot at a time,
+under the shard spinlock, on every store; freed neighbours never merged, and
+splits left small leftovers. Instrumented on the 1 GiB churn workload: ~500
+slots searched and 14 us held per store (an LZ4 compression is 5-10 us),
+15 000 slots at worst. The fault path releases a blob for every page it
+restores under the same lock, so with 8 reader threads a release waited up to
+26 ms. With compaction in place the holes were not worth reusing, so stores
+now only bump, and `release()` takes the lock only when a region empties (it
+locks the shard the region records, rechecks live bytes, and only then
+resets). Lock held 1.3 us, slowest release 2 ms, user CPU 90 -> 29 s, held
+about 10 % higher.
+
+Moved blobs now go to a survivor region per shard, apart from new blobs, on
+the theory that a blob which survived its region draining is long-lived and,
+put back among new blobs, gets moved again. On both workloads measured
+(uniform reads, and 90 % of reads to 5 % of pages) it changed neither the
+bytes moved (598 vs 587 MiB) nor CPU: most blobs are moved once, while their
+region is still filling with short-lived blobs, and repeat moves were rare.
+It costs one more partly filled region per shard. Kept because it is cheap and
+an application with long-lived blobs mixed among fast-churning ones is the case
+it exists for; measure before relying on it.
+

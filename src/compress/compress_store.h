@@ -10,14 +10,24 @@
 // while keeping the virtual mapping.  If the region is reused, the OS
 // zero-fills on access and the bump allocator is reset.
 //
-// Compaction: a region keeps its memory while any blob in it is live, and a
-// freed blob's hole is reused only by a blob that fits it, so churn leaves
-// regions mostly holes (measured on a 128-core application: 1.6 GiB of live
-// blobs holding 15.7 GiB). markDraining() marks each region whose live bytes
-// have fallen under a share of its used bytes; nothing new is stored in a
-// draining region, and the compressor moves its live blobs out (copy into
-// this store, repoint the page under its page lock, release the old one)
-// until the region is empty and decommitted.
+// Blobs are only ever bumped; a freed blob's bytes are never reused in place.
+// Compaction gets them back instead: markDraining() marks each region whose
+// live bytes have fallen under a share of its used bytes; nothing new is
+// stored in a draining region, and the compressor moves its live blobs out
+// (storeMoved(): copy into this store, repoint the page under its page lock,
+// release the old one) until the region is empty and decommitted.
+//
+// Until 2026-10 freed blobs went on a per-region free list that every store
+// searched first-fit under the shard lock: on a churn workload that was ~500
+// slots searched and 14 us held per store (longer than an LZ4 compression),
+// with the fault path's release waiting up to 18 ms behind it; bump-only, the
+// lock is held 1.4 us. A free list also kept regions a few live blobs among
+// holes (1.6 GiB live holding 15.7 GiB on a 128-core application).
+//
+// Moved blobs go to a region of their own per shard (`survivor`), apart from
+// new ones: a blob that survived its region draining is likely long-lived,
+// and back among new blobs it was moved again each time their region
+// drained.
 #pragma once
 
 #include "smash/config.h"
@@ -58,32 +68,15 @@ class CompressStore {
         return PinMode::kOff;
     }
 
-    // In-band free-slot header.  When a blob is released we overwrite the
-    // first 16 bytes with this header and link the slot into its region's
-    // free list.  Future allocations check the free list first before
-    // bumping the offset, so re-tier (release-then-allocate within the same
-    // shard) reuses the freed slot in place instead of growing the region.
-    //
-    // Without this, LZ4 → zstd-9 upgrades on memcached produced ~80 MB
-    // of stranded LZ4 regions that couldn't drain (a few stranger pages
-    // per region kept live_bytes > 0).  See TIERED_RECOMPRESSION.md.
-    //
-    // Sized to fit within the 16-byte minimum alignment of every blob.
-    struct FreeNode {
-        uint32_t size;          // slot size in bytes (incl. this header)
-        uint32_t next_offset;   // offset of next free slot within region, 0 = end
-    };
-    static_assert(sizeof(FreeNode) <= 16, "FreeNode must fit minimum-alignment slot");
-
     // Regions for blob storage (own mmap, not from VmRegion or bootstrap)
     struct Region {
         char* base;
         size_t capacity;
         std::atomic<size_t> offset;
         std::atomic<size_t> live_bytes;  // bytes currently in use (not freed)
-        uint32_t free_head;              // offset of first free slot, 0 = none
         Region* next;
         CompressStore* owner;            // the store that mapped this region
+        uint32_t shard;                  // the shard whose chain holds it
         // Set by markDraining() under the shard lock, cleared when the region
         // empties; read without it by draining() (a hint, rechecked by the
         // caller under the page lock).
@@ -97,11 +90,14 @@ class CompressStore {
     // Per-shard state: independent lock and region chain
     // `current` heads the chain of every region the shard has mapped (only
     // ever prepended to, so usage() can walk it without the lock); `bump` is
-    // the region new blobs are bumped into, or nullptr when the next store
-    // must pick one: a region that emptied, else a new one.
+    // the region new blobs are bumped into and `survivor` the one moved blobs
+    // are, each nullptr when the next store must pick one: a region that
+    // emptied, else a new one. The lock guards both, every region's offset,
+    // and resetting a region.
     struct Shard {
         Region* current = nullptr;
         Region* bump = nullptr;
+        Region* survivor = nullptr;
         Spinlock lock;
     };
 
@@ -119,7 +115,7 @@ class CompressStore {
 
     // Allocate a kRegionSize-aligned region so regionOf() can derive
     // the Region* from any interior pointer via address masking.
-    Region* newRegion() {
+    Region* newRegion(uint32_t shard) {
         // Over-allocate to guarantee alignment: request 2x and trim.
         void* raw = vm::mapPages(kRegionSize * 2);
         if (!raw) return nullptr;
@@ -149,9 +145,9 @@ class CompressStore {
         r->capacity = kRegionSize;
         r->offset.store(kDataStart, std::memory_order_relaxed);
         r->live_bytes.store(0, std::memory_order_relaxed);
-        r->free_head = 0;
         r->next = nullptr;
         r->owner = this;
+        r->shard = shard;
         r->draining.store(false, std::memory_order_relaxed);
 
         if (pin_mode_ == PinMode::kMlock) {
@@ -183,7 +179,6 @@ class CompressStore {
                               r->capacity - decommit_start);
         }
         r->offset.store(kDataStart, std::memory_order_relaxed);
-        r->free_head = 0;
         r->draining.store(false, std::memory_order_relaxed);
         // live_bytes is already 0
     }
@@ -203,98 +198,48 @@ class CompressStore {
         return r->base + aligned;
     }
 
-    // Try to satisfy an allocation from a region's free list (LIFO,
-    // first-fit; splits the slot when the remainder is large enough to
-    // hold its own free-list header — recovers the unused tail when a
-    // smaller blob (e.g. zstd-9, 0.7 KB) is allocated into a slot freed
-    // by a larger blob (e.g. LZ4, 1.3 KB).  Caller (bumpAlloc) holds the
-    // shard lock.  Returns nullptr if no fitting free slot exists; on
-    // success writes the actual returned-slot size into *out_alloc_size.
-    static void* tryFreeList(Region* r, size_t requested,
-                             size_t* out_alloc_size) {
-        if (r->free_head == 0) return nullptr;
-        uint32_t prev_off = 0;
-        uint32_t cur_off = r->free_head;
-        while (cur_off != 0) {
-            auto* node = reinterpret_cast<FreeNode*>(r->base + cur_off);
-            uint32_t slot_size = node->size;
-            if (slot_size >= requested) {
-                uint32_t next_off = node->next_offset;
-                size_t remainder = slot_size - requested;
-                if (remainder >= sizeof(FreeNode)) {
-                    // Split: requested bytes go to caller; remainder
-                    // stays on the free list at offset cur_off+requested.
-                    // requested is 16-byte aligned (enforced in store()),
-                    // and so is slot_size (originally allocated 16-byte
-                    // aligned, never broken since), so the new node's
-                    // offset is also 16-byte aligned.
-                    uint32_t rem_off = cur_off +
-                        static_cast<uint32_t>(requested);
-                    auto* rem_node = reinterpret_cast<FreeNode*>(
-                        r->base + rem_off);
-                    rem_node->size = static_cast<uint32_t>(remainder);
-                    rem_node->next_offset = next_off;
-                    if (prev_off == 0) {
-                        r->free_head = rem_off;
-                    } else {
-                        auto* prev = reinterpret_cast<FreeNode*>(
-                            r->base + prev_off);
-                        prev->next_offset = rem_off;
-                    }
-                    *out_alloc_size = static_cast<uint32_t>(requested);
-                    r->live_bytes.fetch_add(requested,
-                        std::memory_order_relaxed);
-                    return r->base + cur_off;
-                }
-                // No-split: hand the whole slot to caller — remainder
-                // too small to manage on its own.
-                if (prev_off == 0) {
-                    r->free_head = next_off;
-                } else {
-                    auto* prev = reinterpret_cast<FreeNode*>(r->base + prev_off);
-                    prev->next_offset = next_off;
-                }
-                *out_alloc_size = slot_size;
-                r->live_bytes.fetch_add(slot_size, std::memory_order_relaxed);
-                return r->base + cur_off;
-            }
-            prev_off = cur_off;
-            cur_off = node->next_offset;
-        }
-        return nullptr;
-    }
-
-    // Where a blob goes, in order: a hole in the bump region; the bump
-    // region's tail; a hole in any other region not draining; an emptied
-    // region, which becomes the bump region (refilled by bump, not handed one
-    // blob and passed over again); a new region. Draining regions get nothing.
-    void* bumpAlloc(Shard& shard, size_t size, size_t* out_alloc_size)
-            SMASH_REQUIRES(shard.lock) {
-        Region* b = shard.bump;
-        if (b) {
-            if (void* p = tryFreeList(b, size, out_alloc_size)) return p;
-            if (void* p = bumpInto(b, size, out_alloc_size)) return p;
-        }
-        Region* empty = nullptr;
-        for (Region* scan = shard.current; scan; scan = scan->next) {
-            if (scan == b || scan->draining.load(std::memory_order_relaxed)) continue;
-            if (scan->free_head != 0) {
-                if (void* p = tryFreeList(scan, size, out_alloc_size)) return p;
-            } else if (!empty && isEmpty(scan)) {
-                empty = scan;
-            }
-        }
-        if (empty) {
-            shard.bump = empty;
-            return bumpInto(empty, size, out_alloc_size);
-        }
-        Region* nr = newRegion();
+    // A region for one of the shard's two bump slots: an emptied region the
+    // other slot is not using (a draining region is never empty: reset clears
+    // the mark), else a new one.
+    Region* takeRegion(Shard& shard, uint32_t idx) SMASH_REQUIRES(shard.lock) {
+        for (Region* scan = shard.current; scan; scan = scan->next)
+            if (scan != shard.bump && scan != shard.survivor && isEmpty(scan)) return scan;
+        Region* nr = newRegion(idx);
         if (!nr) return nullptr;
         nr->next = shard.current;
-        shard.bump = nr;
-        void* p = bumpInto(nr, size, out_alloc_size);
         publish(shard, nr);
-        return p;
+        return nr;
+    }
+
+    // Bump into `slot` (the shard's bump or survivor region); when it is full
+    // or unset, into the region takeRegion() gives it.
+    void* bumpAlloc(Shard& shard, Region*& slot, size_t size, size_t* out_alloc_size)
+            SMASH_REQUIRES(shard.lock) {
+        if (slot)
+            if (void* p = bumpInto(slot, size, out_alloc_size)) return p;
+        Region* r = takeRegion(shard, static_cast<uint32_t>(&shard - shards_));
+        if (!r) return nullptr;
+        slot = r;
+        return bumpInto(r, size, out_alloc_size);
+    }
+
+    void* storeInto(bool moved, const void* data, size_t size, size_t* alloc_size,
+                    size_t page_idx) {
+        const size_t aligned_size = (size + 15) & ~15ULL;
+        Shard& shard = shards_[page_idx % kCompressStoreShards];
+        LockGuard guard(shard.lock);
+        size_t actual_size = 0;
+        void* ptr = bumpAlloc(shard, moved ? shard.survivor : shard.bump, aligned_size,
+                              &actual_size);
+        if (ptr) {
+            __builtin_memcpy(ptr, data, size);
+            *alloc_size = actual_size;
+            if (pin_mode_ == PinMode::kWillNeed)
+                vm::willNeedPages(ptr, actual_size);
+        } else {
+            *alloc_size = 0;
+        }
+        return ptr;
     }
 
 public:
@@ -307,7 +252,7 @@ public:
             drain_pct_ = x < 0 ? 0u : (x > 100 ? 100u : static_cast<unsigned>(x));
         }
         for (int s = 0; s < kCompressStoreShards; ++s) {
-            Region* r = newRegion();
+            Region* r = newRegion(static_cast<uint32_t>(s));
             shards_[s].bump = r;
             publish(shards_[s], r);
         }
@@ -319,8 +264,8 @@ public:
     // unlinked or unmapped, so a walk from an acquire load of the head sees
     // initialised regions only. `live` is the bytes of the blobs stored now;
     // `held` is the bytes below each region's bump pointer, which is what the
-    // region keeps resident: live plus free-list holes (a reset region,
-    // decommitted, holds only its header). The counts are racy by the blobs
+    // region keeps resident: live plus the holes freed blobs left (a reset
+    // region, decommitted, holds only its header). The counts are racy by the blobs
     // stored or released during the walk, which is fine for a dump.
     void usage(size_t* live, size_t* held, size_t* regions, size_t* draining = nullptr) const {
         for (const Shard& shard : shards_) {
@@ -336,10 +281,10 @@ public:
 
     // Marks every region that has used at least kDrainMinUsed and holds less
     // than `pct` percent of it live (SMASH_STORE_DRAIN_PCT, default 50; 0 =
-    // never). A draining bump region stops being one. Returns the number of
-    // regions draining now. The caller then moves their blobs out: for each
-    // page whose blob is in one (draining()), under the page lock, store a
-    // copy here, repoint the page, release the old blob.
+    // never). A draining bump or survivor region stops being one. Returns
+    // the number of regions draining now. The caller then moves their blobs
+    // out: for each page whose blob is in one (draining()), under the page
+    // lock, storeMoved() a copy, repoint the page, release the old blob.
     size_t markDraining(unsigned pct) {
         size_t n = 0;
         for (Shard& shard : shards_) {
@@ -352,6 +297,7 @@ public:
                     continue;
                 r->draining.store(true, std::memory_order_relaxed);
                 if (shard.bump == r) shard.bump = nullptr;
+                if (shard.survivor == r) shard.survivor = nullptr;
                 ++n;
             }
         }
@@ -369,93 +315,47 @@ public:
         return regionOf(const_cast<void*>(blob))->owner;
     }
 
-    // Push a fresh region to the head of each shard's chain.
-    // Call before a bulk upgrade to ensure new blobs go into fresh regions
-    // while old blob releases drain the old regions (enabling decommit).
-    void pushFreshRegions() {
-        for (int s = 0; s < kCompressStoreShards; ++s) {
-            LockGuard guard(shards_[s].lock);
-            Region* nr = newRegion();
-            if (nr) {
-                nr->next = shards_[s].current;
-                shards_[s].bump = nr;
-                publish(shards_[s], nr);
-            }
-        }
-    }
-
-    // Store a compressed blob. page_idx selects the shard.
-    // Returns pointer to stored data and the actual allocation size — the
-    // latter may be larger than the requested size if the allocator
-    // returned a free-list slot from a previous release.  Caller MUST pass
-    // the exact `alloc_size` back to release() so live_bytes accounting
-    // stays balanced.
+    // Store a compressed blob. page_idx selects the shard. Returns pointer
+    // to stored data and the allocation size (the 16-byte-aligned size), which
+    // the caller MUST pass back to release() so live_bytes stays balanced.
     void* store(const void* data, size_t size, size_t* alloc_size,
                 size_t page_idx = 0) {
-        size_t aligned_size = (size + 15) & ~15ULL;
-        // Free-list nodes need 8 bytes at the head, and bumped allocations
-        // are 16-byte aligned, so any slot we hand out is at least 16
-        // bytes.  Enforce here so future free-list pushes always fit.
-        if (aligned_size < sizeof(FreeNode)) aligned_size = sizeof(FreeNode);
+        return storeInto(false, data, size, alloc_size, page_idx);
+    }
 
-        int shard_idx = static_cast<int>(page_idx % kCompressStoreShards);
-        Shard& shard = shards_[shard_idx];
-
-        LockGuard guard(shard.lock);
-        size_t actual_size = 0;
-        void* ptr = bumpAlloc(shard, aligned_size, &actual_size);
-        if (ptr) {
-            __builtin_memcpy(ptr, data, size);
-            *alloc_size = actual_size;
-            if (pin_mode_ == PinMode::kWillNeed)
-                vm::willNeedPages(ptr, actual_size);
-        } else {
-            *alloc_size = 0;
-        }
-        return ptr;
+    // store() for a blob moved out of a draining region: it goes to the
+    // shard's survivor region, never among new blobs.
+    void* storeMoved(const void* data, size_t size, size_t* alloc_size,
+                     size_t page_idx = 0) {
+        return storeInto(true, data, size, alloc_size, page_idx);
     }
 
     // Release a previously stored blob.  `alloc_size` MUST be the value
-    // returned by the matching store() — the free-list reuses the slot
-    // verbatim, so the size must match the slot, not the original
-    // requested size.
-    void release(void* ptr, size_t alloc_size, size_t page_idx = 0) {
+    // returned by the matching store(). Takes no lock unless the region
+    // empties: the fault path releases a blob for every page it restores.
+    void release(void* ptr, size_t alloc_size, size_t /*page_idx*/ = 0) {
         if (!ptr) return;
 
         // Route by the region itself, never by the caller's idea of which store
         // holds the blob. With a store per NUMA node, a page compressed by one
-        // node's worker can be released through another store's lookup; taking
-        // the wrong store's shard lock would leave two stores mutating the same
-        // region's free list under different locks — silent corruption that no
-        // accounting check would notice. The region knows its owner, so a stale
-        // lookup costs one extra call and nothing else.
+        // node's worker can be released through another store's lookup;
+        // resetting a region under the wrong store's shard lock would race
+        // that store's bumps into it. The region knows its owner and shard,
+        // so a stale lookup costs one extra call and nothing else.
         Region* r = regionOf(ptr);
         if (r->owner && r->owner != this)
-            return r->owner->release(ptr, alloc_size, page_idx);
+            return r->owner->release(ptr, alloc_size);
 
-        int shard_idx = static_cast<int>(page_idx % kCompressStoreShards);
-        Shard& shard = shards_[shard_idx];
-
+        if (r->live_bytes.fetch_sub(alloc_size, std::memory_order_acq_rel) > alloc_size)
+            return;
+        // The region looked empty. Under the lock, which every bump into it
+        // holds, check again: a blob stored since keeps it, and of two
+        // releases that both saw it empty only the first resets it.
+        Shard& shard = shards_[r->shard];
         LockGuard guard(shard.lock);
-
-        size_t prev = r->live_bytes.fetch_sub(alloc_size, std::memory_order_relaxed);
-
-        if (prev <= alloc_size) {
-            // Region is now empty — decommit its data pages.  This also
-            // clears free_head, dropping any free-list nodes (their backing
-            // memory is about to be decommitted).
+        if (r->live_bytes.load(std::memory_order_relaxed) == 0 &&
+            r->offset.load(std::memory_order_relaxed) != kDataStart)
             resetRegion(r);
-        } else {
-            // Region still has live blobs.  Push this slot onto the
-            // region's free list so a future allocation can reuse it
-            // without bumping the offset.
-            uint32_t off = static_cast<uint32_t>(
-                static_cast<char*>(ptr) - r->base);
-            auto* node = reinterpret_cast<FreeNode*>(ptr);
-            node->size = static_cast<uint32_t>(alloc_size);
-            node->next_offset = r->free_head;
-            r->free_head = off;
-        }
     }
 };
 
