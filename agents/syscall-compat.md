@@ -195,6 +195,22 @@ names are not wrapped at all (64-bit builds do not rename `pread` to them, so
 most callers never use them); `fread` and the
 other buffered calls go through `warmPages` as before.
 
+**Open (full mode only): a stdio stream's own buffer can EFAULT inside libc.**
+Found 2026-10-15 as root on claudepc: `test_cold_arena_env`'s parent (full
+mode) read its children's output with `popen` + `fgets`, and every
+`read(2)` glibc issued into the stream's buffer returned `EFAULT` (strace),
+so `fgets` reported end of file and the output was lost. The first stream's first
+read failed at once, the later streams' after blocking until their child
+exited, so warming before the call did not cover either; the
+likely holes (not confirmed separately): the buffer does not exist yet on a
+stream's first read (glibc allocates it inside the call, after the wrapper
+has warmed nothing, from a slab slot whose page may be watched or
+compressed), and a read that blocks (a pipe waiting for a child) can outlast
+the cold timeout, so a buffer warmed before it is protected again by the time
+the kernel writes it. Under `SMASH_LARGE_ONLY=1` stream buffers come
+from glibc and are not affected. The tests now read child output with
+`read(2)` into a stack buffer; the wrapper is not fixed.
+
 ## Datagram receives lost a datagram on a fault (fixed 2026-09-29)
 
 On a message socket (UDP, AF_UNIX `SOCK_DGRAM` / `SOCK_SEQPACKET`, raw) the

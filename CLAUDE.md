@@ -42,7 +42,7 @@ codegen bug: [agents/sanitizers.md](agents/sanitizers.md).
 cd build && ctest --output-on-failure
 ```
 
-All 133 tests must pass; none are registered `DISABLED`. Run the suite **as root** too when touching the compressor: idle-page read tracking only exists with root (and `SMASH_WRITE_TRACK=yt` only with the youngtrace module loaded), and CI (`.github/workflows/ci.yml`, `ubuntu-latest` + `macos-latest`, every push and PR) runs unprivileged. After ctest, CI runs `bench/run_quick_ci.py` (`bench_rss` ≥30 %, `bench_sqlite --quick` ≥5 % RSS reduction).
+All 135 tests must pass; none are registered `DISABLED`. Run the suite **as root** too when touching the compressor: idle-page read tracking only exists with root (and `SMASH_WRITE_TRACK=yt` only with the youngtrace module loaded), and CI (`.github/workflows/ci.yml`, `ubuntu-latest` + `macos-latest`, every push and PR) runs unprivileged. After ctest, CI runs `bench/run_quick_ci.py` (`bench_rss` ≥30 %, `bench_sqlite --quick` ≥5 % RSS reduction).
 
 **Before changing a test or its threshold, read its entry in [agents/tests.md](agents/tests.md).** Thresholds encode measurements, several tests are probabilistic (one run is not a verdict), and some harness shapes (sharing a process between phases, `fork()` with smash threads running) reproduce the very symptom under test.
 
@@ -240,4 +240,6 @@ Full list of constants and environment variables: [agents/config.md](agents/conf
 - `SMASH_WRITE_TRACK=auto|softdirty|uffd|none|idle|yt`, `SMASH_SOFTDIRTY=0`: write detection. `idle` (opt-in, needs `CAP_SYS_ADMIN` and the page_idle bitmap read-write) tracks reads and writes with the kernel's accessed bit and protects nothing: zero monitor faults on the arm64 6.6 path where `SMASH_SOFTDIRTY=0` is the only alternative. `yt` (opt-in, needs the youngtrace module and `CAP_SYS_ADMIN`) reads the same bit through the module's page-table walk: on the same workload 0.50 s of scanning against the bitmap's 2.2 s (K=4), 0.84 s against 9.2 s (K=1).
 - `SMASH_RUN_CACHE_MIB=N` (default off): per-CPU cache of freed large runs — about 2x large-block churn throughput one thread per core, at up to (CPUs) x N MiB of extra RSS. See [agents/design-run-cache.md](agents/design-run-cache.md).
 - `SMASH_CODEC=lz4|zstd`: fast-tier codec (default zstd-1). `SMASH_USE_LZ4` was never an environment variable; the build option of that name is removed.
-- `SMASH_STATS_SIGNAL=1`: enable the SIGUSR2 stats line (`compressed=`, `zero_now=`, `track=`, `codec=`, `boot=`, `reheat=`, `rss=`, `blob=`).
+- `SMASH_STATS_SIGNAL=1`: enable the SIGUSR2 stats line (`compressed=`, `zero_now=`, `track=`, `codec=`, `cold_arenas=`, `boot=`, `reheat=`, `rss=`, `blob=`).
+- `SMASH_PREFETCH_WINDOW=N` (default 2, 0 = off): compressed neighbours a fault restores on each side. Costs the faulting thread a decompress and two syscalls per neighbour; random access measured 53 µs per fault at 2, 15 µs at 0.
+- `SMASH_COLD_ARENA_FEEDBACK=1` (full mode, default off): a call site whose pages keep getting compressed allocates from a separate cold slab.

@@ -28,6 +28,7 @@
 //     written with "fast_codec": "lz4", and a zstd child then rewrites it
 //     with "zstd1" (a file measured with another codec is not reused);
 //   - every child reads its data back intact.
+#include <cerrno>
 #include <climits>
 #include <cstdint>
 #include <cstdio>
@@ -114,6 +115,40 @@ int child() {
     return 0;
 }
 
+// Runs `cmd` and returns its output (the child's stdout and stderr), read with
+// read(2) into a stack buffer, never through a stdio stream: a stream's buffer
+// is malloc'd, in full mode that is smash memory, and a read blocked while the
+// child runs can find it compressed. glibc's internal read then gets EFAULT and
+// the output is lost (seen as root: test_cold_arena_env's children "did not
+// report"). On exit, *status is pclose()'s.
+std::string runChild(const std::string& cmd, int* status) {
+    std::string out;
+    *status = -1;
+    FILE* p = popen(cmd.c_str(), "r");
+    if (!p) return out;
+    char buf[4096];
+    for (ssize_t n; (n = read(fileno(p), buf, sizeof(buf))) != 0;) {
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        out.append(buf, static_cast<size_t>(n));
+    }
+    *status = pclose(p);
+    return out;
+}
+
+// The last lines of a child's output, to show why it did not report.
+void showTail(const std::string& out) {
+    size_t at = out.size(), lines = 0;
+    while (at > 0 && lines < 6) {
+        at = out.rfind('\n', at - 1);
+        if (at == std::string::npos) { at = 0; break; }
+        ++lines;
+    }
+    std::printf("    child output (last lines, status above):\n%s\n", out.substr(at).c_str());
+}
+
 struct Result { bool ok = false; std::string codec; size_t live = 0, resident = 0; int warned = 0, intact = 0; };
 
 Result run(const char* self, const char* env) {
@@ -121,21 +156,24 @@ Result run(const char* self, const char* env) {
     // stderr too: smash reads SMASH_CODEC, and warns, before the child runs.
     std::string cmd = std::string("timeout 90 env -u SMASH_CODEC -u SMASH_VERY_COLD_TICKS -u SMASH_CALIBRATION_FILE ") +
                       env + " '" + self + "' child 2>&1";
-    FILE* p = popen(cmd.c_str(), "r");
-    if (!p) return r;
-    char line[512] = {0}, codec[64] = {0};
-    while (fgets(line, sizeof(line), p)) {
-        if (std::strstr(line, "[smash WARN] SMASH_CODEC")) r.warned = 1;
-        if (std::sscanf(line, "codec=%63s live=%zu resident=%zu intact=%d", codec, &r.live, &r.resident,
+    int st = 0;
+    const std::string out = runChild(cmd, &st);
+    char codec[64] = {0};
+    for (size_t at = 0; at < out.size();) {
+        const size_t end = out.find('\n', at);
+        const std::string line = out.substr(at, end == std::string::npos ? std::string::npos : end - at);
+        at = end == std::string::npos ? out.size() : end + 1;
+        if (line.find("[smash WARN] SMASH_CODEC") != std::string::npos) r.warned = 1;
+        if (std::sscanf(line.c_str(), "codec=%63s live=%zu resident=%zu intact=%d", codec, &r.live, &r.resident,
                         &r.intact) == 4) {
             r.ok = true;
             r.codec = codec;
         }
     }
-    const int st = pclose(p);
     r.ok = r.ok && st == 0;
-    std::printf("%-28s -> codec=%s blob live=%zu MiB, %zu pages resident, warned=%d, intact=%d\n", env,
-                r.codec.c_str(), r.live, r.resident, r.warned, r.intact);
+    std::printf("%-28s -> codec=%s blob live=%zu MiB, %zu pages resident, warned=%d, intact=%d (status %d)\n", env,
+                r.codec.c_str(), r.live, r.resident, r.warned, r.intact, st);
+    if (!r.ok) showTail(out);
     return r;
 }
 

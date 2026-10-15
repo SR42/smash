@@ -455,16 +455,22 @@ inline uintptr_t appCallerRA() {
 }
 
 class SmashHeap {
-    // Slab array sized to kTotalArenas (= kNumArenas when A3 off, 2*kNumArenas
-    // when SMASH_COLD_ARENA_FEEDBACK is on).  Layout:
-    //   arenas [0, kNumArenas)          — hot sub-arenas (default routing)
-    //   arenas [kNumArenas, 2*kNumArenas) — cold sub-arenas (underfilled)
+    // Slab array sized to kTotalArenas (= kMaxArenas).  Layout, N =
+    // getNumArenas() (at most kMaxArenas / 2 when A3 is on):
+    //   arenas [0, N)   — hot sub-arenas (default routing)
+    //   arenas [N, 2N)  — cold sub-arenas (underfilled), only when
+    //                     SMASH_COLD_ARENA_FEEDBACK is on
     Slab slabs_[kTotalArenas * kNumClasses];
 
-    // A3 feedback state (unused/untouched when kColdArenaFeedback is false).
+    // A3 (SMASH_COLD_ARENA_FEEDBACK), read once: the routing below checks it
+    // on every small allocation.
+    const bool cold_feedback_ = coldArenaFeedback();
+    const uint32_t cold_threshold_ = coldArenaThreshold();
+
+    // A3 feedback state (unused/untouched when cold_feedback_ is false).
     // One entry per (base_arena, size_class).  Compressor bumps the counter
     // after every successful page compression that originated from the
-    // corresponding slab; once it crosses kColdArenaThreshold, the sticky
+    // corresponding slab; once it reaches cold_threshold_, the sticky
     // bias flag flips to 1 and callsiteArena() routes subsequent
     // allocations to the cold sub-arena for that (arena, sc).
     std::atomic<uint32_t> compress_count_[kNumArenas * kNumClasses]{};
@@ -696,7 +702,7 @@ class SmashHeap {
         ArenaMemo& memo = s_arena_memo[memo_slot];
         if (memo.valid && memo.key == memo_key) [[likely]] {
             uint8_t base = memo.base;
-            if constexpr (kColdArenaFeedback) {
+            if (cold_feedback_) {
                 if (cold_bias_[base * kNumClasses + sc].load(std::memory_order_relaxed))
                     return static_cast<uint8_t>(base + getNumArenas());
             }
@@ -850,7 +856,7 @@ class SmashHeap {
             }
         }
 #endif  // !SMASH_ABLATION_NO_CALLSITE_ARENA
-        if constexpr (kColdArenaFeedback) {
+        if (cold_feedback_) {
             // If compressor has flagged this (arena, sc) as cold-biased,
             // route to the cold sub-arena.
             if (cold_bias_[base * kNumClasses + sc].load(std::memory_order_relaxed))
@@ -894,14 +900,15 @@ public:
     // threshold is crossed, flips the sticky cold-bias flag so subsequent
     // allocations route to the cold sub-arena.
     void onPageCompressed(uint8_t arena_id, uint8_t sc) {
-        if constexpr (!kColdArenaFeedback && !kAdaptiveCap) return;
+        if (!cold_feedback_ && !kAdaptiveCap) return;
         if (sc >= kNumClasses) return;
         uint8_t base = arena_id & getArenaMask();   // strip cold half
         size_t idx = base * kNumClasses + sc;
-        if constexpr (kColdArenaFeedback) {
+        if (cold_feedback_) {
             uint32_t prev = compress_count_[idx].fetch_add(1, std::memory_order_relaxed);
-            if (prev + 1 == kColdArenaThreshold) {
+            if (prev + 1 == cold_threshold_) {
                 cold_bias_[idx].store(1, std::memory_order_relaxed);
+                g_cold_arena_buckets.fetch_add(1, std::memory_order_relaxed);
             }
         } else {
             compress_count_[idx].fetch_add(1, std::memory_order_relaxed);
@@ -1213,7 +1220,7 @@ public:
             log_time("compressor_init");
             // A3: register the cold-arena feedback hook (no-op when
             // SMASH_COLD_ARENA_FEEDBACK is off — onPageCompressed early-returns).
-            if (!compress_only && (kColdArenaFeedback || kAdaptiveCap)) {
+            if (!compress_only && (cold_feedback_ || kAdaptiveCap)) {
                 compressor_.setCompressedCallback(compressedEventHook, this);
             }
             if (!compress_only && kAdaptiveCap) {
@@ -1231,7 +1238,7 @@ public:
                     // applies globally (ablation mode — measure C1 in
                     // isolation without the feedback loop).
                     uint32_t cap = 0;
-                    if constexpr (kColdArenaFeedback) {
+                    if (cold_feedback_) {
                         if (a >= num_arenas) cap = kMaxSlotsPerPage;
                     } else {
                         cap = kMaxSlotsPerPage;
@@ -1292,7 +1299,7 @@ public:
             const int total_arenas = getTotalArenas();
             for (int a = 0; a < total_arenas; ++a) {
                 uint32_t cap = 0;
-                if constexpr (kColdArenaFeedback) {
+                if (cold_feedback_) {
                     if (a >= num_arenas) cap = kMaxSlotsPerPage;
                 } else {
                     cap = kMaxSlotsPerPage;

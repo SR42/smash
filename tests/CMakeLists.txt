@@ -804,6 +804,26 @@ if(NOT APPLE)
     $<TARGET_FILE:codec_env_test>)
   set_tests_properties(test_codec_env PROPERTIES TIMEOUT 300)
 
+  # SMASH_PREFETCH_WINDOW sets how many neighbours a fault restores
+  # (prefetch_env_test.cpp).
+  add_executable(prefetch_env_test prefetch_env_test.cpp)
+  target_link_libraries(prefetch_env_test PRIVATE ${CMAKE_DL_LIBS})
+  add_test(NAME test_prefetch_env COMMAND ${CMAKE_COMMAND} -E env
+    "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=1"
+    "SMASH_DEFER_PHASES_MS=0" "SMASH_COLD_TIMEOUT_SEC=1"
+    $<TARGET_FILE:prefetch_env_test>)
+  set_tests_properties(test_prefetch_env PROPERTIES TIMEOUT 300)
+
+  # SMASH_COLD_ARENA_FEEDBACK routes a call site that keeps going cold to its
+  # cold slab; full mode (cold_arena_env_test.cpp).
+  add_executable(cold_arena_env_test cold_arena_env_test.cpp)
+  target_link_libraries(cold_arena_env_test PRIVATE ${CMAKE_DL_LIBS})
+  add_test(NAME test_cold_arena_env COMMAND ${CMAKE_COMMAND} -E env
+    "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_STATS_SIGNAL=1"
+    "SMASH_DEFER_PHASES_MS=0" "SMASH_COLD_TIMEOUT_SEC=1"
+    $<TARGET_FILE:cold_arena_env_test>)
+  set_tests_properties(test_cold_arena_env PROPERTIES TIMEOUT 300)
+
   # Freed compressed data must give its blob memory back, and the blobs moved
   # to do it must decompress correctly (blob_compact_test.cpp).
   add_executable(blob_compact_test blob_compact_test.cpp)

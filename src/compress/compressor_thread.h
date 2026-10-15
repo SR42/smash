@@ -409,6 +409,13 @@ class CompressorThread {
     // and took ~40800 protection calls (watch_group_test); a 128-core arm64
     // application had 481k mappings, 397k of them smash's.
     size_t watch_group_ = 1;
+    // Compressed neighbours a fault restores on each side of the faulting
+    // page (prefetchAdjacent). SMASH_PREFETCH_WINDOW=N (0 = off, at most
+    // kMaxPrefetchWindow); the default is kPrefetchWindow. Each one costs a
+    // decompress and two syscalls on the faulting thread: 53 us per random
+    // fault at 2 against 15 us at 0, measured.
+    long prefetch_window_ = kPrefetchWindow;
+    static constexpr long kMaxPrefetchWindow = 64;
     // SMASH_LARGE_STATS=0: pages inside large blocks keep finding no span
     // (no bucket statistics), as before spanOfPage().
     bool large_stats_ = true;
@@ -3771,9 +3778,9 @@ private:
         // Coarse watching restores the faulting page's whole group, so the
         // group comes back as one instead of one page inside it.
         const long lo = watch_group_ > 1
-            ? -static_cast<long>(page_idx % watch_group_) : -kPrefetchWindow;
+            ? -static_cast<long>(page_idx % watch_group_) : -prefetch_window_;
         const long hi = watch_group_ > 1
-            ? static_cast<long>(watch_group_ - 1 - page_idx % watch_group_) : kPrefetchWindow;
+            ? static_cast<long>(watch_group_ - 1 - page_idx % watch_group_) : prefetch_window_;
         for (long delta = lo; delta <= hi; ++delta) {
             if (delta == 0) continue;
 
@@ -6921,6 +6928,20 @@ public:
         }
         if (const char* ls = std::getenv("SMASH_LARGE_STATS"); ls && ls[0] == '0')
             large_stats_ = false;
+        if (const char* w = std::getenv("SMASH_PREFETCH_WINDOW"); w && *w) {
+            char* end = nullptr;
+            const long n = std::strtol(w, &end, 10);
+            if (end != w && *end == '\0' && n >= 0) {
+                prefetch_window_ = n > kMaxPrefetchWindow ? kMaxPrefetchWindow : n;
+            } else {
+                char buf[160];
+                const int len = smash::safe_snprintf(buf, sizeof(buf),
+                    "[smash WARN] SMASH_PREFETCH_WINDOW=%.40s not a page count; using %ld\n",
+                    w, prefetch_window_);
+                if (len > 0) (void)!::write(2, buf, static_cast<size_t>(len) < sizeof(buf)
+                                                     ? static_cast<size_t>(len) : sizeof(buf) - 1);
+            }
+        }
         if (const char* g = std::getenv("SMASH_WATCH_GROUP_PAGES"); g && *g) {
             const long n = std::atol(g);
             size_t p2 = 1;
@@ -7550,7 +7571,7 @@ public:
             "[smash stats] [%s] pid=%d committed=%zu  active=%zu  monitor=%zu"
             "  compressing=%zu  compressed=%zu  shadow=%zu  empty=%zu"
             "  tier_up=%llu/%llu  spilled=%zu  zero=%llu  zero_now=%zu  bump=%zu"
-            "  reheat=%llu  track=%s  codec=%s  boot=%zu/%zuMiB(%zu regions)"
+            "  reheat=%llu  track=%s  codec=%s  cold_arenas=%u  boot=%zu/%zuMiB(%zu regions)"
             "  rss=%zuMiB  blob=%zu/%zuMiB(%zu regions, %zu draining, %lluMiB moved)\n",
             ts, (int)getpid(), total, active, monitor, compressing, compressed,
             shadow, empty,
@@ -7562,6 +7583,7 @@ public:
             (unsigned long long)g_reheat_events.load(std::memory_order_relaxed),
             writeTrackerName(self->write_tracker_),
             ROIConfig::instance().fastCodecName(),
+            g_cold_arena_buckets.load(std::memory_order_relaxed),
             boot_used >> 20, boot_cap >> 20, boot_regions,
             rss >> 20, blob_live >> 20, blob_held >> 20, blob_regions, blob_draining,
             static_cast<unsigned long long>(

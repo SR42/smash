@@ -605,7 +605,7 @@ Key tuning constants in `include/smash/config.h`:
 | `kVeryColdTicks` | 60 | Cold-tick threshold for the deep-tier (zstd-9) profile — only relevant when the deep tier is enabled (`-DSMASH_ENABLE_DEEP_TIER`), off by default (override via `SMASH_VERY_COLD_TICKS`) |
 | `kDeepTierEnabled` | false | Second compression tier (zstd-9). Off by default; enable at build time with `-DSMASH_ENABLE_DEEP_TIER` |
 | `kMinCompressRatio` | 0.75 | Only keep compressed if < 75% of original |
-| `kPrefetchWindow` | 2 | Pages prefetched in each direction on fault |
+| `kPrefetchWindow` | 2 | Pages prefetched in each direction on fault (override via `SMASH_PREFETCH_WINDOW`; 0 = off) |
 | `kDictTrainSamples` | 0 | Pages before dictionary training (disabled by default) |
 | `kNumClasses` | 36 | Size classes (16B to 16KB) |
 | `kNumArenas` | 4 | Call-site arenas (must be a power of 2) |

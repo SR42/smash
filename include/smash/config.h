@@ -110,6 +110,57 @@ inline constexpr int kNumArenasDefault = 4;  // fallback if CPU detection fails
 inline constexpr int kNumArenasDefault = SMASH_NUM_ARENAS;
 #endif
 
+// ── A3: cold-bias feedback arenas ───────────────────────────────────────────
+//
+// When on, each (call-site arena, size class) has a hot slab (arena
+// 0..N-1) and a cold one (arena N..2N-1, N = getNumArenas()). A per-(base
+// arena, size class) flag flips to cold once the compressor has recorded
+// coldArenaThreshold() successful compressions for that bucket; later
+// allocations route to the cold slab, where they may be placed under an
+// underfill policy (C1). SMASH_COLD_ARENA_FEEDBACK=1|0 picks it at startup;
+// the build option of that name only changes the default (off). The cold
+// half shares the kMaxArenas-entry slab table, so with feedback on the hot
+// arenas are capped at kMaxArenas / 2.
+#ifdef SMASH_COLD_ARENA_FEEDBACK
+inline constexpr bool kColdArenaFeedbackDefault = true;
+#else
+inline constexpr bool kColdArenaFeedbackDefault = false;
+#endif
+#ifndef SMASH_COLD_ARENA_THRESHOLD
+inline constexpr uint32_t kColdArenaThreshold = 8;
+#else
+inline constexpr uint32_t kColdArenaThreshold = SMASH_COLD_ARENA_THRESHOLD;
+#endif
+
+inline bool coldArenaFeedback() {
+    static std::atomic<int> cached{-1};
+    int v = cached.load(std::memory_order_relaxed);
+    if (v < 0) [[unlikely]] {
+        const char* env = getenv("SMASH_COLD_ARENA_FEEDBACK");
+        v = (env && *env) ? (env[0] == '1') : kColdArenaFeedbackDefault;
+        cached.store(v, std::memory_order_relaxed);
+    }
+    return v == 1;
+}
+
+// Compressions of a bucket's pages before it flips to its cold slab.
+// SMASH_COLD_ARENA_THRESHOLD=N (N >= 1) overrides kColdArenaThreshold.
+inline uint32_t coldArenaThreshold() {
+    static std::atomic<uint32_t> cached{0};
+    uint32_t v = cached.load(std::memory_order_relaxed);
+    if (v == 0) [[unlikely]] {
+        const char* env = getenv("SMASH_COLD_ARENA_THRESHOLD");
+        const long n = (env && *env) ? atol(env) : 0;
+        v = n >= 1 ? static_cast<uint32_t>(n > 0x7fffffffL ? 0x7fffffffL : n) : kColdArenaThreshold;
+        cached.store(v, std::memory_order_relaxed);
+    }
+    return v;
+}
+
+// Buckets flipped to their cold slab since start (the stats line's
+// cold_arenas=).
+inline std::atomic<uint32_t> g_cold_arena_buckets{0};
+
 // Dynamic arena count based on CPU count using balls-to-bins analysis.
 // With n threads and m arenas, max load per arena ~ n/m + sqrt(2n*ln(m)/m).
 // For good load balancing, we want m ~ sqrt(n) * c where c ~ 2-4.
@@ -121,13 +172,16 @@ inline int getNumArenas() {
     if (v < 0) [[unlikely]] {
         // Check for explicit override first
         const char* env = getenv("SMASH_NUM_ARENAS");
+        // With cold-arena feedback the cold half takes arenas N..2N-1 of the
+        // kMaxArenas-entry slab table.
+        const int cap = (coldArenaFeedback() && kMaxArenas >= 2) ? kMaxArenas / 2 : kMaxArenas;
         if (env && *env) {
             int parsed = atoi(env);
             if (parsed > 0 && parsed <= kMaxArenas) {
                 // Round up to power of 2
                 int p = 1;
                 while (p < parsed) p <<= 1;
-                v = (p <= kMaxArenas) ? p : kMaxArenas;
+                v = (p <= cap) ? p : cap;
                 cached.store(v, std::memory_order_relaxed);
                 return v;
             }
@@ -145,7 +199,7 @@ inline int getNumArenas() {
             target = sqrtn * 4.0;
         }
         int m = 4;
-        while (m < target && m < kMaxArenas) m <<= 1;
+        while (m < target && m < cap) m <<= 1;
         v = m;
         cached.store(v, std::memory_order_relaxed);
     }
@@ -163,30 +217,16 @@ inline constexpr int kNumArenas = kMaxArenas;
 
 // ── Reference-behavior homogeneity knobs (Apr 2026 design memo) ─────────────
 //
-// A3: Cold-bias feedback arenas.  When on, the slab array is doubled to
-// maintain a hot sub-arena (index 0..kNumArenas-1) and a cold sub-arena
-// (index kNumArenas..2*kNumArenas-1) for each (callsite, size class).
-// A per-(base-arena, size-class) flag flips to cold once the compressor
-// records >= kColdArenaThreshold successful compressions for that bucket;
-// subsequent allocations route to the cold sub-arena, where they may be
-// placed under an underfill policy (C1).
-#ifdef SMASH_COLD_ARENA_FEEDBACK
-inline constexpr bool kColdArenaFeedback = true;
-#else
-inline constexpr bool kColdArenaFeedback = false;
-#endif
-#ifndef SMASH_COLD_ARENA_THRESHOLD
-inline constexpr uint32_t kColdArenaThreshold = 8;
-#else
-inline constexpr uint32_t kColdArenaThreshold = SMASH_COLD_ARENA_THRESHOLD;
-#endif
-// Compile-time max for array sizing (uses kMaxArenas, not runtime count)
-inline constexpr int kTotalArenas = kColdArenaFeedback ? (kMaxArenas * 2) : kMaxArenas;
+// A3 (cold-bias feedback arenas) is above getNumArenas(), which it caps.
+
+// Compile-time max for array sizing: hot and cold arenas together
+// (getNumArenas() is capped at kMaxArenas / 2 when feedback is on).
+inline constexpr int kTotalArenas = kMaxArenas;
 
 // Runtime total arena count (hot + cold if feedback enabled)
 [[gnu::always_inline]]
 inline int getTotalArenas() {
-    return kColdArenaFeedback ? (getNumArenas() * 2) : getNumArenas();
+    return coldArenaFeedback() ? (getNumArenas() * 2) : getNumArenas();
 }
 
 // C1: Per-page absolute cap on live objects.  The (1-q)^N argument for

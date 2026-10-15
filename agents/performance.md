@@ -104,7 +104,8 @@ Two things in it were wasteful, and **the one that mattered was not the one
 that looked like it would**:
 
 - `uint32_t counts[kTotalArenas]{}` zeroed **1 KiB on every drain**
-  (`kTotalArenas` is 256 — `kMaxArenas` 128, doubled for cold-arena feedback)
+  (`kTotalArenas` was 256 — `kMaxArenas` 128, doubled for cold-arena
+  feedback; it is 128 since feedback became a runtime switch)
   while `getTotalArenas()` is typically 8. Zeroing only the live entries:
   **119.0 → 110.5 ns, −7.1%** on the hot workload above.
 - The span lookup used `PageMap::get()`, the two-level radix walk, where
@@ -228,7 +229,7 @@ the codec at startup (`SMASH_CODEC=lz4` picks LZ4 as the fast tier), and the ROI
 tiering to build on is in place.
 
 The interesting range is **16–64 KiB**, and there is a second reason to look
-there: the fault path already decompresses `kPrefetchWindow` = 2 pages in each
+there: the fault path already decompresses `SMASH_PREFETCH_WINDOW` = 2 pages in each
 direction, so a fault that finds its neighbours compressed already pays up to
 5 x 7.9 = 40 µs. One 16 KiB unit covers 4 pages for 19 µs *and* compresses 8–12%
 better — cheaper than what the prefetch window already does, for a better
