@@ -19,6 +19,9 @@
 #include <cstdio>
 #include <cmath>
 #include <algorithm>
+#include <cerrno>
+#include <fcntl.h>
+#include <unistd.h>
 
 #include <lz4.h>
 #define ZSTD_STATIC_LINKING_ONLY
@@ -171,6 +174,13 @@ struct ROIConfig {
     // thrash. Off ⇒ discount is hard-256 (1.0) ⇒ behavior identical to today.
     bool softdirty_roi = false;
 
+    // Fast-tier codec: LZ4 when true, else zstd at kZstdFastLevel (the
+    // default). SMASH_CODEC=lz4|zstd picks it at startup. Read once in
+    // init(), before calibration.
+    bool fast_lz4 = false;
+
+    const char* fastCodecName() const { return fast_lz4 ? "lz4" : "zstd1"; }
+
     AlgoProfile profiles[4];
     int num_profiles = 0;
 
@@ -260,6 +270,19 @@ struct ROIConfig {
         if (const char* sr = std::getenv("SMASH_SOFTDIRTY_ROI")) {
             softdirty_roi = (std::atoi(sr) != 0);
         }
+        if (const char* c = std::getenv("SMASH_CODEC")) {
+            if (std::strcmp(c, "lz4") == 0) {
+                fast_lz4 = true;
+            } else if (std::strcmp(c, "zstd") == 0 || std::strcmp(c, "zstd1") == 0) {
+                fast_lz4 = false;
+            } else {
+                char msg[160];
+                const int n = std::snprintf(msg, sizeof(msg),
+                    "[smash WARN] SMASH_CODEC=%.40s not recognised (lz4, zstd); using %s\n",
+                    c, fastCodecName());
+                if (n > 0) (void)!::write(2, msg, std::min(static_cast<size_t>(n), sizeof(msg) - 1));
+            }
+        }
 
         // 2. Try loading calibration file
         const char* cal_mode = std::getenv("SMASH_CALIBRATE");
@@ -283,11 +306,15 @@ struct ROIConfig {
         // 4. Apply per-throughput env var overrides
         applyEnvOverrides();
 
-        // 5. Remove ZSTD profile if very_cold_ticks disabled
+        // 5. Remove the deep-tier profile if very_cold_ticks disabled it.
+        // Only the deep level: the fast tier is zstd too unless it is LZ4,
+        // and removing every zstd profile left none, so nothing was ever
+        // compressed.
         if (very_cold_ticks_overridden && very_cold_ticks >= 9999) {
             int new_count = 0;
             for (int i = 0; i < num_profiles; ++i) {
-                if (profiles[i].algo != CompressAlgo::ZSTD)
+                if (!(profiles[i].algo == CompressAlgo::ZSTD &&
+                      profiles[i].zstd_level == kZstdDeepLevel))
                     profiles[new_count++] = profiles[i];
             }
             num_profiles = new_count;
@@ -302,7 +329,7 @@ private:
     // Calibration data (stored for file save).
     //
     // "fast" = the fast-tier algorithm actually run at compression time
-    //   (LZ4 when kUseLz4FastTier, else zstd-1).
+    //   (LZ4 when fast_lz4, else zstd-1).
     // "deep" = zstd at kZstdDeepLevel (always).
     struct CalData {
         uint16_t fast_comp_hi = 2000, fast_comp_lo = 100;     // zstd-1 defaults
@@ -323,7 +350,7 @@ private:
         // Fast-tier profile.  algo and zstd_level match what compressPage()
         // will actually invoke; calibration data reflects that same algo.
         AlgoProfile fast{};
-        if constexpr (kUseLz4FastTier) {
+        if (fast_lz4) {
             fast.algo = CompressAlgo::LZ4;
             fast.zstd_level = 0;
         } else {
@@ -494,9 +521,9 @@ private:
                 std::min(mbs, 60000.0));
         };
 
-        // Benchmark the fast tier (LZ4 or zstd-1 depending on build config).
+        // Benchmark the fast tier (LZ4 or zstd-1, per fast_lz4).
         TimingResult fast_zeros, fast_random;
-        if constexpr (kUseLz4FastTier) {
+        if (fast_lz4) {
             fast_zeros  = benchLZ4(zeros_page);
             fast_random = benchLZ4(random_page);
         } else {
@@ -554,13 +581,25 @@ private:
         }
     }
 
+    // Both run inside the heap's constructor (via init()): no stdio here.
+    // fopen() allocates its FILE with malloc, which waits for the heap being
+    // constructed, so setting SMASH_CALIBRATION_FILE hung every process at
+    // startup.
     bool loadCalibrationFile(const char* path) {
-        FILE* f = std::fopen(path, "r");
-        if (!f) return false;
+        const int fd = ::open(path, O_RDONLY | O_CLOEXEC);
+        if (fd < 0) return false;
 
         char buf[4096];
-        size_t n = std::fread(buf, 1, sizeof(buf) - 1, f);
-        std::fclose(f);
+        size_t n = 0;
+        for (ssize_t r; n < sizeof(buf) - 1 &&
+                        (r = ::read(fd, buf + n, sizeof(buf) - 1 - n)) != 0;) {
+            if (r < 0) {
+                if (errno == EINTR) continue;
+                break;
+            }
+            n += static_cast<size_t>(r);
+        }
+        ::close(fd);
         if (n == 0) return false;
         buf[n] = '\0';
 
@@ -582,6 +621,19 @@ private:
             while (*p == ' ' || *p == '\t') ++p;
             return std::strtod(p, nullptr);
         };
+
+        // The fast_* figures belong to one codec. A file without the tag
+        // predates SMASH_CODEC: zstd-1, unless written by an LZ4 build (the
+        // removed SMASH_USE_LZ4 option), which nothing here can tell apart.
+        bool file_lz4 = false;
+        if (const char* t = std::strstr(buf, "\"fast_codec\"")) {
+            t += std::strlen("\"fast_codec\"");
+            while (*t && *t != ':') ++t;
+            if (*t == ':') ++t;
+            while (*t == ' ' || *t == '\t') ++t;
+            file_lz4 = std::strncmp(t, "\"lz4\"", 5) == 0;
+        }
+        if (file_lz4 != fast_lz4) return false;  // recalibrate and rewrite it
 
         int v;
         double d;
@@ -616,26 +668,41 @@ private:
     }
 
     void saveCalibrationFile(const char* path) {
-        FILE* f = std::fopen(path, "w");
-        if (!f) return;
-
-        std::fprintf(f, "{\n");
-        std::fprintf(f, "  \"page_size\": %zu,\n",
-                     static_cast<size_t>(kPageSize));
-        std::fprintf(f, "  \"fast_comp_mbs_hi\": %u,\n", cal_.fast_comp_hi);
-        std::fprintf(f, "  \"fast_comp_mbs_lo\": %u,\n", cal_.fast_comp_lo);
-        std::fprintf(f, "  \"fast_decomp_mbs_hi\": %u,\n", cal_.fast_decomp_hi);
-        std::fprintf(f, "  \"fast_decomp_mbs_lo\": %u,\n", cal_.fast_decomp_lo);
-        std::fprintf(f, "  \"fast_ratio_zeros\": %.6f,\n", cal_.fast_ratio_zeros);
-        std::fprintf(f, "  \"fast_ratio_random\": %.6f,\n",cal_.fast_ratio_random);
-        std::fprintf(f, "  \"deep_comp_mbs_hi\": %u,\n", cal_.deep_comp_hi);
-        std::fprintf(f, "  \"deep_comp_mbs_lo\": %u,\n", cal_.deep_comp_lo);
-        std::fprintf(f, "  \"deep_decomp_mbs_hi\": %u,\n",cal_.deep_decomp_hi);
-        std::fprintf(f, "  \"deep_decomp_mbs_lo\": %u,\n",cal_.deep_decomp_lo);
-        std::fprintf(f, "  \"deep_ratio_zeros\": %.6f,\n",cal_.deep_ratio_zeros);
-        std::fprintf(f, "  \"deep_ratio_random\": %.6f\n",cal_.deep_ratio_random);
-        std::fprintf(f, "}\n");
-        std::fclose(f);
+        char out[1024];
+        const int n = std::snprintf(out, sizeof(out),
+            "{\n"
+            "  \"page_size\": %zu,\n"
+            "  \"fast_codec\": \"%s\",\n"
+            "  \"fast_comp_mbs_hi\": %u,\n"
+            "  \"fast_comp_mbs_lo\": %u,\n"
+            "  \"fast_decomp_mbs_hi\": %u,\n"
+            "  \"fast_decomp_mbs_lo\": %u,\n"
+            "  \"fast_ratio_zeros\": %.6f,\n"
+            "  \"fast_ratio_random\": %.6f,\n"
+            "  \"deep_comp_mbs_hi\": %u,\n"
+            "  \"deep_comp_mbs_lo\": %u,\n"
+            "  \"deep_decomp_mbs_hi\": %u,\n"
+            "  \"deep_decomp_mbs_lo\": %u,\n"
+            "  \"deep_ratio_zeros\": %.6f,\n"
+            "  \"deep_ratio_random\": %.6f\n"
+            "}\n",
+            static_cast<size_t>(kPageSize), fastCodecName(),
+            cal_.fast_comp_hi, cal_.fast_comp_lo,
+            cal_.fast_decomp_hi, cal_.fast_decomp_lo,
+            cal_.fast_ratio_zeros, cal_.fast_ratio_random,
+            cal_.deep_comp_hi, cal_.deep_comp_lo,
+            cal_.deep_decomp_hi, cal_.deep_decomp_lo,
+            cal_.deep_ratio_zeros, cal_.deep_ratio_random);
+        if (n <= 0 || static_cast<size_t>(n) >= sizeof(out)) return;
+        const int fd = ::open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+        if (fd < 0) return;
+        for (size_t off = 0; off < static_cast<size_t>(n);) {
+            const ssize_t w = ::write(fd, out + off, static_cast<size_t>(n) - off);
+            if (w < 0 && errno == EINTR) continue;
+            if (w <= 0) break;
+            off += static_cast<size_t>(w);
+        }
+        ::close(fd);
     }
 };
 

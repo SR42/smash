@@ -387,3 +387,38 @@ switches 31 600/s -> 126/s. 2 MiB churn on 8 threads unchanged (default
 sub-arenas on, each queue's thread still wakes once per purge epoch (50 ms by
 default: 20/s per queue); with the run cache on, the shared queue's every 10 ms.
 macOS has no futex here and keeps the 100 us poll.
+
+## SMASH_USE_LZ4 was never an environment variable; two codec-setting defects (fixed 2026-10-15)
+
+The fast-tier codec was chosen at build time only (`-DSMASH_USE_LZ4=ON` defines
+`kUseLz4FastTier`). Nothing read an environment variable of that name, yet one
+application ran for months with `SMASH_USE_LZ4=1` in its environment,
+believing it selected LZ4, and `test_large_bucket_decline` was registered with
+it on the same belief (its claim that zstd-1 would accept its pages was never
+true: both codecs decline them identically). Found while checking every
+tunable against the source for a summary. `SMASH_CODEC=lz4|zstd` now picks
+the codec in `ROIConfig::init()`, before calibration, and the stats line
+reports `codec=`. The build option is removed (CMake warns if it is passed),
+so the codec has one switch. The README's settings table listed
+`SMASH_USE_LZ4=1` as an environment variable, and `tools/debug_compression.sh`
+set it the same way; both are corrected. Blobs already carry their codec in `comp_size`'s top bits,
+so nothing else changed. Measured on 64 MiB of text-like pages: 32 MiB of
+blobs with LZ4, 18 MiB with zstd-1.
+
+Two defects in neighbouring settings, found on the way:
+
+- **`SMASH_VERY_COLD_TICKS=9999` compressed nothing.** Documented as "fast tier
+  only", it removed every profile whose codec was zstd. With zstd-1 as the
+  fast tier (the default) that was every profile,
+  and `selectProfile()` then returns nothing for every page. It now removes
+  the deep level only.
+- **`SMASH_CALIBRATION_FILE` hung every process at startup**, whether the file
+  existed or not: `loadCalibrationFile()` ran `fopen()` inside the heap's
+  constructor, `fopen` allocates its `FILE` with malloc, and malloc waits for
+  the heap being constructed (one thread spinning in
+  `HeapRedirect::getHeap()`). Load and save now use `open`/`read`/`write`
+  with a stack buffer. The file also records the codec its fast-tier figures
+  were measured with, and a file for another codec is re-measured and
+  rewritten instead of feeding LZ4's speeds to a zstd profile.
+
+Guarded by `test_codec_env`.

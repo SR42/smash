@@ -752,10 +752,11 @@ if(NOT APPLE)
     "SMASH_BUCKET_STATS=1" "SMASH_DEFER_PHASES_MS=0" "SMASH_COLD_TIMEOUT_SEC=1"
     $<TARGET_FILE:large_bucket_stats_test>)
   # The ROI decline path needs the default cold timeout (an override makes
-  # shouldCompress() return true at once) and LZ4, as an application runs.
+  # shouldCompress() return true at once). LZ4, as the application runs; zstd
+  # declines the same pages.
   add_test(NAME test_large_bucket_decline COMMAND ${CMAKE_COMMAND} -E env
     "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=1" "SMASH_STATS_SIGNAL=1"
-    "SMASH_DEFER_PHASES_MS=0" "SMASH_USE_LZ4=1" "LBS_PART=decline"
+    "SMASH_DEFER_PHASES_MS=0" "SMASH_CODEC=lz4" "LBS_PART=decline"
     $<TARGET_FILE:large_bucket_stats_test>)
   set_tests_properties(test_large_bucket_stats test_large_bucket_decline PROPERTIES TIMEOUT 180)
 endif()
@@ -792,6 +793,16 @@ if(NOT APPLE)
     "SMASH_STATS_SIGNAL=1" "SMASH_DEFER_PHASES_MS=0" "SMASH_COLD_TIMEOUT_SEC=1"
     $<TARGET_FILE:zero_now_test>)
   set_tests_properties(test_zero_now PROPERTIES TIMEOUT 180)
+
+  # SMASH_CODEC=lz4|zstd picks the codec at startup and codec= reports it;
+  # SMASH_VERY_COLD_TICKS=9999 must leave the fast tier (codec_env_test.cpp).
+  add_executable(codec_env_test codec_env_test.cpp)
+  target_link_libraries(codec_env_test PRIVATE ${CMAKE_DL_LIBS})
+  add_test(NAME test_codec_env COMMAND ${CMAKE_COMMAND} -E env
+    "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=1"
+    "SMASH_STATS_SIGNAL=1" "SMASH_DEFER_PHASES_MS=0" "SMASH_COLD_TIMEOUT_SEC=1"
+    $<TARGET_FILE:codec_env_test>)
+  set_tests_properties(test_codec_env PROPERTIES TIMEOUT 300)
 
   # Freed compressed data must give its blob memory back, and the blobs moved
   # to do it must decompress correctly (blob_compact_test.cpp).

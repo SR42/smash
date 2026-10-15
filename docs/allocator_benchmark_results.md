@@ -113,7 +113,7 @@ Smash full mode is **not production-ready** for neuron-cc. While it occasionally
 | SMASH_NO_COMPRESSOR=1 | 3/3 (100%) | Allocation path is correct |
 | SMASH_COLD_TICKS=9999 | 3/3 (100%) | No compression works |
 | SMASH_NO_MONITOR=1 | 1/3 (33%) | Compression path has bug |
-| SMASH_USE_LZ4=1 | 1/2 (50%) | Bug not zstd-specific |
+| SMASH_USE_LZ4=1 | 1/2 (50%) | Bug not zstd-specific (invalid: this variable was never read, so the run used zstd-1; see `SMASH_CODEC` in agents/config.md) |
 | SMASH_DEFER_PHASES_MS=30000 | 1/2 (50%) | Timing doesn't help |
 | SMASH_FIXAV=1 | 0/3 (0%) | Strictest ordering is WORSE |
 | Default full mode | ~1/3 (33%) | Base failure rate |

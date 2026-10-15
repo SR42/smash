@@ -223,9 +223,8 @@ millisecond per fault under LZ4, which is 60x worse than the 8 µs a zstd-1 page
 costs today.
 
 The choice is therefore between axes, not sizes: **zstd-1 at 16–64 KiB** for
-ratio, **LZ4 at 4 KiB** for fault latency (1.2–1.8 µs). smash already exposes
-the codec as a compile-time ablation (`-DSMASH_USE_LZ4=ON` picks LZ4 as the
-fast tier), and the ROI model chooses fast versus deep tier per page, so the
+ratio, **LZ4 at 4 KiB** for fault latency (1.2–1.8 µs). smash exposes
+the codec at startup (`SMASH_CODEC=lz4` picks LZ4 as the fast tier), and the ROI model chooses fast versus deep tier per page, so the
 tiering to build on is in place.
 
 The interesting range is **16–64 KiB**, and there is a second reason to look

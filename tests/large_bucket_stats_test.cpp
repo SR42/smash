@@ -18,10 +18,11 @@
 // bytes held idle 25 s (LBS_PART=decline, its own process and registration,
 // default cold timeout): at most 5 compression attempts per page ("compress
 // tried="), and some must be declined; 393040 attempts for 32768 pages
-// without the backoff. Registered
-// with SMASH_USE_LZ4=1: under the default zstd-1 profile the model accepts
-// these pages, the codec runs and fails, and the existing ratio-gate backoff
-// applies instead — the check then cannot see the decline path.
+// without the backoff. Registered with SMASH_CODEC=lz4, as the application
+// runs. It was registered with SMASH_USE_LZ4=1, believed to select LZ4 because
+// zstd-1 would accept these pages and fail the ratio gate instead; that
+// variable was never read, and measured with each codec (2026-10-15) the
+// result is the same: 32752 of 32768 declined, 16 ratio-gate failures.
 #include <csignal>
 #include <cstdint>
 #include <cstdio>
@@ -77,7 +78,7 @@ int main() {
         free(r);
         if (roi_skip == 0) {
             dprintf(saved, "FAIL: the ROI model declined nothing (roi_skip=0): the check cannot "
-                    "see the decline path (SMASH_COLD_TIMEOUT_SEC set? SMASH_USE_LZ4 unset?)\n");
+                    "see the decline path (SMASH_COLD_TIMEOUT_SEC set?)\n");
             return 1;
         }
         if (t > rpages * 5) {

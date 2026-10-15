@@ -440,13 +440,18 @@ endforeach()
 # Boolean ablation flags (define to enable, must be truthy)
 foreach(_flag ABLATION_NO_ZERO_EAGER ABLATION_NO_ZERO_DEFERRED
               ABLATION_NO_SKIP_STATS ABLATION_NO_CHUNK_BITMAP
-              ABLATION_NO_CALLSITE_ARENA USE_LZ4
+              ABLATION_NO_CALLSITE_ARENA
               COLD_ARENA_FEEDBACK PAGE_LOCAL_BATCH THREAD_ARENA_HASH
               ADAPTIVE_CAP MEASURE_COHORTS)
   if(SMASH_${_flag})
     target_compile_definitions(smash PRIVATE "SMASH_${_flag}=1")
   endif()
 endforeach()
+# The codec is a runtime choice now; say so rather than build zstd-1 silently.
+if(SMASH_USE_LZ4)
+  message(WARNING "SMASH_USE_LZ4 was removed and is ignored: the library uses "
+                  "zstd-1 unless run with SMASH_CODEC=lz4.")
+endif()
 
 if(APPLE)
   set_target_properties(smash PROPERTIES

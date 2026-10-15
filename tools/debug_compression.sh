@@ -81,11 +81,11 @@ for i in $(seq 1 $RUNS); do
   run_compile "no_compress" "$i" "SMASH_VM_GIB=48 SMASH_COLD_TICKS=9999 SMASH_VERY_COLD_TICKS=99999"
 done
 
-# Config 2: LZ4 instead of zstd (USE_LZ4=1)
+# Config 2: LZ4 instead of zstd (SMASH_CODEC=lz4; SMASH_USE_LZ4=1 was never read)
 echo ""
-echo "lz4_only (USE_LZ4=1):"
+echo "lz4_only (SMASH_CODEC=lz4):"
 for i in $(seq 1 $RUNS); do
-  run_compile "lz4_only" "$i" "SMASH_VM_GIB=48 SMASH_COLD_TIMEOUT_SEC=10 SMASH_USE_LZ4=1 SMASH_DEFER_MADVISE=1"
+  run_compile "lz4_only" "$i" "SMASH_VM_GIB=48 SMASH_COLD_TIMEOUT_SEC=10 SMASH_CODEC=lz4 SMASH_DEFER_MADVISE=1"
 done
 
 # Config 3: Fast tier only (no deep tier)

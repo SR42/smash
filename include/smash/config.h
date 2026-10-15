@@ -589,11 +589,11 @@ inline constexpr bool kDeepTierEnabled = false;
 
 // Tiered recompression (in development): when true, the compressor scans
 // COMPRESSED pages and upgrades fast-tier blobs (zstd-1 by default, LZ4
-// when SMASH_USE_LZ4) to deep-tier (zstd-9) once a page has stayed cold
+// with SMASH_CODEC=lz4) to deep-tier (zstd-9) once a page has stayed cold
 // past kVeryColdTicks.  Without this flag, the initial algorithm chosen
 // at compress time is final until the page is decompressed.
 //
-// Does NOT change the initial tier — see SMASH_USE_LZ4 for that.
+// Does NOT change the initial tier — see SMASH_CODEC for that.
 // See TIERED_RECOMPRESSION.md for design and measurements.
 #ifndef SMASH_NO_TIERED_RECOMPRESSION
 inline constexpr bool kTieredRecompression = true;
@@ -601,8 +601,9 @@ inline constexpr bool kTieredRecompression = true;
 inline constexpr bool kTieredRecompression = false;
 #endif
 
-// When true, use LZ4 as the fast compression tier (opt-in via SMASH_USE_LZ4).
-// When false (default), use zstd-1 as the fast tier for better ratios.
+// The fast-tier codec is chosen at startup by SMASH_CODEC=lz4|zstd
+// (ROIConfig::fast_lz4, compression_roi.h), zstd-1 by default for better
+// ratios. It used to be the build option SMASH_USE_LZ4 only.
 //
 // We measured LZ4 initial + zstd-9 upgrade on memcached and Redis: peak
 // fill_rss is unchanged vs zstd-1 (the bottleneck isn't the algorithm),
@@ -610,11 +611,6 @@ inline constexpr bool kTieredRecompression = false;
 // "stranger" blobs that prevent draining.  Keep as opt-in; the
 // CompressStore freelist (this branch) makes the cost bounded when
 // users do opt in.
-#ifdef SMASH_USE_LZ4
-inline constexpr bool kUseLz4FastTier = true;
-#else
-inline constexpr bool kUseLz4FastTier = false;
-#endif
 inline constexpr int kDictLevel = 3;            // CDict built at level 3 (430KB vs 686KB at level 9)
 inline constexpr size_t kDictCapacity = 16 * 1024; // 16KB dict (down from 32KB)
 inline constexpr int kMaxDictClasses = 8;        // cap total dict memory overhead

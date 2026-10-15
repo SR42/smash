@@ -7550,7 +7550,7 @@ public:
             "[smash stats] [%s] pid=%d committed=%zu  active=%zu  monitor=%zu"
             "  compressing=%zu  compressed=%zu  shadow=%zu  empty=%zu"
             "  tier_up=%llu/%llu  spilled=%zu  zero=%llu  zero_now=%zu  bump=%zu"
-            "  reheat=%llu  track=%s  boot=%zu/%zuMiB(%zu regions)"
+            "  reheat=%llu  track=%s  codec=%s  boot=%zu/%zuMiB(%zu regions)"
             "  rss=%zuMiB  blob=%zu/%zuMiB(%zu regions, %zu draining, %lluMiB moved)\n",
             ts, (int)getpid(), total, active, monitor, compressing, compressed,
             shadow, empty,
@@ -7561,6 +7561,7 @@ public:
             zero_now, raw_bump,
             (unsigned long long)g_reheat_events.load(std::memory_order_relaxed),
             writeTrackerName(self->write_tracker_),
+            ROIConfig::instance().fastCodecName(),
             boot_used >> 20, boot_cap >> 20, boot_regions,
             rss >> 20, blob_live >> 20, blob_held >> 20, blob_regions, blob_draining,
             static_cast<unsigned long long>(
