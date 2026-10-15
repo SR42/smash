@@ -1435,6 +1435,18 @@ int smash_in_arena(const void* ptr) {
     return heap && heap->inArena(ptr) ? 1 : 0;
 }
 
+// Diagnostic / test hook (not public API): the compressor's view of the page
+// holding `ptr` -- PageState (0 EMPTY, 1 ACTIVE, 2 COMPRESSED, 3 COMPRESSING,
+// 4 ACTIVE_MONITORING, 5 COMPRESSED_SHADOW), cold-tick count and recompression
+// count. 0 on success, -1 for an address outside the arena. Used by the
+// placement tests (test_callsite_temperature, test_cooling_close,
+// test_thrash_backoff) to tell when a page was compressed.
+extern "C" __attribute__((visibility("default")))
+int smash_page_info(const void* ptr, int* state, int* cold, int* recompress) {
+    auto* heap = SmashRedirect::getHeap();
+    return heap && heap->pageInfo(ptr, state, cold, recompress) ? 0 : -1;
+}
+
 // Diagnostic / test hook (not public API): bytes held dirty in sub-arenas now
 // and runs purged so far (SMASH_SUBARENAS). 0 if sub-arenas are on, -1 if not.
 extern "C" __attribute__((visibility("default")))

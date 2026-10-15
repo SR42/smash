@@ -1736,6 +1736,46 @@ private:
         }
     }
 
+    // Phase B's check that a COMPRESSED_SHADOW page is unchanged since its
+    // snapshot: the live page against its decompressed blob. The blob came
+    // from a snapshot whose free slots zeroFreeSlots() zeroed, while the live
+    // page still holds the freed objects' bytes there, so a plain memcmp
+    // failed for every page with a dirty free slot: in full mode such a page
+    // was compressed, thrown back to ACTIVE with its cold count reset, and
+    // compressed again, forever (measured: 1280 of 1370 compressions
+    // discarded, 0 of 256 one-live-object pages ever reclaimed). Slots free
+    // now are skipped -- their bytes are garbage either way, and the restore
+    // gives them the blob's zeros. A slot allocated since the snapshot is
+    // compared, so a write to it still discards the page.
+    //
+    // The bitmap is read without the slab lock, after the page was armed
+    // PROT_READ, as zeroFreeSlots() reads it when the snapshot is taken.
+    bool shadowMatchesBlob(const void* live, const void* blob) const {
+        if (__builtin_memcmp(live, blob, kPageSize) == 0) return true;
+        if (!page_map_) return false;
+        const auto page_start = reinterpret_cast<uintptr_t>(live);
+        Span* span = page_map_->get(page_start);
+        if (!span || span->is_large || span->object_size == 0) return false;
+        const size_t obj_size = span->object_size;
+        const size_t page_off = page_start - reinterpret_cast<uintptr_t>(span->base);
+        const auto* l = static_cast<const unsigned char*>(live);
+        const auto* b = static_cast<const unsigned char*>(blob);
+        for (size_t off = 0; off < kPageSize;) {
+            const size_t slot = (page_off + off) / obj_size;
+            size_t seg_end = kPageSize;
+            bool free_now = false;
+            if (slot < span->object_count) {
+                const size_t slot_end = (slot + 1) * obj_size - page_off;
+                if (slot_end < seg_end) seg_end = slot_end;
+                const uint64_t w = __atomic_load_n(&span->bitmap[slot / 64], __ATOMIC_ACQUIRE);
+                free_now = (w >> (slot % 64)) & 1;
+            }
+            if (!free_now && __builtin_memcmp(l + off, b + off, seg_end - off) != 0) return false;
+            off = seg_end;
+        }
+        return true;
+    }
+
     // ── Chunk bitmap management ───────────────────────────────────────────
 
     void rebuildChunkBitmap(size_t committed) {
@@ -1884,7 +1924,10 @@ private:
                     // stop at the floor for a read check.
                     cold_count_[i] = idle_track ? advanceColdBy(prev, idle_scan_elapsed_, 0)
                                                 : advanceCold(prev, cold_floor);
-                    decayRecompressCount(i, prev);
+                    // No decay here: an idle ACTIVE page is serving the wait
+                    // the back-off imposed, and decaying during it cut every
+                    // wait to kRcDecayColdTicks (see decayRecompressCount).
+                    if (cold_count_[i] == 255) recompress_count_[i] = 0;
                 }
                 if (wg > 1 && gn < kMaxWatchGroup) gbuf[gn++] = i;
             } else if (st == PageState::COMPRESSED) {
@@ -1917,6 +1960,14 @@ private:
     // ticks of inactivity (edge-detect on cold_count_), and a hard reset
     // when cold_count_ saturates — by that point the page has been quiet
     // for ~255 ticks and any prior thrash history is stale.
+    //
+    // Called for COMPRESSED pages only: a page settles cold by staying
+    // compressed. It also ran for idle ACTIVE pages, i.e. during the wait
+    // the back-off itself imposes, so the count dropped while the page
+    // waited: with the floor of 2 the waits were 4, 8, 8, 8... ticks instead
+    // of 4, 8, 16, 32 (the count never got past 2), and with the default
+    // floor of 10 a page faulted back once waited no longer than a page
+    // never compressed (test_compression's testRecompressBackoff).
     // cold_count_ advanced by this tick's nominal ticks, saturating at 255.
     // A count below `floor` stops AT it: Phase 2 escalates a watched page to
     // PROT_NONE only when its count equals the floor, so a jump past it
@@ -2721,7 +2772,7 @@ private:
     // mprotect + memcpy) when the fd is not open or the read is short.
     bool readPageViaMem([[maybe_unused]] const void* page_addr, [[maybe_unused]] void* dst) {
 #ifdef __linux__
-        if (self_mem_fd_ < 0) return false;
+        if (self_mem_fd_ < 0 || cfg_test_no_mem_snapshot_) return false;
         pc_.sc_memread_n.fetch_add(1, std::memory_order_relaxed);
         SyscallTimer t(pc_.sc_memread_us);
         const auto off = static_cast<off_t>(reinterpret_cast<uintptr_t>(page_addr));
@@ -4678,8 +4729,7 @@ private:
                     compressed_[i].compressedSize(), kPageSize,
                     algo, sc);
 
-                bool content_matches =
-                    __builtin_memcmp(page_addr, fault_slots_[slot].buf, kPageSize) == 0;
+                bool content_matches = shadowMatchesBlob(page_addr, fault_slots_[slot].buf);
                 releaseFaultSlot(slot);
 
                 if (!content_matches) {
@@ -6898,6 +6948,9 @@ public:
     // the cold counter for their containing page — pages still receiving
     // allocations should never be eligible for compression.
     uint8_t* coldCounts() const { return cold_count_; }
+    // Per-page recompression count (the thrash back-off's per-page input);
+    // read by the smash_page_info() test hook only.
+    const uint8_t* recompressCounts() const { return recompress_count_; }
 
     void init(VmRegion* vm, PageStateTable* states, PageLockTable* locks,
               CompressStore* store, CompressEngine* engine,
@@ -7282,6 +7335,12 @@ public:
     // every tick, to reproduce the multi-minute ticks of a large, contended
     // host (slow_tick_test).
     int cfg_test_tick_delay_ms_ = 0;
+    // SMASH_TEST_NO_MEM_SNAPSHOT=1, test-only: never snapshot a page through
+    // /proc/self/mem, so deferred mode takes its fallback (the page made
+    // PROT_RW and copied) and shadow pages stay writable: Phase B's
+    // shadowMatchesBlob is then all that stands between a write and its loss
+    // (test_shadow_free_slots_rw).
+    bool cfg_test_no_mem_snapshot_ = false;
     long cfg_vma_margin_ = 8192;   // SMASH_VMA_MARGIN; see VMA-cap guard in tick()
     bool cfg_spill_ = false;       // SMASH_SPILL: file-back very-cold blobs
     bool cfg_spill_pageout_ = false; // SMASH_SPILL_PAGEOUT: MADV_PAGEOUT accelerant
@@ -7302,6 +7361,8 @@ public:
         cfg_defer_phases_ms_ = v ? std::atoi(v) : 0;
         v = std::getenv("SMASH_TEST_TICK_DELAY_MS");
         cfg_test_tick_delay_ms_ = v ? std::atoi(v) : 0;
+        v = std::getenv("SMASH_TEST_NO_MEM_SNAPSHOT");
+        cfg_test_no_mem_snapshot_ = v && v[0] == '1';
         v = std::getenv("SMASH_VMA_MARGIN");
         cfg_vma_margin_ = v ? std::atol(v) : 8192L;
         v = std::getenv("SMASH_SPILL");

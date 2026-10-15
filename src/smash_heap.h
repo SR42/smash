@@ -2143,6 +2143,23 @@ public:
         return ptr && vm_region_.inContigArena(reinterpret_cast<uintptr_t>(ptr));
     }
 
+    // Diagnostic / test hook behind smash_page_info(): the compressor's view of
+    // the page holding `ptr` -- its PageState, cold-tick count and
+    // recompression count. False for an address outside the arena or before
+    // the compressor's tables exist. Racy snapshots, like every reader of
+    // these bytes outside the compressor.
+    bool pageInfo(const void* ptr, int* state, int* cold, int* recompress) const {
+        if (!compression_inited_ || !inArena(ptr)) return false;
+        const uint8_t* cc = compressor_.coldCounts();
+        const uint8_t* rc = compressor_.recompressCounts();
+        if (!cc || !rc) return false;
+        const size_t i = vm_region_.pageIndex(reinterpret_cast<uintptr_t>(ptr));
+        if (state) *state = static_cast<int>(page_states_.get(i));
+        if (cold) *cold = cc[i];
+        if (recompress) *recompress = rc[i];
+        return true;
+    }
+
     // Back the diagnostic exports smash_numa_compressor_info() and
     // smash_compressed_blob_for().
 #if defined(__linux__)

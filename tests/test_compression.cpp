@@ -484,6 +484,89 @@ static void testNominalTicks() {
     CHECK(page[0] == 0x5c && page[kPageSize - 1] == 0x5c, "nominal: data mismatch");
 }
 
+// Recompression-thrash back-off: a page faulted back from COMPRESSED must
+// stay idle 2^rc times the floor before it is compressed again (rc = its
+// recompress count, shift capped at kMaxBackoffShift), and the count must
+// decay only once the page has stayed compressed -- one step per
+// kRcDecayColdTicks cold ticks. With SMASH_RECOMPRESS_BACKOFF=0 every round
+// takes the same time (test_compression_backoff_off).
+//
+// The decay used to run on idle ACTIVE pages too, i.e. during the very wait
+// the back-off imposes: at the floor of 2 this test runs with, the waits were
+// 4, 8, 8, 8 ticks instead of 4, 8, 16, 32, and at the default floor of 10 a
+// page faulted back once waited no longer than one never compressed.
+static int ticksUntilCompressed(CompressorThread& c, PageStateTable& states, size_t idx, int max) {
+    for (int t = 1; t <= max; ++t) {
+        c.compressTick();
+        const PageState st = states.get(idx);
+        if (st == PageState::COMPRESSED || st == PageState::COMPRESSED_SHADOW) return t;
+    }
+    return -1;
+}
+
+static void testRecompressBackoff() {
+    const char* off_env = getenv("SMASH_RECOMPRESS_BACKOFF");
+    const bool backoff = !(off_env && atoi(off_env) == 0);
+    setenv("SMASH_REARM_BACKOFF_MAX", "0", 1);
+    VmRegion vm;
+    vm.init(64 * kPageSize);
+    PageStateTable states;
+    states.init(vm.totalPages());
+    PageLockTable locks;
+    locks.init(vm.totalPages());
+    CompressStore store;
+    store.init();
+    CompressEngine engine;
+    engine.init();
+    CompressorThread compressor;
+    compressor.init(&vm, &states, &locks, &store, &engine);
+    unsetenv("SMASH_REARM_BACKOFF_MAX");
+    compressor.setRestoreGranulePages(1);
+
+    auto* page = static_cast<uint8_t*>(vm.allocatePages(1));
+    CHECK(page != nullptr, "recompress: alloc failed");
+    const size_t idx = vm.pageIndex(reinterpret_cast<uintptr_t>(page));
+    states.set(idx, PageState::ACTIVE);
+    memset(page, 0x3d, kPageSize);
+    const uint8_t* rc = compressor.recompressCounts();
+    const int floor = static_cast<int>(ROIConfig::instance().cold_ticks_floor);
+
+    CHECK(ticksUntilCompressed(compressor, states, idx, 40) > 0, "recompress: first compression never happened");
+    // Ticks from a restore fault to the next compression, per recompress count.
+    int wait[6] = {};
+    for (int r = 1; r <= 5; ++r) {
+        CHECK(compressor.handleFault(reinterpret_cast<uintptr_t>(page)), "recompress: restore fault %d", r);
+        CHECK(page[0] == 0x3d && page[kPageSize - 1] == 0x3d, "recompress: data mismatch after fault %d", r);
+        CHECK(rc[idx] == r, "recompress: count %d after fault %d", rc[idx], r);
+        wait[r] = ticksUntilCompressed(compressor, states, idx, 400);
+        fprintf(stderr, "recompress: rc=%d -> compressed again after %d ticks (floor %d, backoff %s)\n", r,
+                wait[r], floor, backoff ? "on" : "off");
+        CHECK(wait[r] > 0, "recompress: rc=%d never compressed again", r);
+    }
+    for (int r = 2; r <= 5; ++r) {
+        // Each fault doubles the idle streak required, so the wait grows by
+        // exactly the difference of the effective floors.
+        const int want = backoff ? wait[1] + (floor << r) - (floor << 1) : wait[1];
+        CHECK(wait[r] == want, "recompress: rc=%d waited %d ticks, want %d", r, wait[r], want);
+    }
+    CHECK(!backoff || wait[1] >= floor << 1, "recompress: rc=1 waited %d ticks, under 2x the floor of %d",
+          wait[1], floor);
+
+    // Left compressed, the count decays one step per kRcDecayColdTicks cold
+    // ticks, to 0; the next fault then starts the schedule over.
+    for (int t = 0; t < 5 * kRcDecayColdTicks + 8; ++t) compressor.compressTick();
+    CHECK(states.get(idx) == PageState::COMPRESSED, "recompress: page left idle is not compressed (state %d)",
+          static_cast<int>(states.get(idx)));
+    CHECK(rc[idx] == 0, "recompress: count %d after %d compressed ticks, want 0", rc[idx],
+          5 * kRcDecayColdTicks + 8);
+    CHECK(compressor.handleFault(reinterpret_cast<uintptr_t>(page)), "recompress: restore fault after decay");
+    CHECK(rc[idx] == 1, "recompress: count %d after the fault that followed the decay", rc[idx]);
+    const int again = ticksUntilCompressed(compressor, states, idx, 400);
+    CHECK(again == wait[1], "recompress: after decay waited %d ticks, want %d (the rc=1 wait)", again, wait[1]);
+    CHECK(compressor.handleFault(reinterpret_cast<uintptr_t>(page)), "recompress: final restore fault");
+    CHECK(page[0] == 0x3d && page[kPageSize - 1] == 0x3d, "recompress: data mismatch at the end");
+}
+
 // Coarse watching (SMASH_WATCH_GROUP_PAGES): a group is idle only when all
 // its pages are, so it is escalated and compressed in one tick; a fault on
 // a compressed page restores the whole group; a group is not armed while one
@@ -605,7 +688,12 @@ static void testReleaseCompressedPages() {
           static_cast<int>(states.get(page_idx)));
 }
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc > 1 && strcmp(argv[1], "recompress") == 0) {
+        testRecompressBackoff();
+        fprintf(stderr, failures ? "compression: %d failures\n" : "compression: all tests passed\n", failures);
+        return failures ? 1 : 0;
+    }
     testCompressEngine();
     testCompressStore();
     testCompressorRoundtrip();
@@ -616,6 +704,7 @@ int main() {
     testRestoreGranule();
     testNominalTicks();
     testWatchGroup();
+    testRecompressBackoff();
     testReleaseCompressedPages();
 
     if (failures == 0) {

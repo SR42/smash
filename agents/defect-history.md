@@ -451,3 +451,67 @@ and measurements: "Stdio stream buffers came from smash" in
 where stream buffers already came from glibc (except a block size above
 16 KiB, now covered too). Guarded by `test_stdio_buffer`, `test_stdio_chk`
 and `test_chk_interposition`.
+
+## Pages with dirty freed slots were never reclaimed in full mode (fixed 2026-10-15)
+
+The compressor zeroes a page's free slots in its snapshot so they compress
+well (`zeroFreeSlots`), but leaves the live page alone: the freed objects'
+bytes stay there until the page is decommitted. In deferred-reclaim mode (the
+default) Phase B checks that a `COMPRESSED_SHADOW` page is unchanged before
+reclaiming it, and compared the live page byte for byte against the
+decompressed, zeroed blob. Every page with a dirty free slot failed: it went
+back to ACTIVE with its cold count reset, was compressed again a few ticks
+later, failed again, forever. Measured with one live object and 15 freed
+256-byte objects per page: **0 of 256 pages ever reclaimed, 1280 of 1370
+compressions discarded** (`release changed=` in the `[smash pipeline]` line),
+the pages cycling every ~6 s; with the freed objects cleared before `free`,
+256 of 256 reclaimed and 0 discarded. Besides the RSS, every cycle cost a
+compression and a decompression, and each discard made the page look freshly
+written, so cooling-page closing (which steers allocations away from pages
+going cold) saw all of them turn warm at once and sent churn onto them.
+
+Found by `test_cooling_close`, whose survivor pages all went back to ACTIVE
+in the same tick although nothing wrote to them. Fixed in
+`shadowMatchesBlob`: a plain memcmp first, and on a mismatch a slot-by-slot
+compare that skips the slots free now (their bytes are garbage either way, and
+the restore gives them the blob's zeros); a slot allocated since the snapshot
+is compared, so a write to it still discards the page. The bitmap is read
+without the slab lock after the page is armed PROT_READ — as `zeroFreeSlots`
+reads it when the snapshot is taken. Not affected: `SMASH_LARGE_ONLY=1` (large
+blocks have no slots) and `SMASH_DEFERRED_RECLAIM=0`. Guarded by
+`test_shadow_free_slots`, which also rewrites live objects on shadow pages and
+checks the rewrites survive.
+
+## Thrash back-off: the count decayed during the wait it imposed (fixed 2026-10-15)
+
+A page faulted back from COMPRESSED has its recompress count raised, and Phase
+2 then wants it idle for `floor << count` ticks before compressing it again.
+The count was meant to decay "once a page truly settles cold", one step per
+`kRcDecayColdTicks` (8) idle ticks — but the decay ran for idle ACTIVE pages
+too, i.e. during the very wait the back-off imposed. So every wait was cut to
+about 8 ticks: at the floor of 2 the waits were 4, 8, 8, 8 ticks instead of 4,
+8, 16, 32 (the count never got past 2), and at the default floor of 10 a page
+faulted back once waited no longer than a page never compressed (the count
+dropped to 0 at 8 idle ticks, before the 20-tick wait ended). The design
+commit (May 2026, floor then 2) expected "after 6 thrash events ... effectively
+exempt until decay brings rc back down". Now the count decays only while the
+page is COMPRESSED (and is still reset when an idle page's cold count
+saturates). Measured end to end (`test_thrash_backoff`, floor 3 s): restored
+pages compressed again after 13.1 s, against 5.0 s with the back-off off.
+
+This applies in `SMASH_LARGE_ONLY=1` too. With the default 10 s cold timeout,
+a page faulted back once (count 1, plus the bucket bias of 1 that its own
+restore set) waited 20 s before and waits 40 s now; faulted back again before
+its count decays (one step per 8 ticks spent compressed), 80 s, and so on up
+to the 200-tick cap. Before the fix the wait was 20 s after one restore and
+grew by only 8 s per further one (24 s at count 3, 32 s at count 4). `SMASH_RECOMPRESS_BACKOFF=0` turns the back-off off.
+
+Two properties of the per-bucket half of the back-off, measured while writing
+the test and left as they are:
+- Any restore counts. The slab hands out a free slot on a COMPRESSED page
+  rather than open a new span when it has nothing else, and the first write to
+  that object faults the page back — the bias counts that as a thrash. One such
+  allocation gave a call site's fresh pages 2x the floor (7.1 s against 5.1 s).
+- The bucket bias never decays: it is set once the bucket's EMA of the restore
+  count reaches 1, and every sample is at least 1, so one restore in a bucket
+  doubles the floor of all its fresh pages for the rest of the process.

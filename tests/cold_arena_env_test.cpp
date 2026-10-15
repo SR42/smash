@@ -22,7 +22,12 @@
 //   - SMASH_COLD_ARENA_THRESHOLD=1000000: the flip never happens;
 //   - SMASH_NUM_ARENAS=128 with feedback: the hot arenas are capped at 64 so
 //     the cold half fits the slab table (old < 64, new = old + 64);
-//   - every child reads its objects back intact.
+//   - every child reads its objects back intact;
+//   - a hot call site is never moved: 2048 objects from another call site
+//     (routed to another arena) are written every 250 ms throughout, and the
+//     last of 512 new objects from it comes from its old arena in every case,
+//     with none of its pages out of RAM. Without this, a flip that moved every
+//     site, or a counter shared across sites, would pass.
 #include <cerrno>
 #include <climits>
 #include <cstdint>
@@ -46,6 +51,20 @@ __attribute__((noinline)) void* site() {
     asm volatile("" ::: "memory");  // keep this call site a real call
     return p;
 }
+
+// Candidates for the hot call site: the first whose arena differs from the
+// cold site's is used.
+static volatile uintptr_t g_hot_sink;
+#define HOT_SITE(n)                                            \
+    __attribute__((noinline)) void* hot_site_##n() {          \
+        void* p = malloc(kObj);                                \
+        g_hot_sink = reinterpret_cast<uintptr_t>(p) + (n);    \
+        return p;                                              \
+    }
+HOT_SITE(0) HOT_SITE(1) HOT_SITE(2) HOT_SITE(3) HOT_SITE(4) HOT_SITE(5)
+using SiteFn = void* (*)();
+SiteFn kHotSites[] = {hot_site_0, hot_site_1, hot_site_2, hot_site_3, hot_site_4, hot_site_5};
+constexpr size_t kHotCount = 2048;
 
 unsigned char want(size_t obj, size_t i) { return i < 64 ? static_cast<unsigned char>(obj + i) : 0; }
 
@@ -73,6 +92,29 @@ int child() {
     }
     const int old_arena = arena_for(objs[0]);
 
+    // The hot site: kept hot by a write to each object every 250 ms below.
+    SiteFn hot_site = kHotSites[0];
+    for (SiteFn h : kHotSites) {
+        void* p = h();
+        const int a = arena_for(p);
+        free(p);
+        if (a != old_arena) {
+            hot_site = h;
+            break;
+        }
+    }
+    std::vector<unsigned char*> hot(kHotCount);
+    for (size_t k = 0; k < kHotCount; ++k) {
+        hot[k] = static_cast<unsigned char*>(hot_site());
+        for (size_t i = 0; i < kObj; ++i) hot[k][i] = want(k + 7, i);
+    }
+    const int hot_old = arena_for(hot[0]);
+    unsigned round = 0;
+    auto heatUp = [&] {
+        ++round;
+        for (auto* h : hot) h[kObj - 1] = static_cast<unsigned char>(round | 1);
+    };
+
     // Wait until at least half of the objects' pages are out of RAM.
     std::vector<uintptr_t> pages;
     for (auto* o : objs) {
@@ -86,9 +128,13 @@ int child() {
         for (uintptr_t pg : pages)
             if (mincore(reinterpret_cast<void*>(pg), kPage, &v) == 0 && !(v & 1)) ++out;
         if (out * 2 >= pages.size()) break;
+        heatUp();
         usleep(250 * 1000);
     }
-    sleep(1);  // let the compressor's callback see the last compressions
+    for (int i = 0; i < 4; ++i) {  // let the compressor's callback see the last compressions
+        heatUp();
+        usleep(250 * 1000);
+    }
 
     // The thread cache can still hold slots the hot slab handed out before
     // the flip, and serves them first: judge by the last of 512.
@@ -100,6 +146,21 @@ int child() {
     }
     const int new_arena = arena_for(fresh.back());
     for (void* f : fresh) free(f);
+    std::vector<void*> hot_fresh(512);
+    for (void*& f : hot_fresh) f = hot_site();
+    const int hot_new = arena_for(hot_fresh.back());
+    for (void* f : hot_fresh) free(f);
+    size_t hot_out = 0;
+    {
+        std::vector<uintptr_t> hp;
+        for (auto* h : hot) {
+            const uintptr_t pg = reinterpret_cast<uintptr_t>(h) & ~(kPage - 1);
+            if (hp.empty() || hp.back() != pg) hp.push_back(pg);
+        }
+        unsigned char v;
+        for (uintptr_t pg : hp)
+            if (mincore(reinterpret_cast<void*>(pg), kPage, &v) == 0 && !(v & 1)) ++hot_out;
+    }
 
     raise(SIGUSR2);
     usleep(100 * 1000);
@@ -115,9 +176,12 @@ int child() {
     size_t bad = 0;
     for (size_t k = 0; k < kCount; ++k)
         for (size_t i = 0; i < kObj; ++i) bad += objs[k][i] != want(k, i);
+    for (size_t k = 0; k < kHotCount; ++k)
+        for (size_t i = 0; i + 1 < kObj; ++i) bad += hot[k][i] != want(k + 7, i);
     for (auto* o : objs) free(o);
-    std::printf("old=%d new=%d cold=%ld out=%zu/%zu bad=%zu from_old=%zu\n", old_arena, new_arena, cold, out,
-                pages.size(), bad, from_old);
+    for (auto* h : hot) free(h);
+    std::printf("old=%d new=%d cold=%ld out=%zu/%zu bad=%zu from_old=%zu hot_old=%d hot_new=%d hot_out=%zu\n",
+                old_arena, new_arena, cold, out, pages.size(), bad, from_old, hot_old, hot_new, hot_out);
     return 0;
 }
 
@@ -159,7 +223,8 @@ struct Result {
     bool ok = false;
     int old_arena = -1, new_arena = -1;
     long cold = -1;
-    size_t out = 0, pages = 0, bad = 0, from_old = 0;
+    size_t out = 0, pages = 0, bad = 0, from_old = 0, hot_out = 0;
+    int hot_old = -1, hot_new = -1;
 };
 
 Result run(const char* self, const char* env) {
@@ -172,13 +237,16 @@ Result run(const char* self, const char* env) {
     size_t at = out.rfind("\nold=");
     at = at != std::string::npos ? at + 1 : (out.compare(0, 4, "old=") == 0 ? 0 : std::string::npos);
     if (at != std::string::npos &&
-        std::sscanf(out.c_str() + at, "old=%d new=%d cold=%ld out=%zu/%zu bad=%zu from_old=%zu", &r.old_arena,
-                    &r.new_arena, &r.cold, &r.out, &r.pages, &r.bad, &r.from_old) == 7)
+        std::sscanf(out.c_str() + at,
+                    "old=%d new=%d cold=%ld out=%zu/%zu bad=%zu from_old=%zu hot_old=%d hot_new=%d hot_out=%zu",
+                    &r.old_arena, &r.new_arena, &r.cold, &r.out, &r.pages, &r.bad, &r.from_old, &r.hot_old,
+                    &r.hot_new, &r.hot_out) == 10)
         r.ok = true;
     r.ok = r.ok && st == 0;
     std::printf("%-58s -> arena %d then %d (%zu of 512 new still from %d), cold_arenas=%ld, %zu of %zu pages out, "
-                "%zu bad bytes (status %d)\n", env, r.old_arena, r.new_arena, r.from_old, r.old_arena, r.cold, r.out,
-                r.pages, r.bad, st);
+                "%zu bad bytes; hot site: arena %d then %d, %zu pages out (status %d)\n", env, r.old_arena,
+                r.new_arena, r.from_old, r.old_arena, r.cold, r.out, r.pages, r.bad, r.hot_old, r.hot_new, r.hot_out,
+                st);
     if (!r.ok) showTail(out);
     return r;
 }
@@ -212,6 +280,11 @@ int main(int argc, char** argv) {
                   std::to_string(c.shift);
         else if (c.shift == 64 && r.old_arena >= 64) why = "hot arena " + std::to_string(r.old_arena) + " above 63";
         else if (c.flipped ? r.cold < 1 : r.cold != 0) why = "cold_arenas=" + std::to_string(r.cold);
+        else if (r.hot_old == r.old_arena) why = "no hot call site routed away from the cold one's arena";
+        else if (r.hot_new != r.hot_old)
+            why = "the hot call site moved from arena " + std::to_string(r.hot_old) + " to " +
+                  std::to_string(r.hot_new);
+        else if (r.hot_out) why = std::to_string(r.hot_out) + " hot pages out of RAM while written every 250 ms";
         if (!why.empty()) {
             std::printf("FAIL: %s: %s\n", *c.env ? c.env : "unset", why.c_str());
             ++failures;

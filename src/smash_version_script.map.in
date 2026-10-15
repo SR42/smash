@@ -88,6 +88,7 @@
     # to guard the call-site-arena invariant.
     smash_arena_for;
     smash_in_arena;
+    smash_page_info;
     smash_run_cache_info;
     smash_subarena_info;
     smash_shared_arena_info;

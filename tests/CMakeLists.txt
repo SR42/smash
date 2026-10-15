@@ -110,6 +110,11 @@ add_test(NAME test_compression COMMAND test_compression)
 # don't exist under the soft-dirty path.
 set_tests_properties(test_compression PROPERTIES
   ENVIRONMENT "SMASH_COLD_TICKS=2;SMASH_SOFTDIRTY=0;SMASH_FIXAV=0")
+# The recompression-thrash schedule with the back-off switched off: every
+# restore-to-recompress wait the same (testRecompressBackoff's control).
+add_test(NAME test_compression_backoff_off COMMAND test_compression recompress)
+set_tests_properties(test_compression_backoff_off PROPERTIES
+  ENVIRONMENT "SMASH_COLD_TICKS=2;SMASH_SOFTDIRTY=0;SMASH_FIXAV=0;SMASH_RECOMPRESS_BACKOFF=0")
 
 # Compression-ratio test (needs LZ4 + zstd): verifies the engine hits the
 # paper's claimed ratios (RQ2), not just "compressed > 0". In-process,
@@ -844,6 +849,50 @@ if(NOT APPLE)
     "SMASH_DEFER_PHASES_MS=0" "SMASH_COLD_TIMEOUT_SEC=1"
     $<TARGET_FILE:cold_arena_env_test>)
   set_tests_properties(test_cold_arena_env PROPERTIES TIMEOUT 300)
+
+  # Full-mode placement by temperature, end to end: call-site arenas keep a
+  # hot site's objects off a cold site's pages (callsite_temperature_test.cpp),
+  # cooling-page closing keeps allocation churn off pages going cold
+  # (cooling_close_test.cpp), and the recompression-thrash back-off makes a
+  # page faulted back, and fresh pages of its call site, wait longer
+  # (thrash_backoff_test.cpp). Each reads page states via smash_page_info.
+  add_executable(callsite_temperature_test callsite_temperature_test.cpp)
+  target_link_libraries(callsite_temperature_test PRIVATE ${CMAKE_DL_LIBS})
+  add_test(NAME test_callsite_temperature COMMAND ${CMAKE_COMMAND} -E env
+    "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=0"
+    "SMASH_DEFER_PHASES_MS=0" "SMASH_COLD_TIMEOUT_SEC=1"
+    $<TARGET_FILE:callsite_temperature_test>)
+  set_tests_properties(test_callsite_temperature PROPERTIES TIMEOUT 300)
+  add_executable(cooling_close_test cooling_close_test.cpp)
+  target_link_libraries(cooling_close_test PRIVATE ${CMAKE_DL_LIBS})
+  add_test(NAME test_cooling_close COMMAND ${CMAKE_COMMAND} -E env
+    "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=0" "SMASH_STATS_SIGNAL=1"
+    "SMASH_DEFER_PHASES_MS=0" "SMASH_COLD_TIMEOUT_SEC=4"
+    $<TARGET_FILE:cooling_close_test>)
+  set_tests_properties(test_cooling_close PROPERTIES TIMEOUT 300)
+  # A page with dirty freed slots must be reclaimed from COMPRESSED_SHADOW, and a
+  # write to a page awaiting reclaim must survive (shadow_free_slots_test.cpp).
+  add_executable(shadow_free_slots_test shadow_free_slots_test.cpp)
+  target_link_libraries(shadow_free_slots_test PRIVATE ${CMAKE_DL_LIBS})
+  add_test(NAME test_shadow_free_slots COMMAND ${CMAKE_COMMAND} -E env
+    "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=0" "SMASH_DEFERRED_RECLAIM=1"
+    "SMASH_DEFER_PHASES_MS=0" "SMASH_COLD_TIMEOUT_SEC=2"
+    $<TARGET_FILE:shadow_free_slots_test>)
+  set_tests_properties(test_shadow_free_slots PROPERTIES TIMEOUT 120)
+  # The same with shadow pages left writable (no /proc/self/mem snapshot): a
+  # rewrite then does not fault, and only Phase B's check keeps it.
+  add_test(NAME test_shadow_free_slots_rw COMMAND ${CMAKE_COMMAND} -E env
+    "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=0" "SMASH_DEFERRED_RECLAIM=1"
+    "SMASH_TEST_NO_MEM_SNAPSHOT=1" "SMASH_DEFER_PHASES_MS=0" "SMASH_COLD_TIMEOUT_SEC=2"
+    $<TARGET_FILE:shadow_free_slots_test>)
+  set_tests_properties(test_shadow_free_slots_rw PROPERTIES TIMEOUT 120)
+  add_executable(thrash_backoff_test thrash_backoff_test.cpp)
+  target_link_libraries(thrash_backoff_test PRIVATE ${CMAKE_DL_LIBS})
+  add_test(NAME test_thrash_backoff COMMAND ${CMAKE_COMMAND} -E env
+    "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=0" "SMASH_PREFETCH_WINDOW=0"
+    "SMASH_DEFER_PHASES_MS=0" "SMASH_COLD_TIMEOUT_SEC=3"
+    $<TARGET_FILE:thrash_backoff_test>)
+  set_tests_properties(test_thrash_backoff PROPERTIES TIMEOUT 300)
 
   # Freed compressed data must give its blob memory back, and the blobs moved
   # to do it must decompress correctly (blob_compact_test.cpp).
