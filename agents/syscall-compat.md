@@ -64,7 +64,7 @@ nm -D --with-symbol-versions libsmash.so | grep <symbol>   # must list that vers
 
 glibc's fortify headers rewrite a call whose destination object size is known at compile time into the `__*_chk` alias: `read(fd, buf, n)` becomes `__read_chk(fd, buf, n, sizeof buf)`. The plain symbol is then never referenced, so interposing `read` alone misses the call and the kernel's EFAULT goes straight back to the application. `_FORTIFY_SOURCE` is on by default on Ubuntu, Fedora and RHEL, and any read into a fixed-size buffer qualifies — measured with plain `gcc -O2` and no sanitizer, a read/pread/recv into a `char buf[4096]` emits `__read_chk`/`__pread_chk`/`__recv_chk`, and only `-U_FORTIFY_SOURCE` brings the plain names back. It surfaced as `test_syscall_efault` failing only under UBSan, because instrumentation made the object size knowable.
 
-Wrapped: `__read_chk`, `__pread_chk`, `__pread64_chk`, `__recv_chk`, `__recvfrom_chk`, `__poll_chk`, `__ppoll_chk`, `__readlink_chk`, `__readlinkat_chk` — the EFAULT-retry family only. `__fgets_chk` / `__fread_chk` / `__getcwd_chk` are deliberately **not** wrapped: they return a pointer or a count, so the retry predicate (`ret == -1 && errno == EFAULT`) cannot apply, and warming the buffer on every call would land on smash's own hot paths (the compressor reads `/proc/self/maps` with `fgets` in a loop). Note the argument-order traps: `__recv_chk` puts `buflen` **before** `flags`, and `__fread_chk` takes `ptrlen` second.
+Wrapped: `__read_chk`, `__pread_chk`, `__pread64_chk`, `__recv_chk`, `__recvfrom_chk`, `__poll_chk`, `__ppoll_chk`, `__readlink_chk`, `__readlinkat_chk` (the EFAULT-retry family), and since 2026-10-15 `__fgets_chk` / `__fread_chk`, which route a call that cannot overflow to the `fgets` / `fread` wrappers and their stdio retry (see "Stdio stream buffers came from smash" below). These were left out at first because their return value does not fit the `ret == -1 && errno == EFAULT` predicate and because warming on every call would sit on smash's own hot paths; the plain wrappers' stdio retry answers the first, and libsmash itself references neither symbol (`nm`), so the second does not apply. `__getcwd_chk` is still not wrapped. Note the argument-order traps: `__recv_chk` puts `buflen` **before** `flags`, and `__fread_chk` takes `ptrlen` second.
 
 **The versions differ per architecture, and that silently disabled the whole carve-out on aarch64.** glibc versions these at GLIBC_2.4 / 2.5 / 2.16 on x86-64, and the map exported smash's wrappers at exactly those versions — but the aarch64 port starts at GLIBC_2.17, so every one of them is `__*_chk@@GLIBC_2.17` there (verified against an aarch64 libc: all ten). No export matched, so on aarch64 every fortified read into a heap buffer went straight to libc and the EFAULT decompress-and-retry never ran. Reported from an aarch64 run as `test_syscall_efault` failing with `__getgroups_chk returned -1 errno=14`; that test is simply the first to call a `__*_chk` by name, and the other nine were equally unbound. CMake now emits the bare names in the base version node when the base *is* `GLIBC_2.17`, and nowhere else — on x86-64 they must stay local, for the self-jump reason below.
 
@@ -195,21 +195,67 @@ names are not wrapped at all (64-bit builds do not rename `pread` to them, so
 most callers never use them); `fread` and the
 other buffered calls go through `warmPages` as before.
 
-**Open (full mode only): a stdio stream's own buffer can EFAULT inside libc.**
-Found 2026-10-15 as root on claudepc: `test_cold_arena_env`'s parent (full
-mode) read its children's output with `popen` + `fgets`, and every
-`read(2)` glibc issued into the stream's buffer returned `EFAULT` (strace),
-so `fgets` reported end of file and the output was lost. The first stream's first
-read failed at once, the later streams' after blocking until their child
-exited, so warming before the call did not cover either; the
-likely holes (not confirmed separately): the buffer does not exist yet on a
-stream's first read (glibc allocates it inside the call, after the wrapper
-has warmed nothing, from a slab slot whose page may be watched or
-compressed), and a read that blocks (a pipe waiting for a child) can outlast
-the cold timeout, so a buffer warmed before it is protected again by the time
-the kernel writes it. Under `SMASH_LARGE_ONLY=1` stream buffers come
-from glibc and are not affected. The tests now read child output with
-`read(2)` into a stack buffer; the wrapper is not fixed.
+## Stdio stream buffers came from smash (fixed 2026-10-15)
+
+glibc allocates a stream's buffer in `_IO_file_doallocate`, with `malloc`, and
+fills it with its own internal `read`, which never reaches smash's `read()`
+wrapper. In full mode the buffer was a slab slot, often on a page the
+compressor owned, and the kernel's `EFAULT` became the stream's error. Only
+the wrapped readers (`fgets`, `fread`, `fgetc`, `getc`) recovered, by warming
+the buffer and retrying. Measured in full mode, each in a fresh process, a
+`popen` read of a child's delayed line: `getline`, `getdelim`, `fscanf`,
+`getc_unlocked`, `fgets_unlocked` and `fread_unlocked` all returned nothing
+with errno 14, every time.
+
+Found through a second hole: `_FORTIFY_SOURCE` turns `fgets`/`fread` into
+`__fgets_chk`/`__fread_chk` whenever the destination's size is known, and
+those were not wrapped. `test_cold_arena_env`'s full-mode parent read its
+children with `fgets` into a `char[512]`; built with UBSan the size became
+known, the call bound `__fgets_chk`, and every child "did not report" (strace:
+every `read` into the stream's buffer returned `EFAULT`). It was first put
+down to root and to the warming itself; neither held: the same program built
+without fortify read all three lines as root and not, and the UBSan build
+failed 3 of 3 unprivileged too.
+
+Two fixes:
+- **The buffer no longer comes from smash.** `StdioBufferCaller`
+  (`smash_heap.h`) holds `_IO_file_doallocate`'s code range, resolved at
+  startup with `dladdr1(RTLD_DL_SYMENT)`; `callsiteArena()` maps a call site in
+  it to `kStdioArena` (memoized like any arena, so the range is checked once
+  per call site and thread), and `malloc` hands those requests to the system
+  allocator, as does the large path for a block-size buffer above 16 KiB (any
+  mode). `free()` already returns pointers smash does not own there. Every
+  reader then works, wrapped or not (`test_stdio_buffer`: 7 of 7, each stream's
+  buffer outside the arena). A first version checked the range on `malloc`'s
+  fast path for every request of 512 bytes or more; it cost 6-7% of 8-thread
+  1 KiB malloc/free throughput and was replaced.
+- **`__fgets_chk` and `__fread_chk` are wrapped** (`GLIBC_2.4` / `GLIBC_2.7`,
+  or the base `GLIBC_2.17` on aarch64). A call that cannot trip glibc's
+  overflow check (`n <= buflen`; `size * n` neither overflowing nor above
+  `buflen`) is exactly the plain call and takes the plain wrapper's warm and
+  retry; one that could goes to glibc's own, which aborts as before. They
+  still matter with the buffer fixed: a buffer the program hands to
+  `setvbuf` is still smash memory, and `fread` of more than the stream's
+  buffer from a regular file reads straight into the caller's (on a pipe glibc
+  only ever filled its own buffer). `test_stdio_chk` covers both; glibc's own
+  `__fread_chk` returned 0, errno 14, into a compressed large block.
+
+The first version of the routing exposed an older bug. smash's own versioned
+`operator new` aliases (`_Znwm@GLIBCXX_3.4` and the rest, the symbols
+libstdc++-linked code binds) never stored their caller in
+`alloc8_caller_ra`, so they routed by whatever the previous allocation left
+there. Before, that only put C++ blocks in an unrelated call site's arena;
+with the routing, a `new` that followed glibc's stdio buffer allocation went
+to the system allocator too: `test_vm_exhaustion` (which reads a `/proc`
+file with `fscanf` first) got 384 of 384 4 MiB blocks outside the arena.
+The aliases now store their caller; `test_stdio_buffer` checks that a 4 MiB
+`new[]` right after a stream's buffer lands in the arena (0 of 7 without the
+store).
+
+Still not wrapped: `__fgets_unlocked_chk`, `__fread_unlocked_chk`,
+`__fgetws_chk` and the plain `*_unlocked` readers. With the buffer out of
+smash they lose data only in the two cases above (a `setvbuf` buffer, a direct
+read into a compressed caller buffer).
 
 ## Datagram receives lost a datagram on a fault (fixed 2026-09-29)
 

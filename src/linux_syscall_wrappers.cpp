@@ -125,8 +125,11 @@ static inline void warmGlibcFileBuffer(FILE* stream, smash::VmRegion* vm) {
 }
 
 // A freshly opened FILE has no buffer yet: glibc allocates it lazily, inside
-// the first read, with malloc -- so under smash it can land on a page the
-// compressor already owns. Warming before delegating cannot help, because
+// the first read, with malloc -- so under smash it could land on a page the
+// compressor already owns. Since 2026-10-15 that allocation goes to the
+// system allocator (StdioBufferCaller, smash_heap.h), so this retry is left
+// for a buffer the program supplies with setvbuf and for reads straight into
+// the caller's buffer. Warming before delegating cannot help, because
 // _IO_buf_base is still null at that point, and glibc's internal read is
 // intra-libc, so the read() wrapper never sees the kernel's EFAULT either. The
 // error reaches the application as a failed stream.
@@ -205,12 +208,12 @@ SMASH_VISIBLE ssize_t read(int fd, void* buf, size_t count) {
 //
 // TWO DELIBERATE LIMITS, both learned the hard way:
 //
-//  1. Only the EFAULT-retry family is wrapped. retryWith1Buf costs nothing
-//     unless the syscall actually returns EFAULT. The proactive-warm functions
-//     (fgets/fread/getcwd) are NOT wrapped: warming walks and faults the whole
-//     buffer on every call, and smash's own code calls fgets in a loop over
-//     /proc/self/maps (readVmaCount), so wrapping them put that cost on the
-//     compressor's own path.
+//  1. The EFAULT-retry family is wrapped; retryWith1Buf costs nothing unless
+//     the syscall actually returns EFAULT. Of the proactive-warm functions,
+//     __fgets_chk and __fread_chk are wrapped too (they route to the fgets /
+//     fread wrappers, further down); libsmash itself references neither, so
+//     smash's own fgets loop over /proc/self/maps (readVmaCount) does not pay
+//     for them. __getcwd_chk is not wrapped.
 //
 //  2. Resolved EAGERLY below, never with dlsym at the call site. smash reads
 //     /proc/self/pagemap with read(), which fortify turns into __read_chk, and
@@ -231,6 +234,8 @@ static int (*g_real_ppoll_chk)(struct pollfd*, nfds_t, const struct timespec*,
 static ssize_t (*g_real_readlink_chk)(const char*, char*, size_t, size_t) = nullptr;
 static ssize_t (*g_real_readlinkat_chk)(int, const char*, char*, size_t, size_t) = nullptr;
 static int (*g_real_getgroups_chk)(int, gid_t*, size_t) = nullptr;
+static char* (*g_real_fgets_chk)(char*, size_t, int, FILE*) = nullptr;
+static size_t (*g_real_fread_chk)(void*, size_t, size_t, size_t, FILE*) = nullptr;
 
 // Resolve one fortified alias, refusing any pointer that lands back inside
 // libsmash. RTLD_NEXT is NOT trustworthy here: resolved from a constructor it
@@ -271,6 +276,8 @@ static void smash_resolve_fortified_syscalls() {
     g_real_readlink_chk = reinterpret_cast<decltype(g_real_readlink_chk)>(resolveFortified(libc, "__readlink_chk", self_base));
     g_real_readlinkat_chk = reinterpret_cast<decltype(g_real_readlinkat_chk)>(resolveFortified(libc, "__readlinkat_chk", self_base));
     g_real_getgroups_chk = reinterpret_cast<decltype(g_real_getgroups_chk)>(resolveFortified(libc, "__getgroups_chk", self_base));
+    g_real_fgets_chk = reinterpret_cast<decltype(g_real_fgets_chk)>(resolveFortified(libc, "__fgets_chk", self_base));
+    g_real_fread_chk = reinterpret_cast<decltype(g_real_fread_chk)>(resolveFortified(libc, "__fread_chk", self_base));
     // Intentionally no dlclose: the handle is RTLD_NOLOAD on a library that is
     // never unloaded, and dropping the refcount buys nothing.
     g_resolving_syscalls.store(false, std::memory_order_relaxed);
@@ -2038,6 +2045,41 @@ SMASH_VISIBLE int getc(FILE* stream) {
     return fgetc(stream);
 }
 
+// _FORTIFY_SOURCE turns fgets/fread into these whenever the compiler knows
+// the destination's size, and then the plain wrappers above never run: in
+// full mode a fortified fgets on a stream whose buffer the compressor owned
+// returned NULL with errno 14 on every call (stdio_chk_test; it surfaced as a
+// UBSan-built test losing its children's output, since instrumentation is
+// what made the size known there). A call that cannot overflow its buffer is
+// exactly the plain call, so it takes the plain wrapper and its retry; one
+// that could goes to glibc's own, whose check aborts as it always did.
+//
+// glibc's __fgets_chk reads at most min(n - 1, buflen) characters and aborts
+// if that reaches buflen, so n <= buflen can never trip it. __fread_chk
+// aborts if size * n overflows or exceeds buflen, before reading anything.
+SMASH_VISIBLE char* __fgets_chk(char* s, size_t buflen, int n, FILE* stream) {
+    if (!g_real_fgets_chk) return fgets(s, n, stream);
+    if (g_syscall_wrap_disabled || (n > 0 && static_cast<size_t>(n) > buflen))
+        return g_real_fgets_chk(s, buflen, n, stream);
+    return fgets(s, n, stream);
+}
+SMASH_VISIBLE char* __fgets_chk_24(char* s, size_t buflen, int n, FILE* stream) {
+    return __fgets_chk(s, buflen, n, stream);
+}
+__asm__(".symver __fgets_chk_24,__fgets_chk@GLIBC_2.4");
+
+SMASH_VISIBLE size_t __fread_chk(void* ptr, size_t buflen, size_t size, size_t n, FILE* stream) {
+    if (!g_real_fread_chk) return fread(ptr, size, n, stream);
+    size_t bytes = 0;
+    if (g_syscall_wrap_disabled || __builtin_mul_overflow(size, n, &bytes) || bytes > buflen)
+        return g_real_fread_chk(ptr, buflen, size, n, stream);
+    return fread(ptr, size, n, stream);
+}
+SMASH_VISIBLE size_t __fread_chk_27(void* ptr, size_t buflen, size_t size, size_t n, FILE* stream) {
+    return __fread_chk(ptr, buflen, size, n, stream);
+}
+__asm__(".symver __fread_chk_27,__fread_chk@GLIBC_2.7");
+
 SMASH_VISIBLE size_t fwrite(const void* ptr, size_t size, size_t nmemb, FILE* stream) {
     using fn_t = size_t(*)(const void*, size_t, size_t, FILE*);
     SMASH_LAZY_RESOLVE(fn_t, fwrite);
@@ -2680,6 +2722,15 @@ SMASH_VISIBLE int posix_spawnp(pid_t* pid, const char* file,
 // We create aliases for the GLIBCXX/CXXABI-versioned symbols that call
 // alloc8's xxmalloc/xxfree directly (NOT through the operator symbols, which
 // would create infinite recursion via PLT).
+//
+// Each allocating entry records its caller (ALLOC8_SET_CALLER_RA), as alloc8's
+// own entries do: smash routes by alloc8_caller_ra, and without the store it
+// read whatever the previous malloc left there. Every C++ allocation through
+// these versioned symbols (the ones libstdc++-linked code binds) took the
+// arena of an unrelated earlier call site, and once the previous malloc was
+// glibc's stdio buffer allocation, smash sent it to the system allocator
+// (test_vm_exhaustion: 384 of 384 4 MiB `operator new` blocks outside the
+// arena; stdio_buffer_test now checks it).
 
 // External declarations for alloc8's core allocation functions
 extern "C" {
@@ -2694,11 +2745,13 @@ extern void* xxmemalign(size_t, size_t);
 // These directly call xxmalloc/xxfree, matching alloc8's operator new/delete
 extern "C" {
 SMASH_VISIBLE void* _Znwm_GLIBCXX_3_4(size_t sz) {
+    ALLOC8_SET_CALLER_RA();
     void* ptr = xxmalloc(sz);
     if (!ptr) throw std::bad_alloc();
     return ptr;
 }
 SMASH_VISIBLE void* _Znam_GLIBCXX_3_4(size_t sz) {
+    ALLOC8_SET_CALLER_RA();
     void* ptr = xxmalloc(sz);
     if (!ptr) throw std::bad_alloc();
     return ptr;
@@ -2706,9 +2759,9 @@ SMASH_VISIBLE void* _Znam_GLIBCXX_3_4(size_t sz) {
 SMASH_VISIBLE void  _ZdlPv_GLIBCXX_3_4(void* p)  { if (p) xxfree(p); }
 SMASH_VISIBLE void  _ZdaPv_GLIBCXX_3_4(void* p)  { if (p) xxfree(p); }
 SMASH_VISIBLE void* _ZnwmRKSt9nothrow_t_GLIBCXX_3_4(size_t sz, const void*)
-    { return xxmalloc(sz); }
+    { ALLOC8_SET_CALLER_RA(); return xxmalloc(sz); }
 SMASH_VISIBLE void* _ZnamRKSt9nothrow_t_GLIBCXX_3_4(size_t sz, const void*)
-    { return xxmalloc(sz); }
+    { ALLOC8_SET_CALLER_RA(); return xxmalloc(sz); }
 SMASH_VISIBLE void  _ZdlPvRKSt9nothrow_t_GLIBCXX_3_4(void* p, const void*)
     { if (p) xxfree(p); }
 SMASH_VISIBLE void  _ZdaPvRKSt9nothrow_t_GLIBCXX_3_4(void* p, const void*)
@@ -2724,11 +2777,13 @@ SMASH_VISIBLE void _ZdaPvm_CXXABI_1_3_9(void* p, size_t sz)  { if (p) xxfree_siz
 // CXXABI_1.3.11 versions (aligned)
 extern "C" {
 SMASH_VISIBLE void* _ZnwmSt11align_val_t_CXXABI_1_3_11(size_t sz, size_t al) {
+    ALLOC8_SET_CALLER_RA();
     void* ptr = xxmemalign(al, sz);
     if (!ptr) throw std::bad_alloc();
     return ptr;
 }
 SMASH_VISIBLE void* _ZnamSt11align_val_t_CXXABI_1_3_11(size_t sz, size_t al) {
+    ALLOC8_SET_CALLER_RA();
     void* ptr = xxmemalign(al, sz);
     if (!ptr) throw std::bad_alloc();
     return ptr;
@@ -2743,10 +2798,10 @@ SMASH_VISIBLE void  _ZdaPvmSt11align_val_t_CXXABI_1_3_11(void* p, size_t sz, siz
     { if (p) xxfree_aligned_sized(p, al, sz); }
 SMASH_VISIBLE void* _ZnwmSt11align_val_tRKSt9nothrow_t_CXXABI_1_3_11(
         size_t sz, size_t al, const void*)
-    { return xxmemalign(al, sz); }
+    { ALLOC8_SET_CALLER_RA(); return xxmemalign(al, sz); }
 SMASH_VISIBLE void* _ZnamSt11align_val_tRKSt9nothrow_t_CXXABI_1_3_11(
         size_t sz, size_t al, const void*)
-    { return xxmemalign(al, sz); }
+    { ALLOC8_SET_CALLER_RA(); return xxmemalign(al, sz); }
 }
 
 // .symver directives create versioned symbol aliases.

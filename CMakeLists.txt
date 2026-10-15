@@ -179,7 +179,9 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     __ppoll_chk;
     __readlink_chk;
     __readlinkat_chk;
-    __getgroups_chk;")
+    __getgroups_chk;
+    __fgets_chk;
+    __fread_chk;")
   else()
     set(SMASH_CHK_BASE_EXPORTS "")
   endif()

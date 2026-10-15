@@ -43,6 +43,7 @@ extern "C" void _putchar(char c) {
 
 // ── System allocator function pointers for compress-only mode ───────────────
 smash::SystemAllocFns smash::g_system_alloc;
+smash::StdioBufferCaller smash::g_stdio_buffer_caller;
 
 // Early init: resolve system malloc/free before alloc8 interposition.
 // Needed for compress-only mode and large-only mode (small alloc passthrough).
@@ -51,6 +52,7 @@ smash::SystemAllocFns smash::g_system_alloc;
 __attribute__((constructor(50)))  // Run before alloc8 (priority 101)
 static void smash_resolve_system_alloc() {
     smash::g_system_alloc.resolve();
+    smash::g_stdio_buffer_caller.resolve();
 }
 
 // SMASH_BANNER=1: print a one-line banner at library-load time so it's

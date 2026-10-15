@@ -66,6 +66,11 @@ int main() {
     expectOwnedBySmash("__readlink_chk",   reinterpret_cast<void*>(&__readlink_chk));
     expectOwnedBySmash("__readlinkat_chk", reinterpret_cast<void*>(&__readlinkat_chk));
     expectOwnedBySmash("__getgroups_chk",  reinterpret_cast<void*>(&__getgroups_chk));
+    // Buffered reads: glibc's internal read into the stream's buffer never
+    // reaches smash's read(), so these route to the fgets/fread wrappers and
+    // their retry (stdio_chk_test).
+    expectOwnedBySmash("__fgets_chk",      reinterpret_cast<void*>(&__fgets_chk));
+    expectOwnedBySmash("__fread_chk",      reinterpret_cast<void*>(&__fread_chk));
 #else
     std::printf("SKIP: _FORTIFY_SOURCE declarations unavailable; nothing to check\n");
     return 0;

@@ -28,6 +28,7 @@
 #include <dlfcn.h>
 #if defined(__linux__)
 #include <sched.h>   // sched_getcpu (vDSO) for CPU-indexed arena routing
+#include <link.h>    // ElfW, for dladdr1 (StdioBufferCaller)
 #endif
 #if defined(__APPLE__)
 #include <mach-o/dyld.h>
@@ -437,6 +438,48 @@ struct SystemAllocFns {
 
 extern SystemAllocFns g_system_alloc;
 
+// The code of glibc's _IO_file_doallocate, whose malloc is every stdio
+// stream's buffer. glibc fills that buffer with its own internal read(), which
+// never reaches smash's read() wrapper and its EFAULT retry, so a buffer on a
+// page the compressor owned made the kernel's EFAULT the stream's error: in
+// full mode getline, getdelim, fscanf and every *_unlocked reader lost a
+// child's delayed output with errno 14, each time, in a fresh process
+// (stdio_buffer_test); only the wrapped fgets/fread/fgetc recovered. A blocked
+// read also outlasts any warming done before it. malloc sends allocations made
+// from this range to the system allocator instead; free() already returns
+// pointers smash does not own there. A stream buffer is a few KiB (or the
+// file system's block size), not worth compressing.
+struct StdioBufferCaller {
+    uintptr_t lo = 0;
+    uintptr_t len = 0;   // 0 until resolved: nothing matches
+
+    [[gnu::always_inline]] bool contains(uintptr_t ra) const { return ra - lo < len; }
+
+    void resolve() {
+#if defined(__GLIBC__)
+        void* f = dlsym(RTLD_NEXT, "_IO_file_doallocate");
+        Dl_info info{};
+        void* extra = nullptr;   // RTLD_DL_SYMENT: a const ElfW(Sym)*
+        const auto* sym = static_cast<const ElfW(Sym)*>(nullptr);
+        if (f && dladdr1(f, &info, &extra, RTLD_DL_SYMENT) &&
+            (sym = static_cast<const ElfW(Sym)*>(extra)) && sym->st_size) {
+            lo = reinterpret_cast<uintptr_t>(f);
+            len = sym->st_size;
+        }
+#endif
+    }
+};
+
+extern StdioBufferCaller g_stdio_buffer_caller;
+
+// The arena callsiteArena() returns for that range: no slab, the system
+// allocator. Decided where the call site's arena is computed and memoized, so
+// malloc's fast path pays one compare of a value it already has; a range
+// check on every malloc of 512 bytes or more cost 6-7% of 1 KiB malloc/free
+// throughput (8 threads, interleaved).
+inline constexpr uint8_t kStdioArena = 0xFF;
+static_assert(kTotalArenas <= kStdioArena, "kStdioArena must not be a real arena");
+
 // The application's allocation call site, for arena routing. alloc8's
 // app-facing wrapper entries (malloc/calloc/realloc/memalign/operator new/...)
 // store __builtin_return_address(0) into alloc8_caller_ra before dispatching
@@ -673,7 +716,7 @@ class SmashHeap {
 
     uint8_t callsiteArena(uint8_t sc, uintptr_t ra) {
 #ifdef SMASH_ABLATION_NO_CALLSITE_ARENA
-        (void)ra;
+        if (g_stdio_buffer_caller.contains(ra)) [[unlikely]] return kStdioArena;
         uint8_t base = 0;
 #else
 #if !defined(SMASH_NO_ARENA_MEMO)
@@ -702,13 +745,23 @@ class SmashHeap {
         ArenaMemo& memo = s_arena_memo[memo_slot];
         if (memo.valid && memo.key == memo_key) [[likely]] {
             uint8_t base = memo.base;
-            if (cold_feedback_) {
+            if (cold_feedback_ && base != kStdioArena) {
                 if (cold_bias_[base * kNumClasses + sc].load(std::memory_order_relaxed))
                     return static_cast<uint8_t>(base + getNumArenas());
             }
             return base;
         }
 #endif
+        // A stdio stream's buffer (StdioBufferCaller): memoized like any
+        // arena, so the range is checked once per call site and thread.
+        if (g_stdio_buffer_caller.contains(ra)) [[unlikely]] {
+#if !defined(SMASH_NO_ARENA_MEMO)
+            memo.base = kStdioArena;
+            memo.key = memo_key;
+            memo.valid = true;
+#endif
+            return kStdioArena;
+        }
         // LLAMA-style stack hash [Maas et al., ASPLOS 2020]:
         // hash(return_address, stack_depth, object_size).
         //
@@ -1497,6 +1550,11 @@ public:
             }
             uintptr_t ra_for_arena = caller_ra ? caller_ra : appCallerRA();
             uint8_t arena = callsiteArena(sc, ra_for_arena);
+            if (arena == kStdioArena) [[unlikely]] {   // a stdio stream's buffer
+                if (!g_system_alloc.malloc) g_system_alloc.resolve();
+                if (g_system_alloc.malloc) return g_system_alloc.malloc(size);
+                arena = 0;
+            }
             void* ptr = tc->allocate(sc, arena);
             if (!ptr) ptr = tc->refill(sc, arena, &slab(arena, sc));
             if (!ptr) [[unlikely]]
@@ -1515,6 +1573,13 @@ public:
         }
         // For large allocations, use the caller's return address for arena routing
         uintptr_t ra_for_arena = caller_ra ? caller_ra : appCallerRA();
+        // A stdio stream's buffer above the small sizes: a file system whose
+        // block size is larger. Under SMASH_LARGE_ONLY too, where it would
+        // otherwise land in the arena.
+        if (g_stdio_buffer_caller.contains(ra_for_arena)) [[unlikely]] {
+            if (!g_system_alloc.malloc) g_system_alloc.resolve();
+            if (g_system_alloc.malloc) return g_system_alloc.malloc(size);
+        }
         uint8_t arena = callsiteArenaForLarge(ra_for_arena);
         // SMASH_MID_BINS=1: serve the (16 KiB, 1 MiB) band from size-binned
         // chunks in the arena so it is compressible at all. Falls through to
@@ -1547,6 +1612,7 @@ public:
             uint8_t sc = sizeToClass(size);
             if (ThreadCache* tc = currentThreadCache()) [[likely]] {
                 uint8_t arena = callsiteArena(sc, caller_ra);
+                if (arena == kStdioArena) [[unlikely]] return mallocSlow(size, caller_ra);
                 if (void* ptr = tc->allocate(sc, arena)) [[likely]] return ptr;
                 if (void* ptr = tc->refill(sc, arena, &slab(arena, sc)))
                     return ptr;
@@ -1815,7 +1881,8 @@ public:
                     // Every slot of this class is already aligned.
                     return this->malloc(size);
                 }
-                const uint8_t arena = callsiteArena(nc, appCallerRA());
+                uint8_t arena = callsiteArena(nc, appCallerRA());
+                if (arena == kStdioArena) arena = 0;
                 // Bypasses the thread cache on purpose: a cached pointer is an
                 // arbitrary slot of the class and cannot be assumed aligned.
                 if (void* p = slab(arena, nc).allocateAligned(

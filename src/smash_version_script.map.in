@@ -308,9 +308,9 @@
 # them at the base version alone would lose to libc, exactly as it did for
 # sched_setaffinity and pthread_create below.
 #
-# Only the EFAULT-retry family is here. The proactive-warm functions
-# (__fgets_chk / __fread_chk / __getcwd_chk) are deliberately not wrapped —
-# see linux_syscall_wrappers.cpp for why.
+# The EFAULT-retry family, plus __fgets_chk / __fread_chk, which route a
+# call that cannot overflow to the fgets / fread wrappers (their warm and
+# retry); __getcwd_chk is not wrapped.
 # Export ONLY the _NN aliases here, never the bare __*_chk names. Exporting
 # both makes libsmash define two symbols matching the same name and version —
 # __recv_chk@@GLIBC_2.4 (the wrapper) and __recv_chk@GLIBC_2.4 (the alias) —
@@ -335,12 +335,18 @@ GLIBC_2.4 {
     __recvfrom_chk_24;
     __readlink_chk_24;
     __getgroups_chk_24;
+    __fgets_chk_24;
 } @SMASH_GLIBC_BASE_VERSION@;
 
 GLIBC_2.5 {
   global:
     __readlinkat_chk_25;
 } GLIBC_2.4;
+
+GLIBC_2.7 {
+  global:
+    __fread_chk_27;
+} GLIBC_2.5;
 
 GLIBC_2.16 {
   global:
@@ -355,7 +361,7 @@ GLIBC_2.16 {
     # GLIBC_2.17), because there the bare name in the base node is what
     # callers bind and exporting it twice is the self-jump trap below.
 @SMASH_ALIGNED_ALLOC_IN_216@
-} GLIBC_2.5;
+} GLIBC_2.7;
 
 # libevent requests epoll_wait@GLIBC_2.3.2
 # Aliases epoll_wait_232/epoll_pwait_232 provide these versioned symbols

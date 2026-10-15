@@ -80,7 +80,13 @@ size_t resident(const char* p) {
 int child() {
     char path[] = "/tmp/smash_codec_XXXXXX";
     const int log = mkstemp(path);
-    if (log < 0) return 2;
+    if (log < 0) {
+        // Says why: one child of test_codec_env, run as root mid-suite,
+        // exited 2 with no output at all (twice; 30 of 30 runs on their own
+        // passed). This is the only exit 2 in the child.
+        std::printf("child: mkstemp failed: %s\n", std::strerror(errno));
+        return 2;
+    }
     unlink(path);
     const int saved = dup(2);
     dup2(log, 2);

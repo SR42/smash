@@ -422,3 +422,32 @@ Two defects in neighbouring settings, found on the way:
   rewritten instead of feeding LZ4's speeds to a zstd profile.
 
 Guarded by `test_codec_env`.
+
+## Stdio readers lost data in full mode (fixed 2026-10-15)
+
+In full mode every stdio stream's buffer was smash memory (glibc mallocs it
+in `_IO_file_doallocate`), and glibc fills it with an internal `read` that
+never reaches smash's EFAULT retry. Only the wrapped `fgets`/`fread`/`fgetc`
+recovered; `getline`, `getdelim`, `fscanf` and the `*_unlocked` readers lost
+a `popen` child's delayed line with errno 14 every time, and so did `fgets`
+and `fread` in any program built with `_FORTIFY_SOURCE` where the buffer
+size is known, because they become the unwrapped `__fgets_chk` /
+`__fread_chk`. Found when `test_cold_arena_env` (full-mode parent, `fgets`
+on `popen`) lost all its children's output in the root UBSan suite. The
+first diagnosis — root only, a hole in the buffer warming — was wrong: the
+same program built without fortify read every line as root and not, and the
+UBSan-built one failed unprivileged too; what UBSan changed was the symbol
+the call bound.
+
+Fixed by sending `_IO_file_doallocate`'s allocations to the system allocator
+(decided in `callsiteArena()`, so `malloc`'s fast path pays one compare of a
+value it already has) and by wrapping `__fgets_chk` / `__fread_chk`. That routing exposed an
+older bug: smash's versioned `operator new` aliases never stored their
+caller, so C++ allocations routed by the previous allocation's call site —
+after a stdio buffer, to the system allocator (`test_vm_exhaustion`: 384 of
+384 blocks outside the arena). They store it now. Details
+and measurements: "Stdio stream buffers came from smash" in
+[syscall-compat.md](syscall-compat.md). Not affected: `SMASH_LARGE_ONLY=1`,
+where stream buffers already came from glibc (except a block size above
+16 KiB, now covered too). Guarded by `test_stdio_buffer`, `test_stdio_chk`
+and `test_chk_interposition`.

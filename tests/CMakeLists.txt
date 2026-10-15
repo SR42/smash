@@ -273,6 +273,27 @@ if(NOT APPLE)
   add_test(NAME test_chk_interposition COMMAND ${CMAKE_COMMAND} -E env
     "LD_PRELOAD=$<TARGET_FILE:smash>" $<TARGET_FILE:chk_interposition_test>)
   set_tests_properties(test_chk_interposition PROPERTIES TIMEOUT 60)
+
+  # Fortified buffered reads must recover from a stream buffer the compressor
+  # owns, as fgets/fread do (stdio_chk_test.cpp). Full mode: the buffers are
+  # smash memory only there.
+  add_executable(stdio_chk_test stdio_chk_test.cpp)
+  target_compile_options(stdio_chk_test PRIVATE -O1 -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=2)
+  target_link_libraries(stdio_chk_test PRIVATE ${CMAKE_DL_LIBS})
+  add_test(NAME test_stdio_chk COMMAND ${CMAKE_COMMAND} -E env
+    "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_COLD_TIMEOUT_SEC=1" "SMASH_DEFER_PHASES_MS=0"
+    $<TARGET_FILE:stdio_chk_test>)
+  set_tests_properties(test_stdio_chk PROPERTIES TIMEOUT 120)
+
+  # Every stdio reader, wrapped or not, must survive a stream buffer that
+  # could go cold: the buffer must not be smash memory (stdio_buffer_test.cpp).
+  add_executable(stdio_buffer_test stdio_buffer_test.cpp)
+  target_compile_options(stdio_buffer_test PRIVATE -U_FORTIFY_SOURCE)
+  target_link_libraries(stdio_buffer_test PRIVATE ${CMAKE_DL_LIBS})
+  add_test(NAME test_stdio_buffer COMMAND ${CMAKE_COMMAND} -E env
+    "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_COLD_TIMEOUT_SEC=1" "SMASH_DEFER_PHASES_MS=0"
+    $<TARGET_FILE:stdio_buffer_test>)
+  set_tests_properties(test_stdio_buffer PROPERTIES TIMEOUT 120)
 endif()
 
 # ── Mid-size bins (Linux) ───────────────────────────────────────────────────
