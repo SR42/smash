@@ -19,14 +19,30 @@
 //   2. at once, 2048 fresh objects from T ("T fresh") and 2048 from call site
 //      C, routed to another arena ("C fresh"), written;
 //   3. poll smash_page_info every 100 ms and note when each page is first
-//      compressed again.
-// Checks (medians, seconds from step 2):
+//      compressed again;
+//   4. 11 s after the last of them (kRcDecayColdTicks = 8 ticks compressed,
+//      plus margin), 2048 more from T ("T later") and from C ("C later"),
+//      polled the same way.
+// Checks (medians, seconds from step 2, and from step 4 for the later sets):
 //   - default: T fresh >= C fresh + 1.5 (2x the floor against 1x: 6 vs 4
 //     ticks), restored >= C fresh + 5.5 (4x: 12 ticks);
-//   - SMASH_RECOMPRESS_BACKOFF=0: all three within 1.5 s of each other;
+//   - default: T later <= C later + 1.5, and <= the control's T later + 1.0:
+//     the bias wears off once T's pages stay compressed. The bucket EMA was
+//     fed restores only, every sample >= 1, so one restore kept the bias for
+//     the rest of the process (measured: T later 6.2 s against C later 4.1 s,
+//     and in large mode 6.2 s against 5.2 s, with the control at 4.2 s); now
+//     a page that stays compressed for kRcDecayColdTicks feeds it a 0;
+//   - SMASH_RECOMPRESS_BACKOFF=0: all five within 1.5 s of each other;
 //   - every object reads back intact.
 // Before the decay fix, the restored pages' count decayed during the wait
 // (after kRcDecayColdTicks = 8 idle ticks), so they compressed at 8, not 12.
+//
+// `large` runs the same with SMASH_LARGE_ONLY=1 and 64 blocks of 256 KiB
+// (SMASH_LARGE_ALLOC_VM_THRESHOLD=65536), whose bucket is (arena, log2 pages).
+// Reading a block restores every page; the bucket EMA hears only of its first
+// page (the page map registers a large block's first page alone), which is
+// enough for the bias. It also checks that a block allocated where compressed
+// blocks were freed starts with no compressed page and no recompress count.
 #include "placement_test_util.h"
 
 #include <algorithm>
@@ -37,7 +53,8 @@ using namespace placement;
 
 namespace {
 
-constexpr size_t kObj = 256, kCount = 2048;
+bool g_large = false;
+size_t kObj = 256, kCount = 2048;
 
 static volatile uintptr_t g_sink;
 
@@ -51,8 +68,9 @@ SITE(0) SITE(1) SITE(2) SITE(3) SITE(4) SITE(5) SITE(6) SITE(7)
 using SiteFn = void* (*)();
 SiteFn kSites[] = {site_0, site_1, site_2, site_3, site_4, site_5, site_6, site_7};
 
+// The first 64 bytes of every page carry data, so no page is a zero page.
 unsigned char want(size_t set, size_t k, size_t i) {
-    return i < 64 ? static_cast<unsigned char>(set * 31 + k * 3 + i) : 0;
+    return (i & (kPage - 1)) < 64 ? static_cast<unsigned char>(set * 31 + k * 3 + (i & 63) + (i >> 12)) : 0;
 }
 
 std::vector<unsigned char*> allocSet(SiteFn s, size_t set) {
@@ -66,10 +84,8 @@ std::vector<unsigned char*> allocSet(SiteFn s, size_t set) {
 
 std::vector<uintptr_t> pagesOf(const std::vector<unsigned char*>& v) {
     std::set<uintptr_t> s;
-    for (auto* p : v) {
-        s.insert(pageOf(p));
-        s.insert(pageOf(p + kObj - 1));
-    }
+    for (auto* p : v)
+        for (uintptr_t pg = pageOf(p); pg <= pageOf(p + kObj - 1); pg += kPage) s.insert(pg);
     return {s.begin(), s.end()};
 }
 
@@ -140,38 +156,78 @@ int child() {
     auto c2 = allocSet(c_site, 3);
     const auto t2_pages = pagesOf(t2), c2_pages = pagesOf(c2);
 
-    // Step 3.
+    // Step 3: when each group's pages are first compressed again, as medians.
+    // Returns the time of the last page seen compressed.
     struct Group { const std::vector<uintptr_t>* pages; std::vector<double> when; };
+    auto poll = [&](Group* groups, int n, double from, double* med, size_t* never) {
+        for (int g = 0; g < n; ++g) groups[g].when.assign(groups[g].pages->size(), -1);
+        double last = from;
+        while (nowSec() - from < 60.0) {
+            bool all = true;
+            for (int g = 0; g < n; ++g)
+                for (size_t j = 0; j < groups[g].pages->size(); ++j) {
+                    if (groups[g].when[j] >= 0) continue;
+                    if (compressedState(state((*groups[g].pages)[j]))) {
+                        last = nowSec();
+                        groups[g].when[j] = last - from;
+                    } else {
+                        all = false;
+                    }
+                }
+            if (all) break;
+            usleep(100 * 1000);
+        }
+        for (int g = 0; g < n; ++g) {
+            std::vector<double> got;
+            for (double w : groups[g].when)
+                if (w >= 0) got.push_back(w);
+            never[g] = groups[g].when.size() - got.size();
+            med[g] = median(got);
+        }
+        return last;
+    };
     Group groups[3] = {{&restored, {}}, {&t2_pages, {}}, {&c2_pages, {}}};
-    for (Group& g : groups) g.when.assign(g.pages->size(), -1);
-    while (nowSec() - start < 60.0) {
-        bool all = true;
-        for (Group& g : groups)
-            for (size_t j = 0; j < g.pages->size(); ++j) {
-                if (g.when[j] >= 0) continue;
-                if (compressedState(state((*g.pages)[j]))) g.when[j] = nowSec() - start;
-                else all = false;
+    double med[5];
+    size_t never[5];
+    const double last = poll(groups, 3, start, med, never);
+
+    // Step 4.
+    while (nowSec() - last < 11.0) usleep(100 * 1000);
+    const double start4 = nowSec();
+    auto t4 = allocSet(kSites[0], 4);
+    auto c4 = allocSet(c_site, 5);
+    const auto t4_pages = pagesOf(t4), c4_pages = pagesOf(c4);
+    Group later[2] = {{&t4_pages, {}}, {&c4_pages, {}}};
+    poll(later, 2, start4, med + 3, never + 3);
+
+    // A block allocated where compressed blocks were freed (large only): the
+    // allocator must not hand out a compressed page.
+    size_t reuse_compressed = 0, reuse_rc = 0;
+    if (g_large) {
+        for (size_t k = 0; k < kCount / 2; ++k) {
+            free(t1[k]);
+            t1[k] = nullptr;
+        }
+        for (size_t k = 0; k < kCount / 2; ++k) {
+            unsigned char* p = static_cast<unsigned char*>(kSites[0]());
+            for (uintptr_t pg = pageOf(p); pg <= pageOf(p + kObj - 1); pg += kPage) {
+                int rc = 0;
+                reuse_compressed += compressedState(state(pg, &rc));
+                reuse_rc += rc > 0;
             }
-        if (all) break;
-        usleep(100 * 1000);
+            free(p);
+        }
     }
-    double med[3];
-    size_t never[3];
-    for (int g = 0; g < 3; ++g) {
-        std::vector<double> got;
-        for (double w : groups[g].when)
-            if (w >= 0) got.push_back(w);
-        never[g] = groups[g].when.size() - got.size();
-        med[g] = median(got);
-    }
+
     for (size_t k = 0; k < kCount; ++k)
         for (size_t i = 0; i < kObj; ++i)
-            bad += (t1[k][i] != want(1, k, i)) + (t2[k][i] != want(2, k, i)) + (c2[k][i] != want(3, k, i));
+            bad += (t1[k] && t1[k][i] != want(1, k, i)) + (t2[k][i] != want(2, k, i)) +
+                   (c2[k][i] != want(3, k, i)) + (t4[k][i] != want(4, k, i)) + (c4[k][i] != want(5, k, i));
     std::printf("result t_arena=%d c_arena=%d t1_pages=%zu reclaimed=%zu restored=%zu restored_s=%.1f t_fresh_s=%.1f "
-                "c_fresh_s=%.1f never=%zu/%zu/%zu bad=%zu\n",
-                t_arena, c_arena, t1_pages.size(), reclaimed, restored.size(), med[0], med[1], med[2], never[0],
-                never[1], never[2], bad);
-    for (auto* v : {&t1, &t2, &c2})
+                "c_fresh_s=%.1f t_later_s=%.1f c_later_s=%.1f never=%zu/%zu/%zu/%zu/%zu reuse=%zu/%zu bad=%zu\n",
+                t_arena, c_arena, t1_pages.size(), reclaimed, restored.size(), med[0], med[1], med[2], med[3],
+                med[4], never[0], never[1], never[2], never[3], never[4], reuse_compressed, reuse_rc, bad);
+    for (auto* v : {&t1, &t2, &c2, &t4, &c4})
         for (auto* p : *v) free(p);
     return 0;
 }
@@ -179,27 +235,33 @@ int child() {
 struct Result {
     bool ok = false;
     int t_arena = 0, c_arena = 0;
-    size_t t1_pages = 0, reclaimed = 0, restored = 0, never[3] = {}, bad = 0;
-    double restored_s = -1, t_fresh_s = -1, c_fresh_s = -1;
+    size_t t1_pages = 0, reclaimed = 0, restored = 0, never[5] = {}, reuse_compressed = 0, reuse_rc = 0, bad = 0;
+    double restored_s = -1, t_fresh_s = -1, c_fresh_s = -1, t_later_s = -1, c_later_s = -1;
 };
 
-Result run(const char* self, const char* env) {
+Result run(const char* self, const char* mode, const char* env) {
     Result r;
-    const std::string cmd = std::string("timeout 150 env -u SMASH_RECOMPRESS_BACKOFF ") + env + " '" + self +
-                            "' child 2>&1";
+    const std::string cmd = std::string("timeout 200 env -u SMASH_RECOMPRESS_BACKOFF ") + env + " '" + self +
+                            "' child " + mode + " 2>&1";
     int st = 0;
     const std::string out = runChild(cmd, &st);
     const std::string line = taggedLine(out, "result ");
     r.ok = st == 0 &&
            std::sscanf(line.c_str(),
                        "result t_arena=%d c_arena=%d t1_pages=%zu reclaimed=%zu restored=%zu restored_s=%lf "
-                       "t_fresh_s=%lf c_fresh_s=%lf never=%zu/%zu/%zu bad=%zu",
+                       "t_fresh_s=%lf c_fresh_s=%lf t_later_s=%lf c_later_s=%lf never=%zu/%zu/%zu/%zu/%zu "
+                       "reuse=%zu/%zu bad=%zu",
                        &r.t_arena, &r.c_arena, &r.t1_pages, &r.reclaimed, &r.restored, &r.restored_s, &r.t_fresh_s,
-                       &r.c_fresh_s, &r.never[0], &r.never[1], &r.never[2], &r.bad) == 12;
+                       &r.c_fresh_s, &r.t_later_s, &r.c_later_s, &r.never[0], &r.never[1], &r.never[2],
+                       &r.never[3], &r.never[4], &r.reuse_compressed, &r.reuse_rc, &r.bad) == 18;
     std::printf("%-28s %zu of %zu pages restored with a count; compressed again after (median): restored %.1f s, "
-                "T fresh %.1f s, C fresh %.1f s; never: %zu/%zu/%zu; %zu bad bytes (status %d)\n",
-                *env ? env : "(default)", r.restored, r.t1_pages, r.restored_s, r.t_fresh_s, r.c_fresh_s, r.never[0],
-                r.never[1], r.never[2], r.bad, st);
+                "T fresh %.1f s, C fresh %.1f s; later: T %.1f s, C %.1f s; never: %zu/%zu/%zu/%zu/%zu; %zu bad "
+                "bytes (status %d)\n",
+                *env ? env : "(default)", r.restored, r.t1_pages, r.restored_s, r.t_fresh_s, r.c_fresh_s,
+                r.t_later_s, r.c_later_s, r.never[0], r.never[1], r.never[2], r.never[3], r.never[4], r.bad, st);
+    if (g_large && r.ok)
+        std::printf("%-28s reused blocks: %zu compressed pages, %zu with a recompress count\n", "", r.reuse_compressed,
+                    r.reuse_rc);
     if (!r.ok) showTail(out);
     return r;
 }
@@ -208,7 +270,14 @@ Result run(const char* self, const char* env) {
 
 int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
-    if (argc > 1 && std::strcmp(argv[1], "child") == 0) return child();
+    const bool child_mode = argc > 1 && std::strcmp(argv[1], "child") == 0;
+    const char* mode = argc > (child_mode ? 2 : 1) ? argv[child_mode ? 2 : 1] : "";
+    g_large = std::strcmp(mode, "large") == 0;
+    if (g_large) {
+        kObj = 256 * 1024;
+        kCount = 64;
+    }
+    if (child_mode) return child();
     if (!dlsym(RTLD_DEFAULT, "smash_in_arena")) {
         std::printf("SKIP: not running under libsmash\n");
         return 0;
@@ -220,16 +289,21 @@ int main(int argc, char** argv) {
         std::printf("FAIL: %s: %s\n", c, why.c_str());
         ++failures;
     };
-    const Result d = run(self, "");
-    const Result o = run(self, "SMASH_RECOMPRESS_BACKOFF=0");
+    const char* env = g_large ? "SMASH_LARGE_ONLY=1 SMASH_LARGE_ALLOC_VM_THRESHOLD=65536" : "SMASH_LARGE_ONLY=0";
+    const Result d = run(self, mode, env);
+    const Result o = run(self, mode, (std::string(env) + " SMASH_RECOMPRESS_BACKOFF=0").c_str());
     for (const Result* r : {&d, &o}) {
         const char* name = r == &d ? "default" : "back-off off";
         if (!r->ok) { fail(name, "the child did not report"); continue; }
         if (r->restored * 10 < r->t1_pages * 8)
             fail(name, "only " + std::to_string(r->restored) + " of " + std::to_string(r->t1_pages) +
                            " pages restored with a recompress count");
-        if (r->never[0] + r->never[1] + r->never[2]) fail(name, "some pages never compressed again within 60 s");
+        if (r->never[0] + r->never[1] + r->never[2] + r->never[3] + r->never[4])
+            fail(name, "some pages never compressed again within 60 s");
         if (r->bad) fail(name, std::to_string(r->bad) + " bytes read back wrong");
+        if (r->reuse_compressed || r->reuse_rc)
+            fail(name, "a block allocated over freed compressed blocks had " + std::to_string(r->reuse_compressed) +
+                           " compressed pages, " + std::to_string(r->reuse_rc) + " with a recompress count");
     }
     char buf[160];
     if (d.ok) {
@@ -243,13 +317,23 @@ int main(int argc, char** argv) {
                           "want >= 5.5 s more (4x the floor)", d.restored_s, d.c_fresh_s);
             fail("default", buf);
         }
+        if (d.t_later_s > d.c_later_s + 1.5) {
+            std::snprintf(buf, sizeof buf, "later pages of the restored call site compressed after %.1f s, the "
+                          "other site's after %.1f s: the bucket bias never wore off", d.t_later_s, d.c_later_s);
+            fail("default", buf);
+        }
+        if (o.ok && d.t_later_s > o.t_later_s + 1.0) {
+            std::snprintf(buf, sizeof buf, "later pages of the restored call site compressed after %.1f s, %.1f s "
+                          "with the back-off off: the bucket bias never wore off", d.t_later_s, o.t_later_s);
+            fail("default", buf);
+        }
     }
     if (o.ok) {
-        const double lo = std::min({o.restored_s, o.t_fresh_s, o.c_fresh_s});
-        const double hi = std::max({o.restored_s, o.t_fresh_s, o.c_fresh_s});
+        const double lo = std::min({o.restored_s, o.t_fresh_s, o.c_fresh_s, o.t_later_s, o.c_later_s});
+        const double hi = std::max({o.restored_s, o.t_fresh_s, o.c_fresh_s, o.t_later_s, o.c_later_s});
         if (hi - lo > 1.5) {
-            std::snprintf(buf, sizeof buf, "control: medians %.1f/%.1f/%.1f s differ by more than 1.5 s",
-                          o.restored_s, o.t_fresh_s, o.c_fresh_s);
+            std::snprintf(buf, sizeof buf, "control: medians %.1f/%.1f/%.1f/%.1f/%.1f s differ by more than 1.5 s",
+                          o.restored_s, o.t_fresh_s, o.c_fresh_s, o.t_later_s, o.c_later_s);
             fail("back-off off", buf);
         }
     }

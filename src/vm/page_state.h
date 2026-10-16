@@ -37,16 +37,47 @@ inline std::atomic<bool> g_any_page_compressed{false};
 
 class PageStateTable {
     std::atomic<uint8_t>* states_;
+    // One bit per page: the allocator handed out a block on the page while
+    // the compressor held it (see markAllocReopened).
+    std::atomic<uint64_t>* alloc_reopened_ = nullptr;
     size_t num_pages_;
 
 public:
     void init(size_t num_pages) {
         num_pages_ = num_pages;
         states_ = bootstrapArray<std::atomic<uint8_t>>(num_pages);
+        alloc_reopened_ = bootstrapArray<std::atomic<uint64_t>>((num_pages + 63) / 64);
     }
 
     PageState get(size_t page_idx) const {
         return static_cast<PageState>(states_[page_idx].load(std::memory_order_acquire));
+    }
+
+    // For the allocation path, where a stale value is harmless (see
+    // SmashHeap::noteBlockOnHeldPages).
+    PageState getRelaxed(size_t page_idx) const {
+        return static_cast<PageState>(states_[page_idx].load(std::memory_order_relaxed));
+    }
+
+    // The allocator may hand out a block on a page the compressor holds
+    // (COMPRESSED, COMPRESSED_SHADOW or COMPRESSING): the thread cache
+    // returns a slot freed into it before the page went cold, and the slab
+    // falls back to one when a span has no warmer free slot. The program's
+    // first write to the block then restores the page, and that restore says
+    // nothing about whether the page was compressed too early: the
+    // recompression back-off must not count it, or the page waited 4x the
+    // cold timeout before it was compressed again and every fresh page of its
+    // call site 2x (test_alloc_reopen). The allocator marks the page; the
+    // fault handler takes the mark. A mark left by a block never written
+    // makes the page's next restore go uncounted -- once.
+    void markAllocReopened(size_t page_idx) {
+        alloc_reopened_[page_idx >> 6].fetch_or(uint64_t{1} << (page_idx & 63), std::memory_order_relaxed);
+    }
+    bool takeAllocReopened(size_t page_idx) {
+        const uint64_t bit = uint64_t{1} << (page_idx & 63);
+        auto& w = alloc_reopened_[page_idx >> 6];
+        if (!(w.load(std::memory_order_relaxed) & bit)) return false;
+        return (w.fetch_and(~bit, std::memory_order_relaxed) & bit) != 0;
     }
 
     void set(size_t page_idx, PageState state) {

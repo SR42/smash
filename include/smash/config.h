@@ -3,7 +3,9 @@
 
 #include <alloc8/platform.h>
 #include <atomic>
+#include <cmath>
 #include <cstddef>
+#include <cstdio>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -378,23 +380,72 @@ inline constexpr int kColdTicksDefault = SMASH_COLD_TICKS;
 #endif
 inline constexpr double kMinCompressRatio = 0.75;
 
-// Runtime cold timeout: SMASH_COLD_TIMEOUT_SEC overrides kColdTicks.
-// This is the primary time-space tradeoff dial.  Lower values compress
-// sooner (more space savings, more decompression faults on re-access).
-// Higher values are conservative (less savings, fewer faults).
-// Default: kColdTicksDefault * kCompressIntervalMs / 1000.
-inline int getColdTicks() {
-    static int ticks = []() {
-        const char* env = getenv("SMASH_COLD_TIMEOUT_SEC");
-        if (env) {
-            double sec = atof(env);
-            if (sec > 0)
-                return static_cast<int>(sec * 1000.0 / kCompressIntervalMs + 0.5);
-        }
-        return kColdTicksDefault;
-    }();
-    return ticks;
+// The cold timeout's upper bound, in ticks. A page's idle count (cold_count_)
+// is one byte that stops at 255, and Phase 2 compresses a page only once the
+// count is ABOVE the floor -- so a floor of 255 or more compressed nothing,
+// with no warning. Larger settings are clamped to this, with a warning.
+inline constexpr int kMaxColdTicks = 254;
+
+struct ColdTicksSetting {
+    int ticks = kColdTicksDefault;
+    bool overridden = false;   // set from the environment
+    char warning[256] = {};    // printed once at startup when non-empty
+};
+
+// SMASH_COLD_TIMEOUT_SEC (seconds; takes precedence) or SMASH_COLD_TICKS
+// (ticks) -> the cold floor in ticks, in [1, kMaxColdTicks]. Text that is not
+// a positive number (empty, trailing characters, 0, negative, nan, inf) keeps
+// the default, with a warning; before, atof() turned "1e12" into an
+// out-of-range conversion (undefined behaviour) and SMASH_COLD_TICKS=-1 into
+// a huge floor. Pure, so tests can call it with any strings.
+inline ColdTicksSetting parseColdTicks(const char* sec_env, const char* ticks_env) {
+    ColdTicksSetting r;
+    const char* name = sec_env ? "SMASH_COLD_TIMEOUT_SEC" : "SMASH_COLD_TICKS";
+    const char* text = sec_env ? sec_env : ticks_env;
+    if (!text) return r;
+    char* end = nullptr;
+    const double v = std::strtod(text, &end);
+    while (end && (*end == ' ' || *end == '\t' || *end == '\n')) ++end;
+    if (end == text || !end || *end != '\0' || !std::isfinite(v) || !(v > 0)) {
+        std::snprintf(r.warning, sizeof r.warning,
+                      "%s=%.40s is not a positive number; using the default of %d s", name, text,
+                      kColdTicksDefault * kCompressIntervalMs / 1000);
+        return r;
+    }
+    r.overridden = true;
+    const double ticks = std::floor((sec_env ? v * 1000.0 / kCompressIntervalMs : v) + 0.5);
+    if (ticks > kMaxColdTicks) {
+        r.ticks = kMaxColdTicks;
+        std::snprintf(r.warning, sizeof r.warning,
+                      "%s=%.40s is above the maximum of %d %s (a page's idle count stops at 255 ticks, and a "
+                      "page is compressed only once it is above the timeout); using %d. To switch "
+                      "compression off, set SMASH_NO_COMPRESSOR=1", name, text, kMaxColdTicks,
+                      sec_env ? "s" : "ticks", kMaxColdTicks);
+        return r;
+    }
+    r.ticks = ticks < 1 ? 1 : static_cast<int>(ticks);
+    return r;
 }
+
+// Runtime cold timeout: SMASH_COLD_TIMEOUT_SEC (or SMASH_COLD_TICKS)
+// overrides kColdTicksDefault. This is the primary time-space tradeoff dial.
+// Lower values compress sooner (more space savings, more decompression faults
+// on re-access). Higher values are conservative (less savings, fewer faults).
+// Read once; a warning about the setting goes to stderr the first time.
+inline const ColdTicksSetting& coldTicksSetting() {
+    static const ColdTicksSetting setting = [] {
+        ColdTicksSetting r = parseColdTicks(getenv("SMASH_COLD_TIMEOUT_SEC"), getenv("SMASH_COLD_TICKS"));
+        if (r.warning[0]) {
+            char line[320];
+            const int n = std::snprintf(line, sizeof line, "[smash WARN] %s\n", r.warning);
+            if (n > 0) (void)!::write(2, line, n < static_cast<int>(sizeof line) ? static_cast<size_t>(n) : sizeof line - 1);
+        }
+        return r;
+    }();
+    return setting;
+}
+
+inline int getColdTicks() { return coldTicksSetting().ticks; }
 
 // ── Cooling-page closing ─────────────────────────────────────────────────────
 // A free slot whose page has already been idle for this many compressor ticks

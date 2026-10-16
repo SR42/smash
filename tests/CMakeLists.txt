@@ -115,6 +115,12 @@ set_tests_properties(test_compression PROPERTIES
 add_test(NAME test_compression_backoff_off COMMAND test_compression recompress)
 set_tests_properties(test_compression_backoff_off PROPERTIES
   ENVIRONMENT "SMASH_COLD_TICKS=2;SMASH_SOFTDIRTY=0;SMASH_FIXAV=0;SMASH_RECOMPRESS_BACKOFF=0")
+# A cold timeout above the maximum (254 ticks) is clamped to it, and a page
+# idle that long is compressed; unclamped, a floor of 255 or more compressed
+# nothing (testColdTicksMax).
+add_test(NAME test_compression_cold_max COMMAND test_compression coldmax)
+set_tests_properties(test_compression_cold_max PROPERTIES
+  ENVIRONMENT "SMASH_COLD_TICKS=300;SMASH_SOFTDIRTY=0;SMASH_FIXAV=0")
 
 # Compression-ratio test (needs LZ4 + zstd): verifies the engine hits the
 # paper's claimed ratios (RQ2), not just "compressed > 0". In-process,
@@ -830,6 +836,15 @@ if(NOT APPLE)
     $<TARGET_FILE:codec_env_test>)
   set_tests_properties(test_codec_env PROPERTIES TIMEOUT 300)
 
+  # A cold timeout smash cannot honour (above 254 s, or not a positive number)
+  # must print one [smash WARN] at startup (cold_timeout_env_test.cpp).
+  add_executable(cold_timeout_env_test cold_timeout_env_test.cpp)
+  target_link_libraries(cold_timeout_env_test PRIVATE ${CMAKE_DL_LIBS})
+  add_test(NAME test_cold_timeout_env COMMAND ${CMAKE_COMMAND} -E env
+    "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_DEFER_PHASES_MS=0"
+    $<TARGET_FILE:cold_timeout_env_test>)
+  set_tests_properties(test_cold_timeout_env PROPERTIES TIMEOUT 120)
+
   # SMASH_PREFETCH_WINDOW sets how many neighbours a fault restores
   # (prefetch_env_test.cpp).
   add_executable(prefetch_env_test prefetch_env_test.cpp)
@@ -893,6 +908,21 @@ if(NOT APPLE)
     "SMASH_DEFER_PHASES_MS=0" "SMASH_COLD_TIMEOUT_SEC=3"
     $<TARGET_FILE:thrash_backoff_test>)
   set_tests_properties(test_thrash_backoff PROPERTIES TIMEOUT 300)
+  # The same with SMASH_LARGE_ONLY=1 and 256 KiB blocks (the test sets both).
+  add_test(NAME test_thrash_backoff_large COMMAND ${CMAKE_COMMAND} -E env
+    "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_PREFETCH_WINDOW=0"
+    "SMASH_DEFER_PHASES_MS=0" "SMASH_COLD_TIMEOUT_SEC=3"
+    $<TARGET_FILE:thrash_backoff_test> large)
+  set_tests_properties(test_thrash_backoff_large PROPERTIES TIMEOUT 300)
+  # A slot the allocator hands out on a compressed page (thread cache or slab
+  # fallback) must not count as recompression thrash (alloc_reopen_test.cpp).
+  add_executable(alloc_reopen_test alloc_reopen_test.cpp)
+  target_link_libraries(alloc_reopen_test PRIVATE ${CMAKE_DL_LIBS})
+  add_test(NAME test_alloc_reopen COMMAND ${CMAKE_COMMAND} -E env
+    "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=0" "SMASH_PREFETCH_WINDOW=0"
+    "SMASH_DEFER_PHASES_MS=0" "SMASH_COLD_TIMEOUT_SEC=3"
+    $<TARGET_FILE:alloc_reopen_test>)
+  set_tests_properties(test_alloc_reopen PROPERTIES TIMEOUT 120)
 
   # Freed compressed data must give its blob memory back, and the blobs moved
   # to do it must decompress correctly (blob_compact_test.cpp).

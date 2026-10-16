@@ -567,6 +567,148 @@ static void testRecompressBackoff() {
     CHECK(page[0] == 0x3d && page[kPageSize - 1] == 0x3d, "recompress: data mismatch at the end");
 }
 
+// A restore of a page the allocator marked (it handed out a block there while
+// the page was compressed: PageStateTable::markAllocReopened) must not count
+// as recompression thrash, and must take the mark; any other restore must
+// count. A mark on a neighbouring page changes nothing. Both restore paths:
+// from COMPRESSED (decompress) and from COMPRESSED_SHADOW (the write fault on
+// a page awaiting deferred reclaim).
+static int ticksUntilState(CompressorThread& c, PageStateTable& states, size_t idx, PageState want, int max) {
+    for (int t = 1; t <= max; ++t) {
+        c.compressTick();
+        if (states.get(idx) == want) return t;
+    }
+    return -1;
+}
+
+static void testAllocReopen() {
+    setenv("SMASH_REARM_BACKOFF_MAX", "0", 1);
+    VmRegion vm;
+    vm.init(64 * kPageSize);
+    PageStateTable states;
+    states.init(vm.totalPages());
+    PageLockTable locks;
+    locks.init(vm.totalPages());
+    CompressStore store;
+    store.init();
+    CompressEngine engine;
+    engine.init();
+    CompressorThread compressor;
+    compressor.init(&vm, &states, &locks, &store, &engine);
+    unsetenv("SMASH_REARM_BACKOFF_MAX");
+    compressor.setRestoreGranulePages(1);
+
+    auto* mem = static_cast<uint8_t*>(vm.allocatePages(3));
+    CHECK(mem != nullptr, "reopen: alloc failed");
+    uint8_t* page = mem + kPageSize;
+    const size_t idx = vm.pageIndex(reinterpret_cast<uintptr_t>(page));
+    for (size_t k = 0; k < 3; ++k) states.set(idx - 1 + k, PageState::ACTIVE);
+    memset(mem, 0x6b, 3 * kPageSize);
+    const uint8_t* rc = compressor.recompressCounts();
+
+    struct Case { const char* what; PageState at; long mark; int want_rc; };
+    const Case cases[] = {
+        {"compressed, page marked", PageState::COMPRESSED, 0, 0},
+        {"compressed, nothing marked", PageState::COMPRESSED, -2, 1},
+        {"compressed, next page marked", PageState::COMPRESSED, 1, 1},
+        {"compressed, page marked again", PageState::COMPRESSED, 0, 0},
+        {"shadow, page marked", PageState::COMPRESSED_SHADOW, 0, 0},
+        {"shadow, nothing marked", PageState::COMPRESSED_SHADOW, -2, 1},
+    };
+    for (const Case& c : cases) {
+        CHECK(ticksUntilState(compressor, states, idx, c.at, 400) > 0, "reopen: %s: page never reached state %d",
+              c.what, static_cast<int>(c.at));
+        const int before = rc[idx];
+        if (c.mark > -2) states.markAllocReopened(idx + c.mark);
+        CHECK(compressor.handleFault(reinterpret_cast<uintptr_t>(page)), "reopen: %s: restore fault", c.what);
+        CHECK(rc[idx] - before == c.want_rc, "reopen: %s: recompress count went %d -> %d, want +%d", c.what, before,
+              rc[idx], c.want_rc);
+        CHECK(!states.takeAllocReopened(idx), "reopen: %s: the restore left the page's mark", c.what);
+        CHECK(page[0] == 0x6b && page[kPageSize - 1] == 0x6b, "reopen: %s: data mismatch", c.what);
+        if (c.mark == 1) (void)states.takeAllocReopened(idx + 1);
+    }
+}
+
+// The cold timeout setting: SMASH_COLD_TIMEOUT_SEC (seconds) wins over
+// SMASH_COLD_TICKS (ticks); text that is not a positive number keeps the
+// default with a warning; a value above kMaxColdTicks is clamped to it with a
+// warning -- a page's idle count stops at 255, and Phase 2 compresses only
+// above the floor, so a floor of 255 or more compressed nothing.
+static void testColdTimeoutParse() {
+    struct Case { const char* sec; const char* ticks; int want; bool overridden; const char* warning; };
+    const Case cases[] = {
+        {nullptr, nullptr, kColdTicksDefault, false, ""},
+        {"3", nullptr, 3, true, ""},
+        {"100", nullptr, 100, true, ""},
+        {"2.4", nullptr, 2, true, ""},
+        {"2.5", nullptr, 3, true, ""},
+        {"0.2", nullptr, 1, true, ""},
+        {"254", nullptr, 254, true, ""},
+        {"254.4", nullptr, 254, true, ""},
+        {"254.6", nullptr, kMaxColdTicks, true, "is above the maximum of 254 s"},
+        {"255", nullptr, kMaxColdTicks, true, "is above the maximum of 254 s"},
+        {"99999", nullptr, kMaxColdTicks, true, "SMASH_NO_COMPRESSOR=1"},
+        {"1e12", nullptr, kMaxColdTicks, true, "is above the maximum"},
+        {"5 ", nullptr, 5, true, ""},
+        {"0", nullptr, kColdTicksDefault, false, "is not a positive number"},
+        {"-3", nullptr, kColdTicksDefault, false, "is not a positive number"},
+        {"", nullptr, kColdTicksDefault, false, "is not a positive number"},
+        {"ten", nullptr, kColdTicksDefault, false, "is not a positive number"},
+        {"10s", nullptr, kColdTicksDefault, false, "is not a positive number"},
+        {"nan", nullptr, kColdTicksDefault, false, "is not a positive number"},
+        {"inf", nullptr, kColdTicksDefault, false, "is not a positive number"},
+        {"7", "2", 7, true, ""},
+        {nullptr, "2", 2, true, ""},
+        {nullptr, "300", kMaxColdTicks, true, "SMASH_COLD_TICKS=300 is above the maximum of 254 ticks"},
+        {nullptr, "-1", kColdTicksDefault, false, "SMASH_COLD_TICKS=-1 is not a positive number"},
+    };
+    for (const Case& c : cases) {
+        const ColdTicksSetting r = parseColdTicks(c.sec, c.ticks);
+        const char* label = c.sec ? c.sec : c.ticks ? c.ticks : "(unset)";
+        CHECK(r.ticks == c.want, "cold timeout %s: %d ticks, want %d", label, r.ticks, c.want);
+        CHECK(r.overridden == c.overridden, "cold timeout %s: overridden=%d", label, r.overridden);
+        if (c.warning[0])
+            CHECK(strstr(r.warning, c.warning) != nullptr, "cold timeout %s: warning \"%s\" lacks \"%s\"", label,
+                  r.warning, c.warning);
+        else
+            CHECK(r.warning[0] == '\0', "cold timeout %s: unexpected warning \"%s\"", label, r.warning);
+    }
+}
+
+// SMASH_COLD_TICKS=300 (test_compression_cold_max): clamped to the maximum
+// floor of 254, and a page idle that long is compressed. Unclamped, the floor
+// was 300 and the page never was.
+static void testColdTicksMax() {
+    setenv("SMASH_REARM_BACKOFF_MAX", "0", 1);
+    VmRegion vm;
+    vm.init(64 * kPageSize);
+    PageStateTable states;
+    states.init(vm.totalPages());
+    PageLockTable locks;
+    locks.init(vm.totalPages());
+    CompressStore store;
+    store.init();
+    CompressEngine engine;
+    engine.init();
+    CompressorThread compressor;
+    compressor.init(&vm, &states, &locks, &store, &engine);
+    unsetenv("SMASH_REARM_BACKOFF_MAX");
+    // ROIConfig reads the environment when the compressor initialises it.
+    CHECK(ROIConfig::instance().cold_ticks_floor == static_cast<uint32_t>(kMaxColdTicks),
+          "cold max: floor %u, want %d", ROIConfig::instance().cold_ticks_floor, kMaxColdTicks);
+    auto* page = static_cast<uint8_t*>(vm.allocatePages(1));
+    CHECK(page != nullptr, "cold max: alloc failed");
+    const size_t idx = vm.pageIndex(reinterpret_cast<uintptr_t>(page));
+    states.set(idx, PageState::ACTIVE);
+    memset(page, 0x2e, kPageSize);
+    const int t = ticksUntilCompressed(compressor, states, idx, 400);
+    fprintf(stderr, "cold max: floor %u, compressed after %d ticks\n", ROIConfig::instance().cold_ticks_floor, t);
+    CHECK(t > kMaxColdTicks && t <= kMaxColdTicks + 3, "cold max: compressed after %d ticks, want %d..%d", t,
+          kMaxColdTicks + 1, kMaxColdTicks + 3);
+    CHECK(compressor.handleFault(reinterpret_cast<uintptr_t>(page)), "cold max: restore fault");
+    CHECK(page[0] == 0x2e && page[kPageSize - 1] == 0x2e, "cold max: data mismatch");
+}
+
 // Coarse watching (SMASH_WATCH_GROUP_PAGES): a group is idle only when all
 // its pages are, so it is escalated and compressed in one tick; a fault on
 // a compressed page restores the whole group; a group is not armed while one
@@ -689,6 +831,11 @@ static void testReleaseCompressedPages() {
 }
 
 int main(int argc, char** argv) {
+    if (argc > 1 && strcmp(argv[1], "coldmax") == 0) {
+        testColdTicksMax();
+        fprintf(stderr, failures ? "compression: %d failures\n" : "compression: all tests passed\n", failures);
+        return failures ? 1 : 0;
+    }
     if (argc > 1 && strcmp(argv[1], "recompress") == 0) {
         testRecompressBackoff();
         fprintf(stderr, failures ? "compression: %d failures\n" : "compression: all tests passed\n", failures);
@@ -705,6 +852,8 @@ int main(int argc, char** argv) {
     testNominalTicks();
     testWatchGroup();
     testRecompressBackoff();
+    testAllocReopen();
+    testColdTimeoutParse();
     testReleaseCompressedPages();
 
     if (failures == 0) {

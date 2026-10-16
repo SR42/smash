@@ -380,6 +380,14 @@ class CompressorThread {
     // Saturating uint8_t — the bucket EMA captures values above ~6 anyway.
     uint8_t* recompress_count_ = nullptr;
 
+    // Ticks a COMPRESSED page has stayed compressed this time, counted by
+    // phase1Range up to kRcDecayColdTicks and reset there whenever it sees
+    // the page uncompressed (it always does between a restore and the next
+    // compression: only Phase 1 advances the cold count Phase 2 needs). On
+    // reaching kRcDecayColdTicks the page feeds a 0 into its bucket's
+    // recompress EMA -- see feedBucketRc.
+    uint8_t* settle_ticks_ = nullptr;
+
     // Per-page count of ratio-gate failures (compressPage attempts whose
     // output exceeded min_compress_ratio). Feeds the same exponential
     // effective-floor backoff as recompress_count_, but is reset ONLY by a
@@ -624,6 +632,11 @@ class CompressorThread {
         std::atomic<uint64_t> ft_hist[kFaultKinds][kFaultBuckets]{};
         std::atomic<uint64_t> rc_checked{0}, rc_released{0}, rc_changed{0}, rc_vma_stop{0};
         std::atomic<uint64_t> f_monitor{0}, f_shadow{0}, f_compressed{0}, f_active{0};
+        // Restores of compressed or shadow pages the allocator caused by
+        // handing out a slot on them, not counted as thrash (see
+        // PageStateTable::markAllocReopened). Included in f_compressed /
+        // f_shadow.
+        std::atomic<uint64_t> f_alloc_reopen{0};
         // Re-arm backoff: write faults on watched pages classified hot, and
         // page-ticks Phase 3 left a page unarmed while it waited.
         std::atomic<uint64_t> f_monitor_hot{0}, p3_backoff{0};
@@ -1862,6 +1875,7 @@ private:
             }
             PageState st = states_->get(i);
             if (st == PageState::ACTIVE || st == PageState::ACTIVE_MONITORING) {
+                if (settle_ticks_[i]) settle_ticks_[i] = 0;
                 if (idle_track && !idleSliceDue(i)) return;
                 // Raw WRITE signal (soft-dirty) BEFORE the idle-read augmentation
                 // below folds reads in. The soft-dirty ROI machinery needs the
@@ -1935,6 +1949,14 @@ private:
                 const uint8_t prev = cold_count_[i];
                 cold_count_[i] = advanceCold(prev, 0);
                 decayRecompressCount(i, prev);
+                if (settle_ticks_[i] < kRcDecayColdTicks) {
+                    const uint32_t s = settle_ticks_[i] + tick_inc_;
+                    settle_ticks_[i] = static_cast<uint8_t>(s > 255 ? 255 : s);
+                    if (s >= static_cast<uint32_t>(kRcDecayColdTicks)) {
+                        const size_t bidx = rcBucketOfPage(i);
+                        if (bidx < kBucketTableLen) feedBucketRc(bidx, 0);
+                    }
+                }
                 if (draining_regions_) moveBlobOutOfDraining(i);
             } else if (st == PageState::COMPRESSED_SHADOW) {
                 if (draining_regions_) moveBlobOutOfDraining(i);
@@ -1980,6 +2002,40 @@ private:
         if (n > 255) n = 255;
         if (cc < floor && n > floor) n = floor;
         return static_cast<uint8_t>(n);
+    }
+
+    // One sample into bucket `bidx`'s recompress EMA, which gives fresh pages
+    // of the bucket bias 1 (a doubled cold floor) while it is >= 256 (see
+    // phase2Range). EMA alpha=1/4, x256 fixed point; relaxed atomics, a torn
+    // update is acceptable. A restore feeds the page's new recompress count
+    // (>= 1, so >= 256); a page that stays compressed for kRcDecayColdTicks
+    // feeds 0, once per compression. Restores alone could never bring the EMA
+    // below 256 again, so one restore kept the bias for the rest of the
+    // process (test_thrash_backoff, "later"); with the zeros the EMA tracks
+    // whether the bucket's compressed pages mostly come back.
+    inline void feedBucketRc(size_t bidx, uint32_t sample_x256) {
+        const uint16_t old = bucket_rc_ema_x256_[bidx].load(std::memory_order_relaxed);
+        const uint16_t sample = static_cast<uint16_t>(sample_x256 > 65535 ? 65535 : sample_x256);
+        const uint8_t cnt = bucket_rc_count_[bidx].load(std::memory_order_relaxed);
+        const uint16_t neu = (cnt == 0)
+            ? sample
+            : static_cast<uint16_t>(static_cast<int32_t>(old)
+                + (static_cast<int32_t>(sample) - static_cast<int32_t>(old)) / 4);
+        bucket_rc_ema_x256_[bidx].store(neu, std::memory_order_relaxed);
+        if (cnt < 64) bucket_rc_count_[bidx].store(cnt + 1, std::memory_order_relaxed);
+    }
+
+    // The recompress-EMA bucket of page `page_idx`, or kBucketTableLen. Found
+    // through the page map, as the restore path finds it, so both feed the
+    // same pages: a slab span's every page, a large block's first only.
+    size_t rcBucketOfPage(size_t page_idx) {
+        if (!page_map_) return kBucketTableLen;
+        Span* sp = page_map_->get(reinterpret_cast<uintptr_t>(vm_->pageAddress(page_idx)));
+        if (!sp) return kBucketTableLen;
+        const uint8_t sc_b = sp->is_large ? largeSizeClass(sp->page_count) : sp->size_class;
+        if (sc_b >= kTotalBucketsPerArena) return kBucketTableLen;
+        const size_t bidx = statsIndex(sp->arena_id, sc_b);
+        return bidx < kBucketTableLen ? bidx : kBucketTableLen;
     }
 
     // One recompress_count_ decrement per multiple of kRcDecayColdTicks the
@@ -6970,6 +7026,7 @@ public:
         accessed_ = bootstrapArray<std::atomic<bool>>(max_pages);
         cold_count_ = bootstrapArray<uint8_t>(max_pages);
         recompress_count_ = bootstrapArray<uint8_t>(max_pages);
+        settle_ticks_ = bootstrapArray<uint8_t>(max_pages);
         compress_fail_count_ = bootstrapArray<uint8_t>(max_pages);
         rearm_exp_max_ = static_cast<uint8_t>(rearmBackoffMaxFromEnv());
         group_unwatched_ = bootstrapArray<uint8_t>(max_pages);
@@ -7661,7 +7718,7 @@ public:
                 " eligible=%llu routed=%llu hint_skip=%llu | compress tried=%llu"
                 " stored=%llu gate_fail=%llu roi_skip=%llu | release checked=%llu released=%llu"
                 " changed=%llu vma_stop=%llu | faults monitor=%llu shadow=%llu"
-                " compressed=%llu active=%llu | phase_ms=%llu/%llu/%llu/%llu"
+                " compressed=%llu active=%llu alloc_reopen=%llu | phase_ms=%llu/%llu/%llu/%llu"
                 " max=%llu/%llu/%llu/%llu | p1 minflt=%llu range_ms_max=%llu workers=%llu cap=%llu"
                 " | p3 armed=%llu calls=%llu p2 mprotect=%llu"
                 " | p5 ms=%llu max=%llu | rearm hot=%llu waits=%llu"
@@ -7672,7 +7729,7 @@ public:
                 v(pc.cp_stored), v(pc.cp_gate_fail), v(pc.cp_roi_skip), v(pc.rc_checked),
                 v(pc.rc_released),
                 v(pc.rc_changed), v(pc.rc_vma_stop), v(pc.f_monitor), v(pc.f_shadow),
-                v(pc.f_compressed), v(pc.f_active), v(pc.phase_ms[1]), v(pc.phase_ms[2]),
+                v(pc.f_compressed), v(pc.f_active), v(pc.f_alloc_reopen), v(pc.phase_ms[1]), v(pc.phase_ms[2]),
                 v(pc.phase_ms[3]), v(pc.phase_ms[4]), v(pc.phase_ms_max[1]),
                 v(pc.phase_ms_max[2]), v(pc.phase_ms_max[3]), v(pc.phase_ms_max[4]),
                 v(pc.p1_minflt), v(pc.p1_range_ms_max), v(pc.workers_last), v(pc.worker_cap),
@@ -8145,9 +8202,13 @@ public:
             // COMPRESSED is direct evidence the page was hotter than we
             // thought; bump the per-page count and feed the per-bucket EMA
             // so phase2 backs off on this page (and on fresh pages from the
-            // same allocation site) the next round.
+            // same allocation site) the next round -- unless the allocator
+            // handed out a block on the page, which is no evidence about the
+            // page at all (see PageStateTable::markAllocReopened).
+            const bool by_alloc = states_->takeAllocReopened(page_idx);
             uint8_t prev_rc = recompress_count_[page_idx];
-            if (prev_rc < 255) recompress_count_[page_idx] = prev_rc + 1;
+            if (!by_alloc && prev_rc < 255) recompress_count_[page_idx] = prev_rc + 1;
+            if (by_alloc) pc_.f_alloc_reopen.fetch_add(1, std::memory_order_relaxed);
 
             // Soft-dirty ROI: classify this decompress as a WRITE re-dirty (the
             // blob was genuinely invalidated → real churn) vs a READ fault (the
@@ -8194,18 +8255,8 @@ public:
                     if (sc_b < kTotalBucketsPerArena) {
                         size_t bidx = statsIndex(sp->arena_id, sc_b);
                         if (bidx < kBucketTableLen) {
-                            // EMA α=1/4, ×256 fixed-point. Relaxed atomics; tearing
-                            // on the EMA is acceptable.
-                            uint16_t old = bucket_rc_ema_x256_[bidx].load(std::memory_order_relaxed);
-                            uint16_t sample_x256 = static_cast<uint16_t>(prev_rc + 1) * 256;
-                            uint8_t cnt = bucket_rc_count_[bidx].load(std::memory_order_relaxed);
-                            uint16_t neu = (cnt == 0)
-                                ? sample_x256
-                                : static_cast<uint16_t>(static_cast<int32_t>(old)
-                                    + (static_cast<int32_t>(sample_x256) - static_cast<int32_t>(old)) / 4);
-                            bucket_rc_ema_x256_[bidx].store(neu, std::memory_order_relaxed);
-                            if (cnt < 64)
-                                bucket_rc_count_[bidx].store(cnt + 1, std::memory_order_relaxed);
+                            if (!by_alloc)
+                                feedBucketRc(bidx, static_cast<uint32_t>(prev_rc + 1) * 256);
 
                             // Time-budget: charge decompress wall-time against
                             // the bucket. Worker 0 is the canonical sink since
@@ -8289,7 +8340,11 @@ public:
             if (page_tier_) page_tier_[page_idx] = kTierNone;
             cold_count_[page_idx] = 0;
             compress_fail_count_[page_idx] = 0;  // write → contents changed
-            if (recompress_count_[page_idx] < 255)
+            // A write to a block the allocator put here is not thrash (see
+            // the COMPRESSED case).
+            if (states_->takeAllocReopened(page_idx))
+                pc_.f_alloc_reopen.fetch_add(1, std::memory_order_relaxed);
+            else if (recompress_count_[page_idx] < 255)
                 recompress_count_[page_idx]++;
             states_->set(page_idx, PageState::ACTIVE);
             locks_->unlock(page_idx);
@@ -8335,6 +8390,8 @@ public:
             states_->set(i, PageState::EMPTY);
             cold_count_[i] = 0;
             recompress_count_[i] = 0;
+            settle_ticks_[i] = 0;
+            (void)states_->takeAllocReopened(i);
             compress_fail_count_[i] = 0;
             accessed_[i].store(false, std::memory_order_relaxed);
             locks_->unlock(i);

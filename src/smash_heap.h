@@ -1560,6 +1560,7 @@ public:
             if (!ptr) [[unlikely]]
                 reportAllocFailure("small (slab span: no VmRegion pages)", size, 0,
                                    vm_region_.rawNextPage(), vm_region_.contigPages());
+            else noteBlockOnHeldPages(ptr, classSize(sc));
             if constexpr (kMeasureCohorts) {
                 if (ptr) {
                     uintptr_t ra = ra_for_arena;
@@ -1599,6 +1600,24 @@ public:
         return ptr;
     }
 
+    // A small block just handed out: mark each page of it the compressor
+    // holds, so the restore its first write causes is not counted as
+    // recompression thrash (PageStateTable::markAllocReopened). One relaxed
+    // byte load per page once anything has been compressed; a stale state
+    // only misses a mark, or leaves one that a later restore takes.
+    [[gnu::always_inline]] void noteBlockOnHeldPages(void* p, size_t size) {
+        if (!g_any_page_compressed.load(std::memory_order_relaxed)) return;
+        const auto a = reinterpret_cast<uintptr_t>(p);
+        if (!vm_region_.inContigArena(a)) return;
+        const size_t last = vm_region_.contigPageIndex(a + size - 1);
+        for (size_t i = vm_region_.contigPageIndex(a); i <= last; ++i) {
+            const PageState st = page_states_.getRelaxed(i);
+            if (st == PageState::COMPRESSED || st == PageState::COMPRESSED_SHADOW ||
+                st == PageState::COMPRESSING) [[unlikely]]
+                page_states_.markAllocReopened(i);
+        }
+    }
+
     // Hot path.  size in [1, kMaxSmallSize] AND thread cache already
     // initialised AND non-empty for this size class → return the cached
     // pointer.  Anything else falls into mallocSlow.  Everything past the
@@ -1613,9 +1632,14 @@ public:
             if (ThreadCache* tc = currentThreadCache()) [[likely]] {
                 uint8_t arena = callsiteArena(sc, caller_ra);
                 if (arena == kStdioArena) [[unlikely]] return mallocSlow(size, caller_ra);
-                if (void* ptr = tc->allocate(sc, arena)) [[likely]] return ptr;
-                if (void* ptr = tc->refill(sc, arena, &slab(arena, sc)))
+                if (void* ptr = tc->allocate(sc, arena)) [[likely]] {
+                    noteBlockOnHeldPages(ptr, classSize(sc));
                     return ptr;
+                }
+                if (void* ptr = tc->refill(sc, arena, &slab(arena, sc))) {
+                    noteBlockOnHeldPages(ptr, classSize(sc));
+                    return ptr;
+                }
             }
         }
         return mallocSlow(size, caller_ra);
@@ -1886,8 +1910,10 @@ public:
                 // Bypasses the thread cache on purpose: a cached pointer is an
                 // arbitrary slot of the class and cannot be assumed aligned.
                 if (void* p = slab(arena, nc).allocateAligned(
-                        static_cast<uint32_t>(stride)))
+                        static_cast<uint32_t>(stride))) {
+                    noteBlockOnHeldPages(p, csz);
                     return p;
+                }
             }
         }
 

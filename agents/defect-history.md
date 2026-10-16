@@ -506,12 +506,61 @@ its count decays (one step per 8 ticks spent compressed), 80 s, and so on up
 to the 200-tick cap. Before the fix the wait was 20 s after one restore and
 grew by only 8 s per further one (24 s at count 3, 32 s at count 4). `SMASH_RECOMPRESS_BACKOFF=0` turns the back-off off.
 
-Two properties of the per-bucket half of the back-off, measured while writing
-the test and left as they are:
-- Any restore counts. The slab hands out a free slot on a COMPRESSED page
-  rather than open a new span when it has nothing else, and the first write to
-  that object faults the page back — the bias counts that as a thrash. One such
-  allocation gave a call site's fresh pages 2x the floor (7.1 s against 5.1 s).
-- The bucket bias never decays: it is set once the bucket's EMA of the restore
-  count reaches 1, and every sample is at least 1, so one restore in a bucket
-  doubles the floor of all its fresh pages for the rest of the process.
+Two properties of the per-bucket half of the back-off, found while writing
+the test, fixed the next day (below):
+- Any restore counted, including one the allocator caused.
+- The bucket bias never decayed.
+
+## Thrash back-off: allocator restores counted, and the bucket bias never wore off (fixed 2026-10-16)
+
+**Allocator restores.** The allocator hands out a block on a page the
+compressor holds in two ways: the thread cache returns a slot freed into it
+before the page went cold, and the slab falls back to a free slot on a
+cooling or compressed page when a span has no warmer one and no empty span is
+left (`consumeFallback`). The program's first write to the block faults the
+page back, and that restore raised the page's recompress count and fed the
+bucket EMA like a page compressed too early. Measured (`test_alloc_reopen`,
+floor 3 s): 128 of 128 reopened pages got a count and were compressed again
+after 13.1 s (4x the floor), the call site's fresh pages after 7.1 s (2x),
+another call site's after 5.1 s. Both ways happen: a probe found the thread
+cache handing back a freed slot on a compressed page as the very next
+allocation, and in 64 allocations from a call site whose free slots were all
+on compressed pages, 6 landed on a page still compressed. Now the heap checks
+the page state of every small block it hands out once any page has been
+compressed (`SmashHeap::noteBlockOnHeldPages`, one relaxed byte load per page
+of the block) and marks a page that is COMPRESSED, COMPRESSED_SHADOW or
+COMPRESSING in a per-page bitmap (`PageStateTable::markAllocReopened`); the
+fault handler takes the mark and counts neither the page nor the bucket.
+`alloc_reopen=` in the `[smash pipeline]` line counts such restores. After:
+0 of 128 counted, all three groups at 5.1 s.
+
+The first version recorded the thread's last small allocation in two TLS words
+and had the fault handler compare the faulting page with it. It caught 3 of
+132 such restores: the test, like any program whose constructors allocate a
+member before writing their first field, allocated something else (a 48-byte
+`std::set` node) between `malloc` and the first write. Don't go back to it.
+
+Left: a mark set for a block that is never written, or whose page is restored
+first by another access, makes that page's next restore go uncounted, once;
+and a block handed out on a page just before it turns COMPRESSING is not
+marked.
+
+**The bias never wore off.** Phase 2 gives a page bias 1 (a doubled floor)
+while its bucket's EMA of restore counts is >= 256 (x256 fixed point). The EMA
+was fed only on restores, and every sample was a count >= 1, so it could never
+fall below 256 again: one restore in a bucket doubled the floor of every fresh
+page of it for the rest of the process. In `SMASH_LARGE_ONLY=1`, where a bucket
+is (arena, log2 pages), that is every new block of that size range from that
+call site's arena. Measured (`test_thrash_backoff`, step 4, 11 s after
+everything was compressed again): the restored site's later pages at 6.2 s,
+the other site's at 4.1 s (large mode: 6.2 against 5.2; 4.2 with the back-off
+off). Now a page that stays COMPRESSED for `kRcDecayColdTicks` (8) ticks feeds
+the EMA a 0, once per compression (`settle_ticks_`, reset by Phase 1 whenever
+it sees the page uncompressed), so the EMA says whether the bucket's
+compressed pages mostly come back. After: 4.1 against 4.1 in both modes; right
+after the restores the fresh pages still wait 2x (7.1 s).
+
+The EMA is reached through the page map on both sides, which registers a
+large block's first page only: in large-only mode the bias is fed by first
+pages alone, restores and zeros alike. Phase 2 applies it to every page of a
+block (it resolves interior pages through its span cache).
