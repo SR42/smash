@@ -27,11 +27,12 @@
 //   - default: T fresh >= C fresh + 1.5 (2x the floor against 1x: 6 vs 4
 //     ticks), restored >= C fresh + 5.5 (4x: 12 ticks);
 //   - default: T later <= C later + 1.5, and <= the control's T later + 1.0:
-//     the bias wears off once T's pages stay compressed. The bucket EMA was
-//     fed restores only, every sample >= 1, so one restore kept the bias for
-//     the rest of the process (measured: T later 6.2 s against C later 4.1 s,
+//     the bias wears off once T's pages stay compressed. It came from an EMA
+//     fed by restores only, every sample >= 1, so one restore kept it for the
+//     rest of the process (measured: T later 6.2 s against C later 4.1 s,
 //     and in large mode 6.2 s against 5.2 s, with the control at 4.2 s); now
-//     a page that stays compressed for kRcDecayColdTicks feeds it a 0;
+//     it holds while more of the bucket's compressed pages came back than
+//     stayed (compressed for kRcDecayColdTicks);
 //   - SMASH_RECOMPRESS_BACKOFF=0: all five within 1.5 s of each other;
 //   - every object reads back intact.
 // Before the decay fix, the restored pages' count decayed during the wait
@@ -39,10 +40,18 @@
 //
 // `large` runs the same with SMASH_LARGE_ONLY=1 and 64 blocks of 256 KiB
 // (SMASH_LARGE_ALLOC_VM_THRESHOLD=65536), whose bucket is (arena, log2 pages).
-// Reading a block restores every page; the bucket EMA hears only of its first
-// page (the page map registers a large block's first page alone), which is
-// enough for the bias. It also checks that a block allocated where compressed
+// Reading a block restores every page. It also checks that a block allocated where compressed
 // blocks were freed starts with no compressed page and no recompress count.
+//
+// `large_interior` is `large` with step 1 reading every page of a block but
+// its first. The restore path used to find the bucket through the page map,
+// which registers a large block's first page only, so restores of the other
+// pages never reached the bias: none at all (measured: T fresh 5.1 s, C fresh
+// 5.1 s, restored 7.1 s). The compressor now records each page's bucket when
+// it compresses it (page_bucket_). This shape also caught the second bias
+// design (an EMA with a 0 for each page that stayed): the 64 first pages
+// that stayed compressed turned the bias off for good although 4032 pages
+// came back -- restored 8.1 s instead of 13.
 #include "placement_test_util.h"
 
 #include <algorithm>
@@ -54,6 +63,7 @@ using namespace placement;
 namespace {
 
 bool g_large = false;
+bool g_skip_first = false;  // large_interior: step 1 leaves each block's first page compressed
 size_t kObj = 256, kCount = 2048;
 
 static volatile uintptr_t g_sink;
@@ -121,7 +131,7 @@ int child() {
     }
     size_t bad = 0;
     for (size_t k = 0; k < kCount; ++k)
-        for (size_t i = 0; i < kObj; ++i) bad += t1[k][i] != want(1, k, i);
+        for (size_t i = g_skip_first ? kPage : 0; i < kObj; ++i) bad += t1[k][i] != want(1, k, i);
     std::vector<uintptr_t> restored;
     for (uintptr_t pg : t1_pages) {
         int rc = 0;
@@ -272,7 +282,8 @@ int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
     const bool child_mode = argc > 1 && std::strcmp(argv[1], "child") == 0;
     const char* mode = argc > (child_mode ? 2 : 1) ? argv[child_mode ? 2 : 1] : "";
-    g_large = std::strcmp(mode, "large") == 0;
+    g_skip_first = std::strcmp(mode, "large_interior") == 0;
+    g_large = g_skip_first || std::strcmp(mode, "large") == 0;
     if (g_large) {
         kObj = 256 * 1024;
         kCount = 64;

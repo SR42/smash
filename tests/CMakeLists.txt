@@ -118,6 +118,11 @@ set_tests_properties(test_compression_backoff_off PROPERTIES
 # A cold timeout above the maximum (254 ticks) is clamped to it, and a page
 # idle that long is compressed; unclamped, a floor of 255 or more compressed
 # nothing (testColdTicksMax).
+# Phase B touches exactly its worker's page range, also when the range starts
+# and ends mid-chunk (testReclaimRange).
+add_test(NAME test_compression_reclaim_range COMMAND test_compression reclaimrange)
+set_tests_properties(test_compression_reclaim_range PROPERTIES
+  ENVIRONMENT "SMASH_COLD_TICKS=2;SMASH_SOFTDIRTY=0;SMASH_FIXAV=0;SMASH_DEFERRED_RECLAIM_DELAY=1000")
 add_test(NAME test_compression_cold_max COMMAND test_compression coldmax)
 set_tests_properties(test_compression_cold_max PROPERTIES
   ENVIRONMENT "SMASH_COLD_TICKS=300;SMASH_SOFTDIRTY=0;SMASH_FIXAV=0")
@@ -914,6 +919,13 @@ if(NOT APPLE)
     "SMASH_DEFER_PHASES_MS=0" "SMASH_COLD_TIMEOUT_SEC=3"
     $<TARGET_FILE:thrash_backoff_test> large)
   set_tests_properties(test_thrash_backoff_large PROPERTIES TIMEOUT 300)
+  # The same reading every page of a block but its first: restores of pages
+  # inside a large block must feed the bucket bias too.
+  add_test(NAME test_thrash_backoff_large_interior COMMAND ${CMAKE_COMMAND} -E env
+    "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_PREFETCH_WINDOW=0"
+    "SMASH_DEFER_PHASES_MS=0" "SMASH_COLD_TIMEOUT_SEC=3"
+    $<TARGET_FILE:thrash_backoff_test> large_interior)
+  set_tests_properties(test_thrash_backoff_large_interior PROPERTIES TIMEOUT 300)
   # A slot the allocator hands out on a compressed page (thread cache or slab
   # fallback) must not count as recompression thrash (alloc_reopen_test.cpp).
   add_executable(alloc_reopen_test alloc_reopen_test.cpp)

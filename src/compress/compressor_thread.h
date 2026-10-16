@@ -377,16 +377,27 @@ class CompressorThread {
     // Per-page recompression count: bumped on every COMPRESSED → ACTIVE
     // fault, decayed in phase1Range when the page settles cold.  phase2Range
     // raises the effective cold-tick floor by 2^min(rc + bucket_bias, kMaxBackoffShift).
-    // Saturating uint8_t — the bucket EMA captures values above ~6 anyway.
+    // Saturating uint8_t.
     uint8_t* recompress_count_ = nullptr;
 
     // Ticks a COMPRESSED page has stayed compressed this time, counted by
     // phase1Range up to kRcDecayColdTicks and reset there whenever it sees
     // the page uncompressed (it always does between a restore and the next
     // compression: only Phase 1 advances the cold count Phase 2 needs). On
-    // reaching kRcDecayColdTicks the page feeds a 0 into its bucket's
-    // recompress EMA -- see feedBucketRc.
+    // reaching kRcDecayColdTicks the page counts as "stayed" for its bucket
+    // -- see noteBucketOutcome.
     uint8_t* settle_ticks_ = nullptr;
+
+    // The (arena, bucket) stats index + 1 of each page, as compressPage found
+    // it (0: none), for the bucket bias (rcBucketOfPage). compressPage
+    // resolves a page inside a large block through spanOfPage's cache; the
+    // fault handler cannot afford that walk, and the page map it used
+    // registers a large block's first page only -- so restores of every other
+    // page never reached the bias, and in SMASH_LARGE_ONLY=1 it came only
+    // from first pages (test_thrash_backoff_large_interior). Written under
+    // the page lock while COMPRESSING; read while the page is compressed or
+    // being restored, when it cannot change.
+    uint16_t* page_bucket_ = nullptr;
 
     // Per-page count of ratio-gate failures (compressPage attempts whose
     // output exceeded min_compress_ratio). Feeds the same exponential
@@ -888,15 +899,17 @@ class CompressorThread {
     // first restore; reset across fork() like the soft-dirty fds.
     [[maybe_unused]] int self_mem_fd_ = -1;
 
-    // Per-(arena, size_class) recompression-rate signal. Single shared
-    // table (not per-worker) so the fault handler can update it without
-    // first finding the right worker. Relaxed atomics; tearing on the EMA
-    // is acceptable.  Indexed by `arena * kTotalBucketsPerArena + bucket`,
-    // where bucket is in [0, kNumClasses) for slab pages or
+    // Per-(arena, size_class) recompression outcomes, for the bucket bias
+    // (see noteBucketOutcome): compressed pages that came back and that
+    // stayed. Single shared table (not per-worker) so the fault handler can
+    // update it without first finding the right worker. Relaxed atomics; a
+    // lost update is acceptable. Indexed by `arena * kTotalBucketsPerArena +
+    // bucket`, where bucket is in [0, kNumClasses) for slab pages or
     // [kNumClasses, kTotalBucketsPerArena) for large-alloc page-count buckets.
-    std::atomic<uint16_t>* bucket_rc_ema_x256_ = nullptr;  // ×256 fixed-point
-    std::atomic<uint8_t>*  bucket_rc_count_ = nullptr;     // sample count, capped 64
+    std::atomic<uint16_t>* bucket_back_ = nullptr;
+    std::atomic<uint16_t>* bucket_kept_ = nullptr;
     static constexpr size_t kBucketTableLen = kNumArenas * kTotalBucketsPerArena;
+    static_assert(kBucketTableLen < 65535, "page_bucket_ holds a stats index + 1 in 16 bits");
 
     // Cohort measurement (kMeasureCohorts).  Points to SmashHeap's CohortPage
     // array — opaque here to avoid circular include.  Layout matches
@@ -1954,7 +1967,7 @@ private:
                     settle_ticks_[i] = static_cast<uint8_t>(s > 255 ? 255 : s);
                     if (s >= static_cast<uint32_t>(kRcDecayColdTicks)) {
                         const size_t bidx = rcBucketOfPage(i);
-                        if (bidx < kBucketTableLen) feedBucketRc(bidx, 0);
+                        if (bidx < kBucketTableLen) noteBucketOutcome(bidx, false);
                     }
                 }
                 if (draining_regions_) moveBlobOutOfDraining(i);
@@ -2004,38 +2017,41 @@ private:
         return static_cast<uint8_t>(n);
     }
 
-    // One sample into bucket `bidx`'s recompress EMA, which gives fresh pages
-    // of the bucket bias 1 (a doubled cold floor) while it is >= 256 (see
-    // phase2Range). EMA alpha=1/4, x256 fixed point; relaxed atomics, a torn
-    // update is acceptable. A restore feeds the page's new recompress count
-    // (>= 1, so >= 256); a page that stays compressed for kRcDecayColdTicks
-    // feeds 0, once per compression. Restores alone could never bring the EMA
-    // below 256 again, so one restore kept the bias for the rest of the
-    // process (test_thrash_backoff, "later"); with the zeros the EMA tracks
-    // whether the bucket's compressed pages mostly come back.
-    inline void feedBucketRc(size_t bidx, uint32_t sample_x256) {
-        const uint16_t old = bucket_rc_ema_x256_[bidx].load(std::memory_order_relaxed);
-        const uint16_t sample = static_cast<uint16_t>(sample_x256 > 65535 ? 65535 : sample_x256);
-        const uint8_t cnt = bucket_rc_count_[bidx].load(std::memory_order_relaxed);
-        const uint16_t neu = (cnt == 0)
-            ? sample
-            : static_cast<uint16_t>(static_cast<int32_t>(old)
-                + (static_cast<int32_t>(sample) - static_cast<int32_t>(old)) / 4);
-        bucket_rc_ema_x256_[bidx].store(neu, std::memory_order_relaxed);
-        if (cnt < 64) bucket_rc_count_[bidx].store(cnt + 1, std::memory_order_relaxed);
+    // One outcome for bucket `bidx`: a compressed page came back (a restore
+    // the allocator did not cause) or stayed (compressed for
+    // kRcDecayColdTicks, counted once per compression). Phase 2 gives the
+    // bucket's pages bias 1 while more came back than stayed (bucketBias);
+    // both counts are halved once they sum to kBucketBiasWindow.
+    //
+    // Two designs before this one: an EMA of restore counts fed by restores
+    // only, every sample >= 1, so one restore kept the bias for the rest of
+    // the process (test_thrash_backoff, "later"); then the same EMA with a 0
+    // for each page that stayed, where a page restored once feeds exactly
+    // the threshold, so a single 0 turned the bias off and, in integer
+    // steps, it never came back -- one untouched first page per block
+    // cancelled the restores of the other 63
+    // (test_thrash_backoff_large_interior).
+    inline void noteBucketOutcome(size_t bidx, bool came_back) {
+        const uint16_t b = bucket_back_[bidx].load(std::memory_order_relaxed);
+        const uint16_t k = bucket_kept_[bidx].load(std::memory_order_relaxed);
+        if (b + k >= kBucketBiasWindow) {
+            bucket_back_[bidx].store(static_cast<uint16_t>(b / 2), std::memory_order_relaxed);
+            bucket_kept_[bidx].store(static_cast<uint16_t>(k / 2), std::memory_order_relaxed);
+        }
+        (came_back ? bucket_back_ : bucket_kept_)[bidx].fetch_add(1, std::memory_order_relaxed);
     }
 
-    // The recompress-EMA bucket of page `page_idx`, or kBucketTableLen. Found
-    // through the page map, as the restore path finds it, so both feed the
-    // same pages: a slab span's every page, a large block's first only.
-    size_t rcBucketOfPage(size_t page_idx) {
-        if (!page_map_) return kBucketTableLen;
-        Span* sp = page_map_->get(reinterpret_cast<uintptr_t>(vm_->pageAddress(page_idx)));
-        if (!sp) return kBucketTableLen;
-        const uint8_t sc_b = sp->is_large ? largeSizeClass(sp->page_count) : sp->size_class;
-        if (sc_b >= kTotalBucketsPerArena) return kBucketTableLen;
-        const size_t bidx = statsIndex(sp->arena_id, sc_b);
-        return bidx < kBucketTableLen ? bidx : kBucketTableLen;
+    bool bucketBias(size_t bidx) const {
+        return bucket_back_[bidx].load(std::memory_order_relaxed) >
+               bucket_kept_[bidx].load(std::memory_order_relaxed);
+    }
+
+    // The bias bucket of a compressed page, or kBucketTableLen: the
+    // one compressPage recorded for it (page_bucket_), so every page of a
+    // large block counts, not just its first.
+    size_t rcBucketOfPage(size_t page_idx) const {
+        const uint16_t b = page_bucket_[page_idx];
+        return b ? static_cast<size_t>(b - 1) : kBucketTableLen;
     }
 
     // One recompress_count_ decrement per multiple of kRcDecayColdTicks the
@@ -2293,7 +2309,7 @@ private:
             // accumulated recompress event, capped at kMaxBackoffShift.
             //
             // Looked up via the span so we also pick up the new-page bias
-            // from the per-bucket EMA — fresh pages from a known-thrashy
+            // from the per-bucket outcomes — fresh pages from a known-thrashy
             // call site inherit the wait without needing their own history.
             uint32_t eff_floor = profile_floor;
             if (backoff_enabled) {
@@ -2308,15 +2324,12 @@ private:
                         if (sc_b < kTotalBucketsPerArena) {
                             size_t bidx = statsIndex(sp->arena_id, sc_b);
                             if (bidx < kBucketTableLen) {
-                                // Bucket bias: a single recompress event in this
-                                // (arena, bucket) gives bias=1 to fresh pages in
-                                // the same bucket — they get a longer initial
-                                // cold window without needing to thrash themselves
-                                // first. Threshold=256 ≈ "one full rc sample"
-                                // with α=1/4 EMA.
-                                uint16_t ema = bucket_rc_ema_x256_[bidx].load(
-                                    std::memory_order_relaxed);
-                                if (ema >= kBucketRcBiasThreshold_x256) bucket_bias = 1;
+                                // Bucket bias: while most of this (arena,
+                                // bucket)'s compressed pages come back, its
+                                // pages -- fresh ones too -- get a longer cold
+                                // window without needing to thrash themselves
+                                // first (see noteBucketOutcome).
+                                if (bucketBias(bidx)) bucket_bias = 1;
                             }
                         }
                     }
@@ -2962,6 +2975,8 @@ private:
         uint8_t arena_id = 0, sc = 0;
         bool have_span = lookupSpanInfo(page_idx, arena_id, sc, &worker.span_cache);
         size_t stats_idx = statsIndex(arena_id, sc);
+        page_bucket_[page_idx] = (have_span && sc < kTotalBucketsPerArena && stats_idx < kBucketTableLen)
+            ? static_cast<uint16_t>(stats_idx + 1) : 0;
         uint8_t stats_count = (have_span && sc < kTotalBucketsPerArena)
             ? worker.sc_stats[stats_idx].count : 0;
         uint16_t stats_sum = (have_span && sc < kTotalBucketsPerArena)
@@ -4607,11 +4622,20 @@ private:
     // For pages in COMPRESSED_SHADOW, verify content hasn't changed since
     // Phase A, then reclaim physical memory (decommit + PROT_NONE).
 
-    void reclaimShadowRange(size_t start, size_t end) {
+    void reclaimShadowRange(size_t start, size_t end, int delay_override = -1) {
         if (!shadow_tick_) return;
-        const int delay = getDeferredReclaimDelay();
-        const size_t num_chunks_range = (end - start + kChunkSize - 1) / kChunkSize;
-        size_t chunk_base = start / kChunkSize;
+        const int delay = delay_override >= 0 ? delay_override : getDeferredReclaimDelay();
+        // Chunks [start / 64, ceil(end / 64)), and in them only pages of
+        // [start, end): worker ranges are not chunk-aligned. Walking whole
+        // chunks from start / 64 reclaimed the previous worker's pages of the
+        // shared chunk concurrently with it, and the look-ahead below, which
+        // arms a run PROT_READ without taking the pages' locks, could then
+        // land after that worker had made them PROT_NONE and dropped them:
+        // COMPRESSED pages that read zeros without a fault. Counting chunks
+        // from end - start also missed the chunk holding the range's last
+        // pages whenever start was mid-chunk (testReclaimRange).
+        const size_t chunk_base = start / kChunkSize;
+        const size_t num_chunks_range = (end + kChunkSize - 1) / kChunkSize - chunk_base;
 
         // Mid-loop VMA budget. This is the dominant VMA-creating path in the
         // default deferred-reclaim mode: each reclaimed shadow page gets its
@@ -4702,6 +4726,7 @@ private:
                 int bit = __builtin_ctzll(mask);
                 mask &= mask - 1;
                 size_t i = page_base + bit;
+                if (i < start) continue;
                 if (i >= end) break;
 
                 if (states_->get(i) != PageState::COMPRESSED_SHADOW) continue;
@@ -7008,6 +7033,10 @@ public:
     // read by the smash_page_info() test hook only.
     const uint8_t* recompressCounts() const { return recompress_count_; }
 
+    // Test hook (test_compression's testReclaimRange): Phase B over one page
+    // range, as one worker runs it, ignoring the reclaim delay.
+    void reclaimShadowRangeForTest(size_t start, size_t end) { reclaimShadowRange(start, end, 0); }
+
     void init(VmRegion* vm, PageStateTable* states, PageLockTable* locks,
               CompressStore* store, CompressEngine* engine,
               PageMap* page_map = nullptr,
@@ -7027,6 +7056,7 @@ public:
         cold_count_ = bootstrapArray<uint8_t>(max_pages);
         recompress_count_ = bootstrapArray<uint8_t>(max_pages);
         settle_ticks_ = bootstrapArray<uint8_t>(max_pages);
+        page_bucket_ = bootstrapArray<uint16_t>(max_pages);
         compress_fail_count_ = bootstrapArray<uint8_t>(max_pages);
         rearm_exp_max_ = static_cast<uint8_t>(rearmBackoffMaxFromEnv());
         group_unwatched_ = bootstrapArray<uint8_t>(max_pages);
@@ -7083,8 +7113,8 @@ public:
         deferred_queue_tick_ = bootstrapArray<uint32_t>(max_pages);
 
         // Per-bucket recompression EMA table (kNumArenas × kNumClasses entries).
-        bucket_rc_ema_x256_ = bootstrapArray<std::atomic<uint16_t>>(kBucketTableLen);
-        bucket_rc_count_    = bootstrapArray<std::atomic<uint8_t>>(kBucketTableLen);
+        bucket_back_ = bootstrapArray<std::atomic<uint16_t>>(kBucketTableLen);
+        bucket_kept_ = bootstrapArray<std::atomic<uint16_t>>(kBucketTableLen);
 
         // Chunk bitmap
         num_chunks_ = (max_pages + kChunkSize - 1) / kChunkSize;
@@ -8200,15 +8230,20 @@ public:
 
             // Recompression-thrash signal. The act of faulting back from
             // COMPRESSED is direct evidence the page was hotter than we
-            // thought; bump the per-page count and feed the per-bucket EMA
-            // so phase2 backs off on this page (and on fresh pages from the
-            // same allocation site) the next round -- unless the allocator
+            // thought; bump the per-page count and count the page as come
+            // back for its bucket, so phase2 backs off on this page (and on
+            // fresh pages from the same allocation site) the next round --
+            // unless the allocator
             // handed out a block on the page, which is no evidence about the
             // page at all (see PageStateTable::markAllocReopened).
             const bool by_alloc = states_->takeAllocReopened(page_idx);
             uint8_t prev_rc = recompress_count_[page_idx];
             if (!by_alloc && prev_rc < 255) recompress_count_[page_idx] = prev_rc + 1;
             if (by_alloc) pc_.f_alloc_reopen.fetch_add(1, std::memory_order_relaxed);
+            if (!by_alloc) {
+                const size_t rc_bidx = rcBucketOfPage(page_idx);
+                if (rc_bidx < kBucketTableLen) noteBucketOutcome(rc_bidx, true);
+            }
 
             // Soft-dirty ROI: classify this decompress as a WRITE re-dirty (the
             // blob was genuinely invalidated → real churn) vs a READ fault (the
@@ -8229,8 +8264,9 @@ public:
             // heap so it can bias cap sizing for this (arena, sc) toward
             // "hot" (no cap / larger cap).
             //
-            // Same lookup gives us (arena, size_class) for the bucket EMA
-            // update — do both in one Span fetch.
+            // The same lookup gives (arena, bucket) for the time budget and
+            // the thrash rate below. It finds a large block's first page
+            // only; the bucket bias above uses page_bucket_ instead.
             bool is_external = page_idx >= vm_->contigPages();
             if (is_external) {
                 // External page thrashed — mark for profile persistence so
@@ -8247,17 +8283,14 @@ public:
                         decompressed_fn_(page_idx, sp->arena_id, sp->size_class,
                                          decompressed_ctx_);
                     }
-                    // Unified bucket for the rc-ema and time-budget tables —
-                    // large allocs land in the kNumClasses+log2(pages) slot.
+                    // Unified bucket for the time-budget table — large
+                    // allocs land in the kNumClasses+log2(pages) slot.
                     uint8_t sc_b = sp->is_large
                         ? largeSizeClass(sp->page_count)
                         : sp->size_class;
                     if (sc_b < kTotalBucketsPerArena) {
                         size_t bidx = statsIndex(sp->arena_id, sc_b);
                         if (bidx < kBucketTableLen) {
-                            if (!by_alloc)
-                                feedBucketRc(bidx, static_cast<uint32_t>(prev_rc + 1) * 256);
-
                             // Time-budget: charge decompress wall-time against
                             // the bucket. Worker 0 is the canonical sink since
                             // we can't know which worker compressed this page.
@@ -8391,6 +8424,7 @@ public:
             cold_count_[i] = 0;
             recompress_count_[i] = 0;
             settle_ticks_[i] = 0;
+            page_bucket_[i] = 0;
             (void)states_->takeAllocReopened(i);
             compress_fail_count_[i] = 0;
             accessed_[i].store(false, std::memory_order_relaxed);

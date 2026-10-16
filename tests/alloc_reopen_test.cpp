@@ -8,7 +8,7 @@
 // only free slots are on cooling or compressed pages and no empty span is
 // left, hands out one of those (consumeFallback). Either way the program's
 // first write to the new object faults the page back. That restore used to
-// bump the page's recompress count and feed the bucket EMA like a page that
+// bump the page's recompress count and count for the bucket bias like a page that
 // was compressed too early: the page then waited 4x the cold timeout before it
 // was compressed again, and every fresh page of the call site 2x.
 //

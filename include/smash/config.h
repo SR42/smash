@@ -555,19 +555,19 @@ inline constexpr int kRcDecayColdTicks = 8;       // decay edge spacing in cold-
 inline constexpr int kRcDecayColdTicks = SMASH_RECOMPRESS_DECAY_TICKS;
 #endif
 
-// EMA divisor (×256 fixed-point) for proportional per-bucket bias on the
-// back-off shift. `bucket_bias = bucket_ema_x256 / kBucketRcBiasThreshold_x256`
-// (capped at kMaxBackoffShift). 256 = "every full unit of average rc in this
-// bucket adds +1 to the shift", so a single recompress event in a bucket
-// immediately gives every other page in that bucket bias=1 (eff_floor=2×).
-// This is load-bearing: without aggressive propagation, fresh pages from a
-// thrashy call site each have to individually thrash before any backoff
-// applies, which doesn't converge on workloads that allocate hundreds of
-// pages per second from the same site.
-#ifndef SMASH_RECOMPRESS_BUCKET_BIAS_X256
-inline constexpr int kBucketRcBiasThreshold_x256 = 256;
+// Per-bucket bias on the back-off shift: every page of an (arena, bucket)
+// gets bias 1 (a doubled floor) while more of the bucket's compressed pages
+// came back (were restored by an access) than stayed (compressed for
+// kRcDecayColdTicks). Both counts are halved once they sum to this window, so
+// they describe roughly the last window's outcomes. The first restore in a
+// quiet bucket sets the bias at once -- load-bearing: without aggressive
+// propagation, fresh pages from a thrashy call site each have to thrash
+// before any backoff applies, which doesn't converge on workloads that
+// allocate hundreds of pages per second from one site.
+#ifndef SMASH_RECOMPRESS_BUCKET_WINDOW
+inline constexpr int kBucketBiasWindow = 1024;
 #else
-inline constexpr int kBucketRcBiasThreshold_x256 = SMASH_RECOMPRESS_BUCKET_BIAS_X256;
+inline constexpr int kBucketBiasWindow = SMASH_RECOMPRESS_BUCKET_WINDOW;
 #endif
 
 // Soft-dirty ROI (SMASH_SOFTDIRTY_ROI): number of consecutive WRITE-clean ticks

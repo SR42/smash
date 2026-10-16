@@ -554,13 +554,69 @@ is (arena, log2 pages), that is every new block of that size range from that
 call site's arena. Measured (`test_thrash_backoff`, step 4, 11 s after
 everything was compressed again): the restored site's later pages at 6.2 s,
 the other site's at 4.1 s (large mode: 6.2 against 5.2; 4.2 with the back-off
-off). Now a page that stays COMPRESSED for `kRcDecayColdTicks` (8) ticks feeds
-the EMA a 0, once per compression (`settle_ticks_`, reset by Phase 1 whenever
-it sees the page uncompressed), so the EMA says whether the bucket's
-compressed pages mostly come back. After: 4.1 against 4.1 in both modes; right
-after the restores the fresh pages still wait 2x (7.1 s).
+off). The first fix fed the EMA a 0 for each page that stayed COMPRESSED for
+`kRcDecayColdTicks` (8) ticks. That was wrong too (see the next section): the
+bias is now two counts per bucket, compressed pages that came back and that
+stayed (`settle_ticks_`, once per compression), halved together once they sum
+to `kBucketBiasWindow` (1024), with bias 1 while more came back than stayed.
+After: 4.1 against 4.1 in both modes; right after the restores the fresh
+pages still wait 2x (7.1 s).
 
-The EMA is reached through the page map on both sides, which registers a
-large block's first page only: in large-only mode the bias is fed by first
-pages alone, restores and zeros alike. Phase 2 applies it to every page of a
-block (it resolves interior pages through its span cache).
+## Thrash back-off: large blocks counted by their first page, and the EMA fix turned the bias off for good (fixed 2026-10-16)
+
+**First pages only.** The restore path found a page's bucket through the
+page map, which registers a large block's first page only, so in
+`SMASH_LARGE_ONLY=1` the restore of any other page never reached the bucket
+bias (Phase 2 applies the bias to every page, resolving interior pages through
+its span cache; the restore path cannot afford that walk). Measured
+(`test_thrash_backoff_large_interior`: step 1 reads every page of 64 blocks of
+256 KiB but the first): no bias at all, T fresh 5.1 s against C fresh 5.1 s,
+restored pages 7.1 s instead of 13. Now `compressPage`, which already resolves
+interior pages for its statistics, records each page's bucket
+(`page_bucket_`, 2 bytes per page, written under the page lock), and the
+restore and the "stayed" count use it. The decompression time charged to the
+bucket and the thrash rate kept for profiles still go through the page map
+(first pages only).
+
+**The EMA with zeros.** Phase 2's bias was on while the bucket EMA was >= 256,
+and a page restored once fed exactly 256. With a 0 for each page that stayed,
+one 0 turned the bias off, and in integer steps of 1/4 the EMA then climbs to
+253 and stops: restores of pages compressed once could never turn it back on.
+In the interior test the 64 untouched first pages, compressed throughout,
+cancelled the restores of the other 4032 (restored pages at 8.1 s instead of
+13). Replaced by the two counts above (back > kept); the threshold constant
+`kBucketRcBiasThreshold_x256` is gone (`kBucketBiasWindow`,
+`-DSMASH_RECOMPRESS_BUCKET_WINDOW=N`). After: restored 13.2 s, T fresh 7.1 s,
+C fresh 5.1 s; later 4.1 against 4.1.
+
+## Phase B reclaimed other workers' pages: COMPRESSED pages read zeros without a fault (fixed 2026-10-16)
+
+**Silent data corruption under load, in the default deferred-reclaim mode.**
+Worker ranges are cut at `committed / workers` and node-group slices at
+`16384 * slice / threads` pages, neither on 64-page chunk boundaries (only
+under coarse watching). `forEachLivePage` filters pages to [start, end), but
+`reclaimShadowRange` walked whole chunks from `start / 64` with only an upper
+bound, so a worker whose range began mid-chunk also reclaimed the previous
+worker's pages of that chunk, concurrently with it. Its per-page work rechecks
+state under the page lock, but its look-ahead arms a run of COMPRESSED_SHADOW
+pages PROT_READ **without** their locks. When the other worker reclaimed
+those pages (decommit, PROT_NONE, COMPRESSED) between the look-ahead's state
+check and its `mprotect`, the PROT_READ landed last: pages marked COMPRESSED,
+their memory dropped, and readable -- every read returned zeros and no fault
+ever restored them. It also counted chunks from `end - start`, one short when
+`start` was mid-chunk, so the chunk holding a range's last pages was walked
+only through the overlap.
+
+Found by `test_thrash_backoff` reading back wrong bytes when its three modes
+ran at once (`ctest -j3`): whole runs of up to 32 consecutive pages of a set
+read as zeros, `smash_page_info` state 2 right after the read. Reproduced on
+the library from before the back-off changes (`f8930c6`) too -- 31628 bad
+bytes in 1 of 5 rounds of six concurrent runs -- so it predates them; the
+current tree hit it in 2 of 5 and 4 of about 19 other rounds. Unprivileged
+and root alike; more workers and a busier machine widen the window, so a
+128-core host with node groups is the most exposed. Fixed: chunks
+[start / 64, ceil(end / 64)), pages outside [start, end) skipped.
+`test_compression`'s `testReclaimRange` (`test_compression_reclaim_range`,
+`SMASH_DEFERRED_RECLAIM_DELAY=1000` so ticks reclaim nothing): Phase B over
+[+10, +74) of two shadow chunks must reclaim exactly those 64 pages -- before
+the fix 10 below the range and 54 of 64 inside.

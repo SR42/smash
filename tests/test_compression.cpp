@@ -629,6 +629,78 @@ static void testAllocReopen() {
     }
 }
 
+// Phase B (reclaimShadowRange) must touch exactly the pages of its range.
+// Worker ranges are cut at committed / workers, not on 64-page chunk
+// boundaries, and the loop walked whole chunks from start / 64: a worker
+// reclaimed the previous worker's pages of a shared chunk too, and its
+// look-ahead, which arms a run PROT_READ without the pages' locks, could land
+// after the other worker had made them PROT_NONE and dropped them -- COMPRESSED
+// pages that read zeros without a fault (seen under load: whole runs of a
+// test's objects read back as zeros, state 2). It also counted chunks from
+// end - start, one short when start is mid-chunk, so the chunk holding the
+// range's last pages was never visited. SMASH_DEFERRED_RECLAIM_DELAY=1000
+// (test_compression_reclaim_range) keeps the ticks from reclaiming; the
+// range runs with no delay.
+static void testReclaimRange() {
+    setenv("SMASH_REARM_BACKOFF_MAX", "0", 1);
+    VmRegion vm;
+    vm.init(512 * kPageSize);
+    PageStateTable states;
+    states.init(vm.totalPages());
+    PageLockTable locks;
+    locks.init(vm.totalPages());
+    CompressStore store;
+    store.init();
+    CompressEngine engine;
+    engine.init();
+    CompressorThread compressor;
+    compressor.init(&vm, &states, &locks, &store, &engine);
+    unsetenv("SMASH_REARM_BACKOFF_MAX");
+    compressor.setRestoreGranulePages(1);
+
+    auto* mem = static_cast<uint8_t*>(vm.allocatePages(256));
+    CHECK(mem != nullptr, "reclaim range: alloc failed");
+    const size_t first = vm.pageIndex(reinterpret_cast<uintptr_t>(mem));
+    const size_t base = (first + 63) & ~size_t{63};   // a 64-page chunk inside the block
+    CHECK(base + 128 <= first + 256, "reclaim range: no two whole chunks in the block");
+    for (size_t k = 0; k < 256; ++k) {
+        states.set(first + k, PageState::ACTIVE);
+        memset(mem + k * kPageSize, static_cast<int>(0x11 + k % 200), kPageSize);
+    }
+    int shadow = 0;
+    for (int t = 0; t < 40 && shadow < 128; ++t) {
+        compressor.compressTick();
+        shadow = 0;
+        for (size_t k = 0; k < 128; ++k) shadow += states.get(base + k) == PageState::COMPRESSED_SHADOW;
+    }
+    CHECK(shadow == 128, "reclaim range: only %d of 128 pages became COMPRESSED_SHADOW", shadow);
+
+    const size_t lo = base + 10, hi = base + 74;   // starts and ends mid-chunk
+    compressor.reclaimShadowRangeForTest(lo, hi);
+    int below = 0, inside = 0, above = 0;
+    for (size_t k = base; k < base + 128; ++k) {
+        const bool reclaimed = states.get(k) == PageState::COMPRESSED;
+        if (k < lo) below += reclaimed;
+        else if (k < hi) inside += reclaimed;
+        else above += reclaimed;
+    }
+    fprintf(stderr, "reclaim range [+10, +74): reclaimed %d below, %d of 64 inside, %d above\n", below, inside,
+            above);
+    CHECK(below == 0, "reclaim range: %d pages below the range reclaimed", below);
+    CHECK(inside == 64, "reclaim range: %d of 64 pages of the range reclaimed", inside);
+    CHECK(above == 0, "reclaim range: %d pages above the range reclaimed", above);
+    for (size_t k = 0; k < 256; ++k) {
+        const size_t idx = first + k;
+        const PageState st = states.get(idx);
+        if (st == PageState::COMPRESSED || st == PageState::COMPRESSED_SHADOW)
+            CHECK(compressor.handleFault(reinterpret_cast<uintptr_t>(mem + k * kPageSize)),
+                  "reclaim range: restore of page %zu", k);
+        CHECK(mem[k * kPageSize] == static_cast<uint8_t>(0x11 + k % 200) &&
+              mem[k * kPageSize + kPageSize - 1] == static_cast<uint8_t>(0x11 + k % 200),
+              "reclaim range: page %zu data mismatch", k);
+    }
+}
+
 // The cold timeout setting: SMASH_COLD_TIMEOUT_SEC (seconds) wins over
 // SMASH_COLD_TICKS (ticks); text that is not a positive number keeps the
 // default with a warning; a value above kMaxColdTicks is clamped to it with a
@@ -831,6 +903,11 @@ static void testReleaseCompressedPages() {
 }
 
 int main(int argc, char** argv) {
+    if (argc > 1 && strcmp(argv[1], "reclaimrange") == 0) {
+        testReclaimRange();
+        fprintf(stderr, failures ? "compression: %d failures\n" : "compression: all tests passed\n", failures);
+        return failures ? 1 : 0;
+    }
     if (argc > 1 && strcmp(argv[1], "coldmax") == 0) {
         testColdTicksMax();
         fprintf(stderr, failures ? "compression: %d failures\n" : "compression: all tests passed\n", failures);
