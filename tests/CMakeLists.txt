@@ -123,6 +123,11 @@ set_tests_properties(test_compression_backoff_off PROPERTIES
 add_test(NAME test_compression_reclaim_range COMMAND test_compression reclaimrange)
 set_tests_properties(test_compression_reclaim_range PROPERTIES
   ENVIRONMENT "SMASH_COLD_TICKS=2;SMASH_SOFTDIRTY=0;SMASH_FIXAV=0;SMASH_DEFERRED_RECLAIM_DELAY=1000")
+# The time budget, the thrash rate and the saved profile count every page of a
+# large block, and the profile's rate every worker (testInteriorBucketStats).
+add_test(NAME test_compression_bucket_stats COMMAND test_compression bucketstats)
+set_tests_properties(test_compression_bucket_stats PROPERTIES
+  ENVIRONMENT "SMASH_COLD_TICKS=2;SMASH_SOFTDIRTY=0;SMASH_FIXAV=0")
 add_test(NAME test_compression_cold_max COMMAND test_compression coldmax)
 set_tests_properties(test_compression_cold_max PROPERTIES
   ENVIRONMENT "SMASH_COLD_TICKS=300;SMASH_SOFTDIRTY=0;SMASH_FIXAV=0")

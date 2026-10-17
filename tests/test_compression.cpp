@@ -4,11 +4,14 @@
 #include "compress/compress_store.h"
 #include "compress/compress_engine.h"
 #include "compress/compressor_thread.h"
+#include "core/page_map.h"
+#include "core/span.h"
 #include "smash/config.h"
 
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <unistd.h>
 
 using namespace smash;
 
@@ -861,6 +864,152 @@ static void testWatchGroup() {
               "group: page %zu data mismatch", k);
 }
 
+// The time budget and the thrash rate must count every page of a large
+// block. The fault handler found a restored page's bucket through the page
+// map, which registers a large block's first page only, while compressPage
+// counted the compression of every page: a call site whose blocks came back
+// whole showed one decompression per block, a thrash rate up to the block's
+// page count too low, and a saved profile marked it stable_cold -- the next
+// run compressed it after a quarter of the cold timeout. The profile save
+// also took the rate from the one worker with the most samples, over its own
+// compressions, though every decompression is charged to worker 0.
+//
+// A 64-page block registered by its first page only, as LargeAlloc does:
+// pages 0-62 hold data, page 63 zeros (a zero page counts no compression, so
+// its restore counts no decompression). All 64 compressed, then the interior
+// pages restored, then the first. SMASH_PREFETCH_WINDOW=0: a prefetched
+// neighbour is restored without a fault.
+static void testInteriorBucketStats() {
+    char path[] = "/tmp/smash_bucket_profile_XXXXXX";
+    const int fd = mkstemp(path);
+    CHECK(fd >= 0, "bucket stats: mkstemp failed");
+    if (fd < 0) return;
+    close(fd);
+    setenv("SMASH_PROFILE_FILE", path, 1);
+    setenv("SMASH_PROFILE_FILE_SAVE", "1", 1);
+    setenv("SMASH_PREFETCH_WINDOW", "0", 1);
+    setenv("SMASH_REARM_BACKOFF_MAX", "0", 1);
+    VmRegion vm;
+    vm.init(256 * kPageSize);
+    PageStateTable states;
+    states.init(vm.totalPages());
+    PageLockTable locks;
+    locks.init(vm.totalPages());
+    CompressStore store;
+    store.init();
+    CompressEngine engine;
+    engine.init();
+    PageMap page_map;
+    page_map.init();
+    CompressorThread compressor;
+    compressor.init(&vm, &states, &locks, &store, &engine, &page_map);
+    unsetenv("SMASH_REARM_BACKOFF_MAX");
+    compressor.setRestoreGranulePages(1);
+
+    constexpr uint32_t kPages = 64;
+    constexpr uint8_t kArena = 2;
+    const uint8_t sc = largeSizeClass(kPages);
+    auto* mem = static_cast<uint8_t*>(vm.allocatePages(kPages));
+    CHECK(mem != nullptr, "bucket stats: alloc failed");
+    if (!mem) return;
+    Span* span = newSpanDescriptor();
+    span->init(mem, kPages, 0, kArena);
+    span->is_large = true;
+    page_map.setRange(reinterpret_cast<uintptr_t>(mem), 1, span);
+    const size_t first = vm.pageIndex(reinterpret_cast<uintptr_t>(mem));
+    // 16 letters at random: compresses to about half, so each restore takes
+    // a measurable decompression.
+    auto want = [](size_t k, size_t i) {
+        if (k == kPages - 1) return uint8_t{0};
+        uint64_t x = (k * kPageSize + i + 1) * 0x9E3779B97F4A7C15ull;
+        x ^= x >> 29;
+        return static_cast<uint8_t>('a' + (x >> 60));
+    };
+    for (size_t k = 0; k < kPages; ++k) {
+        states.set(first + k, PageState::ACTIVE);
+        for (size_t i = 0; i < kPageSize; ++i) mem[k * kPageSize + i] = want(k, i);
+    }
+    size_t done = 0;
+    for (int t = 0; t < 400 && done < kPages; ++t) {
+        compressor.compressTick();
+        done = 0;
+        for (size_t k = 0; k < kPages; ++k) done += states.get(first + k) == PageState::COMPRESSED;
+    }
+    CHECK(done == kPages, "bucket stats: %zu of %u pages compressed", done, kPages);
+
+    auto sums = [&](uint8_t arena, uint64_t* cc, uint64_t* dc, uint64_t* tc) {
+        *cc = *dc = *tc = 0;
+        for (int w = 0; w < kMaxCompressorWorkers; ++w) {
+            const auto& st = compressor.bucketStatsForTest(w, arena, sc);
+            *cc += st.compress_count.load();
+            *dc += st.decompress_count.load();
+            *tc += st.time_cost_total_us.load();
+        }
+    };
+    uint64_t cc0, dc0, tc0, cc1, dc1, tc1, cc2, dc2, tc2;
+    sums(kArena, &cc0, &dc0, &tc0);
+    for (size_t k = 1; k < kPages; ++k)
+        CHECK(compressor.handleFault(reinterpret_cast<uintptr_t>(mem + k * kPageSize)),
+              "bucket stats: restore of page %zu", k);
+    sums(kArena, &cc1, &dc1, &tc1);
+    CHECK(compressor.handleFault(reinterpret_cast<uintptr_t>(mem)), "bucket stats: restore of page 0");
+    sums(kArena, &cc2, &dc2, &tc2);
+    fprintf(stderr, "bucket stats: %llu compressions; decompressions %llu, +%llu after 63 interior restores "
+            "(+%llu us), +%llu after the first page\n", (unsigned long long)cc0, (unsigned long long)dc0,
+            (unsigned long long)(dc1 - dc0), (unsigned long long)(tc1 - tc0), (unsigned long long)(dc2 - dc1));
+    CHECK(cc0 == kPages - 1, "bucket stats: %llu compressions counted, want %u (the zero page counts none)",
+          (unsigned long long)cc0, kPages - 1);
+    CHECK(dc0 == 0, "bucket stats: %llu decompressions before any restore", (unsigned long long)dc0);
+    CHECK(dc1 - dc0 == kPages - 2, "bucket stats: interior restores counted %llu decompressions, want %u",
+          (unsigned long long)(dc1 - dc0), kPages - 2);
+    CHECK(tc1 > tc0, "bucket stats: interior restores charged no decompression time");
+    CHECK(dc2 - dc1 == 1, "bucket stats: the first page's restore counted %llu", (unsigned long long)(dc2 - dc1));
+    size_t bad = 0;
+    for (size_t k = 0; k < kPages; ++k)
+        for (size_t i = 0; i < kPageSize; ++i) bad += mem[k * kPageSize + i] != want(k, i);
+    CHECK(bad == 0, "bucket stats: %zu bytes read back wrong", bad);
+
+    // Bucket (kArena + 1, sc), set by hand: worker 1 holds the most samples
+    // and the compressions, worker 0 the decompressions, as the fault
+    // handler records them. 80 of 100 came back.
+    auto& w0 = compressor.bucketStatsForTest(0, kArena + 1, sc);
+    auto& w1 = compressor.bucketStatsForTest(1, kArena + 1, sc);
+    w0.count = 8;
+    w0.decompress_count.store(80);
+    w1.count = 64;
+    w1.compress_count.store(100);
+
+    compressor.saveProfileFileForTest();
+    using Persist = std::remove_reference_t<decltype(w0)>::Persist;
+    struct Header { uint32_t magic, version; uint16_t num_arenas, num_classes; uint32_t flags; };
+    static_assert(sizeof(Header) == 16, "profile header layout");
+    Persist rec[2] = {};
+    bool read_ok = false;
+    if (FILE* f = fopen(path, "rb")) {
+        Header h{};
+        read_ok = fread(&h, sizeof h, 1, f) == 1 && h.num_classes == kTotalBucketsPerArena &&
+                  fseek(f, static_cast<long>(sizeof(Persist) * (kArena * kTotalBucketsPerArena + sc)), SEEK_CUR) == 0 &&
+                  fread(&rec[0], sizeof(Persist), 1, f) == 1 &&
+                  fseek(f, static_cast<long>(sizeof(Persist) * (kTotalBucketsPerArena - 1)), SEEK_CUR) == 0 &&
+                  fread(&rec[1], sizeof(Persist), 1, f) == 1;
+        fclose(f);
+    }
+    unlink(path);
+    char lock[sizeof path + 8];
+    snprintf(lock, sizeof lock, "%s.lock", path);
+    unlink(lock);
+    CHECK(read_ok, "bucket stats: profile file %s not readable", path);
+    fprintf(stderr, "bucket stats: saved thrash rate %u/255 stable_cold %u (whole block restored); %u/255 "
+            "stable_cold %u (80 of 100, counts split over two workers)\n", rec[0].thrash_rate, rec[0].stable_cold,
+            rec[1].thrash_rate, rec[1].stable_cold);
+    CHECK(rec[0].thrash_rate == 255 && !rec[0].stable_cold,
+          "bucket stats: profile saved thrash rate %u/255, stable_cold %u for a block restored whole; want 255, 0",
+          rec[0].thrash_rate, rec[0].stable_cold);
+    CHECK(rec[1].thrash_rate == 80 * 255 / 100 && !rec[1].stable_cold,
+          "bucket stats: profile saved thrash rate %u/255, stable_cold %u with the counts on two workers; "
+          "want %d, 0", rec[1].thrash_rate, rec[1].stable_cold, 80 * 255 / 100);
+}
+
 static void testReleaseCompressedPages() {
     VmRegion vm;
     vm.init(64 * kPageSize);
@@ -903,6 +1052,11 @@ static void testReleaseCompressedPages() {
 }
 
 int main(int argc, char** argv) {
+    if (argc > 1 && strcmp(argv[1], "bucketstats") == 0) {
+        testInteriorBucketStats();
+        fprintf(stderr, failures ? "compression: %d failures\n" : "compression: all tests passed\n", failures);
+        return failures ? 1 : 0;
+    }
     if (argc > 1 && strcmp(argv[1], "reclaimrange") == 0) {
         testReclaimRange();
         fprintf(stderr, failures ? "compression: %d failures\n" : "compression: all tests passed\n", failures);

@@ -575,8 +575,8 @@ restored pages 7.1 s instead of 13. Now `compressPage`, which already resolves
 interior pages for its statistics, records each page's bucket
 (`page_bucket_`, 2 bytes per page, written under the page lock), and the
 restore and the "stayed" count use it. The decompression time charged to the
-bucket and the thrash rate kept for profiles still go through the page map
-(first pages only).
+bucket and the thrash rate kept for profiles went through the page map until
+the next fix below.
 
 **The EMA with zeros.** Phase 2's bias was on while the bucket EMA was >= 256,
 and a page restored once fed exactly 256. With a 0 for each page that stayed,
@@ -588,6 +588,40 @@ cancelled the restores of the other 4032 (restored pages at 8.1 s instead of
 `kBucketRcBiasThreshold_x256` is gone (`kBucketBiasWindow`,
 `-DSMASH_RECOMPRESS_BUCKET_WINDOW=N`). After: restored 13.2 s, T fresh 7.1 s,
 C fresh 5.1 s; later 4.1 against 4.1.
+
+## Time budget and thrash rate counted a large block's first page; profiles saved one worker's rate (fixed 2026-10-17)
+
+**First pages only, again.** The restore path charged decompression time
+(`time_cost_total_us`, the time budget's input) and counted decompressions
+(`decompress_count`, the thrash rate saved to `SMASH_PROFILE_FILE` and shown by
+`SMASH_BUCKET_STATS=1`) in the bucket it found through the page map -- a large
+block's first page only -- while `compressPage` counted every page's
+compression. A call site whose blocks came back whole showed one
+decompression per block: in `test_compression`'s `testInteriorBucketStats`
+(one 64-page block, every page compressed and restored) a saved thrash rate of
+**4/255 and `stable_cold=1`**, which makes the next run compress that call
+site's pages after a quarter of the cold timeout -- the opposite of what a
+100 % thrash rate should do. Both now use `page_bucket_`, read under the page
+lock. Two smaller corrections with it: a zero page's restore counts neither
+(its compression counted neither, so the rate could exceed 100 %), and an
+allocator restore (`markAllocReopened`) is charged time but not counted as a
+decompression for the thrash rate.
+
+**One worker's rate.** `saveProfileFile` serialized the worker with the most
+samples in each bucket, thrash rate included: its own compressions over its
+own decompressions -- but the fault handler charges every decompression to
+worker 0. Another worker holding the most samples saved 0 % (`stable_cold`);
+worker 0 holding them saved every worker's decompressions over its own
+compressions. It also left out the NUMA node groups, which compress nearly
+every page on a multi-node host. The rate now comes from the counts of every
+worker, node groups included (in the test: 80 of 100 split over two workers
+saved 0/255 `stable_cold=1` before, 204/255 after).
+
+Effect before the fix: none unless `SMASH_PROFILE_FILE` with
+`SMASH_PROFILE_FILE_SAVE`/`_RW`, `SMASH_TIME_BUDGET_PCT` below 100, or
+`SMASH_BUCKET_STATS=1` is set. **Not fixed:** `loadProfileFile` deserializes
+into the default workers only, so on a multi-node host the node groups, which
+run Phase 2 for nearly every page, never see a loaded profile.
 
 ## Phase B reclaimed other workers' pages: COMPRESSED pages read zeros without a fault (fixed 2026-10-16)
 

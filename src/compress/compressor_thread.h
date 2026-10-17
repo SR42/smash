@@ -389,12 +389,13 @@ class CompressorThread {
     uint8_t* settle_ticks_ = nullptr;
 
     // The (arena, bucket) stats index + 1 of each page, as compressPage found
-    // it (0: none), for the bucket bias (rcBucketOfPage). compressPage
-    // resolves a page inside a large block through spanOfPage's cache; the
-    // fault handler cannot afford that walk, and the page map it used
-    // registers a large block's first page only -- so restores of every other
-    // page never reached the bias, and in SMASH_LARGE_ONLY=1 it came only
-    // from first pages (test_thrash_backoff_large_interior). Written under
+    // it (0: none), for the bucket bias and the fault-time statistics
+    // (bucketOfPage). compressPage resolves a page inside a large block
+    // through spanOfPage's cache; the fault handler cannot afford that walk,
+    // and the page map it used registers a large block's first page only --
+    // so restores of every other page never reached the bias, and in
+    // SMASH_LARGE_ONLY=1 it came only from first pages
+    // (test_thrash_backoff_large_interior). Written under
     // the page lock while COMPRESSING; read while the page is compressed or
     // being restored, when it cannot change.
     uint16_t* page_bucket_ = nullptr;
@@ -1125,11 +1126,8 @@ class CompressorThread {
             out->efficiency_x256 = efficiency_x256;
 
             // v6: thrash rate and tier selection
-            uint32_t cc = compress_count.load(std::memory_order_relaxed);
-            uint32_t dc = decompress_count.load(std::memory_order_relaxed);
-            // thrash_rate: fraction of compressions that got decompressed (0-255)
-            out->thrash_rate = (cc > 0) ? static_cast<uint8_t>(
-                std::min<uint32_t>(255, dc * 255 / cc)) : 0;
+            setThrash(out, compress_count.load(std::memory_order_relaxed),
+                      decompress_count.load(std::memory_order_relaxed));
             // best_tier: pick tier with more pulls (has been explored more)
             // If one tier dominates (>2x pulls), use it; else unknown
             if (arm_pulls[0] > 2 * arm_pulls[1] + 4) {
@@ -1139,9 +1137,15 @@ class CompressorThread {
             } else {
                 out->best_tier = 255;  // unknown
             }
-            // stable_cold: thrash rate < 10% means pages stay cold
-            out->stable_cold = (cc >= 8 && out->thrash_rate < 26) ? 1 : 0;
             out->pad = 0;
+        }
+
+        // thrash_rate: fraction of compressions that got decompressed
+        // (0-255); stable_cold: thrash rate < 10% means pages stay cold.
+        static void setThrash(Persist* out, uint64_t cc, uint64_t dc) {
+            out->thrash_rate = (cc > 0) ? static_cast<uint8_t>(
+                std::min<uint64_t>(255, dc * 255 / cc)) : 0;
+            out->stable_cold = (cc >= 8 && out->thrash_rate < 26) ? 1 : 0;
         }
 
         void deserialize(const Persist& in) {
@@ -1966,7 +1970,7 @@ private:
                     const uint32_t s = settle_ticks_[i] + tick_inc_;
                     settle_ticks_[i] = static_cast<uint8_t>(s > 255 ? 255 : s);
                     if (s >= static_cast<uint32_t>(kRcDecayColdTicks)) {
-                        const size_t bidx = rcBucketOfPage(i);
+                        const size_t bidx = bucketOfPage(i);
                         if (bidx < kBucketTableLen) noteBucketOutcome(bidx, false);
                     }
                 }
@@ -2046,10 +2050,10 @@ private:
                bucket_kept_[bidx].load(std::memory_order_relaxed);
     }
 
-    // The bias bucket of a compressed page, or kBucketTableLen: the
+    // The bucket of a compressed page, or kBucketTableLen: the
     // one compressPage recorded for it (page_bucket_), so every page of a
     // large block counts, not just its first.
-    size_t rcBucketOfPage(size_t page_idx) const {
+    size_t bucketOfPage(size_t page_idx) const {
         const uint16_t b = page_bucket_[page_idx];
         return b ? static_cast<size_t>(b - 1) : kBucketTableLen;
     }
@@ -7036,6 +7040,12 @@ public:
     // Test hook (test_compression's testReclaimRange): Phase B over one page
     // range, as one worker runs it, ignoring the reclaim delay.
     void reclaimShadowRangeForTest(size_t start, size_t end) { reclaimShadowRange(start, end, 0); }
+    // Test hooks (test_compression's testInteriorBucketStats): one worker's
+    // statistics of bucket (arena, sc), and the profile save.
+    SizeClassStats& bucketStatsForTest(int worker, uint8_t arena, uint8_t sc) {
+        return workers_[worker].sc_stats[statsIndex(arena, sc)];
+    }
+    void saveProfileFileForTest() { saveProfileFile(); }
 
     void init(VmRegion* vm, PageStateTable* states, PageLockTable* locks,
               CompressStore* store, CompressEngine* engine,
@@ -7314,15 +7324,27 @@ public:
         size_t total = static_cast<size_t>(kNumArenas) * kTotalBucketsPerArena;
 
         // Build THIS process's per-bucket records in memory first (aggregate
-        // across workers: highest sample count wins per bucket).
+        // across workers: highest sample count wins per bucket). The thrash
+        // rate comes from the counts of every worker, NUMA node groups
+        // included: the fault handler charges every decompression to worker
+        // 0, and the rate was the best worker's decompressions over its own
+        // compressions -- 0 when another worker held the most samples, and
+        // nothing at all for the buckets node groups compress, which on a
+        // multi-node host is most of them (testInteriorBucketStats).
         SizeClassStats::Persist* mine = bootstrapArray<SizeClassStats::Persist>(total);
         for (size_t i = 0; i < total; ++i) {
-            int best = 0;
-            for (int w = 1; w < kMaxCompressorWorkers; ++w) {
-                if (workers_[w].sc_stats[i].count >
-                    workers_[best].sc_stats[i].count) best = w;
-            }
-            workers_[best].sc_stats[i].serialize(&mine[i]);
+            const SizeClassStats* best = &workers_[0].sc_stats[i];
+            uint64_t cc = 0, dc = 0;
+            auto visit = [&](CompressWorker& wk) {
+                const auto& st = wk.sc_stats[i];
+                if (st.count > best->count) best = &st;
+                cc += st.compress_count.load(std::memory_order_relaxed);
+                dc += st.decompress_count.load(std::memory_order_relaxed);
+            };
+            for (int w = 0; w < kMaxCompressorWorkers; ++w) visit(workers_[w]);
+            forEachNodeCompressWorker(visit);
+            best->serialize(&mine[i]);
+            SizeClassStats::setThrash(&mine[i], cc, dc);
         }
         uint32_t my_flags = 0;
         if (external_pages_hot_.load(std::memory_order_relaxed))
@@ -8218,6 +8240,13 @@ public:
             restorePageContents(page_addr, fault_slots_[slot].buf);
             releaseFaultSlot(slot);
 
+            // The page's bucket for the bias and the statistics below, read
+            // while the page lock still keeps a release from clearing it. A
+            // zero page (no blob) counted neither compression time nor a
+            // compression there, so its restore counts neither either.
+            const size_t bidx = bucketOfPage(page_idx);
+            const bool zero_blob = compressed_[page_idx].data == nullptr;
+
             // Release compressed blob (sharded store)
             releaseBlob(page_idx);
             compressed_[page_idx] = {};
@@ -8240,10 +8269,7 @@ public:
             uint8_t prev_rc = recompress_count_[page_idx];
             if (!by_alloc && prev_rc < 255) recompress_count_[page_idx] = prev_rc + 1;
             if (by_alloc) pc_.f_alloc_reopen.fetch_add(1, std::memory_order_relaxed);
-            if (!by_alloc) {
-                const size_t rc_bidx = rcBucketOfPage(page_idx);
-                if (rc_bidx < kBucketTableLen) noteBucketOutcome(rc_bidx, true);
-            }
+            if (!by_alloc && bidx < kBucketTableLen) noteBucketOutcome(bidx, true);
 
             // Soft-dirty ROI: classify this decompress as a WRITE re-dirty (the
             // blob was genuinely invalidated → real churn) vs a READ fault (the
@@ -8263,47 +8289,37 @@ public:
             // Adaptive cap: decompression = re-warm evidence.  Notify the
             // heap so it can bias cap sizing for this (arena, sc) toward
             // "hot" (no cap / larger cap).
-            //
-            // The same lookup gives (arena, bucket) for the time budget and
-            // the thrash rate below. It finds a large block's first page
-            // only; the bucket bias above uses page_bucket_ instead.
             bool is_external = page_idx >= vm_->contigPages();
             if (is_external) {
                 // External page thrashed — mark for profile persistence so
                 // future runs skip external pages entirely.
                 external_pages_hot_.store(true, std::memory_order_relaxed);
             }
-            if (page_map_) {
+            if (page_map_ && decompressed_fn_) {
                 Span* sp = page_map_->get(reinterpret_cast<uintptr_t>(page_addr));
-                if (sp) {
-                    // Slab-only feedback (decompressed_fn_ keys on real
-                    // slab size_class for the heap's adaptive-cap tables).
-                    if (decompressed_fn_ && !sp->is_large &&
-                        sp->size_class < kNumClasses) {
-                        decompressed_fn_(page_idx, sp->arena_id, sp->size_class,
-                                         decompressed_ctx_);
-                    }
-                    // Unified bucket for the time-budget table — large
-                    // allocs land in the kNumClasses+log2(pages) slot.
-                    uint8_t sc_b = sp->is_large
-                        ? largeSizeClass(sp->page_count)
-                        : sp->size_class;
-                    if (sc_b < kTotalBucketsPerArena) {
-                        size_t bidx = statsIndex(sp->arena_id, sc_b);
-                        if (bidx < kBucketTableLen) {
-                            // Time-budget: charge decompress wall-time against
-                            // the bucket. Worker 0 is the canonical sink since
-                            // we can't know which worker compressed this page.
-                            // recomputeMarginalEfficiency aggregates across
-                            // workers, so it doesn't matter where we land.
-                            workers_[0].sc_stats[bidx].time_cost_total_us.fetch_add(
-                                dec_us, std::memory_order_relaxed);
-                            // v6 profile: track decompression for thrash rate
-                            workers_[0].sc_stats[bidx].decompress_count.fetch_add(
-                                1, std::memory_order_relaxed);
-                        }
-                    }
+                // Slab-only feedback (decompressed_fn_ keys on real
+                // slab size_class for the heap's adaptive-cap tables).
+                if (sp && !sp->is_large && sp->size_class < kNumClasses) {
+                    decompressed_fn_(page_idx, sp->arena_id, sp->size_class,
+                                     decompressed_ctx_);
                 }
+            }
+            // Time budget and thrash rate, in the page's own bucket: the
+            // page map found a large block's first page only, so restores of
+            // its other pages were never charged, while compressPage counted
+            // every page's compression -- the rate came out up to the block's
+            // page count too low, and a profile saved it as stable_cold
+            // (test_compression's testInteriorBucketStats). Worker 0 is the
+            // canonical sink since we can't know which worker compressed this
+            // page; recomputeMarginalEfficiency and the profile aggregate
+            // across workers. A restore the allocator caused is time spent,
+            // but not thrash (see PageStateTable::markAllocReopened).
+            if (bidx < kBucketTableLen && !zero_blob) {
+                workers_[0].sc_stats[bidx].time_cost_total_us.fetch_add(
+                    dec_us, std::memory_order_relaxed);
+                if (!by_alloc)
+                    workers_[0].sc_stats[bidx].decompress_count.fetch_add(
+                        1, std::memory_order_relaxed);
             }
 
             // Prefetch adjacent compressed pages
