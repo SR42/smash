@@ -126,6 +126,29 @@ inline void simOsCall() {
 #define SMASH_SIM_OS_CALL_VOID() do {} while (0)
 #endif
 
+// SMASH_TEST_JITTER_US=N (tests only; read by CompressorThread::init, at
+// most 100000): one protectPages or decommitPages call in four first sleeps
+// a random 0..N us. A race between checking a page's state and changing its
+// protection -- the Phase B race in defect-history.md had that shape -- has a
+// window of a microsecond or so; widening it is part of what lets
+// integrity_stress_test find one in seconds rather than hours. Off (0) costs
+// one relaxed load.
+inline std::atomic<uint32_t> g_test_jitter_us{0};
+inline std::atomic<uint64_t> g_test_jitter_seq{0};
+inline void testJitter() {
+    const uint32_t max_us = g_test_jitter_us.load(std::memory_order_relaxed);
+    if (!max_us) [[likely]] return;
+    uint64_t x = g_test_jitter_seq.fetch_add(1, std::memory_order_relaxed) * 0x9E3779B97F4A7C15ull;
+    x ^= x >> 31;
+    x *= 0xbf58476d1ce4e5b9ull;
+    x ^= x >> 29;
+    if (x & 3) return;
+#if !defined(_WIN32)
+    timespec ts{0, static_cast<long>((x >> 8) % (max_us + 1)) * 1000};
+    nanosleep(&ts, nullptr);
+#endif
+}
+
 inline void* mapPages(size_t size) {
 #if defined(_WIN32)
     return VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
@@ -204,6 +227,7 @@ inline bool noDecommitEnabled() {
 
 inline void decommitPages(void* addr, size_t size) {
     SMASH_SIM_OS_CALL_VOID();
+    testJitter();
     if (noDecommitEnabled()) return;
     // Bounds check: madvise(DONTNEED) on wrong address drops backing for
     // libc/ld.so pages, causing mysterious SIGSEGV later.
@@ -300,6 +324,7 @@ inline void unmapPages(void* addr, size_t size) {
 // mprotect() calls silently fail. Callers should check the return.
 inline bool protectPages(void* addr, size_t size, bool read, bool write) {
     SMASH_SIM_OS_CALL(true);
+    testJitter();
 #if defined(_WIN32)
     DWORD prot = PAGE_NOACCESS;
     if (read && write) prot = PAGE_READWRITE;

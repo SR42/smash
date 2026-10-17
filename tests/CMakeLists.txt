@@ -941,6 +941,38 @@ if(NOT APPLE)
     $<TARGET_FILE:alloc_reopen_test>)
   set_tests_properties(test_alloc_reopen PROPERTIES TIMEOUT 120)
 
+  # Many threads keep data in smash memory while the compressor compresses,
+  # reclaims and restores it; every byte must read back as last written
+  # (integrity_stress_test.cpp). All with the test-only fast tick, eight
+  # workers and syscall jitter. Full mode; a heap of about 4 MiB (each worker
+  # range under a chunk: what the Phase B race needed); the application's
+  # configuration (large-only, sub-arenas, LZ4); the same with PROT_READ write
+  # tracking; and idle-page tracking (root only: elsewhere it falls back).
+  add_executable(integrity_stress_test integrity_stress_test.cpp)
+  target_link_libraries(integrity_stress_test PRIVATE ${CMAKE_DL_LIBS} Threads::Threads)
+  set(STRESS_KNOBS "SMASH_TEST_TICK_MS=50" "SMASH_TEST_WORKERS=8" "SMASH_TEST_JITTER_US=200"
+    "SMASH_DEFER_PHASES_MS=0" "SMASH_COLD_TIMEOUT_SEC=1")
+  set(STRESS_APP "SMASH_LARGE_ONLY=1" "SMASH_SUBARENAS=1" "SMASH_DIRTY_MAX_MIB=64" "SMASH_CODEC=lz4")
+  add_test(NAME test_integrity_stress COMMAND ${CMAKE_COMMAND} -E env
+    "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=0" ${STRESS_KNOBS}
+    $<TARGET_FILE:integrity_stress_test>)
+  add_test(NAME test_integrity_stress_small_heap COMMAND ${CMAKE_COMMAND} -E env
+    "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=0" "SMASH_LARGE_ALLOC_VM_THRESHOLD=65536"
+    ${STRESS_KNOBS} "STRESS_SEC=60" "STRESS_THREADS=2" "STRESS_MIB=1" "STRESS_BLOCK_KIB=256"
+    "STRESS_OBJ_MAX=256" "STRESS_OBJS=512" "STRESS_SURVIVORS=0" "STRESS_MIN_RESTORES=500"
+    $<TARGET_FILE:integrity_stress_test>)
+  add_test(NAME test_integrity_stress_large COMMAND ${CMAKE_COMMAND} -E env
+    "LD_PRELOAD=$<TARGET_FILE:smash>" ${STRESS_APP} ${STRESS_KNOBS}
+    $<TARGET_FILE:integrity_stress_test>)
+  add_test(NAME test_integrity_stress_large_sd0 COMMAND ${CMAKE_COMMAND} -E env
+    "LD_PRELOAD=$<TARGET_FILE:smash>" ${STRESS_APP} "SMASH_SOFTDIRTY=0" ${STRESS_KNOBS}
+    $<TARGET_FILE:integrity_stress_test>)
+  add_test(NAME test_integrity_stress_idle COMMAND ${CMAKE_COMMAND} -E env
+    "LD_PRELOAD=$<TARGET_FILE:smash>" ${STRESS_APP} "SMASH_WRITE_TRACK=idle" ${STRESS_KNOBS}
+    $<TARGET_FILE:integrity_stress_test>)
+  set_tests_properties(test_integrity_stress test_integrity_stress_small_heap test_integrity_stress_large
+    test_integrity_stress_large_sd0 test_integrity_stress_idle PROPERTIES TIMEOUT 180)
+
   # Freed compressed data must give its blob memory back, and the blobs moved
   # to do it must decompress correctly (blob_compact_test.cpp).
   add_executable(blob_compact_test blob_compact_test.cpp)

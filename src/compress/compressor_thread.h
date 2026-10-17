@@ -6771,6 +6771,12 @@ private:
         return cap;
     }
 
+    int test_workers_ = 0;   // SMASH_TEST_WORKERS
+    // SMASH_TEST_TICK_MS=N (tests only): start a tick every N ms instead of
+    // every kCompressIntervalMs. Every tick still counts as at least one
+    // nominal tick, so the whole pipeline -- cold timeout, shadow delay,
+    // re-arm waits -- runs 1000/N times faster.
+    int test_tick_ms_ = 0;
     int cpu_pressure_cached_cap_ = 0;
     int cpu_pressure_sample_age_ = 1000;  // force resample on first call
 
@@ -6821,6 +6827,10 @@ private:
         // compressor work and the app times out waiting on a fault.
         int cap = cpuPressureWorkerCap();
         if (cap > 0 && n_needed > cap) n_needed = cap;
+        // SMASH_TEST_WORKERS=N (tests only): exactly N workers every tick,
+        // whatever the load -- integrity_stress_test's way to put worker
+        // range boundaries through a heap too small to need them.
+        if (test_workers_ > 0) n_needed = test_workers_;
 
         // Ensure worker state + helper threads exist for the new count
         // (lazily allocated on first scale-up, never destroyed)
@@ -6922,10 +6932,11 @@ private:
             // This keeps the tick interval at kCompressIntervalMs (1 second)
             // while allowing fast shutdown response (~10ms worst case).
             constexpr int kSleepIntervalMs = 10;
+            const int interval_ms = self->test_tick_ms_ > 0 ? self->test_tick_ms_ : kCompressIntervalMs;
             for (int slept = 0;
-                 slept < kCompressIntervalMs && self->running_.load(std::memory_order_relaxed);
+                 slept < interval_ms && self->running_.load(std::memory_order_relaxed);
                  slept += kSleepIntervalMs) {
-                usleep(kSleepIntervalMs * 1000);
+                usleep(static_cast<useconds_t>(std::min(kSleepIntervalMs, interval_ms - slept)) * 1000);
             }
             if (!self->running_.load(std::memory_order_relaxed)) break;
             // Process-exit guard fallback: an application thread smash never
@@ -7078,6 +7089,13 @@ public:
         }
         if (const char* ls = std::getenv("SMASH_LARGE_STATS"); ls && ls[0] == '0')
             large_stats_ = false;
+        if (const char* tt = std::getenv("SMASH_TEST_TICK_MS"); tt && *tt)
+            test_tick_ms_ = std::max(0, std::atoi(tt));
+        if (const char* tw = std::getenv("SMASH_TEST_WORKERS"); tw && *tw)
+            test_workers_ = std::min(kMaxCompressorWorkers, std::max(0, std::atoi(tw)));
+        if (const char* j = std::getenv("SMASH_TEST_JITTER_US"); j && *j)
+            vm::g_test_jitter_us.store(static_cast<uint32_t>(std::clamp(std::atoi(j), 0, 100000)),
+                                       std::memory_order_relaxed);
         if (const char* w = std::getenv("SMASH_PREFETCH_WINDOW"); w && *w) {
             char* end = nullptr;
             const long n = std::strtol(w, &end, 10);
