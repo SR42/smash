@@ -27,7 +27,11 @@
 //     (routed to another arena) are written every 250 ms throughout, and the
 //     last of 512 new objects from it comes from its old arena in every case,
 //     with none of its pages out of RAM. Without this, a flip that moved every
-//     site, or a counter shared across sites, would pass.
+//     site, or a counter shared across sites, would pass. Skipped when the
+//     child reports track=none (arm64 before Linux 6.7: no soft-dirty, no
+//     userfaultfd write-protect): with no write signal the compressor finds
+//     cold memory by compressing pages and re-checking them, hot ones too, so
+//     the feedback sees the hot site's pages compressed and moves it.
 #include <cerrno>
 #include <climits>
 #include <cstdint>
@@ -172,6 +176,8 @@ int child() {
     long cold = -1;
     const size_t at = text.rfind(" cold_arenas=");
     if (at != std::string::npos) cold = std::atol(text.c_str() + at + 13);
+    char track[16] = "?";
+    if (const size_t t = text.rfind(" track="); t != std::string::npos) std::sscanf(text.c_str() + t + 7, "%15s", track);
 
     size_t bad = 0;
     for (size_t k = 0; k < kCount; ++k)
@@ -180,8 +186,8 @@ int child() {
         for (size_t i = 0; i + 1 < kObj; ++i) bad += hot[k][i] != want(k + 7, i);
     for (auto* o : objs) free(o);
     for (auto* h : hot) free(h);
-    std::printf("old=%d new=%d cold=%ld out=%zu/%zu bad=%zu from_old=%zu hot_old=%d hot_new=%d hot_out=%zu\n",
-                old_arena, new_arena, cold, out, pages.size(), bad, from_old, hot_old, hot_new, hot_out);
+    std::printf("old=%d new=%d cold=%ld out=%zu/%zu bad=%zu from_old=%zu hot_old=%d hot_new=%d hot_out=%zu track=%s\n",
+                old_arena, new_arena, cold, out, pages.size(), bad, from_old, hot_old, hot_new, hot_out, track);
     return 0;
 }
 
@@ -225,6 +231,7 @@ struct Result {
     long cold = -1;
     size_t out = 0, pages = 0, bad = 0, from_old = 0, hot_out = 0;
     int hot_old = -1, hot_new = -1;
+    char track[16] = "?";
 };
 
 Result run(const char* self, const char* env) {
@@ -238,15 +245,15 @@ Result run(const char* self, const char* env) {
     at = at != std::string::npos ? at + 1 : (out.compare(0, 4, "old=") == 0 ? 0 : std::string::npos);
     if (at != std::string::npos &&
         std::sscanf(out.c_str() + at,
-                    "old=%d new=%d cold=%ld out=%zu/%zu bad=%zu from_old=%zu hot_old=%d hot_new=%d hot_out=%zu",
+                    "old=%d new=%d cold=%ld out=%zu/%zu bad=%zu from_old=%zu hot_old=%d hot_new=%d hot_out=%zu track=%15s",
                     &r.old_arena, &r.new_arena, &r.cold, &r.out, &r.pages, &r.bad, &r.from_old, &r.hot_old,
-                    &r.hot_new, &r.hot_out) == 10)
+                    &r.hot_new, &r.hot_out, r.track) == 11)
         r.ok = true;
     r.ok = r.ok && st == 0;
     std::printf("%-58s -> arena %d then %d (%zu of 512 new still from %d), cold_arenas=%ld, %zu of %zu pages out, "
-                "%zu bad bytes; hot site: arena %d then %d, %zu pages out (status %d)\n", env, r.old_arena,
-                r.new_arena, r.from_old, r.old_arena, r.cold, r.out, r.pages, r.bad, r.hot_old, r.hot_new, r.hot_out,
-                st);
+                "%zu bad bytes; hot site: arena %d then %d, %zu pages out; track=%s (status %d)\n", env,
+                r.old_arena, r.new_arena, r.from_old, r.old_arena, r.cold, r.out, r.pages, r.bad, r.hot_old,
+                r.hot_new, r.hot_out, r.track, st);
     if (!r.ok) showTail(out);
     return r;
 }
@@ -268,9 +275,10 @@ int main(int argc, char** argv) {
         {"SMASH_COLD_ARENA_FEEDBACK=1 SMASH_COLD_ARENA_THRESHOLD=1000000", 0, false},
         {"SMASH_COLD_ARENA_FEEDBACK=1 SMASH_NUM_ARENAS=128", 64, true},
     };
-    int failures = 0;
+    int failures = 0, hot_skipped = 0;
     for (const Case& c : cases) {
         const Result r = run(self, c.env);
+        const bool no_tracking = std::strcmp(r.track, "none") == 0;
         std::string why;
         if (!r.ok) why = "the child did not report";
         else if (r.out * 2 < r.pages) why = "the objects' pages never left RAM";
@@ -281,6 +289,7 @@ int main(int argc, char** argv) {
         else if (c.shift == 64 && r.old_arena >= 64) why = "hot arena " + std::to_string(r.old_arena) + " above 63";
         else if (c.flipped ? r.cold < 1 : r.cold != 0) why = "cold_arenas=" + std::to_string(r.cold);
         else if (r.hot_old == r.old_arena) why = "no hot call site routed away from the cold one's arena";
+        else if (no_tracking) ++hot_skipped;  // see the header: the hot site looks cold
         else if (r.hot_new != r.hot_old)
             why = "the hot call site moved from arena " + std::to_string(r.hot_old) + " to " +
                   std::to_string(r.hot_new);
@@ -291,6 +300,9 @@ int main(int argc, char** argv) {
         }
     }
     if (failures) return 1;
+    if (hot_skipped)
+        std::printf("hot call site check skipped in %d of 4 cases: track=none (no write tracking on this kernel; "
+                    "SMASH_SOFTDIRTY=0 enables it)\n", hot_skipped);
     std::printf("cold_arena_env_test: all checks passed\n");
     return 0;
 }
