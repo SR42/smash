@@ -239,6 +239,22 @@ int main() {
                 d_ticks, committed, k);
     if (k > 1 && d_pages > committed * (d_ticks / k + 2))
         fail("the scan covered more than 1/K of the arena per tick");
+    // The bitmap is read in 64-page words, and a read makes the kernel check
+    // every idle-marked page of the word, not only the ones asked about:
+    // "N words, M other idle" counts both (diagnostic for the arm64 box,
+    // where the scan cost 46-86 us per page). At least one word per 64 pages.
+    if (!yt()) {
+        const size_t at = after.rfind("idle_scan=");
+        unsigned long long ms = 0, calls = 0, pg = 0, words = 0, other = 0;
+        if (at == std::string::npos ||
+            std::sscanf(after.c_str() + at, "idle_scan=%llu (%llu calls, %llu pages, %llu words, %llu other idle)",
+                        &ms, &calls, &pg, &words, &other) != 5)
+            fail("no \"idle_scan=ms (N calls, P pages, W words, O other idle)\" on the stats line");
+        else if (words * 64 < pg)
+            fail("bitmap words read: " + std::to_string(words) + " for " + std::to_string(pg) + " pages");
+        else
+            std::printf("bitmap: %llu words read for %llu pages, %llu other idle pages in them\n", words, pg, other);
+    }
     if (failures) return 1;
     std::printf("idle_tracker_test: all checks passed\n");
     return 0;

@@ -699,8 +699,11 @@ class CompressorThread {
         std::atomic<uint64_t> p2_mprotect{0};
         // SMASH_WRITE_TRACK=idle: phase 1's page_idle scan (pagemap read,
         // bitmap read and re-mark), cumulative us, system calls, and pages
-        // scanned.
+        // scanned; bitmap words read, and pages found idle in them that the
+        // scan did not ask about (a word read makes the kernel check all 64
+        // of its pages: walk the mappings of each one marked idle).
         std::atomic<uint64_t> sc_idle_us{0}, sc_idle_n{0}, idle_pages{0};
+        std::atomic<uint64_t> idle_words{0}, idle_other{0};
         // SMASH_WRITE_TRACK=yt: phase 1's youngtrace requests, cumulative us,
         // requests, pages they covered, and requests that failed or were cut.
         std::atomic<uint64_t> sc_yt_us{0}, sc_yt_n{0}, yt_pages{0}, yt_cut{0};
@@ -5341,7 +5344,7 @@ private:
         Ent ent[kBatch];
         uint64_t words[kRunMax];
         const uint64_t t0 = monoNs();
-        uint64_t calls = 0, pages = 0;
+        uint64_t calls = 0, pages = 0, nwords = 0, other = 0;
         size_t i = start;
         while (i < end) {
             const size_t slice_end = std::min(end, ((i >> kIdleSliceShift) + 1) << kIdleSliceShift);
@@ -5383,11 +5386,19 @@ private:
                 ++calls;
                 const bool read_ok = pread(page_idle_fd_, words, nw * sizeof(uint64_t), woff) ==
                                      static_cast<ssize_t>(nw * sizeof(uint64_t));
+                uint64_t idle_bits = 0;
+                if (read_ok) {
+                    nwords += nw;
+                    for (uint64_t w = 0; w < nw; ++w) idle_bits += static_cast<uint64_t>(__builtin_popcountll(words[w]));
+                }
                 for (size_t x = r; x < q; ++x) {
                     const uint64_t w = ent[x].pfn / 64 - w0;
                     if (!read_ok || !((words[w] >> (ent[x].pfn % 64)) & 1))
                         accessed_[i + ent[x].off].store(true, std::memory_order_relaxed);
+                    else
+                        --idle_bits;
                 }
+                other += idle_bits;
                 // Mark: only our bits; a 0 bit leaves its page as it is.
                 std::memset(words, 0, nw * sizeof(uint64_t));
                 for (size_t x = r; x < q; ++x) words[ent[x].pfn / 64 - w0] |= 1ULL << (ent[x].pfn % 64);
@@ -5400,6 +5411,8 @@ private:
         pcAdd(pc_.sc_idle_us, (monoNs() - t0) / 1000);
         pcAdd(pc_.sc_idle_n, calls);
         pcAdd(pc_.idle_pages, pages);
+        pcAdd(pc_.idle_words, nwords);
+        pcAdd(pc_.idle_other, other);
     }
 
     // ── SMASH_WRITE_TRACK=yt ──────────────────────────────────────────────
@@ -7828,7 +7841,7 @@ public:
                         " | tick ms total=%llu phases=%llu efficiency=%llu vma_sync=%llu"
                         " bitmap=%llu node_chunks=%llu adapt=%llu dict=%llu sweep=%llu"
                         " | syscall ms memread=%llu (%llu calls) p2_mprotect=%llu p3_mprotect=%llu"
-                        " p4_release=%llu idle_scan=%llu (%llu calls, %llu pages)"
+                        " p4_release=%llu idle_scan=%llu (%llu calls, %llu pages, %llu words, %llu other idle)"
                         " yt_scan=%llu (%llu calls, %llu pages, cut=%llu)\n",
                         v(pc.tick_ms_total), v(pc.phases_ms_total), v(pc.step_ms[kStepEfficiency]),
                         v(pc.step_ms[kStepVmaSync]), v(pc.step_ms[kStepBitmap]),
@@ -7837,7 +7850,7 @@ public:
                         v(pc.sc_memread_us) / 1000, v(pc.sc_memread_n),
                         v(pc.sc_p2_mprotect_us) / 1000, v(pc.sc_p3_mprotect_us) / 1000,
                         v(pc.sc_p4_us) / 1000, v(pc.sc_idle_us) / 1000, v(pc.sc_idle_n),
-                        v(pc.idle_pages), v(pc.sc_yt_us) / 1000, v(pc.sc_yt_n), v(pc.yt_pages),
+                        v(pc.idle_pages), v(pc.idle_words), v(pc.idle_other), v(pc.sc_yt_us) / 1000, v(pc.sc_yt_n), v(pc.yt_pages),
                         v(pc.yt_cut));
                 if (n >= static_cast<int>(sizeof(buf))) n = static_cast<int>(sizeof(buf)) - 1;
             }

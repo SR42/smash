@@ -50,8 +50,17 @@
 // most 16), STRESS_MIB per thread (default 16), STRESS_BLOCK_KIB,
 // STRESS_WAVE_SEC (0: no waves), STRESS_OBJS and STRESS_OBJ_MAX (small objects
 // per thread, default 2048 of up to 4096 bytes), STRESS_SURVIVORS (default
-// 8192 allocations, 0 for none), STRESS_MIN_RESTORES (default 2000). Long runs are the
-// soak test (agents/tests.md).
+// 8192 allocations, 0 for none), STRESS_MIN_RESTORES (default 2000),
+// STRESS_IDLE_SEC (longest wait for the data to be compressed again after the
+// stop, default 180; the wait ends as soon as 90% is). Long runs are the soak
+// test (agents/tests.md).
+//
+// An idle phase longer than 5 s prints, every 5 s, the cold units' page
+// states, idle counts and restore counts, and with SMASH_STATS_SIGNAL=1 smash's
+// stats (stderr) at its start and end. On a 128-core arm64 box with
+// SMASH_WRITE_TRACK=idle, after 1800 s, compressor ticks took 5-9 s and every
+// page still read idle count 0 at 30 s, the old limit: a timing failure, not
+// lost data.
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
@@ -63,6 +72,7 @@
 #include <fcntl.h>
 #include <new>
 #include <pthread.h>
+#include <signal.h>
 #include <sys/mman.h>
 #include <time.h>
 #include <unistd.h>
@@ -503,6 +513,33 @@ size_t checkAll(Thread* threads, size_t nthreads, const char* what) {
     return static_cast<size_t>(g_bad_units.load() + g_bad_objs.load() - before);
 }
 
+// The cold units' page states, idle counts and restore counts (the back-off
+// grows with the count), as smash_page_info reports them.
+void idleBreakdown(Thread* threads, size_t nthreads, double t) {
+    size_t st_hist[16] = {}, rc_hist[8] = {}, cold_hist[8] = {}, total = 0;
+    for (size_t i = 0; i < nthreads; ++i)
+        for (size_t k = 1; k < threads[i].nblocks; ++k) {
+            const Block& b = threads[i].blocks[k];
+            for (size_t u = 0; u < b.units; ++u) {
+                int st = -1, cold = -1, rc = -1;
+                g_page_info(b.p + u * kUnit, &st, &cold, &rc);
+                ++st_hist[st >= 0 && st < 15 ? st : 15];
+                ++rc_hist[rc < 0 ? 7 : rc > 6 ? 6 : rc];
+                ++cold_hist[cold < 0 ? 7 : cold == 0 ? 0 : cold < 4 ? 1 : cold < 16 ? 2 : cold < 64 ? 3
+                            : cold < 128 ? 4 : cold < 255 ? 5 : 6];
+                ++total;
+            }
+        }
+    std::printf("  idle %5.1f s: %zu units; state:", t, total);
+    for (int x = 0; x < 16; ++x)
+        if (st_hist[x]) std::printf(" %d=%zu", x == 15 ? -1 : x, st_hist[x]);
+    std::printf("; restore count 0,1,2,3,4,5,6+,?:");
+    for (size_t n : rc_hist) std::printf(" %zu", n);
+    std::printf("; idle count 0,1-3,4-15,16-63,64-127,128-254,255,?:");
+    for (size_t n : cold_hist) std::printf(" %zu", n);
+    std::printf("\n");
+}
+
 // Fraction of the threads' cold units whose pages the compressor holds.
 double heldFraction(Thread* threads, size_t nthreads) {
     size_t held = 0, total = 0;
@@ -534,6 +571,9 @@ int main() {
     const size_t nthreads = envSize("STRESS_THREADS", std::min<size_t>(16, 2 * static_cast<size_t>(cpus > 0 ? cpus : 1)));
     const size_t mib = envSize("STRESS_MIB", 16);
     const size_t min_restores = envSize("STRESS_MIN_RESTORES", 2000);
+    const double idle_sec = static_cast<double>(envSize("STRESS_IDLE_SEC", 180));
+    const char* sig = std::getenv("SMASH_STATS_SIGNAL");
+    const bool stats = sig && sig[0] == '1';  // otherwise SIGUSR2 would kill us
     if (const size_t kib = envSize("STRESS_BLOCK_KIB", 0)) {
         g_max_units = std::min(kMaxUnits, std::max<size_t>(2, kib * 3 / 8));
         g_min_units = std::max<size_t>(1, g_max_units * 5 / 12);
@@ -610,8 +650,22 @@ int main() {
 
     // Idle until the data is compressed again, then read all of it back.
     const double i0 = nowSec();
-    double held = 0;
-    while (nowSec() - i0 < 30 && (held = heldFraction(threads, nthreads)) < 0.9) usleep(250 * 1000);
+    double held = 0, next_line = i0 + 5;
+    bool slow = false;
+    while (nowSec() - i0 < idle_sec && (held = heldFraction(threads, nthreads)) < 0.9) {
+        if (nowSec() >= next_line) {
+            if (!slow && stats) raise(SIGUSR2);
+            slow = true;
+            idleBreakdown(threads, nthreads, nowSec() - i0);
+            next_line += 5;
+        }
+        usleep(250 * 1000);
+    }
+    const double idled = nowSec() - i0;
+    if (slow) {
+        idleBreakdown(threads, nthreads, idled);
+        if (stats) raise(SIGUSR2);
+    }
     const size_t after_idle = checkAll(threads, nthreads, "check after idling");
 
     std::printf("integrity stress: %llu rounds, %llu accesses found the page compressed and %llu shadow, %llu syscall "
@@ -636,7 +690,8 @@ int main() {
         ++failures;
     }
     if (held < 0.5) {
-        std::printf("FAIL: only %.0f%% of the cold units compressed after idling\n", 100 * held);
+        std::printf("FAIL: only %.0f%% of the cold units compressed after idling %.0f s\n", 100 * held,
+                    idled);
         ++failures;
     }
     if (failures) return 1;
