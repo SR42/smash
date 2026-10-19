@@ -5180,8 +5180,8 @@ private:
                 }
             }
         }
-        // (1) Open the idle bitmap O_RDWR.
-        page_idle_fd_ = open("/sys/kernel/mm/page_idle/bitmap", O_RDWR | O_CLOEXEC);
+        // (1) Open the idle bitmap O_RDWR (the tracker's probe may have).
+        if (page_idle_fd_ < 0) page_idle_fd_ = open("/sys/kernel/mm/page_idle/bitmap", O_RDWR | O_CLOEXEC);
         if (page_idle_fd_ < 0) {
             if (mode == 1) {
                 const char m[] = "[smash] SMASH_IDLE_READ_TRACK=1 but /sys/kernel/mm/page_idle/bitmap unavailable; falling back\n";
@@ -5331,6 +5331,18 @@ private:
         return false;
     }
 
+    // The bitmap file this thread scans through. Each thread opens its own:
+    // sysfs runs one read or write at a time per open file (kernfs
+    // of->mutex), and on the 128-core arm64 box 8 workers sharing
+    // page_idle_fd_ spent their scan spinning on it (mutex_spin_on_owner
+    // under idleScan's pread/pwrite). Workers and node-group threads live
+    // until exit, so the file is never closed. page_idle_fd_ if the open fails.
+    int idleBitmapFd() const {
+        static thread_local int fd = -1;
+        if (fd < 0) fd = open("/sys/kernel/mm/page_idle/bitmap", O_RDWR | O_CLOEXEC);
+        return fd >= 0 ? fd : page_idle_fd_;
+    }
+
     // Phase 1's scan of [start, end): sets accessed_ for every due, resident
     // ACTIVE page whose idle mark is gone, then marks them all idle again.
     // Batched: one pagemap read per kBatch pages, and one read and one write
@@ -5344,6 +5356,7 @@ private:
         Ent ent[kBatch];
         uint64_t words[kRunMax];
         const uint64_t t0 = monoNs();
+        const int bitmap_fd = idleBitmapFd();
         uint64_t calls = 0, pages = 0, nwords = 0, other = 0;
         size_t i = start;
         while (i < end) {
@@ -5384,7 +5397,7 @@ private:
                 const uint64_t nw = ent[q - 1].pfn / 64 - w0 + 1;
                 const off_t woff = static_cast<off_t>(w0 * sizeof(uint64_t));
                 ++calls;
-                const bool read_ok = pread(page_idle_fd_, words, nw * sizeof(uint64_t), woff) ==
+                const bool read_ok = pread(bitmap_fd, words, nw * sizeof(uint64_t), woff) ==
                                      static_cast<ssize_t>(nw * sizeof(uint64_t));
                 uint64_t idle_bits = 0;
                 if (read_ok) {
@@ -5403,7 +5416,7 @@ private:
                 std::memset(words, 0, nw * sizeof(uint64_t));
                 for (size_t x = r; x < q; ++x) words[ent[x].pfn / 64 - w0] |= 1ULL << (ent[x].pfn % 64);
                 ++calls;
-                (void)!pwrite(page_idle_fd_, words, nw * sizeof(uint64_t), woff);
+                (void)!pwrite(bitmap_fd, words, nw * sizeof(uint64_t), woff);
                 r = q;
             }
             i += n;

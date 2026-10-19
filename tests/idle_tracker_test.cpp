@@ -38,6 +38,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <dirent.h>
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <string>
@@ -128,6 +129,23 @@ bool trackerUsable() {
 }
 
 // The "<key>N (C calls, P pages" counters of the syscall line.
+// Open files of this process on the page_idle bitmap.
+int bitmapFiles() {
+    int n = 0;
+    if (DIR* d = opendir("/proc/self/fd")) {
+        while (dirent* e = readdir(d)) {
+            char path[64], target[128];
+            std::snprintf(path, sizeof(path), "/proc/self/fd/%s", e->d_name);
+            const ssize_t len = readlink(path, target, sizeof(target) - 1);
+            if (len <= 0) continue;
+            target[len] = '\0';
+            n += std::strcmp(target, "/sys/kernel/mm/page_idle/bitmap") == 0;
+        }
+        closedir(d);
+    }
+    return n;
+}
+
 unsigned long long scanPages(const std::string& log, const char* key) {
     const size_t at = log.rfind(key);
     if (at == std::string::npos) return ~0ull;
@@ -254,6 +272,16 @@ int main() {
             fail("bitmap words read: " + std::to_string(words) + " for " + std::to_string(pg) + " pages");
         else
             std::printf("bitmap: %llu words read for %llu pages, %llu other idle pages in them\n", words, pg, other);
+    }
+    // Every scanning thread has its own open bitmap: sysfs runs one read or
+    // write at a time per open file (kernfs of->mutex), and 8 workers sharing
+    // one spent the arm64 box's scan spinning on it. With SMASH_TEST_WORKERS
+    // >= 2: the probe's file plus at least two threads' own.
+    const char* tw = std::getenv("SMASH_TEST_WORKERS");
+    if (!yt() && tw && std::atoi(tw) >= 2) {
+        const int files = bitmapFiles();
+        std::printf("page_idle bitmap open %d times with %s workers\n", files, tw);
+        if (files < 3) fail("the scanning threads share one open bitmap: " + std::to_string(files) + " open");
     }
     if (failures) return 1;
     std::printf("idle_tracker_test: all checks passed\n");

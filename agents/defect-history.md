@@ -654,3 +654,14 @@ and root alike; more workers and a busier machine widen the window, so a
 `SMASH_DEFERRED_RECLAIM_DELAY=1000` so ticks reclaim nothing): Phase B over
 [+10, +74) of two shadow chunks must reclaim exactly those 64 pages -- before
 the fix 10 below the range and 54 of 64 inside.
+
+## Idle scan: every worker read and wrote the page_idle bitmap through one open file (fixed 2026-10-19)
+
+`SMASH_WRITE_TRACK=idle` opened `/sys/kernel/mm/page_idle/bitmap` once (`page_idle_fd_`), and every compressor worker's Phase 1 scan read and re-marked it through that file. sysfs runs one read or write at a time per open file (kernfs `of->mutex`), so the workers' scans ran one at a time and the waiting ones spun on the mutex.
+
+Found on the 128-core arm64 box (kernel 6.6) with `integrity_stress_test` at 128 threads x 64 MiB for 1800 s under `idle`: ticks of 4-13 s that were nearly all Phase 1, 10.3M ms of Phase 1 system time against 92 s blocked, and the idle scan at 41.5 us per page over the run, 98 us during the idle wait. A kernel-only profile (`perf record -a -g -e cycles:k`, during the idle wait) put `mutex_spin_on_owner` (7 %) and `osq_lock` (1 %) under `idleScan`'s `pread`/`pwrite`, `page_idle_get_page` at 3 %, and nothing else above 0.6 % but idle and task switching.
+
+Fix: each scanning thread opens its own (`idleBitmapFd()`, thread-local, kept until exit; the shared file if the open fails). `ensureIdleReadFds()` also opened a second shared file over the tracker probe's and leaked the first; it now reuses it. Measured as root on claudepc (2-CPU x86, 2 nodes), the stress workload under `idle` at 2 threads x 256 MiB with 8 workers, 60 s, two runs of each: scan cost **10.1 and 11.3 us per page before, 6.0 and 6.3 after**; Phase 1 system time 13.1/15.0 s to 9.0/9.0 s, blocked 10.1/12.2 s to 4.9/5.2 s. Two CPUs cap the gain there; on the arm64 box eight workers can run at once. Guarded by `test_idle_tracker_workers`.
+
+Not fixed: a bitmap read makes the kernel check all 64 pages of each word and walk the mappings of every one marked idle, asked about or not. The new `O other idle` count on `idle_scan=` measured that at 13.6 per page asked during the arm64 box's idle wait (1.3 during the run, a lower bound), and 7-10 per page on claudepc with a dense 512 MiB heap. Scanning in physical-address order over a larger batch would read each word once per pass.
+
