@@ -26,11 +26,18 @@
 // module's buffer. And once with SMASH_THP=1 and 640-page requests
 // (SMASH_YT_REQ_PAGES), so request edges split huge pages: a huge page has
 // one accessed bit, which the first request covering it clears, so the part
-// the next request covers must have been marked by the first.
+// the next request covers must have been marked by the first. And once with
+// a 512 MiB span allocated and never touched (IDLE_SPAN_MIB) and one worker,
+// so the arena holds several slices: at K > 1 a request must cover a whole
+// slice, the largest power of two of pages the module's buffer can always
+// hold (scan_buf_cap). Every request pays the module a zeroing of that whole
+// buffer, and 64 MiB slices, never adjacent when due, made every request
+// 64 MiB - a quarter of what the default 8 MiB buffer holds.
 //
 // IDLE_PART=fallback (any user): the tracker must refuse - idle with
 // SMASH_THP=1, yt with SMASH_YT_DEVICE naming no device - say why on stderr,
 // and fall back to page protection, which still compresses the idle block.
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <csignal>
@@ -153,6 +160,28 @@ unsigned long long scanPages(const std::string& log, const char* key) {
     return c == std::string::npos ? ~0ull : std::strtoull(log.c_str() + c + 8, nullptr, 10);
 }
 
+unsigned long long scanCalls(const std::string& log, const char* key) {
+    const size_t at = log.rfind(key);
+    if (at == std::string::npos) return ~0ull;
+    const size_t c = log.find(" (", at);
+    return c == std::string::npos ? ~0ull : std::strtoull(log.c_str() + c + 2, nullptr, 10);
+}
+
+// Pages in one yt slice: the largest power of two not above the pages a
+// request can cover without being cut, (scan_buf_cap - 8) / 128 (a record and
+// an item per page at worst), at most 65536.
+unsigned long long ytSlicePages() {
+    unsigned long long cap = 0;
+    if (FILE* f = std::fopen("/sys/module/youngtrace/parameters/scan_buf_cap", "r")) {
+        if (std::fscanf(f, "%llu", &cap) != 1) cap = 0;
+        std::fclose(f);
+    }
+    if (cap < 64 * 1024) return 0;
+    unsigned long long fit = std::min((cap - 8) / 128, 65536ull), s = 1;
+    while (s * 2 <= fit) s *= 2;
+    return s;
+}
+
 }  // namespace
 
 int main() {
@@ -177,6 +206,10 @@ int main() {
     fill(cold, kCold, 1);
     fill(wr, kHot, 2);
     fill(rd, kHot, 3);
+    // Never touched: it only makes the arena span several yt slices.
+    const char* span_env = std::getenv("IDLE_SPAN_MIB");
+    const size_t span = span_env ? static_cast<size_t>(std::atoi(span_env)) << 20 : 0;
+    void* untouched = span ? malloc(span) : nullptr;
 
     std::atomic<bool> stop{false};
     std::thread hot([&] {
@@ -257,6 +290,19 @@ int main() {
                 d_ticks, committed, k);
     if (k > 1 && d_pages > committed * (d_ticks / k + 2))
         fail("the scan covered more than 1/K of the arena per tick");
+    // A request covers a whole due slice (IDLE_SPAN_MIB, one worker, so no
+    // range edge cuts one): on average more than half a slice, where 64 MiB
+    // slices gave at most 16384 pages a request.
+    if (yt() && span && k > 1) {
+        const unsigned long long d_calls = scanCalls(after, "yt_scan=") - scanCalls(before, "yt_scan="),
+                                 slice = ytSlicePages();
+        std::printf("yt requests over the window: %llu for %llu pages, %llu per request; slice %llu pages\n",
+                    d_calls, d_pages, d_calls ? d_pages / d_calls : 0, slice);
+        if (slice == 0) fail("cannot read /sys/module/youngtrace/parameters/scan_buf_cap");
+        else if (d_calls == 0 || d_pages * 2 <= d_calls * slice)
+            fail("yt requests cover less than half a slice: " + std::to_string(d_calls ? d_pages / d_calls : 0) +
+                 " pages each, slice " + std::to_string(slice));
+    }
     // The bitmap is read in 64-page words, and a read makes the kernel check
     // every idle-marked page of the word, not only the ones asked about:
     // "N words, M other idle" counts both (diagnostic for the arm64 box,
@@ -283,6 +329,7 @@ int main() {
         std::printf("page_idle bitmap open %d times with %s workers\n", files, tw);
         if (files < 3) fail("the scanning threads share one open bitmap: " + std::to_string(files) + " open");
     }
+    free(untouched);
     if (failures) return 1;
     std::printf("idle_tracker_test: all checks passed\n");
     return 0;

@@ -5282,12 +5282,15 @@ private:
     bool scanTracker() const {
         return write_tracker_ == WriteTracker::kIdle || write_tracker_ == WriteTracker::kYt;
     }
-    // yt's slices are 64 MiB (a node arena chunk): every request costs the
-    // module a zeroing of its whole output buffer (~110 us at the default
-    // 8 MiB), so a request should cover as much as it can.
-    static constexpr size_t kYtSliceShift = 14;     // 16384 pages = 64 MiB
+    // yt's slices are as large as one request (yt_slice_shift_): every
+    // request costs the module a zeroing of its whole output buffer (~110 us
+    // at the default 8 MiB), and at K > 1 the slices due in one tick are
+    // never adjacent, so a slice is all one request covers. 64 MiB slices
+    // made every request 64 MiB, a quarter of what the buffer holds: 16384
+    // pages per request on the x86 VM, 26 ns per page at K=4 against 11 at
+    // K=1, where due slices are adjacent.
     size_t sliceShift() const {
-        return write_tracker_ == WriteTracker::kYt ? kYtSliceShift : kIdleSliceShift;
+        return write_tracker_ == WriteTracker::kYt ? yt_slice_shift_ : kIdleSliceShift;
     }
     bool idleSliceDue(size_t page_idx) const {
         const uint32_t k = idleScanTicks();
@@ -5440,8 +5443,8 @@ private:
     // no PFNs and no rmap walk: measured as root on an x86 VM, 8-28 ns per
     // 4 KiB page against the bitmap's 380-440, plus ~110 us per request, most
     // of it the module zeroing its whole output buffer (scan_buf_cap, 8 MiB
-    // by default) after each scan. Hence 64 MiB slices, and requests as large
-    // as the buffer can always hold (yt::kMaxBytesPerPage).
+    // by default) after each scan. Hence requests as large as the buffer can
+    // always hold (yt::kMaxBytesPerPage), and slices of one request each.
     //
     // Needs the module loaded and the device openable: CAP_SYS_ADMIN (the
     // module checks it at open) and access to the root-only node.
@@ -5469,6 +5472,10 @@ private:
     };
     YtSlot yt_slots_[kYtSlots];
     size_t yt_req_pages_ = 0;        // pages per request: never cut by the module
+    // log2 of the pages in a yt slice: the largest power of two a request can
+    // cover, 15 (128 MiB) at the default 8 MiB buffer, whose 65535-page
+    // requests miss 256 MiB by one page (8 bytes of output at worst).
+    size_t yt_slice_shift_ = 14;
     std::atomic<bool> yt_warned_{false};
 
     static const char* ytDevice() {
@@ -5559,7 +5566,9 @@ private:
             }
             yt_req_pages_ = std::min<size_t>((cap - yt::kStatusBytes) / yt::kMaxBytesPerPage,
                                              size_t{1} << 16);
-            // Tests: smaller requests, so their edges split huge pages.
+            yt_slice_shift_ = 63 - static_cast<size_t>(__builtin_clzll(yt_req_pages_));
+            // Tests: smaller requests, so their edges split huge pages (the
+            // slices stay as the buffer makes them).
             if (const char* q = std::getenv("SMASH_YT_REQ_PAGES"); q && std::atoi(q) > 0)
                 yt_req_pages_ = std::min(yt_req_pages_, static_cast<size_t>(std::atoi(q)));
             for (YtSlot& s : yt_slots_) {
@@ -5627,7 +5636,7 @@ private:
         YtSlot* slot = ytAcquire();
         size_t i = start;
         while (i < end) {
-            auto next = [&](size_t x) { return std::min(end, ((x >> kYtSliceShift) + 1) << kYtSliceShift); };
+            auto next = [&](size_t x) { return std::min(end, ((x >> yt_slice_shift_) + 1) << yt_slice_shift_); };
             if (!idleSliceDue(i)) { i = next(i); continue; }
             size_t run_end = i;
             while (run_end < end && idleSliceDue(run_end)) run_end = next(run_end);
