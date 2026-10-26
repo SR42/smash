@@ -39,6 +39,7 @@ static_assert(__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__, "the scanner stream is 
 inline constexpr uint32_t kRecordMagic = 0x39565459u;      // "YTV9"
 inline constexpr size_t kStatusBytes = 8;
 inline constexpr size_t kRecordBytes = 120;
+inline constexpr size_t kRecordStartOffset = 8;
 inline constexpr size_t kRecordItemsOffset = 32;
 inline constexpr uint64_t kStatusTruncated = 1;
 inline constexpr uint64_t kItemRun = 1ull << 63;
@@ -84,6 +85,9 @@ public:
                 std::memcpy(&magic, p + off, sizeof(magic));
                 if (magic != kRecordMagic) { malformed_ = true; break; }
                 items_left_ = word(p + off + kRecordItemsOffset);
+                last_start_ = word(p + off + kRecordStartOffset);
+                last_items_ = items_left_;
+                last_end_ = 0;
                 ++records_;
                 off += kRecordBytes;
             } else {
@@ -107,6 +111,7 @@ public:
                 const uint64_t end = addr + pages * 4096;
                 if (pages == 0 || end < addr) { malformed_ = true; break; }
                 if (end > reached_) reached_ = end;
+                if (end > last_end_) last_end_ = end;
                 if ((w & kItemClassMask) == kClassPresent && !(w & kItemOld))
                     on_young(addr, pages, w);
                 --items_left_;
@@ -126,6 +131,13 @@ public:
     // reporting. Pages from there to the request's end are unknown, and in
     // mode=1 their ACCESSED bits may already have been cleared.
     uint64_t reached() const { return reached_; }
+    // Where a cut scan resumes, as youngtrace's chunk_resume_v5() does: the
+    // end of the last record's furthest item, or that record's start when it
+    // has none (the cap fell right after it). 0 before any record. Exact only
+    // with a module that stops before what it has no room to report (yt
+    // c56f1b6, #86): an older one cleared bits past this point that it never
+    // reported.
+    uint64_t resumePoint() const { return last_items_ ? last_end_ : last_start_; }
     uint64_t records() const { return records_; }
 
 private:
@@ -141,6 +153,9 @@ private:
     uint64_t items_left_ = 0;
     uint64_t reached_ = 0;
     uint64_t records_ = 0;
+    uint64_t last_start_ = 0;   // the last record's start (clipped to the request)
+    uint64_t last_items_ = 0;   // and its item count
+    uint64_t last_end_ = 0;     // the end of its furthest item
 };
 
 }  // namespace smash::yt

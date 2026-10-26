@@ -35,7 +35,11 @@
 // 64 MiB - a quarter of what the default 8 MiB buffer holds. And once with
 // SMASH_YT_MMAP=1: the scans are read from the module's buffer mapped into
 // the process (/proc/self/maps must show it), and every check above must
-// still hold; without the variable nothing may be mapped.
+// still hold; without the variable nothing may be mapped. And once with
+// SMASH_YT_WHOLE=1 and the 512 MiB span, default workers: one request per due
+// tick covers the whole arena, so over the window there are at most ticks/K + 2
+// scans (requests resumed after a cut do not count), each over every
+// committed page.
 //
 // IDLE_PART=fallback (any user): the tracker must refuse - idle with
 // SMASH_THP=1, yt with SMASH_YT_DEVICE naming no device - say why on stderr,
@@ -315,7 +319,9 @@ int main() {
     // A request covers a whole due slice (IDLE_SPAN_MIB, one worker, so no
     // range edge cuts one): on average more than half a slice, where 64 MiB
     // slices gave at most 16384 pages a request.
-    if (yt() && span && k > 1) {
+    const char* whole_env = std::getenv("SMASH_YT_WHOLE");
+    const bool whole = yt() && whole_env && whole_env[0] == '1';
+    if (yt() && span && k > 1 && !whole) {
         const unsigned long long d_calls = scanCalls(after, "yt_scan=") - scanCalls(before, "yt_scan="),
                                  slice = ytSlicePages();
         std::printf("yt requests over the window: %llu for %llu pages, %llu per request; slice %llu pages\n",
@@ -324,6 +330,22 @@ int main() {
         else if (d_calls == 0 || d_pages * 2 <= d_calls * slice)
             fail("yt requests cover less than half a slice: " + std::to_string(d_calls ? d_pages / d_calls : 0) +
                  " pages each, slice " + std::to_string(slice));
+    }
+    // SMASH_YT_WHOLE=1: the coordinator scans the whole arena, one request
+    // resumed where the module's cap cuts it, every K ticks.
+    if (whole) {
+        const unsigned long long d_calls = scanCalls(after, "yt_scan=") - scanCalls(before, "yt_scan="),
+                                 d_resumed = field(after, " resumed=") - field(before, " resumed="),
+                                 scans = d_calls - d_resumed;
+        std::printf("whole-arena scans over the window: %llu (%llu requests, %llu resumed) for %llu pages in "
+                    "%llu ticks, %llu pages committed, longest request %llu us\n",
+                    scans, d_calls, d_resumed, d_pages, d_ticks, committed, field(after, "max_req_us="));
+        if (scans == 0 || scans > d_ticks / k + 2)
+            fail("SMASH_YT_WHOLE=1: " + std::to_string(scans) + " scans in " + std::to_string(d_ticks) +
+                 " ticks, want one per due tick");
+        else if (d_pages < scans * (committed / 2))
+            fail("SMASH_YT_WHOLE=1: a scan covered " + std::to_string(d_pages / scans) + " pages of " +
+                 std::to_string(committed) + " committed");
     }
     // The bitmap is read in 64-page words, and a read makes the kernel check
     // every idle-marked page of the word, not only the ones asked about:

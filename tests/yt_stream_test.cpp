@@ -39,9 +39,10 @@ struct Stream {
         b.insert(b.end(), x, x + 8);
     }
     void status(uint64_t s) { u64(s); }
-    void record(uint64_t items, uint32_t magic = kRecordMagic) {
+    void record(uint64_t items, uint32_t magic = kRecordMagic, uint64_t start = 0) {
         std::vector<unsigned char> r(kRecordBytes, 0);
         std::memcpy(r.data(), &magic, 4);
+        std::memcpy(r.data() + kRecordStartOffset, &start, 8);
         std::memcpy(r.data() + kRecordItemsOffset, &items, 8);
         b.insert(b.end(), r.begin(), r.end());
     }
@@ -108,6 +109,7 @@ int main() {
         check(ps.complete() && !ps.truncated() && !ps.malformed(), "complete stream");
         check(ps.records() == 3, "three records");
         check(ps.reached() == A + 0xa00000 + 4 * 4096, "reached = end of the last item");
+        check(ps.resumePoint() == A + 0xa00000 + 4 * 4096, "resume point = end of the last record's last item");
     }
 
     {   // each young item's first word: the node bits of the last one
@@ -145,6 +147,24 @@ int main() {
         check(got == want, "mapped buffer: an earlier scan's records past the terminator are not read");
         check(ps.complete() && ps.ended() && ps.records() == 3 && used == s.b.size(),
               "mapped buffer: the zero word ends the stream");
+    }
+    {   // where a cut stream resumes (SMASH_YT_WHOLE): youngtrace's chunk_resume_v5
+        Stream c;
+        c.status(kStatusTruncated);
+        c.record(2, kRecordMagic, A);
+        c.item(A + 0x3000);
+        c.run(A + 0x8000, 6, /*old=*/true);                 // old: not young, but walked
+        StreamParser ps;
+        parse(c, c.b.size(), ps);
+        check(ps.complete() && ps.truncated() && ps.resumePoint() == A + 0x8000 + 6 * 4096,
+              "a cut stream resumes after its last record's furthest item, old ones included");
+        // The cap fell right after a record: nothing of it was walked, so the
+        // scan resumes at that record's start, past the earlier records' items.
+        c.record(0, kRecordMagic, A + 0x400000);
+        StreamParser ps2;
+        parse(c, c.b.size(), ps2);
+        check(ps2.complete() && ps2.reached() == A + 0x8000 + 6 * 4096 && ps2.resumePoint() == A + 0x400000,
+              "a cut stream whose last record has no items resumes at that record's start");
     }
     {   // padding inside a record's items is not an end
         Stream m;

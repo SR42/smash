@@ -707,6 +707,10 @@ class CompressorThread {
         // SMASH_WRITE_TRACK=yt: phase 1's youngtrace requests, cumulative us,
         // requests, pages they covered, and requests that failed or were cut.
         std::atomic<uint64_t> sc_yt_us{0}, sc_yt_n{0}, yt_pages{0}, yt_cut{0};
+        // SMASH_YT_WHOLE=1: requests resumed after a cut; and the longest
+        // single request's write() (the module's walk, which holds the
+        // process's mmap_lock for reading throughout), in us.
+        std::atomic<uint64_t> yt_resumed{0}, yt_req_max_us{0};
         // SMASH_YT_NODE_HINTS=1: pages whose node hint a yt report set.
         std::atomic<uint64_t> yt_node_hints{0};
         // Phase 2's move_pages node queries (flushNodeQueries): us, calls,
@@ -5304,6 +5308,8 @@ private:
     }
     bool idleSliceDue(size_t page_idx) const {
         const uint32_t k = idleScanTicks();
+        // SMASH_YT_WHOLE: the arena is one slice, scanned every K ticks.
+        if (yt_whole_ && write_tracker_ == WriteTracker::kYt) return tick_counter_ % k == 0;
         return k == 1 || ((page_idx >> sliceShift()) + tick_counter_) % k == 0;
     }
 
@@ -5508,13 +5514,23 @@ private:
     // one folio), and for the rest of a run only a guess, so it fills hints
     // that are still unknown and never overwrites one.
     bool yt_node_hints_ = false;
+    // SMASH_YT_WHOLE=1: one request per scan over the whole committed arena,
+    // made by the coordinator before Phase 1 (ytScanWhole), every K ticks, and
+    // resumed where the module's cap cut it instead of being sized never to
+    // be cut. Needs youngtrace c56f1b6 (#86) or later: an older module clears
+    // bits it cannot report, and a resumed scan loses those accesses. Holds
+    // the process's mmap_lock (read side) for each request's whole walk.
+    bool yt_whole_ = false;
 
     static const char* ytDevice() {
         const char* d = std::getenv("SMASH_YT_DEVICE");
         return d && *d ? d : "/dev/youngtrace/scanner";
     }
 
-    struct YtResult { bool ok; uint64_t reached; };
+    // ok: the scan was read whole and not cut. Otherwise `reached` is where
+    // reporting stopped, and `cut` says the output was well-formed but cut at
+    // the module's cap, to be resumed at `resume` (SMASH_YT_WHOLE).
+    struct YtResult { bool ok; uint64_t reached; bool cut = false; uint64_t resume = 0; };
 
     // One scan of [lo, hi) through `slot`: on_young(addr, pages) for every
     // page reported accessed. ok=false when the request failed or the output
@@ -5525,16 +5541,21 @@ private:
         const int n = smash::safe_snprintf(req, sizeof(req), "pid=%d mode=1 lo=0x%lx hi=0x%lx",
                                            static_cast<int>(getpid()), static_cast<unsigned long>(lo),
                                            static_cast<unsigned long>(hi));
-        if (n <= 0 || static_cast<size_t>(n) >= sizeof(req) ||
-            ::write(slot.fd, req, static_cast<size_t>(n)) != n)
-            return {false, 0};
+        if (n <= 0 || static_cast<size_t>(n) >= sizeof(req)) return {false, 0};
+        const uint64_t w0 = monoNs();
+        const ssize_t wrote = ::write(slot.fd, req, static_cast<size_t>(n));
+        const uint64_t w_us = (monoNs() - w0) / 1000;
+        if (w_us > pc_.yt_req_max_us.load(std::memory_order_relaxed))
+            pc_.yt_req_max_us.store(w_us, std::memory_order_relaxed);
+        if (wrote != n) return {false, 0};
         yt::StreamParser ps;
         if (yt_mmap_ && ytMap(slot)) {
             // The write was the scan: the mapping holds its result, ended by
             // a zero word (or by the cap): what follows that word may be an
             // earlier scan's, and is never read.
             ps.feed(slot.map, yt_cap_, on_young);
-            return {ps.complete() && !ps.truncated(), ps.reached()};
+            return {ps.complete() && !ps.truncated(), ps.reached(), ps.complete() && ps.truncated(),
+                    ps.resumePoint()};
         }
         size_t have = 0;
         off_t off = 0;
@@ -5550,7 +5571,8 @@ private:
             std::memmove(slot.buf, slot.buf + used, have - used);
             have -= used;
         }
-        return {have == 0 && ps.complete() && !ps.truncated(), ps.reached()};
+        const bool whole = have == 0 && ps.complete();
+        return {whole && !ps.truncated(), ps.reached(), whole && ps.truncated(), ps.resumePoint()};
     }
 
     YtSlot* ytAcquire() {
@@ -5626,6 +5648,7 @@ private:
                 close(cf);
             }
             if (const char* m = std::getenv("SMASH_YT_MMAP"); m && m[0] == '1') yt_mmap_ = true;
+            if (const char* w = std::getenv("SMASH_YT_WHOLE"); w && w[0] == '1') yt_whole_ = true;
             if (const char* h = std::getenv("SMASH_YT_NODE_HINTS"); h && h[0] == '1') {
                 char meta[8] = {};
                 if (int mf = open("/sys/module/youngtrace/parameters/page_meta", O_RDONLY | O_CLOEXEC); mf >= 0) {
@@ -5703,19 +5726,12 @@ private:
     // and stops before what it cannot report, so there this is only
     // conservative, and the sizing keeps requests from being cut at all.
     void ytScan(size_t start, size_t end) {
+        if (yt_whole_) return;   // ytScanWhole did the whole arena before Phase 1
         if (end > vm_->contigPages()) end = vm_->contigPages();
         if (start >= end) return;
         const uint64_t t0 = monoNs();
         uint64_t calls = 0, pages = 0, cut = 0, hinted = 0;
         const uintptr_t base = reinterpret_cast<uintptr_t>(vm_->pageAddress(0));
-        const uintptr_t arena_hi = base + vm_->contigPages() * kPageSize;
-        const bool hints = yt_node_hints_ && page_node_ && numa_node_limit_ > 0;
-        auto mark = [&](size_t i) {
-            const PageState st = states_->get(i);
-            if (st != PageState::ACTIVE && st != PageState::ACTIVE_MONITORING) return false;
-            accessed_[i].store(true, std::memory_order_relaxed);
-            return true;
-        };
         YtSlot* slot = ytAcquire();
         size_t i = start;
         while (i < end) {
@@ -5731,47 +5747,13 @@ private:
                 YtResult r{false, 0};
                 if (slot) {
                     r = ytRequest(*slot, lo, hi, [&](uint64_t addr, uint64_t n, uint64_t w) {
-                        // Every arena page the item covers, inside this
-                        // request or not: a huge page straddling a request,
-                        // slice or worker-range edge has one accessed bit,
-                        // which this request has just cleared, so the
-                        // request that covers its other part would read it
-                        // idle. A mark outside the range persists in
-                        // accessed_ until that range's Phase 1 reads it.
-                        if (addr >= arena_hi || n > (arena_hi - base) / kPageSize) return;
-                        const uint64_t s = addr < base ? base : addr;
-                        const uint64_t e = addr + n * kPageSize < arena_hi ? addr + n * kPageSize : arena_hi;
-                        const uint64_t node = (w >> yt::kItemNodeShift) & yt::kItemNodeMask;
-                        if (!hints || node >= numa_node_limit_) {
-                            for (uint64_t x = s; x < e; x += kPageSize) mark((x - base) / kPageSize);
-                            return;
-                        }
-                        // The node is exact for a single item and for a
-                        // run's first member; past that only a guess.
-                        const uint64_t exact_end = (w & yt::kItemRun)
-                            ? addr + (uint64_t{1} << ((w & yt::kItemSizeMask) >> yt::kItemSizeShift)) * kPageSize
-                            : e;
-                        const uint8_t h = static_cast<uint8_t>(node + 1);
-                        for (uint64_t x = s; x < e; x += kPageSize) {
-                            const size_t i = (x - base) / kPageSize;
-                            if (!mark(i) || page_node_[i] == h) continue;
-                            if (x >= exact_end && page_node_[i] != 0) continue;
-                            page_node_[i] = h;
-                            ++hinted;
-                        }
+                        hinted += ytMarkItem(addr, n, w);
                     });
                 }
                 if (!r.ok) {
                     ++cut;
-                    const size_t from = r.reached > lo
-                        ? a + std::min<size_t>((r.reached - lo) / kPageSize, b - a) : a;
-                    for (size_t x = from; x < b; ++x) mark(x);
-                    if (!yt_warned_.exchange(true, std::memory_order_relaxed)) {
-                        static const char kWarn[] =
-                            "[smash WARN] SMASH_WRITE_TRACK=yt: a youngtrace scan failed or was cut; "
-                            "the pages it did not report on count as accessed (yt_scan cut= counts them)\n";
-                        (void)!::write(2, kWarn, sizeof(kWarn) - 1);
-                    }
+                    ytMarkUnreported(r.reached > lo
+                        ? a + std::min<size_t>((r.reached - lo) / kPageSize, b - a) : a, b);
                 }
                 a = b;
             }
@@ -5783,6 +5765,103 @@ private:
         pcAdd(pc_.yt_pages, pages);
         pcAdd(pc_.yt_cut, cut);
         pcAdd(pc_.yt_node_hints, hinted);
+    }
+
+    // SMASH_YT_WHOLE=1: the whole committed arena in one request, resumed
+    // where the module's cap cut it, the way youngtrace's own scan_range()
+    // resumes (yt::StreamParser::resumePoint()), until a request comes back
+    // whole. Runs on the coordinator before Phase 1, on the ticks the arena is
+    // due (idleSliceDue), so every Phase 1 range and node group finds its
+    // marks in accessed_. A request that fails, or a cut that does not
+    // advance, counts what it did not report on as accessed, as ytScan does.
+    void ytScanWhole(size_t committed) {
+        const size_t end = std::min(committed, vm_->contigPages());
+        if (end == 0) return;
+        const uint64_t t0 = monoNs();
+        uint64_t calls = 0, cut = 0, resumed = 0, hinted = 0;
+        const uintptr_t base = reinterpret_cast<uintptr_t>(vm_->pageAddress(0));
+        const uintptr_t hi = base + end * kPageSize;
+        YtSlot* slot = ytAcquire();
+        for (uintptr_t lo = base; lo < hi;) {
+            ++calls;
+            YtResult r{false, 0};
+            if (slot) {
+                r = ytRequest(*slot, lo, hi, [&](uint64_t addr, uint64_t n, uint64_t w) {
+                    hinted += ytMarkItem(addr, n, w);
+                });
+            }
+            if (r.ok) break;
+            if (r.cut && r.resume > lo) {
+                ++resumed;
+                lo = r.resume;
+                continue;
+            }
+            ++cut;
+            const uintptr_t from = r.reached > lo ? std::min<uintptr_t>(r.reached, hi) : lo;
+            ytMarkUnreported((from - base) / kPageSize, end);
+            break;
+        }
+        if (slot) ytRelease(slot);
+        pcAdd(pc_.sc_yt_us, (monoNs() - t0) / 1000);
+        pcAdd(pc_.sc_yt_n, calls);
+        pcAdd(pc_.yt_pages, end);
+        pcAdd(pc_.yt_cut, cut);
+        pcAdd(pc_.yt_resumed, resumed);
+        pcAdd(pc_.yt_node_hints, hinted);
+    }
+
+    bool ytMarkPage(size_t i) {
+        const PageState st = states_->get(i);
+        if (st != PageState::ACTIVE && st != PageState::ACTIVE_MONITORING) return false;
+        accessed_[i].store(true, std::memory_order_relaxed);
+        return true;
+    }
+
+    // One young item a request reported: marks every arena page it covers,
+    // inside the request or not: a huge page straddling a request, slice or
+    // worker-range edge has one accessed bit, which this request has just
+    // cleared, so the request that covers its other part would read it idle.
+    // A mark outside the range persists in accessed_ until that range's
+    // Phase 1 reads it. With node hints, also sets page_node_; returns the
+    // hints it set.
+    uint64_t ytMarkItem(uint64_t addr, uint64_t n, uint64_t w) {
+        const uintptr_t base = reinterpret_cast<uintptr_t>(vm_->pageAddress(0));
+        const uintptr_t arena_hi = base + vm_->contigPages() * kPageSize;
+        if (addr >= arena_hi || n > (arena_hi - base) / kPageSize) return 0;
+        const uint64_t s = addr < base ? base : addr;
+        const uint64_t e = addr + n * kPageSize < arena_hi ? addr + n * kPageSize : arena_hi;
+        const uint64_t node = (w >> yt::kItemNodeShift) & yt::kItemNodeMask;
+        if (!yt_node_hints_ || !page_node_ || numa_node_limit_ == 0 || node >= numa_node_limit_) {
+            for (uint64_t x = s; x < e; x += kPageSize) ytMarkPage((x - base) / kPageSize);
+            return 0;
+        }
+        // The node is exact for a single item and for a run's first member;
+        // past that only a guess.
+        const uint64_t exact_end = (w & yt::kItemRun)
+            ? addr + (uint64_t{1} << ((w & yt::kItemSizeMask) >> yt::kItemSizeShift)) * kPageSize
+            : e;
+        const uint8_t h = static_cast<uint8_t>(node + 1);
+        uint64_t hinted = 0;
+        for (uint64_t x = s; x < e; x += kPageSize) {
+            const size_t i = (x - base) / kPageSize;
+            if (!ytMarkPage(i) || page_node_[i] == h) continue;
+            if (x >= exact_end && page_node_[i] != 0) continue;
+            page_node_[i] = h;
+            ++hinted;
+        }
+        return hinted;
+    }
+
+    // Pages [from, to) a request did not report on: accessed, since their
+    // bits may already be cleared (see ytScan).
+    void ytMarkUnreported(size_t from, size_t to) {
+        for (size_t x = from; x < to; ++x) ytMarkPage(x);
+        if (!yt_warned_.exchange(true, std::memory_order_relaxed)) {
+            static const char kWarn[] =
+                "[smash WARN] SMASH_WRITE_TRACK=yt: a youngtrace scan failed or was cut; "
+                "the pages it did not report on count as accessed (yt_scan cut= counts them)\n";
+            (void)!::write(2, kWarn, sizeof(kWarn) - 1);
+        }
     }
 #endif
 
@@ -6764,6 +6843,11 @@ private:
         // the blobs it finds in them (moveBlobOutOfDraining).
         draining_regions_ = markDrainingRegions();
 
+#ifdef __linux__
+        // SMASH_YT_WHOLE: the whole arena in one resumed request, before any
+        // Phase 1 range reads accessed_.
+        if (write_tracker_ == WriteTracker::kYt && yt_whole_ && idleSliceDue(0)) ytScanWhole(committed);
+#endif
         dispatch(1);  // Phase 1: access tracking
 
         if (!defer_phases && isDeferredReclaimMode())
@@ -7965,7 +8049,8 @@ public:
                         " bitmap=%llu node_chunks=%llu adapt=%llu dict=%llu sweep=%llu"
                         " | syscall ms memread=%llu (%llu calls) p2_mprotect=%llu p3_mprotect=%llu"
                         " p4_release=%llu idle_scan=%llu (%llu calls, %llu pages, %llu words, %llu other idle)"
-                        " yt_scan=%llu (%llu calls, %llu pages, cut=%llu, node_hints=%llu)"
+                        " yt_scan=%llu (%llu calls, %llu pages, cut=%llu, resumed=%llu, max_req_us=%llu,"
+                        " node_hints=%llu)"
                         " node_query=%llu (%llu calls, %llu pages)\n",
                         v(pc.tick_ms_total), v(pc.phases_ms_total), v(pc.step_ms[kStepEfficiency]),
                         v(pc.step_ms[kStepVmaSync]), v(pc.step_ms[kStepBitmap]),
@@ -7975,7 +8060,8 @@ public:
                         v(pc.sc_p2_mprotect_us) / 1000, v(pc.sc_p3_mprotect_us) / 1000,
                         v(pc.sc_p4_us) / 1000, v(pc.sc_idle_us) / 1000, v(pc.sc_idle_n),
                         v(pc.idle_pages), v(pc.idle_words), v(pc.idle_other), v(pc.sc_yt_us) / 1000, v(pc.sc_yt_n), v(pc.yt_pages),
-                        v(pc.yt_cut), v(pc.yt_node_hints), v(pc.sc_nodeq_us) / 1000, v(pc.sc_nodeq_n),
+                        v(pc.yt_cut), v(pc.yt_resumed), v(pc.yt_req_max_us), v(pc.yt_node_hints),
+                        v(pc.sc_nodeq_us) / 1000, v(pc.sc_nodeq_n),
                         v(pc.nodeq_pages));
                 if (n >= static_cast<int>(sizeof(buf))) n = static_cast<int>(sizeof(buf)) - 1;
             }
