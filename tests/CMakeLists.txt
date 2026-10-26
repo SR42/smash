@@ -1019,7 +1019,7 @@ if(NOT APPLE)
   foreach(track idle yt)
     set(cases tracker k1 fallback)
     if(track STREQUAL "yt")
-      list(APPEND cases thp slices)
+      list(APPEND cases thp slices mmap)
     else()
       list(APPEND cases workers)
     endif()
@@ -1040,6 +1040,10 @@ if(NOT APPLE)
       elseif(case STREQUAL "slices")
         # An arena of several slices, one worker: a request covers a slice.
         set(extra "IDLE_SPAN_MIB=512" "SMASH_TEST_WORKERS=1")
+        set(part tracker)
+      elseif(case STREQUAL "mmap")
+        # Scans read from the module's mapped buffer instead of pread.
+        set(extra "SMASH_YT_MMAP=1")
         set(part tracker)
       elseif(case STREQUAL "fallback" AND track STREQUAL "idle")
         set(extra "SMASH_THP=1")
@@ -1272,6 +1276,11 @@ add_smash_mode_test(test_numa_compressor_full       numa_compressor_test 0 120
                     "SMASH_COLD_TIMEOUT_SEC=1")
 add_smash_mode_test(test_numa_compressor_large_only numa_compressor_test 1 120
                     "SMASH_COLD_TIMEOUT_SEC=1")
+# SMASH_YT_NODE_HINTS: the ordinary blocks' nodes come from the yt scan, not
+# move_pages (root and the youngtrace module; skips otherwise).
+add_smash_mode_test(test_numa_compressor_yt_hints numa_compressor_test 1 120
+                    "SMASH_COLD_TIMEOUT_SEC=1" "SMASH_WRITE_TRACK=yt" "SMASH_YT_NODE_HINTS=1"
+                    "SMASH_STATS_SIGNAL=1" "NUMA_YT_HINTS=1")
 
 # Thread-cache reclaim: a ~92 KiB ThreadCache is created lazily on a thread's
 # first allocation and must be returned when the thread exits. Registered three

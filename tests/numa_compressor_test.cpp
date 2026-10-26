@@ -26,6 +26,14 @@
 // smash_compressed_blob_for. The ctest sets SMASH_COLD_TIMEOUT_SEC=1. Skips on
 // single-node hosts, when mbind is refused, and with SMASH_NUMA_COMPRESSOR=0.
 //
+// NUMA_YT_HINTS=1 (test_numa_compressor_yt_hints: SMASH_WRITE_TRACK=yt,
+// SMASH_YT_NODE_HINTS=1, root and the youngtrace module, skips without them):
+// the ordinary blocks' nodes must come from the yt scan's node bits, not from
+// move_pages. Over the ordinary blocks' phase the stats line's node_query
+// must have asked about fewer pages than a quarter of the blocks' compressed
+// pages (each needs one query without the hints), and node_hints must have
+// set some; their blobs must still be on their node, as checked above.
+//
 // Nothing after the cold wait writes to malloc'd memory. CPU lists and pin
 // sets are read before the wait, and later scratch arrays are mmap'd. This was
 // originally required because a write into a cold full-mode heap page could be
@@ -43,6 +51,7 @@
 #include <dlfcn.h>
 
 #if defined(__linux__)
+#include <csignal>
 #include <sys/mman.h>
 #include "numa_test_util.h"
 #endif
@@ -78,6 +87,39 @@ static void fail(const char* fmt, ...) {
 #if defined(__linux__)
 
 static constexpr size_t kBlock = 16 * kMiB;
+
+// NUMA_YT_HINTS=1: the stats line, dumped into a file of its own (fd 2 is
+// pointed at it only for the dump; fail() prints to stderr) and read into a
+// static buffer (nothing after the cold wait allocates).
+static int g_stats_fd = -1;
+static char g_stats[1 << 16];
+
+static void dumpStats() {
+    g_stats[0] = 0;
+    // Truncating keeps the offset: rewind too, or the dump lands past a hole.
+    if (g_stats_fd < 0 || ftruncate(g_stats_fd, 0) != 0 || lseek(g_stats_fd, 0, SEEK_SET) != 0) return;
+    const int saved = dup(2);
+    dup2(g_stats_fd, 2);
+    raise(SIGUSR2);
+    dup2(saved, 2);
+    close(saved);
+    const ssize_t n = pread(g_stats_fd, g_stats, sizeof(g_stats) - 1, 0);
+    g_stats[n > 0 ? n : 0] = 0;
+}
+
+// The number after `key` in the last dump; with `after_calls`, the one after
+// the " calls, " that follows it ("key=ms (C calls, P pages)").
+static unsigned long long statNum(const char* key, bool after_calls = false) {
+    const char* at = strstr(g_stats, key);
+    if (!at) return ~0ull;
+    at += strlen(key);
+    if (after_calls) {
+        at = strstr(at, " calls, ");
+        if (!at) return ~0ull;
+        at += 8;
+    }
+    return strtoull(at, nullptr, 10);
+}
 
 static unsigned char pattern(int node, size_t i) {
     return static_cast<unsigned char>(i * 131 + static_cast<size_t>(node) * 7 + 1);
@@ -191,6 +233,35 @@ static bool runLinux(numa_fn numa, info_fn info, blob_fn blob) {
     }
     free(probe);
 
+    const bool yt_hints = getenv("NUMA_YT_HINTS") && getenv("NUMA_YT_HINTS")[0] == '1';
+    if (yt_hints) {
+        char path[] = "/tmp/smash_numa_yt_XXXXXX";
+        g_stats_fd = mkstemp(path);
+        if (g_stats_fd >= 0) unlink(path);
+        // The tracker is chosen when the compressor starts (track=unprobed
+        // until then).
+        for (int i = 0; i < 100; ++i) {
+            dumpStats();
+            if (g_stats[0] && !strstr(g_stats, "track=unprobed")) break;
+            usleep(100 * 1000);
+        }
+        if (!strstr(g_stats, " track=yt ")) {
+            const char* t = strstr(g_stats, "track=");
+            printf("SKIP: NUMA_YT_HINTS needs track=yt (root and the youngtrace module); %.*s\n",
+                   t ? 20 : 40, t ? t : (g_stats[0] ? g_stats : "no stats line"));
+            return true;
+        }
+        char meta[4] = {};
+        if (FILE* f = fopen("/sys/module/youngtrace/parameters/page_meta", "r")) {
+            if (!fgets(meta, sizeof(meta), f)) meta[0] = 0;
+            fclose(f);
+        }
+        if (meta[0] != 'Y') {
+            printf("SKIP: the youngtrace module reports no page nodes (page_meta is not Y)\n");
+            return true;
+        }
+    }
+
     const size_t ps = static_cast<size_t>(sysconf(_SC_PAGESIZE));
     const size_t pages = kBlock / ps;
     const size_t count = nodes.size();
@@ -242,6 +313,8 @@ static bool runLinux(numa_fn numa, info_fn info, blob_fn blob) {
 
     // Ordinary malloc: unbound, so first touch decides the node and the
     // compressor has to discover it.
+    dumpStats();
+    const unsigned long long hints0 = statNum(" node_hints="), query0 = statNum("node_query=", true);
     for (size_t k = 0; k < count; ++k) {
         const int node = nodes[k];
         auto* p = static_cast<unsigned char*>(malloc(kBlock));
@@ -361,6 +434,21 @@ static bool runLinux(numa_fn numa, info_fn info, blob_fn blob) {
         printf("malloc block on node %d: %zu/%zu pages compressed, %zu/%zu blobs on "
                "the node\n", node, plain_evicted[k], pages, blobs - off, blobs);
         free(p);
+    }
+
+    if (yt_hints) {
+        dumpStats();
+        const unsigned long long hints = statNum(" node_hints=") - hints0,
+                                 queried = statNum("node_query=", true) - query0;
+        size_t compressed = 0;
+        for (size_t k = 0; k < count; ++k) compressed += plain_evicted[k];
+        printf("yt node hints: %llu pages hinted, %llu move_pages queries, for %zu compressed pages "
+               "of the ordinary blocks\n", hints, queried, compressed);
+        if (hints == 0 || hints > (1ull << 40))
+            fail("yt node hints: the scan set no page's node (node_hints +%llu)", hints);
+        if (queried > (1ull << 40) || queried * 4 >= compressed)
+            fail("yt node hints: %llu move_pages queries for %zu compressed pages - the nodes "
+                 "did not come from the scan", queried, compressed);
     }
 
     // Second round for the bound blocks. The off-node read-back above faulted

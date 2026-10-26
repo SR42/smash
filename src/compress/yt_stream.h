@@ -6,7 +6,10 @@
 // device is one scan request ("pid=N mode=1 lo=0x.. hi=0x.."): the module walks
 // that process's page tables under mmap_read_lock, reports the present pages
 // whose ACCESSED bit was set, and (mode=1) clears the bit, without a TLB flush.
-// A read then returns the scan as a little-endian stream:
+// A read then returns the scan as a little-endian stream (or the descriptor's
+// buffer, mmap'd, holds it, followed by a zero word unless it fills the
+// buffer; since yt 992e189 only that one word is zeroed, and the bytes after it
+// may still hold an earlier, longer scan's output):
 //
 //   u64 status            bit 0: the output was cut at the module's buffer cap
 //   per VMA intersecting [lo, hi):
@@ -17,7 +20,9 @@
 //                           w2  w0's low 12 bits again       (runs only)
 //
 // Item metadata: [2:0] class (1 = present), [3] old (ACCESSED was clear),
-// [10:6] log2(page bytes) - 12 (a THP item is one entry of 512 pages).
+// [10:6] log2(page bytes) - 12 (a THP item is one entry of 512 pages),
+// [59:56] NUMA node (valid when the module's page_meta parameter is Y; a
+// run's is its first page's: node is not part of the run key).
 //
 // The constants below are the wire values of the module's include/format.h
 // (its v5 block); they are restated rather than included, so smash builds
@@ -44,6 +49,8 @@ inline constexpr uint64_t kItemOld = 0x8;
 inline constexpr unsigned kItemSizeShift = 6;
 inline constexpr uint64_t kItemSizeMask = 0x07c0;
 inline constexpr uint64_t kItemAddrMask = ~(0x0fffull | (0xffull << 56));
+inline constexpr unsigned kItemNodeShift = 56;
+inline constexpr uint64_t kItemNodeMask = 0xf;
 // Upper bound on the output per 4 KiB page of a request: a record of its own
 // (every page a separate VMA) plus a single-word item. Runs are 3 words for at
 // least 4 pages. A request of at most (cap - 8) / 128 pages therefore always
@@ -51,8 +58,12 @@ inline constexpr uint64_t kItemAddrMask = ~(0x0fffull | (0xffull << 56));
 inline constexpr size_t kMaxBytesPerPage = kRecordBytes + 8;
 
 // Incremental parser: feed() whatever a read returned, keep the bytes it did
-// not consume (an incomplete record or item) in front of the next read.
-// For every young present item it calls on_young(addr, pages_4k).
+// not consume (an incomplete record or item) in front of the next read; or
+// feed the whole mapped buffer once. For every young present item it calls
+// on_young(addr, pages_4k, word), word being the item's first u64 (address
+// and metadata). A zero word where a record would start is the mapped
+// buffer's terminator: the stream ends there (ended()), and nothing after it
+// is read.
 class StreamParser {
 public:
     template <class F>
@@ -66,6 +77,8 @@ public:
                 have_status_ = true;
                 off += kStatusBytes;
             } else if (items_left_ == 0) {
+                if (ended_) break;
+                if (left >= 8 && word(p + off) == 0) { ended_ = true; break; }
                 if (left < kRecordBytes) break;
                 uint32_t magic;
                 std::memcpy(&magic, p + off, sizeof(magic));
@@ -76,6 +89,9 @@ public:
             } else {
                 if (left < 8) break;
                 const uint64_t w = word(p + off);
+                // Address 0 is never mapped, so no item is all zeros: this
+                // is padding where an item is due.
+                if (w == 0) { malformed_ = true; break; }
                 uint64_t pages;
                 size_t len = 8;
                 if (w & kItemRun) {
@@ -92,7 +108,7 @@ public:
                 if (pages == 0 || end < addr) { malformed_ = true; break; }
                 if (end > reached_) reached_ = end;
                 if ((w & kItemClassMask) == kClassPresent && !(w & kItemOld))
-                    on_young(addr, pages);
+                    on_young(addr, pages, w);
                 --items_left_;
                 off += len;
             }
@@ -102,6 +118,8 @@ public:
 
     bool truncated() const { return truncated_; }
     bool malformed() const { return malformed_; }
+    // The zero word after the last record was reached (mapped buffer).
+    bool ended() const { return ended_; }
     // A complete stream ends on a record boundary with every item read.
     bool complete() const { return have_status_ && items_left_ == 0 && !malformed_; }
     // End of the furthest item seen (0 if none): where a cut scan stopped
@@ -119,6 +137,7 @@ private:
     bool have_status_ = false;
     bool truncated_ = false;
     bool malformed_ = false;
+    bool ended_ = false;
     uint64_t items_left_ = 0;
     uint64_t reached_ = 0;
     uint64_t records_ = 0;

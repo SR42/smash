@@ -707,6 +707,11 @@ class CompressorThread {
         // SMASH_WRITE_TRACK=yt: phase 1's youngtrace requests, cumulative us,
         // requests, pages they covered, and requests that failed or were cut.
         std::atomic<uint64_t> sc_yt_us{0}, sc_yt_n{0}, yt_pages{0}, yt_cut{0};
+        // SMASH_YT_NODE_HINTS=1: pages whose node hint a yt report set.
+        std::atomic<uint64_t> yt_node_hints{0};
+        // Phase 2's move_pages node queries (flushNodeQueries): us, calls,
+        // pages asked about.
+        std::atomic<uint64_t> sc_nodeq_us{0}, sc_nodeq_n{0}, nodeq_pages{0};
         // Blob store compaction: blobs moved out of draining regions, and
         // their bytes.
         std::atomic<uint64_t> blob_moved{0}, blob_moved_bytes{0};
@@ -2443,8 +2448,12 @@ private:
             addrs[k] = vm_->pageAddress(worker.pending_node_pages[k]);
             status[k] = -1;
         }
+        const uint64_t q0 = monoNs();
         const bool queried =
             syscall(SYS_move_pages, 0, n, addrs, nullptr, status, 0) == 0;
+        pcAdd(pc_.sc_nodeq_us, (monoNs() - q0) / 1000);
+        pcAdd(pc_.sc_nodeq_n, 1);
+        pcAdd(pc_.nodeq_pages, n);
         size_t local[CompressWorker::kPendingNodeCap];
         size_t n_local = 0;
         for (size_t k = 0; k < n; ++k) {
@@ -5283,8 +5292,9 @@ private:
         return write_tracker_ == WriteTracker::kIdle || write_tracker_ == WriteTracker::kYt;
     }
     // yt's slices are as large as one request (yt_slice_shift_): every
-    // request costs the module a zeroing of its whole output buffer (~110 us
-    // at the default 8 MiB), and at K > 1 the slices due in one tick are
+    // request has a fixed cost in the module (~110 us at the default 8 MiB
+    // before yt 992e189, most of it zeroing its whole output buffer; it
+    // zeroes one word now), and at K > 1 the slices due in one tick are
     // never adjacent, so a slice is all one request covers. 64 MiB slices
     // made every request 64 MiB, a quarter of what the buffer holds: 16384
     // pages per request on the x86 VM, 26 ns per page at K=4 against 11 at
@@ -5443,8 +5453,9 @@ private:
     // no PFNs and no rmap walk: measured as root on an x86 VM, 8-28 ns per
     // 4 KiB page against the bitmap's 380-440, plus ~110 us per request, most
     // of it the module zeroing its whole output buffer (scan_buf_cap, 8 MiB
-    // by default) after each scan. Hence requests as large as the buffer can
-    // always hold (yt::kMaxBytesPerPage), and slices of one request each.
+    // by default) after each scan (yt before 992e189). Hence requests as large
+    // as the buffer can always hold (yt::kMaxBytesPerPage), and slices of one
+    // request each.
     //
     // Needs the module loaded and the device openable: CAP_SYS_ADMIN (the
     // module checks it at open) and access to the root-only node.
@@ -5469,6 +5480,10 @@ private:
         std::atomic<uint8_t> busy{0};
         int fd = -1;
         unsigned char* buf = nullptr;
+        // SMASH_YT_MMAP=1: the descriptor's output buffer, mapped at its
+        // first request (the module allocates it then, if no scan has).
+        const unsigned char* map = nullptr;
+        bool map_failed = false;
     };
     YtSlot yt_slots_[kYtSlots];
     size_t yt_req_pages_ = 0;        // pages per request: never cut by the module
@@ -5477,6 +5492,22 @@ private:
     // requests miss 256 MiB by one page (8 bytes of output at worst).
     size_t yt_slice_shift_ = 14;
     std::atomic<bool> yt_warned_{false};
+    // scan_buf_cap as read from the module (0 when it could not be read:
+    // then nothing is mapped, since a mapping must be exactly the cap).
+    size_t yt_cap_ = 0;
+    // SMASH_YT_MMAP=1: read each scan from the mapped buffer instead of
+    // pread()ing it through kYtBufBytes in pieces: no copy, no read calls.
+    // Costs the process's RSS the mapped buffers (scan_buf_cap per slot in
+    // use, 8 MiB by default): the module maps every page of one at mmap().
+    bool yt_mmap_ = false;
+    // SMASH_YT_NODE_HINTS=1 (needs the module's page_meta=Y): every young
+    // item's node bits set page_node_, the hint Phase 2 routes a heap page to
+    // its node's group by, so a page the scan has seen needs no move_pages
+    // query. A run's node is its first page's (the module leaves node out of
+    // the run key): exact for that page and for single items (a huge page is
+    // one folio), and for the rest of a run only a guess, so it fills hints
+    // that are still unknown and never overwrites one.
+    bool yt_node_hints_ = false;
 
     static const char* ytDevice() {
         const char* d = std::getenv("SMASH_YT_DEVICE");
@@ -5498,6 +5529,13 @@ private:
             ::write(slot.fd, req, static_cast<size_t>(n)) != n)
             return {false, 0};
         yt::StreamParser ps;
+        if (yt_mmap_ && ytMap(slot)) {
+            // The write was the scan: the mapping holds its result, ended by
+            // a zero word (or by the cap): what follows that word may be an
+            // earlier scan's, and is never read.
+            ps.feed(slot.map, yt_cap_, on_young);
+            return {ps.complete() && !ps.truncated(), ps.reached()};
+        }
         size_t have = 0;
         off_t off = 0;
         for (;;) {
@@ -5532,8 +5570,31 @@ private:
     }
     void ytRelease(YtSlot* s) { s->busy.store(0, std::memory_order_release); }
 
+    // Map `slot`'s output buffer once; false (and pread from then on) when
+    // the module refuses, which it does for any length but scan_buf_cap.
+    bool ytMap(YtSlot& slot) {
+        if (slot.map) return true;
+        if (slot.map_failed || yt_cap_ == 0) return false;
+        void* m = ::mmap(nullptr, yt_cap_, PROT_READ, MAP_SHARED, slot.fd, 0);
+        if (m == MAP_FAILED) {
+            slot.map_failed = true;
+            static std::atomic<bool> warned{false};
+            if (!warned.exchange(true, std::memory_order_relaxed)) {
+                static const char kWarn[] =
+                    "[smash WARN] SMASH_YT_MMAP=1: mmap of the youngtrace buffer failed; reading "
+                    "scans with pread instead\n";
+                (void)!::write(2, kWarn, sizeof(kWarn) - 1);
+            }
+            return false;
+        }
+        slot.map = static_cast<const unsigned char*>(m);
+        return true;
+    }
+
     void ytCloseAll() {
         for (YtSlot& s : yt_slots_) {
+            if (s.map) ::munmap(const_cast<unsigned char*>(s.map), yt_cap_);
+            s.map = nullptr;
             if (s.fd >= 0) close(s.fd);
             s.fd = -1;
             s.busy.store(0, std::memory_order_relaxed);
@@ -5560,9 +5621,24 @@ private:
                 char num[32] = {};
                 if (read(cf, num, sizeof(num) - 1) > 0) {
                     const unsigned long long v = std::strtoull(num, nullptr, 10);
-                    if (v >= 64 * 1024) cap = static_cast<size_t>(v);
+                    if (v >= 64 * 1024) cap = yt_cap_ = static_cast<size_t>(v);
                 }
                 close(cf);
+            }
+            if (const char* m = std::getenv("SMASH_YT_MMAP"); m && m[0] == '1') yt_mmap_ = true;
+            if (const char* h = std::getenv("SMASH_YT_NODE_HINTS"); h && h[0] == '1') {
+                char meta[8] = {};
+                if (int mf = open("/sys/module/youngtrace/parameters/page_meta", O_RDONLY | O_CLOEXEC); mf >= 0) {
+                    if (read(mf, meta, sizeof(meta) - 1) <= 0) meta[0] = 0;
+                    close(mf);
+                }
+                yt_node_hints_ = meta[0] == 'Y';
+                if (!yt_node_hints_) {
+                    static const char kWarn[] =
+                        "[smash WARN] SMASH_YT_NODE_HINTS=1 ignored: the youngtrace module reports no "
+                        "page nodes (/sys/module/youngtrace/parameters/page_meta is not Y)\n";
+                    (void)!::write(2, kWarn, sizeof(kWarn) - 1);
+                }
             }
             yt_req_pages_ = std::min<size_t>((cap - yt::kStatusBytes) / yt::kMaxBytesPerPage,
                                              size_t{1} << 16);
@@ -5592,8 +5668,10 @@ private:
                 static_cast<volatile char*>(scratch)[kPageSize] = 1;
                 const auto lo = reinterpret_cast<uintptr_t>(scratch), hi = lo + 2 * kPageSize;
                 uint64_t seen1 = 0, seen2 = 0;
-                const YtResult r1 = ytRequest(yt_slots_[0], lo, hi, [&](uint64_t, uint64_t p) { seen1 += p; });
-                const YtResult r2 = ytRequest(yt_slots_[0], lo, hi, [&](uint64_t, uint64_t p) { seen2 += p; });
+                const YtResult r1 = ytRequest(yt_slots_[0], lo, hi,
+                                              [&](uint64_t, uint64_t p, uint64_t) { seen1 += p; });
+                const YtResult r2 = ytRequest(yt_slots_[0], lo, hi,
+                                              [&](uint64_t, uint64_t p, uint64_t) { seen2 += p; });
                 ::munmap(scratch, 2 * kPageSize);
                 if (!r1.ok || !r2.ok)
                     smash::safe_snprintf(why, sizeof(why), "a scan request failed or returned output "
@@ -5619,19 +5697,24 @@ private:
     // Phase 1's scan of [start, end): sets accessed_ for every due ACTIVE
     // page the module reports accessed, one request per run of due slices
     // (split at yt_req_pages_). A failed or cut request counts every page it
-    // did not report on as accessed: in mode=1 their bits may already be
-    // cleared, so the next scan could not tell either.
+    // did not report on as accessed: with youngtrace before c56f1b6 (#86) a
+    // cut mode=1 request had cleared bits it could not report, so the next
+    // scan could not tell either. A fixed module reports every bit it clears
+    // and stops before what it cannot report, so there this is only
+    // conservative, and the sizing keeps requests from being cut at all.
     void ytScan(size_t start, size_t end) {
         if (end > vm_->contigPages()) end = vm_->contigPages();
         if (start >= end) return;
         const uint64_t t0 = monoNs();
-        uint64_t calls = 0, pages = 0, cut = 0;
+        uint64_t calls = 0, pages = 0, cut = 0, hinted = 0;
         const uintptr_t base = reinterpret_cast<uintptr_t>(vm_->pageAddress(0));
         const uintptr_t arena_hi = base + vm_->contigPages() * kPageSize;
+        const bool hints = yt_node_hints_ && page_node_ && numa_node_limit_ > 0;
         auto mark = [&](size_t i) {
             const PageState st = states_->get(i);
-            if (st == PageState::ACTIVE || st == PageState::ACTIVE_MONITORING)
-                accessed_[i].store(true, std::memory_order_relaxed);
+            if (st != PageState::ACTIVE && st != PageState::ACTIVE_MONITORING) return false;
+            accessed_[i].store(true, std::memory_order_relaxed);
+            return true;
         };
         YtSlot* slot = ytAcquire();
         size_t i = start;
@@ -5647,7 +5730,7 @@ private:
                 pages += b - a;
                 YtResult r{false, 0};
                 if (slot) {
-                    r = ytRequest(*slot, lo, hi, [&](uint64_t addr, uint64_t n) {
+                    r = ytRequest(*slot, lo, hi, [&](uint64_t addr, uint64_t n, uint64_t w) {
                         // Every arena page the item covers, inside this
                         // request or not: a huge page straddling a request,
                         // slice or worker-range edge has one accessed bit,
@@ -5658,7 +5741,24 @@ private:
                         if (addr >= arena_hi || n > (arena_hi - base) / kPageSize) return;
                         const uint64_t s = addr < base ? base : addr;
                         const uint64_t e = addr + n * kPageSize < arena_hi ? addr + n * kPageSize : arena_hi;
-                        for (uint64_t x = s; x < e; x += kPageSize) mark((x - base) / kPageSize);
+                        const uint64_t node = (w >> yt::kItemNodeShift) & yt::kItemNodeMask;
+                        if (!hints || node >= numa_node_limit_) {
+                            for (uint64_t x = s; x < e; x += kPageSize) mark((x - base) / kPageSize);
+                            return;
+                        }
+                        // The node is exact for a single item and for a
+                        // run's first member; past that only a guess.
+                        const uint64_t exact_end = (w & yt::kItemRun)
+                            ? addr + (uint64_t{1} << ((w & yt::kItemSizeMask) >> yt::kItemSizeShift)) * kPageSize
+                            : e;
+                        const uint8_t h = static_cast<uint8_t>(node + 1);
+                        for (uint64_t x = s; x < e; x += kPageSize) {
+                            const size_t i = (x - base) / kPageSize;
+                            if (!mark(i) || page_node_[i] == h) continue;
+                            if (x >= exact_end && page_node_[i] != 0) continue;
+                            page_node_[i] = h;
+                            ++hinted;
+                        }
                     });
                 }
                 if (!r.ok) {
@@ -5682,6 +5782,7 @@ private:
         pcAdd(pc_.sc_yt_n, calls);
         pcAdd(pc_.yt_pages, pages);
         pcAdd(pc_.yt_cut, cut);
+        pcAdd(pc_.yt_node_hints, hinted);
     }
 #endif
 
@@ -7864,7 +7965,8 @@ public:
                         " bitmap=%llu node_chunks=%llu adapt=%llu dict=%llu sweep=%llu"
                         " | syscall ms memread=%llu (%llu calls) p2_mprotect=%llu p3_mprotect=%llu"
                         " p4_release=%llu idle_scan=%llu (%llu calls, %llu pages, %llu words, %llu other idle)"
-                        " yt_scan=%llu (%llu calls, %llu pages, cut=%llu)\n",
+                        " yt_scan=%llu (%llu calls, %llu pages, cut=%llu, node_hints=%llu)"
+                        " node_query=%llu (%llu calls, %llu pages)\n",
                         v(pc.tick_ms_total), v(pc.phases_ms_total), v(pc.step_ms[kStepEfficiency]),
                         v(pc.step_ms[kStepVmaSync]), v(pc.step_ms[kStepBitmap]),
                         v(pc.step_ms[kStepNodeChunks]), v(pc.step_ms[kStepAdapt]),
@@ -7873,7 +7975,8 @@ public:
                         v(pc.sc_p2_mprotect_us) / 1000, v(pc.sc_p3_mprotect_us) / 1000,
                         v(pc.sc_p4_us) / 1000, v(pc.sc_idle_us) / 1000, v(pc.sc_idle_n),
                         v(pc.idle_pages), v(pc.idle_words), v(pc.idle_other), v(pc.sc_yt_us) / 1000, v(pc.sc_yt_n), v(pc.yt_pages),
-                        v(pc.yt_cut));
+                        v(pc.yt_cut), v(pc.yt_node_hints), v(pc.sc_nodeq_us) / 1000, v(pc.sc_nodeq_n),
+                        v(pc.nodeq_pages));
                 if (n >= static_cast<int>(sizeof(buf))) n = static_cast<int>(sizeof(buf)) - 1;
             }
             // Fault handler time per kind: count, mean, percentiles as the

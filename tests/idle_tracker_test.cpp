@@ -32,7 +32,10 @@
 // slice, the largest power of two of pages the module's buffer can always
 // hold (scan_buf_cap). Every request pays the module a zeroing of that whole
 // buffer, and 64 MiB slices, never adjacent when due, made every request
-// 64 MiB - a quarter of what the default 8 MiB buffer holds.
+// 64 MiB - a quarter of what the default 8 MiB buffer holds. And once with
+// SMASH_YT_MMAP=1: the scans are read from the module's buffer mapped into
+// the process (/proc/self/maps must show it), and every check above must
+// still hold; without the variable nothing may be mapped.
 //
 // IDLE_PART=fallback (any user): the tracker must refuse - idle with
 // SMASH_THP=1, yt with SMASH_YT_DEVICE naming no device - say why on stderr,
@@ -160,6 +163,17 @@ unsigned long long scanPages(const std::string& log, const char* key) {
     return c == std::string::npos ? ~0ull : std::strtoull(log.c_str() + c + 8, nullptr, 10);
 }
 
+// Mappings of the youngtrace device in this process.
+int scannerMaps() {
+    int n = 0;
+    if (FILE* f = std::fopen("/proc/self/maps", "r")) {
+        char line[512];
+        while (std::fgets(line, sizeof(line), f)) n += std::strstr(line, "youngtrace/scanner") != nullptr;
+        std::fclose(f);
+    }
+    return n;
+}
+
 unsigned long long scanCalls(const std::string& log, const char* key) {
     const size_t at = log.rfind(key);
     if (at == std::string::npos) return ~0ull;
@@ -278,6 +292,14 @@ int main() {
     if (pages == 0 || pages == ~0ull) fail("the idle scan covered no pages");
     if (!yt() && flags.find(" nh") == std::string::npos) fail("the arena is not MADV_NOHUGEPAGE");
     if (cut != 0) fail("youngtrace requests failed or were cut: cut=" + std::to_string(cut));
+    if (yt()) {
+        const char* m = std::getenv("SMASH_YT_MMAP");
+        const bool want = m && m[0] == '1';
+        const int maps = scannerMaps();
+        std::printf("youngtrace buffer mapped %d times (SMASH_YT_MMAP=%s)\n", maps, m ? m : "unset");
+        if (want && maps == 0) fail("SMASH_YT_MMAP=1 but no youngtrace buffer is mapped");
+        if (!want && maps != 0) fail("a youngtrace buffer is mapped without SMASH_YT_MMAP=1");
+    }
     // SMASH_IDLE_SCAN_TICKS=K scans 1/K of the arena per tick: over the
     // window, at most ticks/K + 2 arenas' worth (the slices fall due in
     // whole slices, so a tick can take more than its share).
