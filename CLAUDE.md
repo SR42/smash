@@ -42,7 +42,7 @@ codegen bug: [agents/sanitizers.md](agents/sanitizers.md).
 cd build && ctest --output-on-failure
 ```
 
-All 160 tests must pass; none are registered `DISABLED`. Run the suite **as root** too when touching the compressor: idle-page read tracking only exists with root (and `SMASH_WRITE_TRACK=yt` only with the youngtrace module loaded), and CI (`.github/workflows/ci.yml`, `ubuntu-latest` + `macos-latest`, every push and PR) runs unprivileged. After ctest, CI runs `bench/run_quick_ci.py` (`bench_rss` ≥30 %, `bench_sqlite --quick` ≥5 % RSS reduction).
+All 161 tests must pass; none are registered `DISABLED`. Run the suite **as root** too when touching the compressor: idle-page read tracking only exists with root (and `SMASH_WRITE_TRACK=yt` only with the youngtrace module loaded), and CI (`.github/workflows/ci.yml`, `ubuntu-latest` + `macos-latest`, every push and PR) runs unprivileged. After ctest, CI runs `bench/run_quick_ci.py` (`bench_rss` ≥30 %, `bench_sqlite --quick` ≥5 % RSS reduction).
 
 **Before changing a test or its threshold, read its entry in [agents/tests.md](agents/tests.md).** Thresholds encode measurements, several tests are probabilistic (one run is not a verdict), and some harness shapes (sharing a process between phases, `fork()` with smash threads running) reproduce the very symptom under test.
 

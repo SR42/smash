@@ -1411,6 +1411,11 @@ add_executable(vm_exhaustion_test vm_exhaustion_test.cpp)
 set_target_properties(vm_exhaustion_test PROPERTIES CXX_STANDARD 20)
 target_link_libraries(vm_exhaustion_test PRIVATE ${CMAKE_DL_LIBS})
 add_smash_mode_test(test_vm_exhaustion vm_exhaustion_test 0 300 "SMASH_VM_GIB=1")
+# The same through malloc_numa(0, ...): the node arena's fallback must warn once,
+# as the plain path does (it was silent). Large-only, the mode it was found in;
+# skips where malloc_numa is not exported.
+add_smash_mode_test(test_vm_exhaustion_numa vm_exhaustion_test 1 300 "SMASH_VM_GIB=1"
+                    "VM_EXHAUST_NUMA=1")
 
 # ── Hugepage / VMA-pressure guards ──────────────────────────────────────────
 # Follow-ups to the aarch64 std::bad_alloc investigation for the case where the

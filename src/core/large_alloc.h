@@ -73,6 +73,36 @@ public:
         if (n > 0) (void)!::write(2, buf, static_cast<size_t>(n));
     }
 
+#if defined(__linux__)
+    // One-shot, as warnLargeAllocNotCompressible: a malloc_numa block the
+    // node's arena could not take. It used to fall back silently.
+    [[gnu::cold, gnu::noinline]] void warnNumaAllocNotCompressible(size_t alloc_size, uint32_t node) {
+        static std::atomic<bool> warned{false};
+        if (warned.exchange(true, std::memory_order_relaxed)) return;
+        const size_t total = vm_region_->contigPages();
+        const size_t bump = vm_region_->rawNextPage();
+        size_t carved = 0, node_free = 0;
+        vm_region_->nodeArenaInfo(node, &carved, &node_free);
+        char buf[640];
+        const int n = smash::safe_snprintf(buf, sizeof(buf),
+            "[smash WARN] a %zu MiB malloc_numa allocation for node %u did not fit the compressible arena: "
+            "%zu of %zu MiB handed out, node %u's arena holds %zu MiB of it with %zu MiB free. "
+            "It came from a separate mapping bound to node %u instead and will NEVER be compressed, "
+            "however cold it gets. %s\n",
+            alloc_size >> 20, node, (bump < total ? bump : total) * kPageSize >> 20, total * kPageSize >> 20,
+            node, carved * kPageSize >> 20, node_free * kPageSize >> 20, node,
+            // Exact: the node's arena failed this block with that much free,
+            // so the free space is in runs too short, or where this block
+            // cannot take it (another sub-arena's, or still being decommitted).
+            node_free >= alloc_size / kPageSize
+                ? "The node's arena has the space but could not give it to this block: a larger "
+                  "SMASH_VM_GIB only postpones this."
+                : "The arena is full: raise SMASH_VM_GIB (ceiling 1024; an unused arena costs "
+                  "address space, not memory).");
+        if (n > 0) (void)!::write(2, buf, static_cast<size_t>(n));
+    }
+#endif
+
     void* allocate(size_t size, size_t alignment, uint8_t arena_id = 0) {
         if (alignment < kPageSize) alignment = kPageSize;
 
@@ -177,6 +207,7 @@ public:
                     page_states_->set(idx + p, PageState::ACTIVE);
             }
         }
+        if (!mem && vm_region_) [[unlikely]] warnNumaAllocNotCompressible(alloc_size, node);
         if (!mem) {
             // Separate bound mapping: never compressed. Over-map and trim for
             // an alignment the mapping itself does not guarantee, exactly as

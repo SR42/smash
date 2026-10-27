@@ -29,10 +29,16 @@
 // everything and reallocates — so it covers the fallback path, the mixed
 // free routing, and reuse of the recycled arena afterwards.
 //
+// VM_EXHAUST_NUMA=1 (test_vm_exhaustion_numa, Linux) does the same through
+// malloc_numa(0, ...): a node arena that cannot serve a block falls back to a
+// separate mapping bound to the node, never compressed, and must say so once,
+// as the plain path does. It used to fall back silently.
+//
 // Only the first and last page of each chunk is touched, so the whole run
 // costs a few MiB of RSS despite reserving well over a gigabyte.
 
 #include <algorithm>
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -139,6 +145,90 @@ const char* vmGib() {
     return e ? e : "(default)";
 }
 
+// Run `fn` with fd 2 pointed at a temporary file; return what it wrote there,
+// after re-emitting it on the real stderr so a FAIL line is never swallowed.
+template <typename Fn>
+std::string captureStderr(Fn&& fn) {
+    char path[] = "/tmp/smash-vm-exhaustion-warn-XXXXXX";
+    const int fd = mkstemp(path);
+    const int saved = fd >= 0 ? dup(2) : -1;
+    if (fd >= 0) unlink(path);
+    if (saved >= 0) {
+        fflush(stderr);
+        dup2(fd, 2);
+    }
+    fn();
+    std::string out;
+    if (saved >= 0) {
+        fflush(stderr);
+        dup2(saved, 2);
+        close(saved);
+        lseek(fd, 0, SEEK_SET);
+        char rb[4096];
+        ssize_t n;
+        while ((n = read(fd, rb, sizeof(rb))) > 0) out.append(rb, static_cast<size_t>(n));
+        if (!out.empty()) fwrite(out.data(), 1, out.size(), stderr);
+    }
+    if (fd >= 0) close(fd);
+    return out;
+}
+
+size_t countOf(const std::string& s, const char* needle) {
+    size_t n = 0;
+    for (size_t at = s.find(needle); at != std::string::npos; at = s.find(needle, at + 1)) ++n;
+    return n;
+}
+
+// VM_EXHAUST_NUMA=1: overflow the arena through malloc_numa on node 0.
+int runNumaMode() {
+    using MallocNuma = void* (*)(uint32_t, size_t);
+    using InArena = int (*)(const void*);
+    auto malloc_numa = reinterpret_cast<MallocNuma>(dlsym(RTLD_DEFAULT, "malloc_numa"));
+    auto in_arena = reinterpret_cast<InArena>(dlsym(RTLD_DEFAULT, "smash_in_arena"));
+    if (!malloc_numa || !in_arena) {
+        printf("SKIP: malloc_numa / smash_in_arena not exported (libsmash not interposed, or not Linux)\n");
+        return 0;
+    }
+    std::vector<void*> chunks;
+    chunks.reserve(kNumChunks);
+    size_t outside = 0;
+    const std::string err = captureStderr([&] {
+        for (size_t i = 0; i < kNumChunks; ++i) {
+            void* p = malloc_numa(0, kChunkBytes);
+            if (!p) {
+                fprintf(stderr, "FAIL: malloc_numa(0, %zu) returned nullptr on chunk %zu (errno %d)\n",
+                        kChunkBytes, i, errno);
+                ++failures;
+                break;
+            }
+            if (!in_arena(p)) ++outside;
+            stamp(p, kChunkBytes, i);
+            chunks.push_back(p);
+        }
+    });
+    printf("numa: allocated %zu / %zu chunks on node 0, %zu outside the arena\n", chunks.size(), kNumChunks,
+           outside);
+    CHECK(chunks.size() == kNumChunks, "only %zu of %zu malloc_numa chunks allocated", chunks.size(), kNumChunks);
+    // Coverage: without a block outside the arena the fallback never ran.
+    CHECK(outside >= 1,
+          "every malloc_numa chunk is in the arena, so the node arena never ran out and the fallback was not "
+          "taken; check that SMASH_VM_GIB=%s took effect", vmGib());
+    const size_t warnings = countOf(err, "did not fit the compressible arena");
+    CHECK(warnings == 1 && err.find("malloc_numa") != std::string::npos && err.find("node 0") != std::string::npos,
+          "%zu malloc_numa chunks fell out of the arena and smash printed %zu 'did not fit the compressible "
+          "arena' warnings naming malloc_numa and node 0, want exactly 1 (none: the fallback is silent, and "
+          "that memory is never compressed; more: the warning is not one-shot)", outside, warnings);
+    for (size_t i = 0; i < chunks.size(); ++i)
+        if (!checkStamp(chunks[i], kChunkBytes, i, i, "numa")) break;
+    for (void* p : chunks) std::free(p);
+    if (failures) {
+        printf("vm_exhaustion_test (numa): %d FAILURES\n", failures);
+        return 1;
+    }
+    printf("vm_exhaustion_test (numa): all checks passed\n");
+    return 0;
+}
+
 } // namespace
 
 int main() {
@@ -160,6 +250,7 @@ int main() {
                "can fail for reasons unrelated to smash\n");
         return 0;
     }
+    if (const char* e = std::getenv("VM_EXHAUST_NUMA"); e && e[0] == '1') return runNumaMode();
 
     std::vector<void*> chunks;
     chunks.reserve(kNumChunks);

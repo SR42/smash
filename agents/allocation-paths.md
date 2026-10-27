@@ -114,6 +114,30 @@ fallback); **verified as a real discriminator** — against a library without it
 the test fails with "smash said nothing". So size the arena above the live set:
 `SMASH_VM_GIB` costs address space, not memory.
 
+**`malloc_numa` warns too (2026-10-27).** A node arena that cannot take a block
+falls back to a separate mapping bound to the node, never compressed, and until
+then said nothing (`LargeAlloc::allocateOnNode`). It now prints its own one-shot
+line, with the same phrase so one grep finds both, the node, and how much of
+the arena the node holds and has free:
+
+```
+[smash WARN] a 4 MiB malloc_numa allocation for node 0 did not fit the
+compressible arena: 1024 of 1024 MiB handed out, node 0's arena holds 1024 MiB
+of it with 0 MiB free. It came from a separate mapping bound to node 0 instead
+and will NEVER be compressed, however cold it gets. The arena is full: …
+```
+
+When the node's free pages cover the block, the line says the node's arena had
+the space but could not give it to this block (runs too short, another
+sub-arena's, or still being decommitted) instead. `test_vm_exhaustion_numa`
+overflows a 1 GiB arena through `malloc_numa(0, …)` (128 of 384 4 MiB blocks
+fall out) and requires exactly one such line: the library before it printed 0,
+and a mutant without the one-shot guard 128.
+
+Still silent: `posix_memalign`/`aligned_alloc` above `kMinAlignment` on a large
+block always take a direct mapping (above), from the first allocation, so there
+is no overflow to report.
+
 The threshold is a **runtime** setting, `SMASH_LARGE_ALLOC_VM_THRESHOLD`
 (bytes, rounded up to a page, floored at one page), defaulting to the
 compile-time `kLargeAllocVmThreshold`. The compile-time define still works as
