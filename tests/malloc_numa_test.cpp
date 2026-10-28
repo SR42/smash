@@ -17,8 +17,11 @@
 //     back byte-exact from off-node CPUs with every page on the node. Needs
 //     SMASH_COLD_TIMEOUT_SEC=1, which the ctest sets.
 // It also checks that an offline or out-of-range node fails with EINVAL, that
-// freed blocks go back to their node's arena, and that ordinary malloc memory
-// carries no policy, so a binding never leaks into the heap.
+// size 0 is a one-page block, that a size whose page count does not fit fails
+// with ENOMEM, that freed blocks go back to their node's arena, and that
+// ordinary malloc memory carries no policy, so a binding never leaks into the
+// heap. With MALLOC_NUMA_EXPECT_ENOTSUP=1 it only checks that both calls fail
+// with ENOTSUP (registered under SMASH_PASSTHROUGH=1 and compress-only).
 //
 // Skips when the kernel or a seccomp filter refuses mbind (ENOSYS/EPERM).
 
@@ -237,6 +240,45 @@ static void runLinux(numa_fn numa, arena_fn arena_for) {
         }
     }
 
+    // Size 0 is a block of one page, as malloc(0) is a block: not NULL, a new
+    // one each call, bound to the node, freeable.
+    const size_t ps = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    for (int node : nodes) {
+        errno = 0;
+        void* a = numa(static_cast<uint32_t>(node), 0);
+        void* b = numa(static_cast<uint32_t>(node), 0);
+        if (!a || !b) {
+            fail("malloc_numa(%d, 0) returned NULL (errno=%d %s)", node, errno, strerror(errno));
+        } else {
+            if (a == b) fail("malloc_numa(%d, 0) returned %p twice", node, a);
+            for (void* p : {a, b}) {
+                Policy pol;
+                if (arena_for(p) < 0) fail("malloc_numa(%d, 0)=%p is not smash-owned", node, p);
+                if (reinterpret_cast<uintptr_t>(p) % ps != 0)
+                    fail("malloc_numa(%d, 0)=%p is not page-aligned", node, p);
+                if (!isBoundTo(p, node, &pol))
+                    fail("malloc_numa(%d, 0): policy mode=%#x mask[0]=%#lx, want "
+                         "MPOL_BIND|MPOL_F_STATIC_NODES on {%d}", node, pol.mode, pol.mask[0], node);
+                *static_cast<volatile unsigned char*>(p) = 1;
+            }
+        }
+        free(a);
+        free(b);
+    }
+
+    // A size whose page count does not fit is NULL with ENOMEM, never a
+    // shorter block: SIZE_MAX overflows the rounding, SIZE_MAX - ps + 2 rounds
+    // to 0, and 2^32 + 1 pages is one page in a 32-bit page count.
+    for (size_t size : {SIZE_MAX, SIZE_MAX - ps + 2, ((size_t{1} << 32) + 1) * ps}) {
+        errno = 0;
+        void* p = numa(static_cast<uint32_t>(nodes.front()), size);
+        if (p || errno != ENOMEM) {
+            fail("malloc_numa(%d, %zu) = %p errno=%d %s, want NULL with ENOMEM",
+                 nodes.front(), size, p, errno, strerror(errno));
+            free(p);
+        }
+    }
+
     // free() returns a block's pages to their node's own arena. Checked as
     // what that promises, not as "the same address comes back": frees reach
     // the arena through the node's decommit queue asynchronously, and while
@@ -350,6 +392,38 @@ static void runSingleNode(numa_fn numa, arena_fn arena_for) {
 
 #endif
 
+// MALLOC_NUMA_EXPECT_ENOTSUP=1, run with SMASH_PASSTHROUGH=1 or
+// SMASH_MODE=compress_only: neither heap can own a node block (passthrough
+// answers malloc_usable_size from the system allocator, compress-only also
+// frees through it), so both calls must fail with ENOTSUP instead of handing
+// libc a mapping it never made. A block returned anyway is not freed: that
+// free is the hazard.
+static int runNotSupported(numa_fn numa) {
+    using aligned_fn = void* (*)(uint32_t, size_t, size_t);
+    auto aligned = reinterpret_cast<aligned_fn>(dlsym(RTLD_DEFAULT, "malloc_numa_aligned"));
+    const char* pt = getenv("SMASH_PASSTHROUGH");
+    const char* mode = getenv("SMASH_MODE");
+    printf("SMASH_PASSTHROUGH=%s SMASH_MODE=%s\n", pt ? pt : "(unset)", mode ? mode : "(unset)");
+    errno = 0;
+    if (void* p = numa(0, kMiB); p || errno != ENOTSUP)
+        fail("malloc_numa(0, 1 MiB) = %p errno=%d %s, want NULL with ENOTSUP",
+             p, errno, strerror(errno));
+    if (!aligned) {
+        fail("malloc_numa_aligned is not exported");
+    } else {
+        errno = 0;
+        if (void* p = aligned(0, kMiB, 2 * kMiB); p || errno != ENOTSUP)
+            fail("malloc_numa_aligned(0, 1 MiB, 2 MiB) = %p errno=%d %s, want NULL with ENOTSUP",
+                 p, errno, strerror(errno));
+    }
+    if (g_failures) {
+        fprintf(stderr, "FAIL: %d check(s) failed\n", g_failures);
+        return 1;
+    }
+    printf("PASS: malloc_numa and malloc_numa_aligned refuse with ENOTSUP\n");
+    return 0;
+}
+
 int main() {
     setvbuf(stdout, nullptr, _IONBF, 0);
 
@@ -359,6 +433,8 @@ int main() {
         printf("SKIP: malloc_numa not found (not running under libsmash)\n");
         return 0;
     }
+    if (const char* e = getenv("MALLOC_NUMA_EXPECT_ENOTSUP"); e && e[0] == '1')
+        return runNotSupported(numa);
 
 #if defined(__linux__)
     runLinux(numa, arena_for);

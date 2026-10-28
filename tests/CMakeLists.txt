@@ -588,6 +588,12 @@ add_smash_mode_test(test_malloc_numa_full       malloc_numa_test 0 120
                     "SMASH_COLD_TIMEOUT_SEC=1")
 add_smash_mode_test(test_malloc_numa_large_only malloc_numa_test 1 120
                     "SMASH_COLD_TIMEOUT_SEC=1")
+# Passthrough and compress-only cannot own a node block (libc would answer its
+# malloc_usable_size or free it), so both calls must fail with ENOTSUP.
+add_smash_mode_test(test_malloc_numa_passthrough   malloc_numa_test 0 60
+                    "SMASH_PASSTHROUGH=1" "MALLOC_NUMA_EXPECT_ENOTSUP=1")
+add_smash_mode_test(test_malloc_numa_compress_only malloc_numa_test 0 60
+                    "SMASH_MODE=compress_only" "MALLOC_NUMA_EXPECT_ENOTSUP=1")
 
 # The shared arena (every ordinary large allocation) must reuse freed pages
 # rather than spill onto uncompressible direct mappings. SMASH_VM_GIB=1 is
@@ -1419,6 +1425,12 @@ add_smash_mode_test(test_vm_exhaustion vm_exhaustion_test 0 300 "SMASH_VM_GIB=1"
 # skips where malloc_numa is not exported.
 add_smash_mode_test(test_vm_exhaustion_numa vm_exhaustion_test 1 300 "SMASH_VM_GIB=1"
                     "VM_EXHAUST_NUMA=1")
+# The same through malloc_numa_aligned(0, 4 MiB, 8 MiB), whose fallback maps
+# the block plus the alignment and trims it. Both NUMA runs also check that
+# every block is bound to node 0, aligned, and that the fallback mappings cost
+# the address space only their own size.
+add_smash_mode_test(test_vm_exhaustion_numa_aligned vm_exhaustion_test 1 300 "SMASH_VM_GIB=1"
+                    "VM_EXHAUST_NUMA=aligned")
 
 # ── Hugepage / VMA-pressure guards ──────────────────────────────────────────
 # Follow-ups to the aarch64 std::bad_alloc investigation for the case where the

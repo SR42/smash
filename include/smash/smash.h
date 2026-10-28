@@ -20,8 +20,9 @@ extern "C" {
 // instead of spilling onto another node. Pages are placed lazily on first
 // touch, so node exhaustion shows up then, not as a NULL return.
 //
-// Blocks are rounded up to whole pages, so use this for buffers, not small
-// objects. They come from a per-node arena inside smash's heap region, and
+// Blocks are rounded up to whole pages (size 0 gives one page, as malloc(0)
+// gives a block), so use this for buffers, not small objects. They come from
+// a per-node arena inside smash's heap region, and
 // smash compresses their cold pages. On a host with two or more memory nodes,
 // each node's pages are compressed by threads pinned to that node's CPUs,
 // using working memory on the node, and the compressed copies are stored on
@@ -33,7 +34,7 @@ extern "C" {
 //
 // Returns NULL with errno set:
 //   EINVAL  `numa` is not an online node with memory in this process's cpuset
-//   ENOMEM  the mapping failed
+//   ENOMEM  the mapping failed, or `size` (in pages) is too large to map
 //   EPERM / ENOSYS  the kernel or a seccomp filter refused mbind
 //   ENOTSUP under SMASH_PASSTHROUGH=1 or SMASH_MODE=compress_only
 // Without NUMA (macOS), node 0 is a plain malloc and any other node is EINVAL.

@@ -32,7 +32,9 @@
 // VM_EXHAUST_NUMA=1 (test_vm_exhaustion_numa, Linux) does the same through
 // malloc_numa(0, ...): a node arena that cannot serve a block falls back to a
 // separate mapping bound to the node, never compressed, and must say so once,
-// as the plain path does. It used to fall back silently.
+// as the plain path does. It used to fall back silently. VM_EXHAUST_NUMA=aligned
+// (test_vm_exhaustion_numa_aligned) does it through malloc_numa_aligned, whose
+// fallback trims an over-sized mapping to the alignment.
 //
 // Only the first and last page of each chunk is touched, so the whole run
 // costs a few MiB of RSS despite reserving well over a gigabyte.
@@ -48,6 +50,11 @@
 #include <string>
 #include <unistd.h>
 #include <vector>
+
+#if defined(__linux__)
+#include <sched.h>
+#include "numa_test_util.h"
+#endif
 
 namespace {
 
@@ -179,45 +186,122 @@ size_t countOf(const std::string& s, const char* needle) {
     return n;
 }
 
-// VM_EXHAUST_NUMA=1: overflow the arena through malloc_numa on node 0.
-int runNumaMode() {
+#if defined(__linux__)
+// The process's address space (VmSize) in bytes, 0 if unreadable.
+size_t addressSpaceBytes() {
+    FILE* f = fopen("/proc/self/status", "r");
+    if (!f) return 0;
+    char line[256];
+    size_t kb = 0;
+    while (fgets(line, sizeof(line), f))
+        if (sscanf(line, "VmSize: %zu kB", &kb) == 1) break;
+    fclose(f);
+    return kb * 1024;
+}
+
+// VM_EXHAUST_NUMA=1: overflow the arena through malloc_numa on node 0;
+// VM_EXHAUST_NUMA=aligned: through malloc_numa_aligned(0, 4 MiB, 8 MiB), whose
+// fallback maps the block plus the alignment, trims both ends and binds what
+// is left. The blocks are written from CPUs off node 0 (where there are any),
+// so only a binding can put their pages there. Every block, in the arena or
+// not, must be bound to node 0, have its written pages there and, aligned,
+// sit on an 8 MiB boundary: a plain 4 MiB mmap is often 2 MiB-aligned by the
+// kernel, never 8 MiB-aligned on purpose. A block outside the arena must
+// cost the address space exactly its own size (an untrimmed fallback keeps
+// 8 MiB more each).
+int runNumaMode(bool aligned) {
     using MallocNuma = void* (*)(uint32_t, size_t);
+    using MallocNumaAligned = void* (*)(uint32_t, size_t, size_t);
     using InArena = int (*)(const void*);
+    constexpr size_t kAlign = 8ull * 1024 * 1024;
     auto malloc_numa = reinterpret_cast<MallocNuma>(dlsym(RTLD_DEFAULT, "malloc_numa"));
+    auto malloc_numa_aligned =
+        reinterpret_cast<MallocNumaAligned>(dlsym(RTLD_DEFAULT, "malloc_numa_aligned"));
     auto in_arena = reinterpret_cast<InArena>(dlsym(RTLD_DEFAULT, "smash_in_arena"));
-    if (!malloc_numa || !in_arena) {
-        printf("SKIP: malloc_numa / smash_in_arena not exported (libsmash not interposed, or not Linux)\n");
+    if (!malloc_numa || !malloc_numa_aligned || !in_arena) {
+        printf("SKIP: malloc_numa / malloc_numa_aligned / smash_in_arena not exported (libsmash not "
+               "interposed)\n");
         return 0;
     }
+    const char* fn = aligned ? "malloc_numa_aligned" : "malloc_numa";
+    cpu_set_t allowed;
+    CPU_ZERO(&allowed);
+    const bool have_affinity = sched_getaffinity(0, sizeof(allowed), &allowed) == 0;
+    const bool pinned = have_affinity && numa_test::pinOutside(0, allowed);
     std::vector<void*> chunks;
     chunks.reserve(kNumChunks);
+    std::vector<long> fallback_cost;   // address space each block outside the arena added
+    fallback_cost.reserve(kNumChunks);
     size_t outside = 0;
     const std::string err = captureStderr([&] {
         for (size_t i = 0; i < kNumChunks; ++i) {
-            void* p = malloc_numa(0, kChunkBytes);
+            const size_t vm_before = addressSpaceBytes();
+            void* p = aligned ? malloc_numa_aligned(0, kChunkBytes, kAlign) : malloc_numa(0, kChunkBytes);
+            const size_t vm_after = addressSpaceBytes();
             if (!p) {
-                fprintf(stderr, "FAIL: malloc_numa(0, %zu) returned nullptr on chunk %zu (errno %d)\n",
-                        kChunkBytes, i, errno);
+                fprintf(stderr, "FAIL: %s(0, %zu) returned nullptr on chunk %zu (errno %d)\n",
+                        fn, kChunkBytes, i, errno);
                 ++failures;
                 break;
             }
-            if (!in_arena(p)) ++outside;
+            if (!in_arena(p)) {
+                ++outside;
+                fallback_cost.push_back(static_cast<long>(vm_after) - static_cast<long>(vm_before));
+            }
             stamp(p, kChunkBytes, i);
             chunks.push_back(p);
         }
     });
-    printf("numa: allocated %zu / %zu chunks on node 0, %zu outside the arena\n", chunks.size(), kNumChunks,
-           outside);
-    CHECK(chunks.size() == kNumChunks, "only %zu of %zu malloc_numa chunks allocated", chunks.size(), kNumChunks);
+    if (pinned) sched_setaffinity(0, sizeof(allowed), &allowed);
+    printf("numa: %s allocated %zu / %zu chunks on node 0, %zu outside the arena, writer %s\n", fn,
+           chunks.size(), kNumChunks, outside, pinned ? "pinned off node 0" : "on node 0 (no other CPUs)");
+    CHECK(chunks.size() == kNumChunks, "only %zu of %zu %s chunks allocated", chunks.size(), kNumChunks, fn);
     // Coverage: without a block outside the arena the fallback never ran.
     CHECK(outside >= 1,
-          "every malloc_numa chunk is in the arena, so the node arena never ran out and the fallback was not "
-          "taken; check that SMASH_VM_GIB=%s took effect", vmGib());
+          "every %s chunk is in the arena, so the node arena never ran out and the fallback was not "
+          "taken; check that SMASH_VM_GIB=%s took effect", fn, vmGib());
     const size_t warnings = countOf(err, "did not fit the compressible arena");
     CHECK(warnings == 1 && err.find("malloc_numa") != std::string::npos && err.find("node 0") != std::string::npos,
-          "%zu malloc_numa chunks fell out of the arena and smash printed %zu 'did not fit the compressible "
+          "%zu %s chunks fell out of the arena and smash printed %zu 'did not fit the compressible "
           "arena' warnings naming malloc_numa and node 0, want exactly 1 (none: the fallback is silent, and "
-          "that memory is never compressed; more: the warning is not one-shot)", outside, warnings);
+          "that memory is never compressed; more: the warning is not one-shot)", outside, fn, warnings);
+
+    size_t misaligned = 0, unbound = 0, unbound_outside = 0;
+    int first_mode = 0;
+    std::vector<void*> written;
+    for (void* p : chunks) {
+        if (aligned && reinterpret_cast<uintptr_t>(p) % kAlign != 0) ++misaligned;
+        numa_test::Policy pol;
+        if (!numa_test::isBoundTo(p, 0, &pol)) {
+            if (unbound++ == 0) first_mode = pol.mode;
+            if (!in_arena(p)) ++unbound_outside;
+        }
+        written.push_back(p);
+        written.push_back(static_cast<char*>(p) + kChunkBytes - g_page);
+    }
+    int first_status = 0;
+    const size_t off_node = numa_test::pointersOffNode(written, 0, &first_status);
+    CHECK(misaligned == 0, "%zu of %zu malloc_numa_aligned chunks are not 8 MiB-aligned", misaligned,
+          chunks.size());
+    CHECK(unbound == 0,
+          "%zu of %zu %s chunks (%zu of them outside the arena) are not bound MPOL_BIND|MPOL_F_STATIC_NODES "
+          "to {0} (first: mode %#x)", unbound, chunks.size(), fn, unbound_outside, first_mode);
+    CHECK(off_node == 0, "%zu of %zu written pages of %s chunks are not on node 0 (first status %d)",
+          off_node, written.size(), fn, first_status);
+
+    // Per call, and the median: a thread smash starts meanwhile adds its stack
+    // and, in large-only mode, a 64 MiB glibc arena to whichever call it lands
+    // in (measured 15-79 MiB over the whole loop).
+    if (!fallback_cost.empty()) {
+        std::sort(fallback_cost.begin(), fallback_cost.end());
+        const long median = fallback_cost[fallback_cost.size() / 2];
+        printf("numa: each chunk outside the arena added %ld KiB of address space (median; %ld..%ld)\n",
+               median / 1024, fallback_cost.front() / 1024, fallback_cost.back() / 1024);
+        CHECK(median == static_cast<long>(kChunkBytes),
+              "a %s chunk outside the arena added %ld KiB of address space (median), want %zu: the "
+              "fallback mapping keeps more than its block", fn, median / 1024, kChunkBytes / 1024);
+    }
+
     for (size_t i = 0; i < chunks.size(); ++i)
         if (!checkStamp(chunks[i], kChunkBytes, i, i, "numa")) break;
     for (void* p : chunks) std::free(p);
@@ -228,6 +312,7 @@ int runNumaMode() {
     printf("vm_exhaustion_test (numa): all checks passed\n");
     return 0;
 }
+#endif
 
 } // namespace
 
@@ -250,7 +335,15 @@ int main() {
                "can fail for reasons unrelated to smash\n");
         return 0;
     }
-    if (const char* e = std::getenv("VM_EXHAUST_NUMA"); e && e[0] == '1') return runNumaMode();
+    if (const char* e = std::getenv("VM_EXHAUST_NUMA")) {
+#if defined(__linux__)
+        if (e[0] == '1') return runNumaMode(false);
+        if (strcmp(e, "aligned") == 0) return runNumaMode(true);
+#else
+        printf("SKIP: VM_EXHAUST_NUMA=%s needs Linux (without NUMA, malloc_numa is plain malloc)\n", e);
+        return 0;
+#endif
+    }
 
     std::vector<void*> chunks;
     chunks.reserve(kNumChunks);

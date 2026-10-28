@@ -8,8 +8,10 @@
 // block is:
 //   - aligned: the address is a multiple of the requested alignment, for
 //     alignments from one page to 16 MiB and sizes across the routing
-//     boundaries. This is the whole point of the call and the only thing
-//     malloc_numa does not already promise;
+//     boundaries, of one page for an alignment below that (1 to half a page),
+//     and served from the arena at 128 MiB, past the 64 MiB chunk size. This
+//     is the whole point of the call and the only thing malloc_numa does not
+//     already promise;
 //   - everything malloc_numa promises: smash-owned, MPOL_BIND |
 //     MPOL_F_STATIC_NODES on exactly {node}, physically on the node once
 //     written from off-node CPUs, usable_size >= size, byte-stable;
@@ -20,7 +22,8 @@
 //     page — the trimming must not disturb the ACTIVE marking of the range
 //     that is actually handed out.
 // It also checks EINVAL for an alignment that is zero or not a power of two,
-// and for a bad node id.
+// and for a bad node id; size 0 as a one-page block; and ENOMEM for a size
+// whose page count does not fit and for a 2^63 alignment.
 //
 // Skips when the kernel or a seccomp filter refuses mbind (ENOSYS/EPERM), and
 // when malloc_numa_aligned is not exported (not running under libsmash).
@@ -88,11 +91,14 @@ static void checkBlock(aligned_fn numa_aligned, arena_fn arena_for, int node,
         return;
     }
 
-    // The guarantee this call exists for.
-    if (reinterpret_cast<uintptr_t>(p) % align != 0)
+    // The guarantee this call exists for; an alignment below a page is raised
+    // to one.
+    const size_t ps = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    const size_t want = align > ps ? align : ps;
+    if (reinterpret_cast<uintptr_t>(p) % want != 0)
         fail("malloc_numa_aligned(%d, %zu, %zu)=%p is not %zu-aligned "
-             "(offset %zu)", node, size, align, static_cast<void*>(p), align,
-             reinterpret_cast<uintptr_t>(p) % align);
+             "(offset %zu)", node, size, align, static_cast<void*>(p), want,
+             reinterpret_cast<uintptr_t>(p) % want);
 
     if (arena_for(p) < 0)
         fail("malloc_numa_aligned(%d, %zu, %zu)=%p is not smash-owned, so free() "
@@ -234,6 +240,63 @@ static void checkFootprint(aligned_fn numa_aligned, arena_info_fn arena_info, in
     free(warm);
 }
 
+// What the node's arena has handed out (carved - free) once it reads `want`,
+// or, with `want` < 0, once two readings 50 ms apart agree; otherwise the last
+// reading after 5 s. Frees reach the arena through the node's decommit queue,
+// so a reading right after free() is high for a while.
+static long usedPages(arena_info_fn arena_info, int node, long want) {
+    long prev = LONG_MIN;
+    for (int i = 0; i < 100; ++i) {
+        size_t c = 0, f = 0;
+        if (arena_info(static_cast<uint32_t>(node), &c, &f) != 0) return -1;
+        const long used = static_cast<long>(c) - static_cast<long>(f);
+        if (want >= 0 ? used == want : used == prev) return used;
+        prev = used;
+        usleep(50 * 1000);
+    }
+    return prev;
+}
+
+// An alignment past a 64 MiB chunk: the node arena carves as many chunks as
+// the block and its worst-case gap need. The block must come from the arena —
+// the fallback mapping is aligned too, so only smash_in_arena tells them
+// apart — and once it is freed every page it cost goes back to the node.
+static void checkBeyondChunk(aligned_fn numa_aligned, arena_fn arena_for, in_arena_fn in_arena,
+                             arena_info_fn arena_info, int node, const cpu_set_t* allowed) {
+    constexpr size_t kAlign = 128 * kMiB;
+    for (size_t size : {kMiB, 65 * kMiB}) {
+        checkBlock(numa_aligned, arena_for, node, size, kAlign, allowed);
+        const long before = usedPages(arena_info, node, -1);
+        if (before < 0) {
+            fail("node %d: smash_numa_arena_info failed", node);
+            return;
+        }
+        void* p = numa_aligned(static_cast<uint32_t>(node), size, kAlign);
+        if (!p) {
+            fail("malloc_numa_aligned(%d, %zu, 128 MiB) returned NULL (errno=%d %s)",
+                 node, size, errno, strerror(errno));
+            continue;
+        }
+        const bool from_arena = in_arena(p);
+        if (!from_arena)
+            fail("malloc_numa_aligned(%d, %zu, 128 MiB)=%p is outside the compressible "
+                 "arena: the node arena could not serve an alignment past its chunk size",
+                 node, size, p);
+        if (reinterpret_cast<uintptr_t>(p) % kAlign != 0)
+            fail("malloc_numa_aligned(%d, %zu, 128 MiB)=%p is not aligned", node, size, p);
+        *static_cast<volatile unsigned char*>(p) = 1;
+        free(p);
+        const long after = usedPages(arena_info, node, before);
+        printf("node %d: %zu MiB at 128 MiB alignment from the %s, arena pages in use "
+               "%ld -> %ld after free\n", node, size / kMiB, from_arena ? "arena" : "fallback",
+               before, after);
+        if (after != before)
+            fail("node %d: %ld arena pages in use before a %zu-byte block at 128 MiB "
+                 "alignment, %ld after it was freed and the queue drained", node, before,
+                 size, after);
+    }
+}
+
 // Cold aligned blocks are compressed and restored on their node, exactly like
 // unaligned ones: the trim must not disturb the ACTIVE marking of the range
 // that is handed out.
@@ -341,6 +404,57 @@ static void runLinux(aligned_fn numa_aligned, arena_fn arena_for, in_arena_fn in
 
     for (int node : nodes)
         checkNoArenaLeak(numa_aligned, in_arena, node, ps, 2 * kMiB, 3000);
+
+    // Run after the leak check, which was measured on arenas without the
+    // extra chunks a 128 MiB alignment carves.
+    // Any power of two below a page, 1 included, is raised to one page.
+    for (int node : nodes)
+        for (size_t align : {size_t{1}, size_t{2}, size_t{8}, size_t{64}, ps / 2})
+            checkBlock(numa_aligned, arena_for, node, 3 * ps + 1, align, pin);
+
+    for (int node : nodes)
+        checkBeyondChunk(numa_aligned, arena_for, in_arena, arena_info, node, pin);
+
+    // Size 0 is a block of one page, as for malloc_numa, at the alignment asked.
+    for (int node : nodes) {
+        errno = 0;
+        void* a = numa_aligned(static_cast<uint32_t>(node), 0, 2 * kMiB);
+        void* b = numa_aligned(static_cast<uint32_t>(node), 0, 2 * kMiB);
+        if (!a || !b) {
+            fail("malloc_numa_aligned(%d, 0, 2 MiB) returned NULL (errno=%d %s)", node,
+                 errno, strerror(errno));
+        } else {
+            if (a == b) fail("malloc_numa_aligned(%d, 0, 2 MiB) returned %p twice", node, a);
+            for (void* p : {a, b}) {
+                Policy pol;
+                if (reinterpret_cast<uintptr_t>(p) % (2 * kMiB) != 0)
+                    fail("malloc_numa_aligned(%d, 0, 2 MiB)=%p is not aligned", node, p);
+                if (arena_for(p) < 0)
+                    fail("malloc_numa_aligned(%d, 0, 2 MiB)=%p is not smash-owned", node, p);
+                if (!isBoundTo(p, node, &pol))
+                    fail("malloc_numa_aligned(%d, 0, 2 MiB): policy mode=%#x mask[0]=%#lx, "
+                         "want MPOL_BIND|MPOL_F_STATIC_NODES on {%d}", node, pol.mode,
+                         pol.mask[0], node);
+                *static_cast<volatile unsigned char*>(p) = 1;
+            }
+        }
+        free(a);
+        free(b);
+    }
+
+    // A size whose page count does not fit is NULL with ENOMEM, as for
+    // malloc_numa, and so is an alignment no mapping can have.
+    struct Huge { size_t size, align; };
+    for (Huge h : {Huge{SIZE_MAX, 2 * kMiB}, Huge{SIZE_MAX - ps + 2, 2 * kMiB},
+                   Huge{((size_t{1} << 32) + 1) * ps, 2 * kMiB}, Huge{ps, size_t{1} << 63}}) {
+        errno = 0;
+        void* p = numa_aligned(static_cast<uint32_t>(nodes.front()), h.size, h.align);
+        if (p || errno != ENOMEM) {
+            fail("malloc_numa_aligned(%d, %zu, %zu) = %p errno=%d %s, want NULL with ENOMEM",
+                 nodes.front(), h.size, h.align, p, errno, strerror(errno));
+            free(p);
+        }
+    }
 
     // An alignment that is zero or not a power of two is EINVAL, and nothing
     // is allocated.
