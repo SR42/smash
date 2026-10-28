@@ -134,6 +134,21 @@ overflows a 1 GiB arena through `malloc_numa(0, …)` (128 of 384 4 MiB blocks
 fall out) and requires exactly one such line: the library before it printed 0,
 and a mutant without the one-shot guard 128.
 
+**Both warnings print only once the block exists (2026-10-28).** They used to
+print before the fallback mapping was tried, so a request no mapping could serve
+(a 16 TiB `malloc`, a `malloc_numa_aligned` at 2^63 alignment) got NULL, said
+"it came from a direct mmap" (or "a separate mapping") falsely, and spent the
+one-shot: the real overflow that followed printed nothing. Each also weighs the
+block against the whole arena first: a block larger than it (or, for
+`malloc_numa_aligned`, its pages plus the worst-case alignment gap) gets "The
+block needs N MiB, more than the whole M MiB arena: raise SMASH_VM_GIB above
+that", where the plain line blamed "the live set" and the node line said its
+arena "has the space" (it weighed the free pages against the block alone). A
+block under 1 MiB is named in KiB, not "0 MiB", and an aligned node block gets
+"at N MiB alignment". Guarded by `test_vm_exhaustion{,_numa,_numa_aligned}`
+(a refused request first, which must print nothing) and
+`test_vm_exhaustion_too_big` ([tests.md](tests.md)).
+
 Still silent: `posix_memalign`/`aligned_alloc` above `kMinAlignment` on a large
 block always take a direct mapping (above), from the first allocation, so there
 is no overflow to report.

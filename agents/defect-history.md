@@ -692,3 +692,27 @@ Cause, measured with an instrumented `smash_sim` at each miss: the requests that
 Fix: (1) the last-resort retry in `allocateOnSubArena`, reached only when no fresh chunk is left, takes a block across a dirty run and the clean runs next to it (`takeMixedFromSubLocked`). Only the block's dirty pages leave the dirty count, and the rest of each run goes back as it was. That is safe because `calloc` always clears and nothing assumes arena pages are zero. (2) `donateSharedPool` retires the tails first and then purges only the dirty runs of chunks that the sub-arena's runs cover wholly, which are the only ones it can donate. Interleaved old/new on a loaded 8-CPU host, live 45 and 48 per thread: old 9-11k blocks/s in the second half with 2.4-3.3k blocks out; new 137-198k with none out. `smash_sim` (stubbed OS calls, 8 threads, 1 GiB, 8 s): at live 52, 327742 blocks out and 6.1M runs purged became 1 and 222. In four other configurations (cold pages, cross-thread frees, `malloc_numa` on 2 and 4 nodes) new put no more blocks out and purged up to 25 000x fewer runs. No invariant failures. `test_subarena_exhaust_mixed` guards both parts.
 
 Not fixed: a chunk donated to the shared free map never returns to the sub-arenas, and a block freed there goes through the decommit queue (`madvise`) rather than staying dirty. At 81 % and above (live 52-60 here) blocks really do not fit. They leave the region with the warning, and each one is a fresh mapping faulted in. Throughput there went from 5-7k to 15-160k, but not to 200k.
+
+## Arena-overflow warnings spent on requests that got no block (fixed 2026-10-28)
+
+`LargeAlloc`'s one-shot "did not fit the compressible arena" warnings (plain
+large blocks and `malloc_numa`) printed as soon as the arena missed, before the
+fallback mapping was tried. A request no mapping could serve — a 16 TiB
+`malloc`, one page of `malloc_numa_aligned` at 2^63 alignment — returned NULL
+after saying "It came from a direct mmap instead" (or "a separate mapping"),
+which was false, and spent the one-shot: the real overflow later in the process
+printed nothing, the very case the warning exists for. Found by
+`test_malloc_numa_aligned`'s 2^63 check, whose run printed the warning with
+"a 0 MiB malloc_numa allocation … The node's arena has the space".
+
+Fixed: both warn after the block is registered. Two verdicts were wrong as well.
+The node line weighed the node's free pages against the block alone, so one page
+at 2 GiB alignment in a 1 GiB arena "has the space"; it now counts the worst-case
+alignment gap, and a need larger than the whole arena says so ("The block and
+its alignment need N MiB, more than the whole M MiB arena: raise SMASH_VM_GIB
+above that"). The plain line said "the live set outgrew the arena" for a single
+block larger than the arena with nothing else live; it gets the same verdict.
+Sizes under 1 MiB print in KiB. Tests: a refused request at the start of
+`test_vm_exhaustion{,_numa,_numa_aligned}`, and `test_vm_exhaustion_too_big`;
+the library before failed all four, and five mutants (each part of the fix
+undone) each failed only their own check.

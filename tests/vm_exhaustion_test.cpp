@@ -34,7 +34,10 @@
 // separate mapping bound to the node, never compressed, and must say so once,
 // as the plain path does. It used to fall back silently. VM_EXHAUST_NUMA=aligned
 // (test_vm_exhaustion_numa_aligned) does it through malloc_numa_aligned, whose
-// fallback trims an over-sized mapping to the alignment.
+// fallback trims an over-sized mapping to the alignment. VM_EXHAUST_TOO_BIG=1
+// (test_vm_exhaustion_too_big) checks what the warnings say about blocks no
+// 1 GiB arena can hold, a plain one and one by its alignment. Every mode first makes a request no
+// mapping can serve: it must print nothing, or the one-shot warning is spent.
 //
 // Only the first and last page of each chunk is touched, so the whole run
 // costs a few MiB of RSS despite reserving well over a gigabyte.
@@ -224,6 +227,23 @@ int runNumaMode(bool aligned) {
         return 0;
     }
     const char* fn = aligned ? "malloc_numa_aligned" : "malloc_numa";
+
+    // A request no mapping can serve is NULL and prints nothing. The warning
+    // says the block came from a separate mapping, and it is one-shot: printed
+    // here it would be false and would silence the real overflow below.
+    void* impossible = nullptr;
+    int impossible_errno = 0;
+    const std::string err_impossible = captureStderr([&] {
+        errno = 0;
+        impossible = malloc_numa_aligned(0, g_page, size_t{1} << 63);
+        impossible_errno = errno;
+    });
+    CHECK(!impossible && impossible_errno == ENOMEM,
+          "malloc_numa_aligned(0, %zu, 2^63) = %p errno=%d, want NULL with ENOMEM", g_page, impossible,
+          impossible_errno);
+    CHECK(countOf(err_impossible, "did not fit the compressible arena") == 0,
+          "a malloc_numa_aligned request that got no block printed the one-shot 'did not fit' warning");
+
     cpu_set_t allowed;
     CPU_ZERO(&allowed);
     const bool have_affinity = sched_getaffinity(0, sizeof(allowed), &allowed) == 0;
@@ -314,6 +334,108 @@ int runNumaMode(bool aligned) {
 }
 #endif
 
+// VM_EXHAUST_TOO_BIG=1: blocks no 1 GiB arena can hold, each from its fallback,
+// and what the one warning of each kind says about it. A plain 2 GiB malloc:
+// the block alone needs more than the whole arena, which is not "the live set
+// outgrew the arena". One page from malloc_numa_aligned at 2 GiB alignment,
+// while node 0's arena has a free 64 MiB run holding no 2 GiB boundary: the
+// block and its alignment need more than the whole arena, so raise
+// SMASH_VM_GIB — not that the node's arena "has the space" (that verdict
+// weighed the free pages against the block alone). A block under 1 MiB is
+// named in KiB, not "0 MiB". Where the host refuses a 2 GiB mapping, there is
+// no fallback block and nothing to check.
+int runTooBigMode() {
+    constexpr size_t kBig = 2ull << 30;
+    {
+        void* (*volatile do_malloc)(size_t) = std::malloc;   // not elided with its free
+        void* p = nullptr;
+        const std::string err = captureStderr([&] { p = do_malloc(kBig); });
+        if (!p) {
+            printf("SKIP (plain): the host refused malloc(2 GiB)\n");
+        } else {
+            const size_t warnings = countOf(err, "did not fit the compressible arena");
+            CHECK(warnings == 1, "%zu 'did not fit' warnings for a 2 GiB malloc, want 1", warnings);
+            CHECK(err.find("live set outgrew") == std::string::npos,
+                  "the warning blames the live set for a single block larger than the whole arena");
+            CHECK(err.find("more than the whole") != std::string::npos,
+                  "the warning does not say the block is larger than the whole arena");
+            std::memset(p, 0x5a, g_page);
+            std::free(p);
+        }
+    }
+#if defined(__linux__)
+    using MallocNuma = void* (*)(uint32_t, size_t);
+    using MallocNumaAligned = void* (*)(uint32_t, size_t, size_t);
+    using InArena = int (*)(const void*);
+    using ArenaInfo = int (*)(uint32_t, size_t*, size_t*);
+    constexpr size_t kAlign = 2ull << 30;
+    constexpr size_t kChunk = 64ull << 20;
+    auto malloc_numa = reinterpret_cast<MallocNuma>(dlsym(RTLD_DEFAULT, "malloc_numa"));
+    auto malloc_numa_aligned =
+        reinterpret_cast<MallocNumaAligned>(dlsym(RTLD_DEFAULT, "malloc_numa_aligned"));
+    auto in_arena = reinterpret_cast<InArena>(dlsym(RTLD_DEFAULT, "smash_in_arena"));
+    auto arena_info = reinterpret_cast<ArenaInfo>(dlsym(RTLD_DEFAULT, "smash_numa_arena_info"));
+    if (!malloc_numa || !malloc_numa_aligned || !in_arena || !arena_info) {
+        printf("SKIP (numa): malloc_numa / malloc_numa_aligned / smash_in_arena / smash_numa_arena_info "
+               "not exported (libsmash not interposed)\n");
+        return failures ? 1 : 0;
+    }
+    // Two whole chunks; free the one whose range holds no 2 GiB boundary (at
+    // most one of two neighbours does), so its free run cannot place the block.
+    void* w[2] = {malloc_numa(0, kChunk), malloc_numa(0, kChunk)};
+    const bool warm_ok = w[0] && w[1] && in_arena(w[0]) && in_arena(w[1]);
+    CHECK(warm_ok, "the two 64 MiB warm-up blocks are not in the arena");
+    if (!warm_ok) return 1;
+    auto holdsBoundary = [&](void* p) {
+        const auto a = reinterpret_cast<uintptr_t>(p);
+        return (a + kAlign - 1) / kAlign * kAlign <= a + kChunk - g_page;
+    };
+    const int victim = holdsBoundary(w[0]) ? 1 : 0;
+    std::free(w[victim]);
+    size_t carved = 0, node_free = 0;
+    for (int i = 0; i < 500; ++i) {
+        if (arena_info(0, &carved, &node_free) == 0 && node_free * g_page >= kChunk) break;
+        usleep(10 * 1000);
+    }
+    printf("too big: node 0's arena carved %zu MiB, %zu MiB free\n", carved * g_page >> 20,
+           node_free * g_page >> 20);
+    CHECK(node_free * g_page >= kChunk, "the freed 64 MiB block never came back to node 0's arena");
+
+    void* p = nullptr;
+    int p_errno = 0;
+    const std::string err = captureStderr([&] {
+        errno = 0;
+        p = malloc_numa_aligned(0, g_page, kAlign);
+        p_errno = errno;
+    });
+    if (!p) {
+        printf("SKIP (numa): the host refused a 2 GiB mapping (errno %d)\n", p_errno);
+    } else {
+        numa_test::Policy pol;
+        CHECK(!in_arena(p), "one page at 2 GiB alignment came from the arena: the test's premise is wrong");
+        CHECK(reinterpret_cast<uintptr_t>(p) % kAlign == 0, "the fallback block %p is not 2 GiB-aligned", p);
+        CHECK(numa_test::isBoundTo(p, 0, &pol), "the fallback block is not bound to node 0 (mode %#x)", pol.mode);
+        char size_name[64];
+        snprintf(size_name, sizeof(size_name), "a %zu KiB malloc_numa allocation", g_page / 1024);
+        const size_t warnings = countOf(err, "did not fit the compressible arena");
+        CHECK(warnings == 1, "%zu 'did not fit' warnings for the fallback block, want 1", warnings);
+        CHECK(err.find("has the space") == std::string::npos,
+              "the warning says the node's arena has the space, though the block and its 2 GiB "
+              "alignment need more than the whole 1 GiB arena");
+        CHECK(err.find("raise SMASH_VM_GIB") != std::string::npos, "the warning does not say to raise SMASH_VM_GIB");
+        CHECK(err.find(size_name) != std::string::npos, "the warning does not name the block as '%s'", size_name);
+        std::free(p);
+    }
+    std::free(w[1 - victim]);
+#endif
+    if (failures) {
+        printf("vm_exhaustion_test (too big): %d FAILURES\n", failures);
+        return 1;
+    }
+    printf("vm_exhaustion_test (too big): all checks passed\n");
+    return 0;
+}
+
 } // namespace
 
 int main() {
@@ -335,6 +457,7 @@ int main() {
                "can fail for reasons unrelated to smash\n");
         return 0;
     }
+    if (const char* e = std::getenv("VM_EXHAUST_TOO_BIG"); e && e[0] == '1') return runTooBigMode();
     if (const char* e = std::getenv("VM_EXHAUST_NUMA")) {
 #if defined(__linux__)
         if (e[0] == '1') return runNumaMode(false);
@@ -343,6 +466,26 @@ int main() {
         printf("SKIP: VM_EXHAUST_NUMA=%s needs Linux (without NUMA, malloc_numa is plain malloc)\n", e);
         return 0;
 #endif
+    }
+
+    // A request no mapping can serve is nullptr and prints nothing: the
+    // warning says the block came from a direct mmap, and it is one-shot, so
+    // printed here it would be false and phase 1 would get none. 16 TiB less
+    // a page still fits LargeAlloc's 32-bit page count, and the default
+    // heuristic overcommit refuses a mapping that size on any host with less
+    // memory; where one is made, the check is skipped.
+    {
+        constexpr size_t kHuge = ((size_t{1} << 32) - 1) * 4096;
+        void* (*volatile do_malloc)(size_t) = std::malloc;   // not elided with its free
+        void* huge = nullptr;
+        const std::string err_huge = captureStderr([&] { huge = do_malloc(kHuge); });
+        if (huge) {
+            printf("note: the host mapped malloc(%zu); the no-warning check needs a refused mapping\n", kHuge);
+            std::free(huge);
+        } else {
+            CHECK(countOf(err_huge, "did not fit the compressible arena") == 0,
+                  "malloc(%zu) got nullptr and printed the one-shot 'did not fit' warning", kHuge);
+        }
     }
 
     std::vector<void*> chunks;

@@ -1431,6 +1431,11 @@ add_smash_mode_test(test_vm_exhaustion_numa vm_exhaustion_test 1 300 "SMASH_VM_G
 # the address space only their own size.
 add_smash_mode_test(test_vm_exhaustion_numa_aligned vm_exhaustion_test 1 300 "SMASH_VM_GIB=1"
                     "VM_EXHAUST_NUMA=aligned")
+# Blocks no 1 GiB arena can hold (a plain 2 GiB malloc, one page of
+# malloc_numa_aligned at 2 GiB alignment): each warning must say the block
+# needs more than the whole arena, not blame the live set or say it has space.
+add_smash_mode_test(test_vm_exhaustion_too_big vm_exhaustion_test 1 120 "SMASH_VM_GIB=1"
+                    "VM_EXHAUST_TOO_BIG=1")
 
 # ── Hugepage / VMA-pressure guards ──────────────────────────────────────────
 # Follow-ups to the aarch64 std::bad_alloc investigation for the case where the

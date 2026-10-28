@@ -39,9 +39,17 @@ public:
         release_ctx_ = hook_ctx;
     }
 
+    // A size in a warning: MiB, or KiB below 1 MiB, so a small block does not
+    // read "0 MiB".
+    static size_t warnSize(size_t bytes) { return bytes >= (size_t{1} << 20) ? bytes >> 20 : bytes >> 10; }
+    static const char* warnUnit(size_t bytes) { return bytes >= (size_t{1} << 20) ? "MiB" : "KiB"; }
+
     // One-shot: the arena could not take a block that was meant to be
-    // compressible. Mirrors Slab::warnArenaExhausted, including the
-    // capacity-vs-fragmentation split, because the fix differs.
+    // compressible, and the block now exists outside it. Called only then:
+    // a request that got no block at all spent the warning on a false "it came
+    // from a direct mmap", and the overflow that followed went unreported.
+    // Mirrors Slab::warnArenaExhausted, including the capacity-vs-fragmentation
+    // split, because the fix differs.
     [[gnu::cold, gnu::noinline]] void warnLargeAllocNotCompressible(size_t alloc_size) {
         static std::atomic<bool> warned{false};
         if (warned.exchange(true, std::memory_order_relaxed)) return;
@@ -50,55 +58,86 @@ public:
         const size_t free_pages = vm_region_->arenaFreePages();
         const size_t longest = vm_region_->arenaLongestFreeRun();
         const size_t want_pages = alloc_size / kPageSize;
-        char buf[512];
+        char verdict[224];
+        if (want_pages > total)
+            // Not "the live set outgrew the arena": nothing else need be live.
+            smash::safe_snprintf(verdict, sizeof(verdict),
+                "The block alone needs %zu MiB, more than the whole %zu MiB arena: raise "
+                "SMASH_VM_GIB above that (ceiling 1024; an unused arena costs address "
+                "space, not memory).", alloc_size >> 20, total * kPageSize >> 20);
+        else
+            smash::safe_snprintf(verdict, sizeof(verdict), "%s",
+                // Exact, not a guess: it is fragmentation precisely when enough
+                // pages are free but no single run is long enough. A ratio of free
+                // to total cannot tell those apart — measured, an arena with 1021
+                // of 4096 MiB free in 512 KB runs is 24.9% free and was reported as
+                // "the live set outgrew the arena", which is the opposite of the
+                // truth and sends the reader to raise SMASH_VM_GIB for nothing.
+                (free_pages >= want_pages && longest < want_pages)
+                    ? "A run that long is not available though the space is: the arena is "
+                      "fragmented, so a larger SMASH_VM_GIB only postpones this. Blocks "
+                      "of very different sizes sharing the arena is the usual cause."
+                    : "The live set outgrew the arena: raise SMASH_VM_GIB (ceiling 1024; "
+                      "an unused arena costs address space, not memory).");
+        char buf[640];
         const int n = smash::safe_snprintf(buf, sizeof(buf),
-            "[smash WARN] a %zu MiB allocation did not fit the compressible arena: "
+            "[smash WARN] a %zu %s allocation did not fit the compressible arena: "
             "%zu of %zu MiB handed out, %zu MiB free in %zu-page runs or shorter. "
             "It came from a direct mmap instead and will NEVER be compressed, "
             "however cold it gets. %s\n",
-            alloc_size >> 20, bump * kPageSize >> 20, total * kPageSize >> 20,
-            free_pages * kPageSize >> 20, longest,
-            // Exact, not a guess: it is fragmentation precisely when enough
-            // pages are free but no single run is long enough. A ratio of free
-            // to total cannot tell those apart — measured, an arena with 1021
-            // of 4096 MiB free in 512 KB runs is 24.9% free and was reported as
-            // "the live set outgrew the arena", which is the opposite of the
-            // truth and sends the reader to raise SMASH_VM_GIB for nothing.
-            (free_pages >= want_pages && longest < want_pages)
-                ? "A run that long is not available though the space is: the arena is "
-                  "fragmented, so a larger SMASH_VM_GIB only postpones this. Blocks "
-                  "of very different sizes sharing the arena is the usual cause."
-                : "The live set outgrew the arena: raise SMASH_VM_GIB (ceiling 1024; "
-                  "an unused arena costs address space, not memory).");
+            warnSize(alloc_size), warnUnit(alloc_size), bump * kPageSize >> 20, total * kPageSize >> 20,
+            free_pages * kPageSize >> 20, longest, verdict);
         if (n > 0) (void)!::write(2, buf, static_cast<size_t>(n));
     }
 
 #if defined(__linux__)
-    // One-shot, as warnLargeAllocNotCompressible: a malloc_numa block the
-    // node's arena could not take. It used to fall back silently.
-    [[gnu::cold, gnu::noinline]] void warnNumaAllocNotCompressible(size_t alloc_size, uint32_t node) {
+    // One-shot, as warnLargeAllocNotCompressible, and like it called only once
+    // the block exists: a malloc_numa block the node's arena could not take.
+    // It used to fall back silently.
+    [[gnu::cold, gnu::noinline]] void warnNumaAllocNotCompressible(size_t alloc_size, uint32_t node,
+                                                                   size_t alignment) {
         static std::atomic<bool> warned{false};
         if (warned.exchange(true, std::memory_order_relaxed)) return;
         const size_t total = vm_region_->contigPages();
         const size_t bump = vm_region_->rawNextPage();
         size_t carved = 0, node_free = 0;
         vm_region_->nodeArenaInfo(node, &carved, &node_free);
-        char buf[640];
+        // What the node's arena needs to be sure of placing the block: its
+        // pages and, for an alignment past a page, the worst-case gap before
+        // an aligned start. Weighing the free pages against the block alone
+        // said "has the space" for one page at 2 GiB alignment in a 1 GiB arena.
+        const bool aligned = alignment > kPageSize;
+        const size_t need_pages = alloc_size / kPageSize + (aligned ? alignment / kPageSize - 1 : 0);
+        char align_note[48] = "";
+        if (aligned)
+            smash::safe_snprintf(align_note, sizeof(align_note), " at %zu %s alignment",
+                                 warnSize(alignment), warnUnit(alignment));
+        char verdict[224];
+        if (need_pages > total)
+            smash::safe_snprintf(verdict, sizeof(verdict),
+                "%s %zu MiB, more than the whole %zu MiB arena: raise SMASH_VM_GIB above that "
+                "(ceiling 1024; an unused arena costs address space, not memory).",
+                aligned ? "The block and its alignment need" : "The block needs",
+                need_pages * kPageSize >> 20, total * kPageSize >> 20);
+        else
+            smash::safe_snprintf(verdict, sizeof(verdict), "%s",
+                // Exact: the node's arena failed this block with that much free,
+                // so the free space is in runs too short, or where this block
+                // cannot take it (another sub-arena's, or still being decommitted).
+                node_free >= need_pages
+                    ? "The node's arena has the space but could not give it to this block: a larger "
+                      "SMASH_VM_GIB only postpones this."
+                    : "The arena is full: raise SMASH_VM_GIB (ceiling 1024; an unused arena costs "
+                      "address space, not memory).");
+        char buf[768];
         const int n = smash::safe_snprintf(buf, sizeof(buf),
-            "[smash WARN] a %zu MiB malloc_numa allocation for node %u did not fit the compressible arena: "
+            "[smash WARN] a %zu %s malloc_numa allocation%s for node %u did not fit the compressible arena: "
             "%zu of %zu MiB handed out, node %u's arena holds %zu MiB of it with %zu MiB free. "
             "It came from a separate mapping bound to node %u instead and will NEVER be compressed, "
             "however cold it gets. %s\n",
-            alloc_size >> 20, node, (bump < total ? bump : total) * kPageSize >> 20, total * kPageSize >> 20,
-            node, carved * kPageSize >> 20, node_free * kPageSize >> 20, node,
-            // Exact: the node's arena failed this block with that much free,
-            // so the free space is in runs too short, or where this block
-            // cannot take it (another sub-arena's, or still being decommitted).
-            node_free >= alloc_size / kPageSize
-                ? "The node's arena has the space but could not give it to this block: a larger "
-                  "SMASH_VM_GIB only postpones this."
-                : "The arena is full: raise SMASH_VM_GIB (ceiling 1024; an unused arena costs "
-                  "address space, not memory).");
+            warnSize(alloc_size), warnUnit(alloc_size), align_note, node,
+            (bump < total ? bump : total) * kPageSize >> 20, total * kPageSize >> 20,
+            node, carved * kPageSize >> 20, node_free * kPageSize >> 20, node, verdict);
         if (n > 0) (void)!::write(2, buf, static_cast<size_t>(n));
     }
 #endif
@@ -126,14 +165,13 @@ public:
 
         // Fallback to direct mmap. When the caller asked for a compressible
         // block (at or above the threshold) and the arena could not serve it,
-        // say so once: this memory is never walked by the compressor, so it
-        // stays resident for the life of the process however cold it gets,
-        // and nothing else in the process reports that. It is the failure mode
-        // that matters most for a workload of multi-MB or GB blocks, where a
-        // few allocations can exhaust the arena outright.
-        if (!mem && vm_region_ && alignment <= kPageSize &&
-            alloc_size >= largeAllocVmThreshold()) [[unlikely]]
-            warnLargeAllocNotCompressible(alloc_size);
+        // say so once the block exists (below): this memory is never walked by
+        // the compressor, so it stays resident for the life of the process
+        // however cold it gets, and nothing else in the process reports that.
+        // It is the failure mode that matters most for a workload of multi-MB
+        // or GB blocks, where a few allocations can exhaust the arena outright.
+        const bool arena_missed = !mem && vm_region_ && alignment <= kPageSize &&
+                                  alloc_size >= largeAllocVmThreshold();
         if (!mem) {
             if (alignment <= kPageSize) {
                 mem = vm::mapPages(alloc_size);
@@ -170,6 +208,7 @@ public:
         // page_count so we can compute the full range from just the base.
         // PageMap::set uses atomic stores internally - no external lock needed.
         page_map_->set(reinterpret_cast<uintptr_t>(mem), span);
+        if (arena_missed) [[unlikely]] warnLargeAllocNotCompressible(alloc_size);
         return mem;
     }
 
@@ -207,7 +246,7 @@ public:
                     page_states_->set(idx + p, PageState::ACTIVE);
             }
         }
-        if (!mem && vm_region_) [[unlikely]] warnNumaAllocNotCompressible(alloc_size, node);
+        const bool arena_missed = !mem && vm_region_;   // warned once the block exists, below
         if (!mem) {
             // Separate bound mapping: never compressed. Over-map and trim for
             // an alignment the mapping itself does not guarantee, exactly as
@@ -253,6 +292,7 @@ public:
         }
         span->initLarge(mem, size, num_pages);
         page_map_->set(reinterpret_cast<uintptr_t>(mem), span);
+        if (arena_missed) [[unlikely]] warnNumaAllocNotCompressible(alloc_size, node, alignment);
         return mem;
     }
 #endif
