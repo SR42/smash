@@ -126,6 +126,24 @@ public:
         return true;
     }
 
+    // The free run that starts at `start`: false if none does. Caller-locked,
+    // for walking runs of different owners that sit next to each other.
+    bool runAtUnlocked(size_t start, size_t* len, uint32_t* owner, uint32_t* stamp) const {
+        if (start >= num_pages_ || !isRunStart(start)) return false;
+        *len = tags_[start].len;
+        *owner = tags_[start].owner;
+        *stamp = tags_[start].stamp;
+        return true;
+    }
+    // The start of the free run that ends right before `start`, or kNone.
+    size_t runBeforeUnlocked(size_t start) const {
+        if (start == 0 || start > num_pages_) return kNone;
+        const uint32_t t = ends_[start - 1];
+        if (!t) return kNone;
+        const size_t s = t - 1;   // the end tag may be stale: re-validate it
+        return isRunStart(s) && s + tags_[s].len == start ? s : kNone;
+    }
+
     // Take `len` pages from a free run of `owner`; kNone if none is large
     // enough.
     size_t take(size_t len, uint32_t owner) {

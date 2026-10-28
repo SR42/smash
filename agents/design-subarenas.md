@@ -243,6 +243,20 @@ memory freed by one sub-arena is not stranded there.
   objects fit instead of 960; 978 with sub-arenas off). For any set, the
   last-resort retry after the region is out also takes siblings' tails, not
   only the caller's own. Both are `test_subarena_exhaust_*`.
+- **The full-region cliff (fixed 2026-10-27)**: once the region has no fresh
+  chunk left, the last-resort retry also takes a block across a sub-arena's
+  dirty run and the clean runs next to it (`takeMixedFromSubLocked`), and
+  `donateSharedPool` purges only the dirty runs of chunks that are then
+  wholly free, after retiring the tails. Dirty and clean runs never merge,
+  and a full region's free space ends up alternating between them, so a
+  request neither kind held alone left the sub-arenas. `donateSharedPool`
+  then purged every dirty run of every sub-arena, so each later block was
+  faulted in again. On the next such miss it all repeated. With 8 threads
+  churning 1-3 MiB blocks at 70-75 % of a 1 GiB region and the compressor
+  off, throughput fell from about 200k to 9-11k blocks a second, with
+  1.5-1.7M page faults a second and every `madvise` coming from that purge;
+  it did not recover. It now stays at 190-198k with no block outside the
+  region. `test_subarena_exhaust_mixed`.
 - **A miss folds the tail into the clean runs** before looking at siblings
   (the tail and its free neighbour can serve what neither can alone), and
   both that fold and a tail change pool the chunk if it is now wholly free.

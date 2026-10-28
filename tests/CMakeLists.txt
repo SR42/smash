@@ -1187,8 +1187,9 @@ if(NOT APPLE)
 
   # Sub-arenas must not strand free space when a 1 GiB region runs out:
   # siblings' tails for a node arena, tails and pooled chunks handed to slab
-  # spans for the shared arena (full mode), and pooled chunks reused by blocks
-  # larger than a chunk.
+  # spans for the shared arena (full mode), pooled chunks reused by blocks
+  # larger than a chunk, and a block taken across a dirty and a clean run
+  # rather than every sub-arena purged (the full-region cliff).
   add_executable(subarena_exhaust_test subarena_exhaust_test.cpp)
   set_target_properties(subarena_exhaust_test PROPERTIES CXX_STANDARD 20)
   target_link_libraries(subarena_exhaust_test PRIVATE ${CMAKE_DL_LIBS} Threads::Threads)
@@ -1200,8 +1201,10 @@ if(NOT APPLE)
     "SMASH_LARGE_ONLY=0" "SUBARENA_EXHAUST_PHASE=B" $<TARGET_FILE:subarena_exhaust_test>)
   add_test(NAME test_subarena_exhaust_big COMMAND ${CMAKE_COMMAND} -E env ${_sx_env}
     "SMASH_LARGE_ONLY=1" "SUBARENA_EXHAUST_PHASE=C" $<TARGET_FILE:subarena_exhaust_test>)
+  add_test(NAME test_subarena_exhaust_mixed COMMAND ${CMAKE_COMMAND} -E env ${_sx_env}
+    "SMASH_LARGE_ONLY=1" "SUBARENA_EXHAUST_PHASE=D" $<TARGET_FILE:subarena_exhaust_test>)
   set_tests_properties(test_subarena_exhaust_node test_subarena_exhaust_shared
-    test_subarena_exhaust_big PROPERTIES TIMEOUT 120)
+    test_subarena_exhaust_big test_subarena_exhaust_mixed PROPERTIES TIMEOUT 120)
 endif()
 
 # smash_sim (tools/smash_sim.cpp): drives the real large-block allocator —

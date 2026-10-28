@@ -1876,15 +1876,15 @@ private:
     // non-sub-arena users of the region (slab spans, the fallback) once it
     // is exhausted. A pooled chunk has no runs in the set's map and no owner.
     //
-    // First make every chunk that is wholly free poolable: purge dirty runs
-    // (their chunks become clean) and retire each sub-arena's unused tail to
-    // its clean runs, so a tail chunk with nothing live is pooled too.
+    // First make every chunk that is wholly free poolable: retire each
+    // sub-arena's unused tail to its clean runs, so a tail chunk with nothing
+    // live is pooled too, and purge the dirty runs of wholly free chunks
+    // (their chunks become clean).
     // Without that, 8 threads' sub-arenas held up to 512 MiB of a 1 GiB
     // arena in tails that slab spans could never use.
     bool donateSharedPool() {
         NodeArena* s = shared_set_.load(std::memory_order_acquire);
         if (!s || !s->subs_ready.load(std::memory_order_acquire)) return false;
-        for (uint32_t i = 0; i < s->nsubs; ++i) purgeSubArena(*s, i, /*all=*/true);
         for (uint32_t i = 0; i < s->nsubs; ++i) {
             SubArena& sa = s->subs[i];
             LockGuard guard(sa.lock);
@@ -1894,6 +1894,14 @@ private:
             sa.cur = sa.end;
             maybeReturnChunkLocked(*s, i, idx);
         }
+        // Only the dirty runs of chunks that are then wholly free: a purge
+        // elsewhere frees nothing the shared free map can use, and purging
+        // every dirty run on each miss made every later block fault its pages
+        // in again (smash_sim's 8 threads at 75 % of a 1 GiB region: 1.95M
+        // runs purged in 6 s). The tails go first, so a chunk free but for its
+        // tail counts as wholly free.
+        for (uint32_t i = 0; i < s->nsubs; ++i)
+            purgeSubArena(*s, i, /*all=*/true, /*whole_chunks_only=*/true);
         bool any = false;
         for (;;) {
             size_t c;
@@ -2041,6 +2049,72 @@ private:
         return base_ + start * kPageSize;
     }
 
+    // Under sa.lock: where the span of sub-arena `s`'s free runs, dirty and
+    // clean, that starts at `start` ends; `start` if no run of `s` starts
+    // there. Runs never cross a chunk boundary, and neither does the span.
+    size_t mixedSpanEnd(NodeArena& na, uint32_t s, size_t start) const {
+        size_t e = start, len;
+        uint32_t o, stamp;
+        do {
+            if (!na.map.runAtUnlocked(e, &len, &o, &stamp) ||
+                (o != ownerDirty(s) && o != ownerClean(s)))
+                break;
+            e += len;
+        } while (e % kNodeChunkPages);
+        return e;
+    }
+
+    // Under sa.lock, once the region has no fresh chunk left: `num_pages`
+    // from a dirty run and the clean runs next to it, which never merge (a
+    // clean run's pages are purged, a dirty run's are not). A full region's
+    // free space ends up split that way, frees landing dirty next to purged
+    // runs, and a request neither kind of run holds alone used to leave the
+    // sub-arenas — where each one purged every dirty run (donateSharedPool),
+    // so the next blocks were all faulted in again: 1-3 MiB churn at 70-75 %
+    // of a 1 GiB region fell from 200k to 10k blocks a second for good.
+    // The block's dirty pages leave the dirty count, and what the request
+    // does not use of the runs goes back as it was.
+    void* takeMixedFromSubLocked(NodeArena& na, uint32_t s, size_t num_pages,
+                                 size_t align_pages, size_t phase) {
+        SubArena& sa = na.subs[s];
+        const uint32_t dirty = ownerDirty(s), clean = ownerClean(s);
+        size_t span = PageRunMap::kNone, at = 0;
+        auto consider = [&](size_t start, size_t, uint32_t) {
+            if (span != PageRunMap::kNone) return;
+            if (start % kNodeChunkPages) {   // a span is walked from its first run only
+                const size_t l = na.map.runBeforeUnlocked(start);
+                size_t len;
+                uint32_t o, stamp;
+                if (l != PageRunMap::kNone && na.map.runAtUnlocked(l, &len, &o, &stamp) &&
+                    (o == dirty || o == clean))
+                    return;
+            }
+            const size_t b = start + alignGap(start, align_pages, phase);
+            if (b >= start && b + num_pages <= mixedSpanEnd(na, s, start)) { span = start; at = b; }
+        };
+        na.map.forEachRunUnlocked(dirty, consider);
+        na.map.forEachRunUnlocked(clean, consider);
+        if (span == PageRunMap::kNone) return nullptr;
+        const size_t blk_end = at + num_pages;
+        for (size_t e = span; e < blk_end;) {
+            size_t len;
+            uint32_t o, stamp;
+            if (!na.map.runAtUnlocked(e, &len, &o, &stamp)) break;   // walked above: cannot happen
+            const size_t next = e + len;
+            if (next > at) {
+                na.map.removeRunUnlocked(e, len, o);
+                const size_t lo = e > at ? e : at, hi = next < blk_end ? next : blk_end;
+                if (o == dirty) sa.dirty_pages -= hi - lo;
+                if (e < at) na.map.insertUnlocked(e, at - e, o, kNodeChunkPages, stamp);
+                if (next > blk_end)
+                    na.map.insertUnlocked(blk_end, next - blk_end, o, kNodeChunkPages, stamp);
+            }
+            e = next;
+        }
+        sa.dirty_published.store(sa.dirty_pages, std::memory_order_relaxed);
+        return base_ + at * kPageSize;
+    }
+
     void* allocateOnSubArena(NodeArena& na, int node, size_t num_pages,
                              size_t align_pages, size_t phase) {
         if (!ensureSubArenas(na, node)) { errno = ENOMEM; return nullptr; }
@@ -2097,6 +2171,8 @@ private:
         // clean runs, and siblings are worth waiting for now — their unused
         // tails too (a block there belongs to the sibling's chunk and goes
         // home to it), or free space parked in them fails the allocation.
+        // Then a dirty run with the clean runs next to it, before the request
+        // gives up on the sub-arenas (takeMixedFromSubLocked).
         uint64_t deadline = 0;
         for (int attempt = 0; drainWaitMore(attempt, deadline); ++attempt) {
             drainQueueNow(subQueue(na));
@@ -2104,6 +2180,12 @@ private:
                 const uint32_t s = (me + i) % n;
                 LockGuard guard(na.subs[s].lock);
                 if (void* p = takeFromSubLocked(na, s, num_pages, align_pages, phase, true))
+                    return p;
+            }
+            for (uint32_t i = 0; i < n; ++i) {
+                const uint32_t s = (me + i) % n;
+                LockGuard guard(na.subs[s].lock);
+                if (void* p = takeMixedFromSubLocked(na, s, num_pages, align_pages, phase))
                     return p;
             }
             if (!inFlight(subQueue(na))) break;
@@ -2215,8 +2297,10 @@ private:
     // Purge one sub-arena's aged (or, with `all`, every) dirty run, and runs
     // beyond the cap oldest first: remove them under the lock, madvise with
     // it dropped, re-insert them clean. `all` blocks on the lock; the
-    // periodic sweep only tries it.
-    void purgeSubArena(NodeArena& na, uint32_t s, bool all) {
+    // periodic sweep only tries it. `whole_chunks_only` limits the purge to
+    // runs in chunks that the sub-arena's runs cover wholly, which it then
+    // pools.
+    void purgeSubArena(NodeArena& na, uint32_t s, bool all, bool whole_chunks_only = false) {
         SubArena& sa = na.subs[s];
         if (sa.dirty_published.load(std::memory_order_relaxed) == 0) return;
         struct Victim { size_t start, len; uint32_t stamp; };
@@ -2229,7 +2313,12 @@ private:
         const uint64_t decay = dirtyDecayMs();
         const size_t cap = dirtyMaxPages();
         na.map.forEachRunUnlocked(ownerDirty(s), [&](size_t start, size_t len, uint32_t stamp) {
-            if (n < kMaxVictims) runs[n++] = Victim{start, len, stamp};
+            if (n >= kMaxVictims) return;
+            if (whole_chunks_only) {
+                const size_t c0 = chunkOfPage(start) * kNodeChunkPages;
+                if (mixedSpanEnd(na, s, c0) != c0 + kNodeChunkPages) return;
+            }
+            runs[n++] = Victim{start, len, stamp};
         });
         // Oldest first.
         for (size_t i = 1; i < n; ++i)
