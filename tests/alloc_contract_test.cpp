@@ -48,6 +48,12 @@
 #include <utility>
 #include <vector>
 
+#if defined(__linux__)
+#include <csignal>
+#include <sys/resource.h>
+#include <sys/wait.h>
+#endif
+
 #if defined(__APPLE__)
 #include <malloc/malloc.h>
 #define USABLE_SIZE(p) malloc_size(p)
@@ -516,6 +522,197 @@ const char* modeName() {
 
 } // namespace
 
+// ── operator new and the new_handler ────────────────────────────────────────
+// An operator new that cannot allocate calls the installed std::new_handler
+// and tries again; only with no handler left does it throw std::bad_alloc, and
+// the nothrow forms return nullptr where the throwing ones throw
+// ([new.delete.single]; libstdc++'s do). alloc8's and smash's operators threw
+// at once without calling it, so a program whose handler frees a cache got
+// bad_alloc instead of its memory. Checked through the operators as this
+// binary binds them (smash's GLIBCXX/CXXABI-versioned aliases) and, on Linux,
+// looked up by plain name (alloc8's default-version ones).
+namespace nh {
+int calls = 0;
+int uninstall_at = 0;
+void* reserve = nullptr;
+constexpr size_t kReserveAlign = size_t{2} << 20;
+struct Custom : std::bad_alloc {};
+void counting() { if (++calls >= uninstall_at) std::set_new_handler(nullptr); }
+void throwing() { ++calls; throw Custom(); }
+void releasing() {   // frees the reserve once, then gives up
+    ++calls;
+    if (!reserve) { std::set_new_handler(nullptr); return; }
+    ::operator delete(reserve, std::align_val_t(kReserveAlign));
+    reserve = nullptr;
+}
+
+struct NewSet {
+    const char* name;
+    void* (*plain)(size_t);
+    void* (*array)(size_t);
+    void* (*plain_nt)(size_t, const std::nothrow_t&);
+    void* (*array_nt)(size_t, const std::nothrow_t&);
+    void* (*al)(size_t, std::align_val_t);
+    void* (*al_array)(size_t, std::align_val_t);
+    void* (*al_nt)(size_t, std::align_val_t, const std::nothrow_t&);
+    void* (*al_array_nt)(size_t, std::align_val_t, const std::nothrow_t&);
+};
+
+NewSet boundSet() {
+    return {"as bound",
+            static_cast<void* (*)(size_t)>(::operator new),
+            static_cast<void* (*)(size_t)>(::operator new[]),
+            static_cast<void* (*)(size_t, const std::nothrow_t&)>(::operator new),
+            static_cast<void* (*)(size_t, const std::nothrow_t&)>(::operator new[]),
+            static_cast<void* (*)(size_t, std::align_val_t)>(::operator new),
+            static_cast<void* (*)(size_t, std::align_val_t)>(::operator new[]),
+            static_cast<void* (*)(size_t, std::align_val_t, const std::nothrow_t&)>(::operator new),
+            static_cast<void* (*)(size_t, std::align_val_t, const std::nothrow_t&)>(::operator new[])};
+}
+
+#if defined(__linux__)
+template <typename T> T byName(const char* sym) { return reinterpret_cast<T>(dlsym(RTLD_DEFAULT, sym)); }
+NewSet nameSet() {
+    NewSet s = boundSet();
+    s.name = "by name";
+    s.plain = byName<decltype(s.plain)>("_Znwm");
+    s.array = byName<decltype(s.array)>("_Znam");
+    s.plain_nt = byName<decltype(s.plain_nt)>("_ZnwmRKSt9nothrow_t");
+    s.array_nt = byName<decltype(s.array_nt)>("_ZnamRKSt9nothrow_t");
+    s.al = byName<decltype(s.al)>("_ZnwmSt11align_val_t");
+    s.al_array = byName<decltype(s.al_array)>("_ZnamSt11align_val_t");
+    s.al_nt = byName<decltype(s.al_nt)>("_ZnwmSt11align_val_tRKSt9nothrow_t");
+    s.al_array_nt = byName<decltype(s.al_array_nt)>("_ZnamSt11align_val_tRKSt9nothrow_t");
+    return s;
+}
+#endif
+
+// One operator over a size nothing can serve: a handler that removes itself on
+// its third call is called three times, then the operator fails; a handler
+// that throws is passed through by the throwing forms and turned into nullptr
+// by the nothrow ones.
+template <typename F>
+void expectLoop(const char* set, const char* what, bool nothrow, F call) {
+    calls = 0;
+    uninstall_at = 3;
+    std::set_new_handler(counting);
+    void* p = nullptr;
+    bool threw = false;
+    try { p = call(); } catch (const std::bad_alloc&) { threw = true; }
+    std::set_new_handler(nullptr);
+    CHECK(calls == 3 && !p && threw != nothrow,
+          "%s %s: the new_handler was called %d times (want 3, until it removed itself), then %s",
+          set, what, calls, p ? "a block" : threw ? "bad_alloc" : "nullptr");
+
+    calls = 0;
+    std::set_new_handler(throwing);
+    bool custom = false;
+    threw = false;
+    p = nullptr;
+    try { p = call(); } catch (const Custom&) { custom = true; } catch (const std::bad_alloc&) { threw = true; }
+    std::set_new_handler(nullptr);
+    CHECK(calls == 1 && !p && custom != nothrow && !threw,
+          "%s %s with a throwing new_handler: %d call(s), then %s (want 1, then %s)", set, what, calls,
+          p ? "a block" : custom ? "its exception" : threw ? "plain bad_alloc" : "nullptr",
+          nothrow ? "nullptr" : "its exception");
+}
+
+void checkLoop(const NewSet& s) {
+    static volatile size_t huge = SIZE_MAX / 2;
+    const std::align_val_t al{64};
+    expectLoop(s.name, "operator new", false, [&] { return s.plain(huge); });
+    expectLoop(s.name, "operator new[]", false, [&] { return s.array(huge); });
+    expectLoop(s.name, "operator new(nothrow)", true, [&] { return s.plain_nt(huge, std::nothrow); });
+    expectLoop(s.name, "operator new[](nothrow)", true, [&] { return s.array_nt(huge, std::nothrow); });
+    expectLoop(s.name, "operator new(align)", false, [&] { return s.al(huge, al); });
+    expectLoop(s.name, "operator new[](align)", false, [&] { return s.al_array(huge, al); });
+    expectLoop(s.name, "operator new(align, nothrow)", true, [&] { return s.al_nt(huge, al, std::nothrow); });
+    expectLoop(s.name, "operator new[](align, nothrow)", true,
+               [&] { return s.al_array_nt(huge, al, std::nothrow); });
+}
+
+#if defined(__linux__)
+long vmSizeKiB() {
+    FILE* f = fopen("/proc/self/status", "r");
+    char line[256];
+    long v = -1;
+    while (f && fgets(line, sizeof line, f))
+        if (!strncmp(line, "VmSize:", 7)) { v = atol(line + 7); break; }
+    if (f) fclose(f);
+    return v;
+}
+
+// A handler that frees memory lets the retry succeed. In a child (one thread,
+// so nothing else maps memory meanwhile) whose address space is capped 32 MiB
+// above what it uses, a 64 MiB block at 2 MiB alignment (a direct mapping in
+// glibc and smash alike) does not fit until the handler frees a 64 MiB
+// reserve: exactly one call, then the block.
+int retryChild(const NewSet& s) {
+    constexpr size_t kSize = size_t{64} << 20;
+    const std::align_val_t al{kReserveAlign};
+    struct Form { const char* what; void* (*call)(const NewSet&, size_t, std::align_val_t); };
+    const Form forms[] = {
+        {"operator new(align)", [](const NewSet& n, size_t z, std::align_val_t a) { return n.al(z, a); }},
+        {"operator new[](align)", [](const NewSet& n, size_t z, std::align_val_t a) { return n.al_array(z, a); }},
+        {"operator new(align, nothrow)",
+         [](const NewSet& n, size_t z, std::align_val_t a) { return n.al_nt(z, a, std::nothrow); }},
+        {"operator new[](align, nothrow)",
+         [](const NewSet& n, size_t z, std::align_val_t a) { return n.al_array_nt(z, a, std::nothrow); }},
+    };
+    int bad = 0;
+    for (const Form& f : forms) {
+        reserve = ::operator new(kSize, al);
+        rlimit old{};
+        getrlimit(RLIMIT_AS, &old);
+        const rlimit cap{static_cast<rlim_t>(vmSizeKiB()) * 1024 + (rlim_t{32} << 20), old.rlim_max};
+        setrlimit(RLIMIT_AS, &cap);
+        calls = 0;
+        std::set_new_handler(releasing);
+        void* p = nullptr;
+        try { p = f.call(s, kSize, al); } catch (const std::bad_alloc&) {}
+        std::set_new_handler(nullptr);
+        setrlimit(RLIMIT_AS, &old);
+        if (!p || calls != 1) {
+            fprintf(stderr, "FAIL: %s %s with a new_handler that frees 64 MiB: %s after %d call(s) "
+                    "(want the block after 1)\n", s.name, f.what, p ? "the block" : "no block", calls);
+            ++bad;
+        }
+        if (p) ::operator delete(p, al);
+        if (reserve) ::operator delete(reserve, al);
+        reserve = nullptr;
+    }
+    return bad;
+}
+#endif
+}  // namespace nh
+
+void testNewHandler() {
+    const nh::NewSet bound = nh::boundSet();
+    nh::checkLoop(bound);
+#if defined(__linux__)
+    const nh::NewSet named = nh::nameSet();
+    const bool have_named = named.plain && named.array && named.plain_nt && named.array_nt &&
+                            named.al && named.al_array && named.al_nt && named.al_array_nt;
+    CHECK(have_named, "operator new by name: dlsym found only some of the eight");
+    if (have_named) nh::checkLoop(named);
+    const pid_t pid = fork();
+    if (pid == 0) _exit(nh::retryChild(bound) + (have_named ? nh::retryChild(named) : 0));
+    int status = 0;
+    bool done = false;
+    for (int i = 0; i < 6000 && !done; ++i) {   // 60 s
+        done = waitpid(pid, &status, WNOHANG) == pid;
+        if (!done) usleep(10000);
+    }
+    if (!done) { kill(pid, SIGKILL); waitpid(pid, &status, 0); }
+    CHECK(done && WIFEXITED(status) && WEXITSTATUS(status) == 0,
+          "new_handler retry child: %s (status 0x%x)", done ? "failed checks" : "hung, killed at 60 s", status);
+    printf("new_handler: 8 operators x %d sets loop and pass a throw through; the retry gets the "
+           "block once the handler frees memory\n", have_named ? 2 : 1);
+#else
+    printf("new_handler: 8 operators loop and pass a throw through\n");
+#endif
+}
+
 // ── Sizes no allocator can serve ────────────────────────────────────────────
 // The other half of the contract: an unsatisfiable request fails, with
 // ENOMEM, as glibc's does, and never yields a block shorter than asked for.
@@ -646,6 +843,7 @@ int main() {
     testCalloc(sizes);
     testReallocChain();
     testChurn();
+    testNewHandler();
     testHugeSizes();
 
     if (failures) {

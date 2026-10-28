@@ -2741,27 +2741,56 @@ extern void  xxfree_aligned_sized(void*, size_t, size_t);
 extern void* xxmemalign(size_t, size_t);
 }
 
+// operator new's out-of-memory path ([new.delete.single]): call the installed
+// std::new_handler and try again, and throw std::bad_alloc only once there is
+// none. These threw at once, so a program whose handler frees a cache got
+// bad_alloc where libstdc++'s operator new gives it the block. The nothrow
+// forms return nullptr for whatever the handler throws, as libstdc++'s do.
+// The handler may allocate, so the caller's routing hint is put back before
+// each retry. `al` 0: plain malloc.
+[[gnu::noinline, gnu::cold]] static void* newRetry(size_t sz, size_t al) {
+    void* const ra = alloc8_caller_ra;
+    for (;;) {
+        const std::new_handler handler = std::get_new_handler();
+        if (!handler) throw std::bad_alloc();
+        handler();
+        alloc8_caller_ra = ra;
+        if (void* ptr = al ? xxmemalign(al, sz) : xxmalloc(sz)) return ptr;
+    }
+}
+[[gnu::noinline, gnu::cold]] static void* newRetryNothrow(size_t sz, size_t al) noexcept {
+    try {
+        return newRetry(sz, al);
+    } catch (...) {
+        return nullptr;
+    }
+}
+
 // Aliased wrapper functions for GLIBCXX_3.4 versions
 // These directly call xxmalloc/xxfree, matching alloc8's operator new/delete
 extern "C" {
 SMASH_VISIBLE void* _Znwm_GLIBCXX_3_4(size_t sz) {
     ALLOC8_SET_CALLER_RA();
     void* ptr = xxmalloc(sz);
-    if (!ptr) throw std::bad_alloc();
-    return ptr;
+    return ptr ? ptr : newRetry(sz, 0);
 }
 SMASH_VISIBLE void* _Znam_GLIBCXX_3_4(size_t sz) {
     ALLOC8_SET_CALLER_RA();
     void* ptr = xxmalloc(sz);
-    if (!ptr) throw std::bad_alloc();
-    return ptr;
+    return ptr ? ptr : newRetry(sz, 0);
 }
 SMASH_VISIBLE void  _ZdlPv_GLIBCXX_3_4(void* p)  { if (p) xxfree(p); }
 SMASH_VISIBLE void  _ZdaPv_GLIBCXX_3_4(void* p)  { if (p) xxfree(p); }
-SMASH_VISIBLE void* _ZnwmRKSt9nothrow_t_GLIBCXX_3_4(size_t sz, const void*)
-    { ALLOC8_SET_CALLER_RA(); return xxmalloc(sz); }
-SMASH_VISIBLE void* _ZnamRKSt9nothrow_t_GLIBCXX_3_4(size_t sz, const void*)
-    { ALLOC8_SET_CALLER_RA(); return xxmalloc(sz); }
+SMASH_VISIBLE void* _ZnwmRKSt9nothrow_t_GLIBCXX_3_4(size_t sz, const void*) {
+    ALLOC8_SET_CALLER_RA();
+    void* ptr = xxmalloc(sz);
+    return ptr ? ptr : newRetryNothrow(sz, 0);
+}
+SMASH_VISIBLE void* _ZnamRKSt9nothrow_t_GLIBCXX_3_4(size_t sz, const void*) {
+    ALLOC8_SET_CALLER_RA();
+    void* ptr = xxmalloc(sz);
+    return ptr ? ptr : newRetryNothrow(sz, 0);
+}
 SMASH_VISIBLE void  _ZdlPvRKSt9nothrow_t_GLIBCXX_3_4(void* p, const void*)
     { if (p) xxfree(p); }
 SMASH_VISIBLE void  _ZdaPvRKSt9nothrow_t_GLIBCXX_3_4(void* p, const void*)
@@ -2779,14 +2808,12 @@ extern "C" {
 SMASH_VISIBLE void* _ZnwmSt11align_val_t_CXXABI_1_3_11(size_t sz, size_t al) {
     ALLOC8_SET_CALLER_RA();
     void* ptr = xxmemalign(al, sz);
-    if (!ptr) throw std::bad_alloc();
-    return ptr;
+    return ptr ? ptr : newRetry(sz, al);
 }
 SMASH_VISIBLE void* _ZnamSt11align_val_t_CXXABI_1_3_11(size_t sz, size_t al) {
     ALLOC8_SET_CALLER_RA();
     void* ptr = xxmemalign(al, sz);
-    if (!ptr) throw std::bad_alloc();
-    return ptr;
+    return ptr ? ptr : newRetry(sz, al);
 }
 SMASH_VISIBLE void  _ZdlPvSt11align_val_t_CXXABI_1_3_11(void* p, size_t)
     { if (p) xxfree(p); }
@@ -2797,11 +2824,17 @@ SMASH_VISIBLE void  _ZdlPvmSt11align_val_t_CXXABI_1_3_11(void* p, size_t sz, siz
 SMASH_VISIBLE void  _ZdaPvmSt11align_val_t_CXXABI_1_3_11(void* p, size_t sz, size_t al)
     { if (p) xxfree_aligned_sized(p, al, sz); }
 SMASH_VISIBLE void* _ZnwmSt11align_val_tRKSt9nothrow_t_CXXABI_1_3_11(
-        size_t sz, size_t al, const void*)
-    { ALLOC8_SET_CALLER_RA(); return xxmemalign(al, sz); }
+        size_t sz, size_t al, const void*) {
+    ALLOC8_SET_CALLER_RA();
+    void* ptr = xxmemalign(al, sz);
+    return ptr ? ptr : newRetryNothrow(sz, al);
+}
 SMASH_VISIBLE void* _ZnamSt11align_val_tRKSt9nothrow_t_CXXABI_1_3_11(
-        size_t sz, size_t al, const void*)
-    { ALLOC8_SET_CALLER_RA(); return xxmemalign(al, sz); }
+        size_t sz, size_t al, const void*) {
+    ALLOC8_SET_CALLER_RA();
+    void* ptr = xxmemalign(al, sz);
+    return ptr ? ptr : newRetryNothrow(sz, al);
+}
 }
 
 // .symver directives create versioned symbol aliases.

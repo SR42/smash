@@ -1,0 +1,225 @@
+diff --git a/src/common/new_delete.cpp b/src/common/new_delete.cpp
+index 0a688bf..e3c1942 100644
+--- a/src/common/new_delete.cpp
++++ b/src/common/new_delete.cpp
+@@ -17,36 +17,58 @@ extern "C" {
+   void  xxfree_aligned_sized(void*, size_t, size_t);
+ }
+ 
++// Out of memory ([new.delete.single]): call the installed std::new_handler
++// and try again, and throw std::bad_alloc only once there is none. Throwing at
++// once gave bad_alloc to a program whose handler frees a cache. The nothrow
++// forms return nullptr for whatever the handler throws, as libstdc++'s do.
++// The handler may allocate, so the caller's routing hint is put back before
++// each retry. `al` 0: plain xxmalloc.
++__attribute__((noinline, cold)) static void* alloc8_new_retry(std::size_t sz, std::size_t al) {
++  void* const ra = alloc8_caller_ra;
++  for (;;) {
++    const std::new_handler handler = std::get_new_handler();
++    if (!handler) throw std::bad_alloc();
++    handler();
++    alloc8_caller_ra = ra;
++    if (void* ptr = al ? xxmemalign(al, sz) : xxmalloc(sz)) return ptr;
++  }
++}
++
++__attribute__((noinline, cold)) static void* alloc8_new_retry_nothrow(std::size_t sz,
++                                                                     std::size_t al) noexcept {
++  try {
++    return alloc8_new_retry(sz, al);
++  } catch (...) {
++    return nullptr;
++  }
++}
++
+ // ─── THROWING VARIANTS ────────────────────────────────────────────────────────
+ 
+ ALLOC8_EXPORT void* operator new(std::size_t sz) {
+   ALLOC8_SET_CALLER_RA();
+   void* ptr = xxmalloc(sz);
+-  if (ALLOC8_UNLIKELY(!ptr)) {
+-    throw std::bad_alloc();
+-  }
+-  return ptr;
++  return ALLOC8_LIKELY(ptr != nullptr) ? ptr : alloc8_new_retry(sz, 0);
+ }
+ 
+ ALLOC8_EXPORT void* operator new[](std::size_t sz) {
+   ALLOC8_SET_CALLER_RA();
+   void* ptr = xxmalloc(sz);
+-  if (ALLOC8_UNLIKELY(!ptr)) {
+-    throw std::bad_alloc();
+-  }
+-  return ptr;
++  return ALLOC8_LIKELY(ptr != nullptr) ? ptr : alloc8_new_retry(sz, 0);
+ }
+ 
+ // ─── NON-THROWING VARIANTS ────────────────────────────────────────────────────
+ 
+ ALLOC8_EXPORT void* operator new(std::size_t sz, const std::nothrow_t&) noexcept {
+   ALLOC8_SET_CALLER_RA();
+-  return xxmalloc(sz);
++  void* ptr = xxmalloc(sz);
++  return ALLOC8_LIKELY(ptr != nullptr) ? ptr : alloc8_new_retry_nothrow(sz, 0);
+ }
+ 
+ ALLOC8_EXPORT void* operator new[](std::size_t sz, const std::nothrow_t&) noexcept {
+   ALLOC8_SET_CALLER_RA();
+-  return xxmalloc(sz);
++  void* ptr = xxmalloc(sz);
++  return ALLOC8_LIKELY(ptr != nullptr) ? ptr : alloc8_new_retry_nothrow(sz, 0);
+ }
+ 
+ // ─── DELETE OPERATORS ─────────────────────────────────────────────────────────
+@@ -88,29 +110,25 @@ ALLOC8_EXPORT void operator delete[](void* ptr, std::size_t sz) noexcept {
+ ALLOC8_EXPORT void* operator new(std::size_t sz, std::align_val_t al) {
+   ALLOC8_SET_CALLER_RA();
+   void* ptr = xxmemalign(static_cast<std::size_t>(al), sz);
+-  if (ALLOC8_UNLIKELY(!ptr)) {
+-    throw std::bad_alloc();
+-  }
+-  return ptr;
++  return ALLOC8_LIKELY(ptr != nullptr) ? ptr : alloc8_new_retry(sz, static_cast<std::size_t>(al));
+ }
+ 
+ ALLOC8_EXPORT void* operator new[](std::size_t sz, std::align_val_t al) {
+   ALLOC8_SET_CALLER_RA();
+   void* ptr = xxmemalign(static_cast<std::size_t>(al), sz);
+-  if (ALLOC8_UNLIKELY(!ptr)) {
+-    throw std::bad_alloc();
+-  }
+-  return ptr;
++  return ALLOC8_LIKELY(ptr != nullptr) ? ptr : alloc8_new_retry(sz, static_cast<std::size_t>(al));
+ }
+ 
+ ALLOC8_EXPORT void* operator new(std::size_t sz, std::align_val_t al, const std::nothrow_t&) noexcept {
+   ALLOC8_SET_CALLER_RA();
+-  return xxmemalign(static_cast<std::size_t>(al), sz);
++  void* ptr = xxmemalign(static_cast<std::size_t>(al), sz);
++  return ALLOC8_LIKELY(ptr != nullptr) ? ptr : alloc8_new_retry_nothrow(sz, static_cast<std::size_t>(al));
+ }
+ 
+ ALLOC8_EXPORT void* operator new[](std::size_t sz, std::align_val_t al, const std::nothrow_t&) noexcept {
+   ALLOC8_SET_CALLER_RA();
+-  return xxmemalign(static_cast<std::size_t>(al), sz);
++  void* ptr = xxmemalign(static_cast<std::size_t>(al), sz);
++  return ALLOC8_LIKELY(ptr != nullptr) ? ptr : alloc8_new_retry_nothrow(sz, static_cast<std::size_t>(al));
+ }
+ 
+ ALLOC8_EXPORT void operator delete(void* ptr, std::align_val_t) noexcept {
+diff --git a/src/common/new_delete.inc b/src/common/new_delete.inc
+index 8cab1fb..09f69a4 100644
+--- a/src/common/new_delete.inc
++++ b/src/common/new_delete.inc
+@@ -10,26 +10,46 @@
+ 
+ // Expects xxmalloc, xxfree, xxmemalign, xxfree_sized, xxfree_aligned_sized to be declared
+ 
++// Out of memory ([new.delete.single]): call the installed std::new_handler
++// and try again, and throw std::bad_alloc only once there is none. Throwing at
++// once gave bad_alloc to a program whose handler frees a cache. The nothrow
++// forms return nullptr for whatever the handler throws, as libstdc++'s do.
++// The handler may allocate, so the caller's routing hint is put back before
++// each retry. `al` 0: plain xxmalloc.
++__attribute__((noinline, cold)) static void* alloc8_new_retry(std::size_t sz, std::size_t al) {
++  void* const ra = alloc8_caller_ra;
++  for (;;) {
++    const std::new_handler handler = std::get_new_handler();
++    if (!handler) throw std::bad_alloc();
++    handler();
++    alloc8_caller_ra = ra;
++    if (void* ptr = al ? xxmemalign(al, sz) : xxmalloc(sz)) return ptr;
++  }
++}
++
++__attribute__((noinline, cold)) static void* alloc8_new_retry_nothrow(std::size_t sz,
++                                                                     std::size_t al) noexcept {
++  try {
++    return alloc8_new_retry(sz, al);
++  } catch (...) {
++    return nullptr;
++  }
++}
++
+ // ─── THROWING VARIANTS ────────────────────────────────────────────────────────
+ 
+ ATTRIBUTE_EXPORT __attribute__((flatten))
+ void* operator new(std::size_t sz) {
+   ALLOC8_SET_CALLER_RA();
+   void* ptr = xxmalloc(sz);
+-  if (!ptr) {
+-    throw std::bad_alloc();
+-  }
+-  return ptr;
++  return ptr ? ptr : alloc8_new_retry(sz, 0);
+ }
+ 
+ ATTRIBUTE_EXPORT __attribute__((flatten))
+ void* operator new[](std::size_t sz) {
+   ALLOC8_SET_CALLER_RA();
+   void* ptr = xxmalloc(sz);
+-  if (!ptr) {
+-    throw std::bad_alloc();
+-  }
+-  return ptr;
++  return ptr ? ptr : alloc8_new_retry(sz, 0);
+ }
+ 
+ // ─── NON-THROWING VARIANTS ────────────────────────────────────────────────────
+@@ -37,13 +57,15 @@ void* operator new[](std::size_t sz) {
+ ATTRIBUTE_EXPORT __attribute__((flatten))
+ void* operator new(std::size_t sz, const std::nothrow_t&) noexcept {
+   ALLOC8_SET_CALLER_RA();
+-  return xxmalloc(sz);
++  void* ptr = xxmalloc(sz);
++  return ptr ? ptr : alloc8_new_retry_nothrow(sz, 0);
+ }
+ 
+ ATTRIBUTE_EXPORT __attribute__((flatten))
+ void* operator new[](std::size_t sz, const std::nothrow_t&) noexcept {
+   ALLOC8_SET_CALLER_RA();
+-  return xxmalloc(sz);
++  void* ptr = xxmalloc(sz);
++  return ptr ? ptr : alloc8_new_retry_nothrow(sz, 0);
+ }
+ 
+ // ─── DELETE OPERATORS ─────────────────────────────────────────────────────────
+@@ -92,32 +114,28 @@ ATTRIBUTE_EXPORT __attribute__((flatten))
+ void* operator new(std::size_t sz, std::align_val_t al) {
+   ALLOC8_SET_CALLER_RA();
+   void* ptr = xxmemalign(static_cast<std::size_t>(al), sz);
+-  if (!ptr) {
+-    throw std::bad_alloc();
+-  }
+-  return ptr;
++  return ptr ? ptr : alloc8_new_retry(sz, static_cast<std::size_t>(al));
+ }
+ 
+ ATTRIBUTE_EXPORT __attribute__((flatten))
+ void* operator new[](std::size_t sz, std::align_val_t al) {
+   ALLOC8_SET_CALLER_RA();
+   void* ptr = xxmemalign(static_cast<std::size_t>(al), sz);
+-  if (!ptr) {
+-    throw std::bad_alloc();
+-  }
+-  return ptr;
++  return ptr ? ptr : alloc8_new_retry(sz, static_cast<std::size_t>(al));
+ }
+ 
+ ATTRIBUTE_EXPORT __attribute__((flatten))
+ void* operator new(std::size_t sz, std::align_val_t al, const std::nothrow_t&) noexcept {
+   ALLOC8_SET_CALLER_RA();
+-  return xxmemalign(static_cast<std::size_t>(al), sz);
++  void* ptr = xxmemalign(static_cast<std::size_t>(al), sz);
++  return ptr ? ptr : alloc8_new_retry_nothrow(sz, static_cast<std::size_t>(al));
+ }
+ 
+ ATTRIBUTE_EXPORT __attribute__((flatten))
+ void* operator new[](std::size_t sz, std::align_val_t al, const std::nothrow_t&) noexcept {
+   ALLOC8_SET_CALLER_RA();
+-  return xxmemalign(static_cast<std::size_t>(al), sz);
++  void* ptr = xxmemalign(static_cast<std::size_t>(al), sz);
++  return ptr ? ptr : alloc8_new_retry_nothrow(sz, static_cast<std::size_t>(al));
+ }
+ 
+ ATTRIBUTE_EXPORT __attribute__((flatten))

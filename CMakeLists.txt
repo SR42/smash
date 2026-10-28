@@ -262,7 +262,8 @@ include(FetchContent)
 # under every fresh configure, release builds included), and the fixes in
 # patches/alloc8 are applied on top: aligned_alloc of any size, with EINVAL for
 # an alignment that is not a power of two; pvalloc of a size within a page of
-# SIZE_MAX is ENOMEM. Moving the pin means checking that each patch still
+# SIZE_MAX is ENOMEM (0001); operator new calls the new_handler before it
+# throws (0002). Moving the pin means checking that each patch still
 # applies (the patch step fails if one does not) and is still needed.
 set(SMASH_ALLOC8_COMMIT 816c933b79d68c40c0e1960318554f531832d9d0)
 set(SMASH_ALLOC8_PATCHES "${CMAKE_CURRENT_SOURCE_DIR}/patches/alloc8")

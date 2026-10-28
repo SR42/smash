@@ -808,3 +808,30 @@ Tests, written first: `test_calloc_*` (nine registrations) and
 before failed both contract tests and six calloc registrations; fourteen
 mutants, each undoing one part, were each caught.
 
+## operator new never called the new_handler (fixed 2026-10-28)
+
+An `operator new` that cannot allocate must call the installed
+`std::new_handler` and try again, throwing `std::bad_alloc` only once there is
+none; the nothrow forms do the same and return nullptr where the throwing ones
+throw ([new.delete.single]). libstdc++'s do. Both sets smash exports threw at
+once: alloc8's operators (`new_delete.inc`, the default-version `_Znwm` and
+friends) and smash's own GLIBCXX/CXXABI-versioned aliases in
+linux_syscall_wrappers.cpp (what code linked against libstdc++ binds). Measured
+with a handler installed and a request nothing can serve: glibc's runtime
+called it once before throwing (and before nothrow returned nullptr), smash 0
+times, in full and large-only modes. A program whose handler frees a cache
+and retries got `bad_alloc` instead of its memory.
+
+Fixed in both: on a null result each allocating operator calls a cold
+`newRetry` / `alloc8_new_retry` (alloc8 patch 0002, also its macOS
+`new_delete.cpp`) that loops on `std::get_new_handler()`, retrying the same
+allocation and restoring `alloc8_caller_ra` after the handler (which may
+allocate, and would otherwise move the retry to another arena); the nothrow
+forms wrap it in `catch (...)` and return nullptr, as libstdc++'s
+`operator new(size_t, nothrow_t)` does. The fast path is unchanged: one
+null test.
+
+Guarded by `test_alloc_contract_{full,large_only}`'s `testNewHandler`
+([tests.md](tests.md)); the library before failed 33 of its checks in each
+mode.
+
