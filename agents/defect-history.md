@@ -716,3 +716,38 @@ Sizes under 1 MiB print in KiB. Tests: a refused request at the start of
 `test_vm_exhaustion{,_numa,_numa_aligned}`, and `test_vm_exhaustion_too_big`;
 the library before failed all four, and five mutants (each part of the fix
 undone) each failed only their own check.
+
+## Large blocks: sizes past 2^32 pages returned short blocks (fixed 2026-10-28)
+
+`LargeAlloc::allocate` rounded the size up to a page without an overflow check
+and cast the page count to the span's 32 bits. In both modes, where glibc
+returns NULL with `ENOMEM`:
+
+| request | before |
+|---|---|
+| `malloc(16 TiB + 4 KiB)` (2^32 + 1 pages) | a one-page block, `malloc_usable_size` 16 TiB |
+| `malloc(16 TiB)`, `malloc(2^62)` (2^32, 2^50 pages) | a block of 0 pages |
+| `posix_memalign(2 MiB, SIZE_MAX)` | 0, with a 2 MiB block (the size rounded to 0, the over-map was the alignment alone) |
+| `malloc(SIZE_MAX)` | NULL, but `errno` `EINVAL` (mmap of 0 bytes) |
+
+A caller that writes what it asked for runs off the end: `calloc` of such a
+size zeroed the whole length and faulted, and `realloc` to it copied the old
+block into nothing. Any caller passing an unchecked length (a size read from a
+file or the network, `n * size` computed by hand) got a short block instead of
+NULL. Found while testing `malloc_numa`'s oversized requests, whose path had
+the guard (`allocateOnNode`) and so behaved.
+
+Fixed: the same guard in `allocate`, `ENOMEM` for a wrapping size or a page
+count past 32 bits. Every entry point reaches it: `malloc`, `realloc` and
+`calloc` through `SmashHeap::malloc` (`calloc`'s own multiplication was already
+checked), the aligned calls through `memalign`. The mid-size bins and the
+aligned slab classes return before any arithmetic for sizes this large. Guarded
+by `test_alloc_contract_{full,large_only}`'s `testHugeSizes`.
+
+Not fixed, not smash's: alloc8's `pvalloc` rounds the size up to a page itself
+(`(sz + pagesize - 1) & ~(pagesize - 1)`), so `pvalloc(SIZE_MAX)` asks smash
+for 0 bytes: measured with the fix, a 4 KiB block in full mode and a 24-byte
+system block in large-only mode (a 0-byte request is small, so it passes
+through), where glibc's own `pvalloc` returns NULL with `ENOMEM`. Sizes that
+do not wrap there, such as 2^32 + 1 pages, fail correctly.
+

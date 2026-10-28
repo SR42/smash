@@ -145,8 +145,17 @@ public:
     void* allocate(size_t size, size_t alignment, uint8_t arena_id = 0) {
         if (alignment < kPageSize) alignment = kPageSize;
 
-        // Round size up to page boundary
+        // Round size up to page boundary. A size whose rounding wraps or whose
+        // page count does not fit the span's 32 bits is ENOMEM, as glibc says
+        // for any size it cannot map: unchecked, malloc(16 TiB + 4 KiB)
+        // returned one page, malloc(2^62) and malloc(16 TiB) a block of none,
+        // and posix_memalign(2 MiB, SIZE_MAX) a block of the alignment alone,
+        // each with malloc_usable_size claiming the size asked for.
         size_t alloc_size = roundUp(size, kPageSize);
+        if (alloc_size < size || alloc_size / kPageSize > UINT32_MAX) [[unlikely]] {
+            errno = ENOMEM;
+            return nullptr;
+        }
         uint32_t num_pages = static_cast<uint32_t>(alloc_size / kPageSize);
 
         void* mem = nullptr;

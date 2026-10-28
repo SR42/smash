@@ -1,4 +1,5 @@
-// The allocation contract: a satisfiable request must never fail.
+// The allocation contract: a satisfiable request must never fail, and an
+// unsatisfiable one must fail (testHugeSizes, at the end).
 //
 // This is the direct regression test for the reported aarch64 symptom — an
 // application running under libsmash throwing std::bad_alloc. There is
@@ -43,6 +44,7 @@
 #include <cstring>
 #include <dlfcn.h>
 #include <new>
+#include <utility>
 #include <vector>
 
 #if defined(__APPLE__)
@@ -483,6 +485,99 @@ const char* modeName() {
 
 } // namespace
 
+// ── Sizes no allocator can serve ────────────────────────────────────────────
+// The other half of the contract: an unsatisfiable request fails, with
+// ENOMEM, as glibc's does, and never yields a block shorter than asked for.
+// LargeAlloc counted pages in 32 bits and rounded without an overflow check,
+// so malloc(16 TiB + 4 KiB) returned one page whose malloc_usable_size was
+// 16 TiB, malloc(2^62) returned a block too, and posix_memalign(2 MiB,
+// SIZE_MAX) returned 0 with one: a caller that writes what it asked for runs
+// off the end. The sizes: the rounding wraps (SIZE_MAX), rounds to 0
+// (SIZE_MAX - 4094), and the page count is 2^32 (truncates to 0), 2^32 + 1
+// (to 1) and 2^50 (2^62 bytes, to 0). Called through volatile pointers so the
+// compiler cannot reason about the result. calloc runs last: given a short
+// block it zeroes the whole size and faults.
+void testHugeSizes() {
+    static volatile size_t kHuge[] = {
+        SIZE_MAX, SIZE_MAX - 4094, (size_t{1} << 32) * 4096, ((size_t{1} << 32) + 1) * 4096, size_t{1} << 62,
+    };
+    void* (*volatile p_malloc)(size_t) = std::malloc;
+    void* (*volatile p_realloc)(void*, size_t) = std::realloc;
+    void* (*volatile p_calloc)(size_t, size_t) = std::calloc;
+    void* (*volatile p_aligned_alloc)(size_t, size_t) = aligned_alloc;
+    int (*volatile p_posix_memalign)(void**, size_t, size_t) = posix_memalign;
+    void* (*volatile p_new)(size_t) = static_cast<void* (*)(size_t)>(::operator new);
+    void* (*volatile p_new_arr)(size_t) = static_cast<void* (*)(size_t)>(::operator new[]);
+#if !defined(__APPLE__)
+    void* (*volatile p_memalign)(size_t, size_t) = memalign;
+#endif
+    constexpr size_t kAlign = 2 * 1024 * 1024;
+    for (size_t n : kHuge) {
+        errno = 0;
+        void* p = p_malloc(n);
+        CHECK(!p && errno == ENOMEM, "malloc(%zu) = %p (usable %zu) errno=%d, want nullptr with ENOMEM",
+              n, p, p ? USABLE_SIZE(p) : 0, errno);
+        if (p) std::free(p);
+
+        // A smash-owned block in both modes, so realloc is smash's own; on
+        // failure it must be left as it was.
+        auto* old = static_cast<unsigned char*>(std::malloc(kAlign));
+        if (old) {
+            fillPattern(old, 4096);
+            errno = 0;
+            void* q = p_realloc(old, n);
+            CHECK(!q && errno == ENOMEM, "realloc(2 MiB block, %zu) = %p errno=%d, want nullptr with ENOMEM",
+                  n, q, errno);
+            if (q) {
+                std::free(q);
+            } else {
+                CHECK(verifyPattern(old, 4096), "realloc(2 MiB block, %zu) failed and changed the old block", n);
+                std::free(old);
+            }
+        }
+
+        void* a = nullptr;
+        const int rc = p_posix_memalign(&a, kAlign, n);
+        CHECK(rc == ENOMEM && !a, "posix_memalign(2 MiB, %zu) = %d with %p, want ENOMEM", n, rc, a);
+        if (rc == 0) std::free(a);
+        if (n % kAlign == 0) {
+            errno = 0;
+            void* b = p_aligned_alloc(kAlign, n);
+            CHECK(!b && errno == ENOMEM, "aligned_alloc(2 MiB, %zu) = %p errno=%d, want nullptr with ENOMEM",
+                  n, b, errno);
+            if (b) std::free(b);
+        }
+#if !defined(__APPLE__)
+        errno = 0;
+        void* m = p_memalign(4096, n);
+        CHECK(!m && errno == ENOMEM, "memalign(4096, %zu) = %p errno=%d, want nullptr with ENOMEM", n, m, errno);
+        if (m) std::free(m);
+#endif
+        for (auto [fn, what] : {std::pair{p_new, "operator new"}, std::pair{p_new_arr, "operator new[]"}}) {
+            void* o = nullptr;
+            bool threw = false;
+            try {
+                o = fn(n);
+            } catch (const std::bad_alloc&) {
+                threw = true;
+            }
+            CHECK(threw, "%s(%zu) returned %p instead of throwing std::bad_alloc", what, n, o);
+            if (o) ::operator delete(o);
+        }
+        void* nt = ::operator new(n, std::nothrow);
+        CHECK(!nt, "operator new(%zu, nothrow) returned %p, want nullptr", n, nt);
+        if (nt) ::operator delete(nt);
+    }
+    for (size_t n : kHuge) {
+        errno = 0;
+        void* c = p_calloc(1, n);
+        CHECK(!c && errno == ENOMEM, "calloc(1, %zu) = %p errno=%d, want nullptr with ENOMEM", n, c, errno);
+        if (c) std::free(c);
+    }
+    printf("huge sizes: %zu sizes through malloc, realloc, posix_memalign, aligned_alloc, memalign, "
+           "operator new, calloc\n", sizeof(kHuge) / sizeof(kHuge[0]));
+}
+
 int main() {
     // Unbuffered stdout: full mode used to zero the tail of glibc's buffered
     // stdout page at exit (fixed; guarded by test_stdout_buffer_integrity_full),
@@ -501,6 +596,7 @@ int main() {
     testCalloc(sizes);
     testReallocChain();
     testChurn();
+    testHugeSizes();
 
     if (failures) {
         printf("alloc_contract_test (%s): %d FAILURES\n", modeName(), failures);
