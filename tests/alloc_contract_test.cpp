@@ -44,6 +44,7 @@
 #include <cstring>
 #include <dlfcn.h>
 #include <new>
+#include <unistd.h>
 #include <utility>
 #include <vector>
 
@@ -280,22 +281,52 @@ void testPosixAligned() {
         }
     }
 
-    // aligned_alloc requires size to be a multiple of alignment.
+    // aligned_alloc: any size, a multiple of the alignment or not. C17 (DR 460)
+    // dropped the multiple rule and glibc never had it; alloc8's wrapper
+    // returned nullptr for aligned_alloc(64, 100), with errno untouched.
+    void* (*volatile p_aligned_alloc)(size_t, size_t) = aligned_alloc;
     for (size_t a : kAligns) {
         if (a < sizeof(void*)) continue;
-        for (size_t mult : {size_t{1}, size_t{3}, size_t{16}}) {
-            size_t n = a * mult;
-            void* p = aligned_alloc(a, n);
+        for (size_t n : {a, 3 * a, 16 * a, size_t{1}, size_t{100}, a + 1, 3 * a / 2 + 7,
+                         size_t{3} << 20}) {
+            void* p = p_aligned_alloc(a, n);
             CHECK(p != nullptr, "aligned_alloc(align=%zu, size=%zu) returned "
                   "nullptr", a, n);
             if (!p) continue;
             CHECK((reinterpret_cast<uintptr_t>(p) & (a - 1)) == 0,
                   "aligned_alloc(align=%zu, size=%zu) returned %p, misaligned",
                   a, n, p);
+            checkUsable(p, n, "aligned_alloc");
             fillAndVerify(p, n);
             std::free(p);
         }
     }
+    // An alignment that is not a power of two is EINVAL (glibc 2.38+, C17's
+    // "not supported"); the wrapper passed aligned_alloc(24, 48) through and
+    // full mode returned a block that is not 24-aligned.
+    for (size_t a : {size_t{0}, size_t{3}, size_t{24}, size_t{48}, size_t{4097}}) {
+        errno = 0;
+        void* p = p_aligned_alloc(a, 48);
+        CHECK(!p && errno == EINVAL, "aligned_alloc(align=%zu, size=48) = %p errno=%d, want "
+              "nullptr with EINVAL", a, p, errno);
+        if (p) std::free(p);
+    }
+
+#if !defined(__APPLE__)
+    // pvalloc rounds the size up to a whole page.
+    const size_t page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    for (size_t n : {size_t{1}, size_t{100}, page, page + 1, size_t{3} << 20}) {
+        void* p = pvalloc(n);
+        CHECK(p != nullptr, "pvalloc(%zu) returned nullptr", n);
+        if (!p) continue;
+        CHECK((reinterpret_cast<uintptr_t>(p) & (page - 1)) == 0,
+              "pvalloc(%zu) returned %p, not page-aligned", n, p);
+        const size_t rounded = (n + page - 1) & ~(page - 1);
+        checkUsable(p, rounded, "pvalloc");
+        fillAndVerify(p, rounded);
+        std::free(p);
+    }
+#endif
 }
 
 // ── calloc ──────────────────────────────────────────────────────────────────
@@ -510,6 +541,7 @@ void testHugeSizes() {
     void* (*volatile p_new_arr)(size_t) = static_cast<void* (*)(size_t)>(::operator new[]);
 #if !defined(__APPLE__)
     void* (*volatile p_memalign)(size_t, size_t) = memalign;
+    void* (*volatile p_pvalloc)(size_t) = pvalloc;
 #endif
     constexpr size_t kAlign = 2 * 1024 * 1024;
     for (size_t n : kHuge) {
@@ -540,18 +572,23 @@ void testHugeSizes() {
         const int rc = p_posix_memalign(&a, kAlign, n);
         CHECK(rc == ENOMEM && !a, "posix_memalign(2 MiB, %zu) = %d with %p, want ENOMEM", n, rc, a);
         if (rc == 0) std::free(a);
-        if (n % kAlign == 0) {
-            errno = 0;
-            void* b = p_aligned_alloc(kAlign, n);
-            CHECK(!b && errno == ENOMEM, "aligned_alloc(2 MiB, %zu) = %p errno=%d, want nullptr with ENOMEM",
-                  n, b, errno);
-            if (b) std::free(b);
-        }
+        errno = 0;
+        void* b = p_aligned_alloc(kAlign, n);
+        CHECK(!b && errno == ENOMEM, "aligned_alloc(2 MiB, %zu) = %p errno=%d, want nullptr with ENOMEM",
+              n, b, errno);
+        if (b) std::free(b);
 #if !defined(__APPLE__)
         errno = 0;
         void* m = p_memalign(4096, n);
         CHECK(!m && errno == ENOMEM, "memalign(4096, %zu) = %p errno=%d, want nullptr with ENOMEM", n, m, errno);
         if (m) std::free(m);
+        // alloc8's pvalloc rounded up to a page before smash saw the size, so
+        // SIZE_MAX and SIZE_MAX - 4094 wrapped to 0 and got a block.
+        errno = 0;
+        void* pv = p_pvalloc(n);
+        CHECK(!pv && errno == ENOMEM, "pvalloc(%zu) = %p (usable %zu) errno=%d, want nullptr with ENOMEM",
+              n, pv, pv ? USABLE_SIZE(pv) : 0, errno);
+        if (pv) std::free(pv);
 #endif
         for (auto [fn, what] : {std::pair{p_new, "operator new"}, std::pair{p_new_arr, "operator new[]"}}) {
             void* o = nullptr;
@@ -574,8 +611,21 @@ void testHugeSizes() {
         CHECK(!c && errno == ENOMEM, "calloc(1, %zu) = %p errno=%d, want nullptr with ENOMEM", n, c, errno);
         if (c) std::free(c);
     }
+    // A count * size that wraps: alloc8's calloc returned nullptr and left
+    // errno as it was.
+    static volatile size_t kWrap[][2] = {
+        {SIZE_MAX / 2 + 1, 2}, {size_t{1} << 32, size_t{1} << 32}, {SIZE_MAX, SIZE_MAX}, {3, SIZE_MAX / 2},
+    };
+    for (auto& w : kWrap) {
+        errno = 0;
+        void* c = p_calloc(w[0], w[1]);
+        CHECK(!c && errno == ENOMEM, "calloc(%zu, %zu) = %p errno=%d, want nullptr with ENOMEM",
+              w[0], w[1], c, errno);
+        if (c) std::free(c);
+    }
     printf("huge sizes: %zu sizes through malloc, realloc, posix_memalign, aligned_alloc, memalign, "
-           "operator new, calloc\n", sizeof(kHuge) / sizeof(kHuge[0]));
+           "pvalloc, operator new, calloc; %zu wrapping calloc products\n",
+           sizeof(kHuge) / sizeof(kHuge[0]), sizeof(kWrap) / sizeof(kWrap[0]));
 }
 
 int main() {

@@ -142,7 +142,10 @@ public:
     }
 #endif
 
-    void* allocate(size_t size, size_t alignment, uint8_t arena_id = 0) {
+    // `*zeroed`, if given, says whether every page of the block reads as zero
+    // already: a fresh mapping, or an arena run that was never used or was
+    // decommitted (VmRegion::allocateLargePages). calloc skips its memset then.
+    void* allocate(size_t size, size_t alignment, uint8_t arena_id = 0, bool* zeroed = nullptr) {
         if (alignment < kPageSize) alignment = kPageSize;
 
         // Round size up to page boundary. A size whose rounding wraps or whose
@@ -159,12 +162,14 @@ public:
         uint32_t num_pages = static_cast<uint32_t>(alloc_size / kPageSize);
 
         void* mem = nullptr;
+        bool fresh = false;
 
         // Route large-enough allocations through VmRegion for compression
         if (vm_region_ && alignment <= kPageSize && alloc_size >= largeAllocVmThreshold()) {
-            // A run this CPU freed warm, if SMASH_RUN_CACHE_MIB is on.
+            // A run this CPU freed warm, if SMASH_RUN_CACHE_MIB is on: its
+            // pages hold what the last block wrote.
             mem = vm_region_->takeCachedRun(num_pages, /*node=*/-1, kPageSize);
-            if (!mem) mem = vm_region_->allocateLargePages(num_pages);
+            if (!mem) mem = vm_region_->allocateLargePages(num_pages, &fresh);
             if (mem && page_states_) {
                 size_t idx = vm_region_->pageIndex(reinterpret_cast<uintptr_t>(mem));
                 for (uint32_t p = 0; p < num_pages; ++p)
@@ -182,6 +187,7 @@ public:
         const bool arena_missed = !mem && vm_region_ && alignment <= kPageSize &&
                                   alloc_size >= largeAllocVmThreshold();
         if (!mem) {
+            fresh = true;
             if (alignment <= kPageSize) {
                 mem = vm::mapPages(alloc_size);
             } else {
@@ -218,6 +224,7 @@ public:
         // PageMap::set uses atomic stores internally - no external lock needed.
         page_map_->set(reinterpret_cast<uintptr_t>(mem), span);
         if (arena_missed) [[unlikely]] warnLargeAllocNotCompressible(alloc_size);
+        if (zeroed) *zeroed = fresh;
         return mem;
     }
 

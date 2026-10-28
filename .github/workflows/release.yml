@@ -67,12 +67,6 @@ jobs:
           path: smash
           ref: ${{ github.event.inputs.ref || github.ref }}
 
-      - name: Checkout alloc8 (sibling dir)
-        uses: actions/checkout@v4
-        with:
-          repository: emeryberger/alloc8
-          path: alloc8
-
       - name: Build libsmash inside manylinux_2_28 (glibc 2.28)
         run: |
           docker run --rm -v "$GITHUB_WORKSPACE:/work" -w /work \
@@ -84,11 +78,11 @@ jobs:
               ln -sf /opt/python/cp312-cp312/bin/cmake /usr/local/bin/cmake
               ln -sf /opt/python/cp312-cp312/bin/ninja /usr/local/bin/ninja
               cmake --version; gcc --version
-              # Point at the sibling alloc8 checkout (no network fetch of
-              # alloc8; lz4/zstd are still FetchContent. Library only.
+              # alloc8, lz4 and zstd come from FetchContent; alloc8 at the
+              # commit CMakeLists.txt pins, with patches/alloc8 applied (a
+              # checkout of its default branch shipped neither). Library only.
               cmake -S smash -B smash/build -G Ninja \
                 -DCMAKE_BUILD_TYPE=Release \
-                -DALLOC8_DIR=/work/alloc8 \
                 -DSMASH_BUILD_TESTS=OFF \
                 -DSMASH_BUILD_BENCH=OFF
               cmake --build smash/build --target smash -j
@@ -142,12 +136,6 @@ jobs:
           path: smash
           ref: ${{ github.event.inputs.ref || github.ref }}
 
-      - name: Checkout alloc8 (sibling dir)
-        uses: actions/checkout@v4
-        with:
-          repository: emeryberger/alloc8
-          path: alloc8
-
       - name: Configure (fat arm64 + arm64e)
         working-directory: smash
         # Build FAT. libsmash must carry an arm64e slice to interpose into
@@ -155,10 +143,10 @@ jobs:
         # app with "incompatible architecture (have 'arm64', need 'arm64e')".
         # We ship two macOS assets from this one build (see the stage step):
         # the arm64-only dylib as a direct download, and the fat dylib in a zip.
+        # alloc8 comes from FetchContent at the pinned commit, patches applied.
         run: |
           cmake -S . -B build \
             -DCMAKE_BUILD_TYPE=Release \
-            -DALLOC8_DIR="$GITHUB_WORKSPACE/alloc8" \
             -DSMASH_BUILD_TESTS=OFF \
             -DSMASH_BUILD_BENCH=OFF \
             -DCMAKE_OSX_ARCHITECTURES="arm64;arm64e"

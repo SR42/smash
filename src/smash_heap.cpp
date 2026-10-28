@@ -1324,7 +1324,15 @@ extern "C" {
 volatile int xxthread_created_flag = 0;
 }
 
-using SmashRedirect = alloc8::HeapRedirect<smash::SmashHeap>;
+// alloc8's HeapRedirect::calloc is malloc + memset over the whole block and
+// never asks the heap, so every calloc wrote every page it got (and in
+// passthrough mode bypassed libc's calloc). SmashHeap::calloc clears only what
+// is not zero already.
+struct SmashRedirect : alloc8::HeapRedirect<smash::SmashHeap> {
+    ALLOC8_ALWAYS_INLINE static void* calloc(size_t count, size_t size) {
+        return getHeap()->calloc(count, size);
+    }
+};
 
 // When SMASH_NO_THREAD_HOOKS_BUILD is defined (via -D), use ALLOC8_REDIRECT
 // which doesn't register xxthread_init/xxthread_cleanup. This avoids alloc8's

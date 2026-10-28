@@ -258,6 +258,16 @@ endif()
 
 include(FetchContent)
 
+# alloc8 is pinned to the commit smash is tested against (its main branch moved
+# under every fresh configure, release builds included), and the fixes in
+# patches/alloc8 are applied on top: aligned_alloc of any size, with EINVAL for
+# an alignment that is not a power of two; pvalloc of a size within a page of
+# SIZE_MAX is ENOMEM. Moving the pin means checking that each patch still
+# applies (the patch step fails if one does not) and is still needed.
+set(SMASH_ALLOC8_COMMIT 816c933b79d68c40c0e1960318554f531832d9d0)
+set(SMASH_ALLOC8_PATCHES "${CMAKE_CURRENT_SOURCE_DIR}/patches/alloc8")
+find_package(Git QUIET)
+
 if(ALLOC8_DIR)
   # Explicit local checkout requested.
   if(NOT EXISTS "${ALLOC8_DIR}/CMakeLists.txt")
@@ -266,15 +276,42 @@ if(ALLOC8_DIR)
       "Point it at a valid alloc8 checkout, or unset it to fetch from GitHub.")
   endif()
   message(STATUS "Using local alloc8 from ALLOC8_DIR=${ALLOC8_DIR}")
+  # Its tree is not ours to patch: say which fixes it lacks.
+  if(GIT_FOUND)
+    file(GLOB _a8_patches "${SMASH_ALLOC8_PATCHES}/*.patch")
+    foreach(_p IN LISTS _a8_patches)
+      execute_process(COMMAND "${GIT_EXECUTABLE}" apply --reverse --check "${_p}"
+                      WORKING_DIRECTORY "${ALLOC8_DIR}"
+                      RESULT_VARIABLE _a8_applied OUTPUT_QUIET ERROR_QUIET)
+      if(NOT _a8_applied EQUAL 0)
+        get_filename_component(_name "${_p}" NAME)
+        message(WARNING "ALLOC8_DIR lacks patches/alloc8/${_name}; apply it there "
+                        "(git apply) or the build keeps the bug it fixes.")
+      endif()
+    endforeach()
+  endif()
   add_subdirectory("${ALLOC8_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/alloc8")
 else()
-  # Default: self-contained. Clone alloc8 from GitHub.
-  message(STATUS "Fetching alloc8 from GitHub (set -DALLOC8_DIR=... to use a local checkout)")
+  # Default: self-contained. Clone alloc8 from GitHub at the pinned commit.
+  message(STATUS "Fetching alloc8 ${SMASH_ALLOC8_COMMIT} from GitHub "
+                 "(set -DALLOC8_DIR=... to use a local checkout)")
+  # The patches' digest is part of the patch command, so editing or adding
+  # one re-runs the patch step.
+  file(GLOB _a8_patches "${SMASH_ALLOC8_PATCHES}/*.patch")
+  list(SORT _a8_patches)
+  set(_a8_digest "")
+  foreach(_p IN LISTS _a8_patches)
+    file(SHA256 "${_p}" _h)
+    string(APPEND _a8_digest "${_h}")
+  endforeach()
+  string(SHA256 _a8_digest "${_a8_digest}")
   FetchContent_Declare(
     alloc8
     GIT_REPOSITORY https://github.com/emeryberger/alloc8.git
-    GIT_TAG main
-    GIT_SHALLOW TRUE
+    GIT_TAG ${SMASH_ALLOC8_COMMIT}
+    PATCH_COMMAND ${CMAKE_COMMAND} -DPATCH_DIR=${SMASH_ALLOC8_PATCHES}
+                  -DGIT=${GIT_EXECUTABLE} -DPATCH_DIGEST=${_a8_digest}
+                  -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/apply_patches.cmake
   )
   FetchContent_MakeAvailable(alloc8)
 endif()

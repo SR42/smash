@@ -744,10 +744,67 @@ checked), the aligned calls through `memalign`. The mid-size bins and the
 aligned slab classes return before any arithmetic for sizes this large. Guarded
 by `test_alloc_contract_{full,large_only}`'s `testHugeSizes`.
 
-Not fixed, not smash's: alloc8's `pvalloc` rounds the size up to a page itself
-(`(sz + pagesize - 1) & ~(pagesize - 1)`), so `pvalloc(SIZE_MAX)` asks smash
+Not smash's: alloc8's `pvalloc` rounds the size up to a page itself
+(`(sz + pagesize - 1) & ~(pagesize - 1)`), so `pvalloc(SIZE_MAX)` asked smash
 for 0 bytes: measured with the fix, a 4 KiB block in full mode and a 24-byte
 system block in large-only mode (a 0-byte request is small, so it passes
 through), where glibc's own `pvalloc` returns NULL with `ENOMEM`. Sizes that
-do not wrap there, such as 2^32 + 1 pages, fail correctly.
+do not wrap there, such as 2^32 + 1 pages, failed correctly. Fixed the same day
+by smash's patch to alloc8 (next section).
+
+## calloc wrote every page of its block; alloc8's aligned_alloc refused most sizes (fixed 2026-10-28)
+
+Found by reading the alloc8 code smash links, then measured against glibc 2.39
+(probe, `SMASH_NO_COMPRESSOR=1`; full and large-only alike):
+
+| call | glibc | smash before |
+|---|---|---|
+| `calloc(1, 64 MiB)` | 0 ms, RSS +0 | 45 ms, RSS +64 MiB |
+| `calloc(1, 1 GiB)` | 0 ms, RSS +0 | 660-725 ms, RSS +960 MiB |
+| `aligned_alloc(64, 100)`, `(4096, 100)`, `(2 MiB, 3 MiB)` | a block | NULL, `errno` untouched |
+| `aligned_alloc(24, 48)` | NULL, `EINVAL` | full mode: a block not 24-aligned |
+| `calloc(SIZE_MAX/2 + 1, 2)` | NULL, `ENOMEM` | NULL, `errno` untouched |
+
+**calloc.** alloc8's `HeapRedirect::calloc` is `malloc` + `memset` of the
+whole block; it never asks the heap, so `SmashHeap::calloc` was dead code (its
+comment said so). The `memset` faults in every page of a block whose pages are
+zero already, so a large sparse table allocated with `calloc` became resident
+at once, the opposite of what smash is for. It also bypassed libc's `calloc`
+in passthrough and compress-only modes (+256 MiB for a 256 MiB `calloc`).
+
+Fixed: `SmashRedirect` (smash_heap.cpp) derives from `HeapRedirect` and sends
+`calloc` to `SmashHeap::calloc`, which routes compressor threads,
+passthrough and compress-only to libc's `calloc` (as `mallocSlow` routes their
+`malloc`), checks the product (`ENOMEM`), and for a block past
+`kMaxSmallSize` asks `mallocSlow` whether its pages read as zero. They do when
+the block is a fresh mapping (below `SMASH_LARGE_ALLOC_VM_THRESHOLD`, or an
+arena miss) or an arena run that was never used or was decommitted: every run
+in the shared free map, a sub-arena's clean runs and tail, and the chunk pool
+is fresh or went through `decommitPages` before it got there. Not when it is a
+sub-arena's dirty run (`takeFromSubLocked`), a span that includes one
+(`takeMixedFromSubLocked`), a run-cache hit, or when the decommit does not
+zero (`vm::decommitZeroes()`: `SMASH_MADV_FREE=1`, `SMASH_NO_DECOMMIT=1`,
+macOS). Slab slots and mid bins are always cleared. After: +0 MiB for 256 MiB
+fresh, 64 x 512 KiB, and 256 MiB over a decommitted block, in every mode.
+
+**alloc8.** Its `aligned_alloc` kept C11's rule that the size be a multiple of
+the alignment, which C17 (DR 460) dropped and glibc never enforced, so a
+program that works on glibc got NULL (and a "Success" error message); it did
+not check that the alignment is a power of two. Its `pvalloc` wrapped (previous
+section). Neither is smash's code, so the fix is a patch, not an edit:
+alloc8 is now pinned to the commit smash is tested against (`GIT_TAG main`
+had pulled whatever upstream was at each fresh configure, release builds
+included) and `patches/alloc8/*.patch` is applied by FetchContent's patch step
+(`cmake/apply_patches.cmake`): any size, `EINVAL` for an alignment that is not
+a power of two (glibc 2.38+), `ENOMEM` for a `pvalloc` within a page of
+`SIZE_MAX`, on Linux and in the macOS wrapper. A build against `-DALLOC8_DIR`
+warns for each patch that tree lacks. The release workflow did exactly that,
+with a checkout of alloc8's default branch, and CI checked one out unused;
+both now take the pinned fetch. The calloc overflow `errno` needed no
+patch: smash's own `calloc` now sets it.
+
+Tests, written first: `test_calloc_*` (nine registrations) and
+`test_alloc_contract_{full,large_only}`; [tests.md](tests.md). The library
+before failed both contract tests and six calloc registrations; fourteen
+mutants, each undoing one part, were each caught.
 

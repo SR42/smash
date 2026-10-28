@@ -1,0 +1,48 @@
+diff --git a/src/platform/linux/gnu_wrapper.cpp b/src/platform/linux/gnu_wrapper.cpp
+index 80c33e0..2be4764 100644
+--- a/src/platform/linux/gnu_wrapper.cpp
++++ b/src/platform/linux/gnu_wrapper.cpp
+@@ -129,8 +129,11 @@ int CUSTOM_PREFIX(posix_memalign)(void** memptr, size_t alignment, size_t size)
+ extern "C" ATTRIBUTE_EXPORT __attribute__((flatten))
+ void* CUSTOM_PREFIX(aligned_alloc)(size_t alignment, size_t size) __THROW {
+   ALLOC8_SET_CALLER_RA();
+-  // C11: size must be multiple of alignment
+-  if (alignment == 0 || (size % alignment) != 0) {
++  // Any size: C17 (DR 460) dropped C11's multiple-of-alignment rule and glibc
++  // never enforced it, so aligned_alloc(64, 100) must not fail. An alignment
++  // that is not a power of two is EINVAL, as glibc 2.38+ says.
++  if (ALLOC8_UNLIKELY(alignment == 0 || (alignment & (alignment - 1)) != 0)) {
++    errno = EINVAL;
+     return nullptr;
+   }
+   return xxmemalign(alignment, size);
+@@ -203,8 +206,13 @@ void* CUSTOM_PREFIX(valloc)(size_t sz) {
+ extern "C" ATTRIBUTE_EXPORT
+ void* CUSTOM_PREFIX(pvalloc)(size_t sz) {
+   ALLOC8_SET_CALLER_RA();
+-  // Round up to page size
++  // Round up to page size. Within a page of SIZE_MAX that wraps to 0 and
++  // would hand back one page: fail as glibc does.
+   size_t pagesize = ALLOC8_PAGE_SIZE;
++  if (ALLOC8_UNLIKELY(sz > SIZE_MAX - (pagesize - 1))) {
++    errno = ENOMEM;
++    return nullptr;
++  }
+   size_t rounded = (sz + pagesize - 1) & ~(pagesize - 1);
+   return xxmemalign(pagesize, rounded);
+ }
+diff --git a/src/platform/macos/mac_wrapper.cpp b/src/platform/macos/mac_wrapper.cpp
+index f5234ba..1c747a2 100644
+--- a/src/platform/macos/mac_wrapper.cpp
++++ b/src/platform/macos/mac_wrapper.cpp
+@@ -449,7 +449,9 @@ void* replace_memalign(size_t alignment, size_t size) {
+ 
+ void* replace_aligned_alloc(size_t alignment, size_t size) {
+   ALLOC8_SET_CALLER_RA();
+-  if (alignment == 0 || (size % alignment) != 0) {
++  // Any size (C17, DR 460); an alignment that is not a power of two is EINVAL.
++  if (alignment == 0 || (alignment & (alignment - 1)) != 0) {
++    errno = EINVAL;
+     return nullptr;
+   }
+   void* p = xxmemalign(alignment, size);

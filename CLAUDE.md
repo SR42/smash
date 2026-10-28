@@ -42,7 +42,7 @@ codegen bug: [agents/sanitizers.md](agents/sanitizers.md).
 cd build && ctest --output-on-failure
 ```
 
-All 166 tests must pass; none are registered `DISABLED`. Run the suite **as root** too when touching the compressor: idle-page read tracking only exists with root (and `SMASH_WRITE_TRACK=yt` only with the youngtrace module loaded), and CI (`.github/workflows/ci.yml`, `ubuntu-latest` + `macos-latest`, every push and PR) runs unprivileged. After ctest, CI runs `bench/run_quick_ci.py` (`bench_rss` ≥30 %, `bench_sqlite --quick` ≥5 % RSS reduction).
+All 175 tests must pass; none are registered `DISABLED`. Run the suite **as root** too when touching the compressor: idle-page read tracking only exists with root (and `SMASH_WRITE_TRACK=yt` only with the youngtrace module loaded), and CI (`.github/workflows/ci.yml`, `ubuntu-latest` + `macos-latest`, every push and PR) runs unprivileged. After ctest, CI runs `bench/run_quick_ci.py` (`bench_rss` ≥30 %, `bench_sqlite --quick` ≥5 % RSS reduction).
 
 **Before changing a test or its threshold, read its entry in [agents/tests.md](agents/tests.md).** Thresholds encode measurements, several tests are probabilistic (one run is not a verdict), and some harness shapes (sharing a process between phases, `fork()` with smash threads running) reproduce the very symptom under test.
 
@@ -191,10 +191,11 @@ One line each; the incident and measurements behind each are in [agents/conventi
 - An application's `sigaction()`/`signal()` for SIGSEGV/SIGBUS must never displace smash's handler: they are interposed and chained (`FaultHandler::interposedSigaction`); smash's own installs go through `FaultHandler::sysSigaction`.
 - The fault handler handles ACTIVE (not just ACTIVE_MONITORING) pages, covering Phase 3's batched mprotect overwriting a per-page PROT_RW restore. A page's state is not proof of its protection.
 - ThreadCache `drain()`/`drainAll()` bucket pointers by `span->arena_id` before returning them to the right arena's slab.
+- Never put a page into the shared free map, a sub-arena's clean runs or the chunk pool unless it is fresh or was decommitted: `calloc` skips its memset for a block from there (`VmRegion::allocateLargePages`'s `zeroed`). A dirty source must report itself (`took_dirty`).
 
 ## Dependencies
 
-- **alloc8**: Interposition framework (cloned via FetchContent; override with `-DALLOC8_DIR=`)
+- **alloc8**: Interposition framework (cloned via FetchContent at a pinned commit, `SMASH_ALLOC8_COMMIT` in CMakeLists.txt, with `patches/alloc8/*.patch` applied on top; override with `-DALLOC8_DIR=`, which warns for each patch that tree lacks). Fix alloc8 bugs with a patch there, never by editing `_deps/alloc8-src`; moving the pin means checking each patch still applies and is still needed.
 - **LZ4 v1.9.4**: Fast compression (fetched via CMake FetchContent)
 - **Zstandard v1.5.6**: Dictionary compression (fetched via CMake FetchContent)
 

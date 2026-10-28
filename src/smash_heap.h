@@ -1492,9 +1492,11 @@ public:
     // fast path: compress-only/large-only/eager-zero modes, size > 16 KiB
     // (large alloc), or thread cache miss (refill from slab).  Marked
     // noinline+cold so the fast-path body stays small and the prologue
-    // can be a single register save pair.
+    // can be a single register save pair. `*zeroed` (calloc's) is set when the
+    // block is a large one whose pages read as zero already; every other path
+    // leaves it as the caller set it.
     [[gnu::noinline, gnu::cold]]
-    void* mallocSlow(size_t size, uintptr_t caller_ra = 0) {
+    void* mallocSlow(size_t size, uintptr_t caller_ra = 0, bool* zeroed = nullptr) {
         // SMASH_PASSTHROUGH=1: pass ALL allocations to system malloc.
         // Lazy-resolve if needed so we never fall through to smash's heap —
         // a smash-allocated pointer leaking into passthrough mode causes
@@ -1592,7 +1594,7 @@ public:
                 return p;
             }
         }
-        void* ptr = large_alloc_.allocate(size, kMinAlignment, arena);
+        void* ptr = large_alloc_.allocate(size, kMinAlignment, arena, zeroed);
         if (!ptr) [[unlikely]]
             reportAllocFailure("large (VmRegion and direct mmap)", size, 0,
                                vm_region_.rawNextPage(), vm_region_.contigPages());
@@ -1988,6 +1990,12 @@ public:
             if (g_system_alloc.calloc) return g_system_alloc.calloc(count, size);
             return nullptr;
         }
+        // A compressor thread's memory comes from the system allocator,
+        // untracked, as in mallocSlow.
+        if (g_compressor_thread) [[unlikely]] {
+            if (!g_system_alloc.calloc) g_system_alloc.resolve();
+            return g_system_alloc.calloc ? g_system_alloc.calloc(count, size) : nullptr;
+        }
         if (isCompressOnlyMode()) {
             if (!g_system_alloc.calloc) return nullptr;
             void* ptr = g_system_alloc.calloc(count, size);
@@ -1996,12 +2004,9 @@ public:
         }
         // count * size can wrap: calloc(2^60 + 1, 16) would otherwise hand back
         // a 16-byte block to a caller that believes it owns 2^60 elements.
-        // Today every public entry point (calloc, xxcalloc, macOS
-        // replace_calloc) goes through alloc8's checked wrapper, which returns
-        // null on overflow and then calls SmashHeap::malloc — nothing reaches
-        // this function — so this is defence in depth for the first caller
-        // that does. Verified against glibc on the wrapping shapes, including
-        // products that wrap to 16 and 256 bytes.
+        // alloc8's wrapper checked too, but returned null with errno untouched.
+        // Verified against glibc on the wrapping shapes, including products
+        // that wrap to 16 and 256 bytes.
         size_t total = 0;
         if (__builtin_mul_overflow(count, size, &total)) {
             errno = ENOMEM;
@@ -2010,6 +2015,17 @@ public:
         // Large-only: small callocs go to system allocator
         if (isLargeOnlyMode() && total <= largeOnlyThreshold() && g_system_alloc.calloc) {
             return g_system_alloc.calloc(count, size);
+        }
+        // A large block whose pages read as zero already (a fresh mapping, or
+        // an arena run never used or decommitted) is not written: the memset
+        // faulted in every page, so calloc(1 GiB) took 0.7 s and made 960 MiB
+        // resident where glibc's fresh mapping costs neither. Everything else
+        // (slab slots, mid bins, dirty and cached runs) is cleared.
+        if (total > kMaxSmallSize) {
+            bool zeroed = false;
+            void* ptr = mallocSlow(total, 0, &zeroed);
+            if (ptr && !zeroed) __builtin_memset(ptr, 0, total);
+            return ptr;
         }
         void* ptr = this->malloc(total);
         if (ptr) __builtin_memset(ptr, 0, total);

@@ -240,6 +240,23 @@ having it at runtime rather than picking a new constant. A workload in
 large-only mode with cold mid-size blocks wants it lowered on both counts;
 full mode wants measurement first.
 
+## calloc clears only what is not zero already
+
+`calloc` goes to `SmashHeap::calloc` (through `SmashRedirect`, smash_heap.cpp;
+alloc8's own `calloc` was `malloc` + `memset` of the whole block). Passthrough,
+compress-only, compressor threads and, in large-only mode, sizes up to the
+threshold get libc's `calloc`. A slab or mid-bin block is always cleared. A
+block past `kMaxSmallSize` is cleared only when `LargeAlloc::allocate` cannot
+vouch that its pages read as zero: a fresh mapping (below
+`SMASH_LARGE_ALLOC_VM_THRESHOLD`, or an arena miss) and an arena run that was
+never used or was decommitted are not written, so `calloc(1, 256 MiB)` costs no
+RSS until the pages are touched, as with glibc. A sub-arena's dirty run, a
+span that includes one and a run-cache hit are cleared, and so is every arena
+run under `SMASH_MADV_FREE=1` or `SMASH_NO_DECOMMIT=1`, whose decommit keeps
+the bytes. The invariant this rests on is in
+[conventions.md](conventions.md); the history in
+[defect-history.md](defect-history.md).
+
 ## Aligned small allocations come from the slab
 
 `memalign()` sent every alignment above `kMinAlignment` (16 B) to `LargeAlloc`,

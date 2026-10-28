@@ -281,6 +281,19 @@ inline void decommitPages(void* addr, size_t size) {
 #endif
 }
 
+// Whether a page decommitPages() released reads as zero when next touched.
+// MADV_DONTNEED on a private anonymous mapping guarantees it; MADV_FREE
+// (SMASH_MADV_FREE=1) keeps the old bytes until the kernel reclaims the page,
+// SMASH_NO_DECOMMIT keeps them outright, and macOS's MADV_FREE_REUSABLE makes
+// no promise. calloc skips its memset only for runs this vouches for.
+inline bool decommitZeroes() {
+#if defined(__linux__) && !defined(SMASH_SIM)
+    return madvMode() == MADV_DONTNEED && !noDecommitEnabled();
+#else
+    return false;
+#endif
+}
+
 // decommitPages() for smash's OWN direct mappings outside the VmRegion — a
 // small-object span mapped after the arena was exhausted (Slab::
 // allocateNewSpan). Same release, minus the bounds check: that check exists to

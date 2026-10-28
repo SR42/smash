@@ -34,6 +34,8 @@ Checkout/upload actions run on the **host** runner (modern glibc); only the *bui
 
 lz4 and zstd are statically linked, so there are no third-party shared-lib runtime deps beyond libc/libstdc++/libdl/libpthread/libm.
 
+alloc8 comes from FetchContent like everything else: the commit `SMASH_ALLOC8_COMMIT` in CMakeLists.txt pins, with `patches/alloc8/*.patch` applied. Until 2026-10-28 both release jobs checked out alloc8's default branch beside smash and passed it as `ALLOC8_DIR`, so a released library carried whatever alloc8 was that day and none of smash's fixes to it.
+
 ## macOS artifacts — the arm64 / arm64e split
 
 This is the subtle part; it went through several wrong turns before landing. See [macos-arm64e.md](macos-arm64e.md) for the full mechanism. In short:

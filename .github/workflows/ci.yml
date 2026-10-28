@@ -20,12 +20,8 @@ jobs:
         with:
           path: smash
 
-      # smash's CMake expects ALLOC8_DIR=$smash/../alloc8 (a sibling dir).
-      - name: Checkout alloc8 (sibling dir)
-        uses: actions/checkout@v4
-        with:
-          repository: emeryberger/alloc8
-          path: alloc8
+      # alloc8 comes from FetchContent at the commit CMakeLists.txt pins, with
+      # patches/alloc8 applied; no checkout of its own.
 
       - name: Configure
         working-directory: smash

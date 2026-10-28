@@ -573,6 +573,33 @@ target_link_libraries(alloc_contract_test PRIVATE ${CMAKE_DL_LIBS})
 add_smash_mode_test(test_alloc_contract_full       alloc_contract_test 0 300)
 add_smash_mode_test(test_alloc_contract_large_only alloc_contract_test 1 300)
 
+# calloc returns zeroed memory and writes the zeros only where the pages are
+# not zero already (tests/calloc_test.cpp). Fresh and decommitted blocks must
+# not grow RSS; memory that held 0xA5 must come back zeroed through each free
+# path: a sub-arena's dirty run (the production config), the run cache, a
+# decommit that does not zero (MADV_FREE, none), a clean run next to a dirty
+# one in a full region. Passthrough and compress-only hand calloc to libc.
+if(NOT APPLE)
+  add_executable(calloc_test calloc_test.cpp)
+  set_target_properties(calloc_test PROPERTIES CXX_STANDARD 20)
+  target_link_libraries(calloc_test PRIVATE ${CMAKE_DL_LIBS})
+  add_smash_mode_test(test_calloc_full       calloc_test 0 120)
+  add_smash_mode_test(test_calloc_large_only calloc_test 1 120)
+  add_smash_mode_test(test_calloc_subarenas  calloc_test 1 120
+                      "SMASH_SUBARENAS=1" "SMASH_DIRTY_MAX_MIB=64" "CALLOC_TEST_REUSE=1")
+  add_smash_mode_test(test_calloc_run_cache  calloc_test 1 120
+                      "SMASH_RUN_CACHE_MIB=32" "CALLOC_TEST_REUSE=1")
+  add_smash_mode_test(test_calloc_madv_free  calloc_test 1 120
+                      "SMASH_MADV_FREE=1" "CALLOC_TEST_REUSE=1" "CALLOC_TEST_DRAIN=1" "CALLOC_TEST_RSS=0")
+  add_smash_mode_test(test_calloc_no_decommit calloc_test 1 120
+                      "SMASH_NO_DECOMMIT=1" "CALLOC_TEST_REUSE=1" "CALLOC_TEST_DRAIN=1" "CALLOC_TEST_RSS=0")
+  add_smash_mode_test(test_calloc_mixed      calloc_test 1 120
+                      "SMASH_VM_GIB=1" "SMASH_SUBARENAS=1" "SMASH_SUBARENAS_PER_NODE=2"
+                      "SMASH_DIRTY_DECAY_MS=100" "CALLOC_TEST_MIXED=1")
+  add_smash_mode_test(test_calloc_passthrough calloc_test 0 120 "SMASH_PASSTHROUGH=1")
+  add_smash_mode_test(test_calloc_compress_only calloc_test 0 120 "SMASH_MODE=compress_only")
+endif()
+
 # malloc_numa(node, size), the exported NUMA API. Checks the MPOL_BIND |
 # MPOL_F_STATIC_NODES binding (get_mempolicy) and physical placement on every
 # online node with the writer pinned off-node (move_pages). Then checks that
