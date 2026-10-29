@@ -3,6 +3,8 @@
 #include <chrono>
 #include "smash/config.h"
 #include "core/bootstrap_alloc.h"
+#include "core/early_alloc.h"
+#include "util/fork_locks.h"
 #include "core/size_classes.h"
 #include "core/span.h"
 #include "core/page_map.h"
@@ -387,6 +389,10 @@ struct SystemAllocFns {
 #endif
 
     void resolve() {
+        // dlsym may allocate (glibc < 2.34 callocs a dlerror record on a
+        // thread's first call); with no system calloc yet that allocation is
+        // served from the early arena instead of resolving again.
+        early::Window early_window;
 #if defined(__APPLE__)
         // On macOS, dlsym returns the interposed wrapper, not the real system
         // function.  Read the original from the __DATA,__interpose section.
@@ -549,6 +555,7 @@ class SmashHeap {
 
     LargeAlloc large_alloc_;
     MidAlloc mid_alloc_;
+    ForkLockSet fork_locks_;
     // Exhausted-hook serialisation (reclaimEmptySpansHook): the token, and
     // how many passes have started / the last one that finished.
     std::atomic<bool> reclaim_busy_{false};
@@ -1161,13 +1168,62 @@ public:
     // multiprocessing/worker case 8c11ee79 targeted). A child that persists
     // single-threaded and only allocates gets no compressor until issue #61's
     // full prepare-side quiesce lands — strictly safer than deadlocking.
-    void preparePauseForFork() {
-        if (!compression_inited_) return;
-        compressor_.pauseForFork();
+    // fork(): the prepare handler pauses the compressor's tick and takes every
+    // allocator lock (util/fork_locks.h); the parent handler releases them,
+    // the child handler re-initialises them. Before, only the tick was paused
+    // (and for 50 ms at most): a child whose first allocation needed a lock
+    // another parent thread held at the fork spun for ever.
+    // lock()/unlock() below are what alloc8's own atfork handlers call
+    // (xxmalloc_lock in prepare, xxmalloc_unlock in parent and child), and
+    // they are the quiesce; forkChild() adds the child's bookkeeping.
+    void forkChild() {
+        fork_locks_.resetAll();
+        resetForFork();
+        // Page locks are not in the set above: the prepare handler does not
+        // wait for them (a fault handler holds one for microseconds, and
+        // waiting would make fork() wait on every faulting thread). Whoever
+        // held one at the clone does not exist here, so every held one is
+        // reset -- a worker's after a timed-out tick pause, a fault handler's
+        // at any time. Only the mid-tick case used to be covered, and a child
+        // that inherited a fault handler's lock spun on its first read of
+        // that page for ever.
+        if (compression_inited_) compressor_.resetPageLocksForFork(vm_region_.committedPages());
     }
-    void resumeAfterFork() {
-        if (!compression_inited_) return;
-        compressor_.resumeAfterFork();
+    // `all` false leaves out the slabs and LargeAlloc: what lock() covered
+    // before every lock was in the set (debugHoldLocks, so a test can hold
+    // exactly the locks a fork used to leave behind).
+    void collectForkLocks(ForkLockSet& set, bool all = true) {
+        set.clear();
+        if (isCompressOnlyMode()) return;
+        ThreadCachePool::instance().forkLocks(set);
+        const int total = getTotalArenas() * kNumClasses;
+        if (all) for (int i = 0; i < total; ++i) slabs_[i].forkLocks(set);
+        mid_alloc_.forkLocks(set);
+        if (all) large_alloc_.forkLocks(set);
+        for (unsigned i = 0; i < kSpanFreeShards; ++i) set.add(spanFreeList(i).lock);
+        if (compression_inited_) {
+            vm_region_.forkLocks(set);
+            compressor_.forkLocks(set);
+        }
+        BootstrapAlloc::instance().forkLocks(set);
+    }
+    // Diagnostic / test hook: hold the locks a fork used to leave behind for
+    // `ms` on this thread, as a thread caught mid-operation by a fork would.
+    // Its own set: fork_locks_ belongs to the forking thread.
+    void debugHoldLocks(unsigned ms) {
+        ForkLockSet held;
+        collectForkLocks(held, /*all=*/false);
+        held.lockAll();
+        usleep(ms * 1000u);
+        held.unlockAll();
+    }
+    // Diagnostic / test hook: hold the page lock of the page `ptr` is on for
+    // `ms`, as a thread inside the fault handler would. False if `ptr` is
+    // not an arena page.
+    bool debugHoldPageLock(const void* ptr, unsigned ms) {
+        if (!compression_inited_ || !inArena(ptr)) return false;
+        compressor_.debugHoldPageLock(vm_region_.pageIndex(reinterpret_cast<uintptr_t>(ptr)), ms);
+        return true;
     }
     void resetForFork() {
         // A pass in another parent thread may hold the reclaim token between
@@ -1225,6 +1281,10 @@ private:
 
 public:
     SmashHeap() {
+        // Anything this constructor allocates (directly, or through a libc
+        // call such as dlsym on glibc < 2.34) comes from the early arena, not
+        // from the heap being constructed (see core/early_alloc.h).
+        early::Window early_window;
         // Debug timing
         static const bool time_init = [] {
             const char* v = std::getenv("SMASH_TIME_INIT");
@@ -1439,7 +1499,10 @@ public:
         pthread_key_create(&s_exit_key_, &SmashHeap::onThreadExiting);
     }
 
-    static void onThreadExiting(void*) { exit_guard::noteThreadExiting(); }
+    static void onThreadExiting(void*) {
+        vm::FaultHandler::releaseAltStackForThread();
+        exit_guard::noteThreadExiting();
+    }
 
     // Stops every thread smash created — the compressor's coordinator,
     // helpers and node groups, plus VmRegion's lazily started decommit
@@ -1724,6 +1787,9 @@ public:
     // Cold path: full free() semantics for every mode. Never inlined.
     [[gnu::noinline, gnu::cold]]
     void freeSlow(void* ptr) {
+        // A block from the early arena (an allocation made while smash was
+        // being set up): never reused, nothing to do.
+        if (early::owns(ptr)) [[unlikely]] return;
         if (!ptr) return;
         if (BootstrapAlloc::instance().owns(ptr)) return;
 
@@ -2036,6 +2102,10 @@ public:
         // SMASH_PASSTHROUGH=1: pass realloc to system allocator, except for
         // pointers smash itself allocated during early init.
         if (isPassthroughMode()) {
+            if (old_ptr && early::owns(old_ptr)) [[unlikely]] {
+                if (size == 0) return nullptr;
+                return reallocEarly(old_ptr, size);
+            }
             if (old_ptr) {
                 uintptr_t addr = reinterpret_cast<uintptr_t>(old_ptr);
                 Span* sp = vm_region_.inContigArena(addr) && vm_region_.hasSpanTable()
@@ -2061,6 +2131,10 @@ public:
             return nullptr;
         }
         if (isCompressOnlyMode()) {
+            if (old_ptr && early::owns(old_ptr)) [[unlikely]] {
+                if (size == 0) return nullptr;
+                return reallocEarly(old_ptr, size);
+            }
             if (!g_system_alloc.realloc) return nullptr;
             void* ptr = g_system_alloc.realloc(old_ptr, size);
             trackAllocation(ptr, size);
@@ -2072,6 +2146,7 @@ public:
         // foreign pointers and any answer we make up corrupts the data.
         if (!old_ptr) return this->malloc(size);
         if (size == 0) { this->free(old_ptr); return nullptr; }
+        if (early::owns(old_ptr)) [[unlikely]] return reallocEarly(old_ptr, size);
         uintptr_t addr = reinterpret_cast<uintptr_t>(old_ptr);
         Span* sp = vm_region_.inContigArena(addr) && vm_region_.hasSpanTable()
             ? vm_region_.getSpan(vm_region_.contigPageIndex(addr))
@@ -2090,7 +2165,19 @@ public:
         return new_ptr;
     }
 
+    // realloc of an early-arena block: copy it out (its size is in its
+    // header) and leave the old block where it is.
+    void* reallocEarly(void* old_ptr, size_t size) {
+        void* new_ptr = this->malloc(size);
+        if (new_ptr) {
+            const size_t old_size = early::sizeOf(old_ptr);
+            __builtin_memcpy(new_ptr, old_ptr, old_size < size ? old_size : size);
+        }
+        return new_ptr;
+    }
+
     size_t getSize(void* ptr) {
+        if (early::owns(ptr)) [[unlikely]] return early::sizeOf(ptr);
         if (!ptr) return 0;
         if (BootstrapAlloc::instance().owns(ptr)) return 0;
 
@@ -2173,8 +2260,33 @@ public:
     bool subArenaInfo(uint64_t* dirty_bytes, uint64_t* purged_runs) {
         return compression_inited_ && vm_region_.subArenaInfo(dirty_bytes, purged_runs);
     }
+    bool subArenaPressure(uint64_t* peak_dirty_bytes, uint64_t* inline_purges) {
+        return compression_inited_ && vm_region_.subArenaPressure(peak_dirty_bytes, inline_purges);
+    }
     void sharedArenaInfo(size_t* used, size_t* free_pages) {
         vm_region_.sharedArenaInfo(used, free_pages);
+    }
+    bool tickCostInfo(uint64_t* sweep_pages, uint64_t* memread_calls, uint64_t* ticks) const {
+        if (!compression_inited_) return false;
+        compressor_.tickCost(sweep_pages, memread_calls, ticks);
+        return true;
+    }
+    bool resilienceInfo(uint64_t* store_fail, uint64_t* restore_retries) const {
+        if (!compression_inited_) return false;
+        compressor_.resilienceCounters(store_fail, restore_retries);
+        return true;
+    }
+    bool blobUsage(size_t* live, size_t* held) {
+        if (!compression_inited_) return false;
+        size_t regions = 0, draining = 0;
+        *live = *held = 0;
+        compressor_.blobUsage(live, held, &regions, &draining);
+        return true;
+    }
+    bool releaseHookInfo(uint64_t* walked, uint64_t* bulk) const {
+        if (!compression_inited_) return false;
+        compressor_.releaseCounters(walked, bulk);
+        return true;
     }
 
     bool runCacheInfo(uint64_t* hits, uint64_t* bytes) const {
@@ -2222,17 +2334,25 @@ public:
     // are exempted. They are exact mirrors (lock all ascending; unlock large
     // then all descending) and both short-circuit identically in compress-only
     // mode, so the pairing is balanced by construction.
+    // The fork quiesce (alloc8 calls lock() in its atfork prepare handler and
+    // unlock() in the parent and the child): pause the compressor's tick,
+    // then take every allocator lock (util/fork_locks.h). Before, this took
+    // the slabs and LargeAlloc only, so a child whose first allocation needed
+    // a span shard, a free map, the commit lock, a mid class, the thread
+    // cache pool, the metadata arena's lock or a blob store shard that
+    // another parent thread held at the fork spun for ever. In the child
+    // unlock() releases what was taken, and forkChild() re-initialises the
+    // rest.
     void lock() SMASH_NO_TS_ANALYSIS {
         if (isCompressOnlyMode()) return;
-        const int total = getTotalArenas() * kNumClasses;
-        for (int i = 0; i < total; ++i) slabs_[i].lockSlab();
-        large_alloc_.lockAlloc();
+        if (compression_inited_) compressor_.pauseForFork();
+        collectForkLocks(fork_locks_);
+        fork_locks_.lockAll();
     }
     void unlock() SMASH_NO_TS_ANALYSIS {
         if (isCompressOnlyMode()) return;
-        large_alloc_.unlockAlloc();
-        const int total = getTotalArenas() * kNumClasses;
-        for (int i = total - 1; i >= 0; --i) slabs_[i].unlockSlab();
+        fork_locks_.unlockAll();
+        if (compression_inited_) compressor_.resumeAfterFork();
     }
     // SMASH_NO_THREAD_HOOKS=1: disable all thread lifecycle hooks.
     // Useful for debugging crashes that occur during thread exit.
@@ -2248,6 +2368,9 @@ public:
         // Before any early return: a thread that never allocates, and a thread
         // in a mode with no cache at all, still has to be seen exiting.
         armExitWatch();
+        // Its alternate signal stack, while the fault handler is installed
+        // (SA_ONSTACK); released by onThreadExiting.
+        if (compression_inited_ && fault_handler_.running()) vm::FaultHandler::ensureAltStackForThread();
         if (noThreadHooks()) return;
         if (!isCompressOnlyMode()) {
             getOrCreateThreadCache();

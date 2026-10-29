@@ -22,6 +22,8 @@
 #include "../core/bootstrap_alloc.h"
 #include "../core/page_map.h"
 #include "../util/spinlock.h"
+#include "../util/fork_locks.h"
+#include "../util/cpu_shard.h"
 #include "../util/exit_guard.h"
 #include "../util/safe_printf.h"
 #include "../util/thread_stack.h"
@@ -574,6 +576,10 @@ class CompressorThread {
     // pending bit is set; any state transition out of COMPRESSED clears
     // the bit FIRST so the sweeper never madvise's a non-COMPRESSED page.
     std::atomic<bool>* deferred_pending_ = nullptr;
+    // Pages with deferred_pending_ set: the sweep walks nothing when it is 0,
+    // where it used to read every page's bit up to the high-water mark each
+    // tick -- and in the default deferred-reclaim mode nothing ever sets one.
+    std::atomic<uint64_t> deferred_pending_n_{0};
     uint32_t* deferred_queue_tick_ = nullptr;
 
     uint32_t tick_counter_ = 0;
@@ -633,6 +639,12 @@ class CompressorThread {
         std::atomic<uint64_t> cp_attempts{0}, cp_stored{0}, cp_gate_fail{0};
         // Compressions declined by the ROI model before any codec ran.
         std::atomic<uint64_t> cp_roi_skip{0};
+        // Blobs the store refused (SMASH_BLOB_MAX_MIB, or a region it could
+        // not map), and restores that had to wait for the kernel to find a
+        // VMA (restorePageContents: mprotect/mmap ENOMEM at vm.max_map_count).
+        std::atomic<uint64_t> cp_store_fail{0}, restore_retries{0};
+        // Page bits the deferred-madvise sweep read (0 when nothing is pending).
+        std::atomic<uint64_t> sweep_scan_pages{0};
         // Time inside the fault handler per fault kind (FaultKind), from
         // entry — so waiting for the page lock counts — to return: count,
         // total and worst in ns, and a log2 histogram in us (bucket 0:
@@ -940,7 +952,7 @@ class CompressorThread {
     // ── Chunk bitmap for fast scanning ────────────────────────────────────
     // One bit per page in kChunkSize-page chunks. Rebuilt at tick start.
     // All three phases iterate only set bits via ctzll + mask clear.
-    uint64_t* live_chunks_ = nullptr;
+    const std::atomic<uint64_t>* live_chunks_ = nullptr;   // PageStateTable::liveWords()
     size_t num_chunks_ = 0;
 
     // ── Fault handler slots ───────────────────────────────────────────────
@@ -1405,12 +1417,29 @@ class CompressorThread {
     static constexpr int kMaxHelpers = kMaxCompressorWorkers > 1 ? kMaxCompressorWorkers - 1 : 1;
     pthread_t helper_threads_[kMaxHelpers]{};
     std::atomic<bool> running_{false};
+    // Latched by start() and never cleared (a fork child keeps it): until it
+    // is set no compressor thread exists, so no per-page array but the state
+    // bytes has ever been written, and releaseCompressedPages can skip its
+    // walk. SMASH_NO_COMPRESSOR=1 never sets it.
+    std::atomic<bool> ever_started_{false};
+
+    // releaseCompressedPages accounting: pages given back through the
+    // per-page walk and through the bulk path. Sharded by CPU — one cache
+    // line written by every large free on every core was once 49 % of all
+    // time (performance.md, g_pagemap_generation).
+    static constexpr unsigned kReleaseShards = 256;
+    struct alignas(64) ReleaseCounters {
+        std::atomic<uint64_t> walked{0};
+        std::atomic<uint64_t> bulk{0};
+    };
+    ReleaseCounters release_counters_[kReleaseShards];
 
     // Fork coordination. paused_ is set by the atfork prepare handler;
     // in_tick_ is set while the coordinator is mid-tick (holding page
     // locks etc.). prepare waits for in_tick_=0 before letting fork()
     // proceed, so the child never inherits a half-done tick.
     std::atomic<bool> paused_{false};
+    bool fork_mid_tick_ = false;   // pauseForFork gave up with a tick in flight
     std::atomic<bool> in_tick_{false};
 
 public:
@@ -1423,10 +1452,34 @@ public:
         // release/acquire does NOT forbid the store-load reordering this
         // handshake relies on.
         paused_.store(true, std::memory_order_seq_cst);
-        // Coordinator wakes on its 10 ms tick boundary. Give it a few of
-        // those (~50 ms total) to drain in_tick_ before we let fork proceed.
-        for (int i = 0; i < 50 && in_tick_.load(std::memory_order_seq_cst); ++i)
+        // A tick in flight stops at its next chunk (forEachLivePage and the
+        // reclaim loop read paused_), so this is normally milliseconds. Past
+        // the bound fork() goes ahead with the tick in flight (fork_mid_tick_,
+        // a diagnostic); the child re-initialises every held page lock either
+        // way (SmashHeap::forkChild), since a fault handler holds one too.
+        // It used to give up after 50 ms, with no trace and nothing reset.
+        fork_mid_tick_ = false;
+        for (int i = 0; i < 2000 && in_tick_.load(std::memory_order_seq_cst); ++i)
             usleep(1000);
+        fork_mid_tick_ = in_tick_.load(std::memory_order_seq_cst);
+    }
+    bool forkMidTick() const { return fork_mid_tick_; }
+    size_t resetPageLocksForFork(size_t committed) { return locks_->resetForFork(committed); }
+    // Diagnostic / test hook: hold one page's lock on this thread for `ms`,
+    // as a thread inside the fault handler does for microseconds.
+    void debugHoldPageLock(size_t page_idx, unsigned ms) {
+        locks_->lock(page_idx);
+        usleep(ms * 1000u);
+        locks_->unlock(page_idx);
+    }
+
+    // Every blob store's shard locks, for fork() (util/fork_locks.h).
+    void forkLocks(ForkLockSet& s) {
+        if (store_) store_->forkLocks(s);
+#if defined(__linux__)
+        for (NodeGroup* g : node_groups_)
+            if (g && g->store) g->store->forkLocks(s);
+#endif
     }
 
     // Resume after fork() in the parent.
@@ -1820,20 +1873,6 @@ private:
 
     // ── Chunk bitmap management ───────────────────────────────────────────
 
-    void rebuildChunkBitmap(size_t committed) {
-        size_t nchunks = (committed + kChunkSize - 1) / kChunkSize;
-        for (size_t c = 0; c < nchunks; ++c) {
-            uint64_t mask = 0;
-            size_t base = c * kChunkSize;
-            size_t end = base + kChunkSize;
-            if (end > committed) end = committed;
-            for (size_t i = base; i < end; ++i) {
-                if (states_->get(i) != PageState::EMPTY)
-                    mask |= (1ULL << (i - base));
-            }
-            live_chunks_[c] = mask;
-        }
-    }
 
     // Iterate live pages in [start, end) and call fn(page_idx)
     template<typename Fn>
@@ -1848,7 +1887,9 @@ private:
         size_t start_chunk = start / kChunkSize;
         size_t end_chunk = (end + kChunkSize - 1) / kChunkSize;
         for (size_t c = start_chunk; c < end_chunk; ++c) {
-            uint64_t mask = live_chunks_[c];
+            // A fork is waiting for this tick: stop at the chunk boundary.
+            if (paused_.load(std::memory_order_relaxed)) [[unlikely]] return;
+            uint64_t mask = live_chunks_[c].load(std::memory_order_relaxed);
             if (mask == 0) continue;
             size_t base = c * kChunkSize;
             if (ownedByRunningNodeGroup(base)) continue;
@@ -3483,8 +3524,26 @@ private:
                     }
                     __builtin_memcpy(page_addr, worker.page_buf, kPageSize);
                 }
+                // The store refused the blob (SMASH_BLOB_MAX_MIB, or it could
+                // not map a region). Back off exactly like a ratio-gate
+                // failure: restart the cold streak and double the effective
+                // floor. Left ACTIVE with its streak intact, the page was
+                // re-selected, snapshotted and compressed again every tick,
+                // for ever, with nothing printed.
+                if (compress_fail_count_ && compress_fail_count_[page_idx] < 255)
+                    compress_fail_count_[page_idx]++;
+                cold_count_[page_idx] = 0;
                 states_->set(page_idx, PageState::ACTIVE);
                 locks_->unlock(page_idx);
+                if (pc_.cp_store_fail.fetch_add(1, std::memory_order_relaxed) == 0) {
+                    char wbuf[200];
+                    const int wn = smash::safe_snprintf(wbuf, sizeof(wbuf),
+                        "[smash WARN] the blob store refused a compressed page "
+                        "(SMASH_BLOB_MAX_MIB=%zu MiB reached, or a region could not be "
+                        "mapped); such pages stay uncompressed and are retried with back-off\n",
+                        blobMaxBytes() >> 20);
+                    if (wn > 0) (void)!::write(2, wbuf, static_cast<size_t>(wn));
+                }
                 return false;
             }
             noteBlobStore(page_idx, worker);
@@ -4733,10 +4792,11 @@ private:
         };
 
         for (size_t c = 0; c < num_chunks_range; ++c) {
+            if (paused_.load(std::memory_order_relaxed)) [[unlikely]] { flushReclaimRun(); break; }
             if (vma_cap > 0 && vma_now >= vma_cap) { ++n_vma_stop; flushReclaimRun(); break; }
             size_t ci = chunk_base + c;
             if (ci >= num_chunks_) break;
-            uint64_t mask = live_chunks_[ci];
+            uint64_t mask = live_chunks_[ci].load(std::memory_order_relaxed);
             if (!mask) continue;
             size_t page_base = ci * kChunkSize;
             if (ownedByRunningNodeGroup(page_base)) continue;
@@ -5956,15 +6016,37 @@ private:
             !vm::remapPages(page_addr, kPageSize, true, true)) {
             static std::atomic<uint64_t> warned{0};
             if (warned.fetch_add(1, std::memory_order_relaxed) == 0) {
-                char buf[160];
+                char buf[200];
                 int n = smash::safe_snprintf(buf, sizeof(buf),
                     "[smash WARN] restorePageContents: cannot make page %p "
                     "writable (mprotect/mmap ENOMEM — likely vm.max_map_count "
-                    "exhausted); skipping restore to avoid wild-store crash\n",
+                    "exhausted); waiting for a VMA to come free\n",
                     page_addr);
                 if (n > 0) (void)!::write(2, buf, (size_t)n);
             }
-            return;  // page stays PROT_NONE+COMPRESSED → access re-faults; no crash
+            // Returning here left the page PROT_NONE + COMPRESSED and the
+            // faulting instruction re-executed at once: a thread spinning at
+            // full speed, silently, until some other thread's unmap freed a
+            // VMA -- or for ever. Wait for one instead (5 ms steps, 2 s in
+            // all: unmaps elsewhere in the process are what free VMAs), and
+            // if none comes, say so and stop: the blob cannot be put back.
+            pc_.restore_retries.fetch_add(1, std::memory_order_relaxed);
+            bool ok = false;
+            for (int i = 0; i < 400 && !ok; ++i) {
+                struct timespec ts = {0, 5 * 1000 * 1000};
+                syscall(SYS_nanosleep, &ts, nullptr);
+                ok = vm::commitPages(page_addr, kPageSize) ||
+                     vm::remapPages(page_addr, kPageSize, true, true);
+            }
+            if (!ok) {
+                char buf[200];
+                int n = smash::safe_snprintf(buf, sizeof(buf),
+                    "[smash FATAL] restorePageContents: page %p could not be made "
+                    "writable for 2 s (vm.max_map_count exhausted); a compressed page "
+                    "cannot be restored, aborting\n", page_addr);
+                if (n > 0) (void)!::write(2, buf, (size_t)n);
+                abort();
+            }
         }
         __builtin_memcpy(page_addr, src, kPageSize);
     }
@@ -6226,7 +6308,8 @@ private:
     [[gnu::always_inline]]
     inline void deferMadvise(size_t page_idx) {
         deferred_queue_tick_[page_idx] = tick_counter_;
-        deferred_pending_[page_idx].store(true, std::memory_order_release);
+        if (!deferred_pending_[page_idx].exchange(true, std::memory_order_acq_rel))
+            deferred_pending_n_.fetch_add(1, std::memory_order_relaxed);
     }
 
     // Sweep the deferred-madvise queue. Called once per tick at the END of
@@ -6518,9 +6601,11 @@ private:
 
     void sweepDeferredMadvise() {
         if (!deferMadviseEnabled() || !deferred_pending_) return;
+        if (deferred_pending_n_.load(std::memory_order_relaxed) == 0) return;
         const uint32_t now = tick_counter_;
         const uint32_t ttl = deferMadviseTicks();
         const size_t total = vm_->committedPages();
+        pc_.sweep_scan_pages.fetch_add(total, std::memory_order_relaxed);
 
         // Mid-sweep VMA budget. This sweep is where deferred-madvise mode
         // actually issues mprotect(PROT_NONE) — each contiguous run splits
@@ -6595,7 +6680,7 @@ private:
                 if (!deferred_pending_[j].load(std::memory_order_acquire) ||
                     states_->get(j) != PageState::COMPRESSED) {
                     // Defensively clear a stale pending bit; state moved on.
-                    deferred_pending_[j].store(false, std::memory_order_release);
+                    if (deferred_pending_[j].exchange(false, std::memory_order_acq_rel)) deferred_pending_n_.fetch_sub(1, std::memory_order_relaxed);
                     locks_->unlock(j);
                     break;
                 }
@@ -6611,7 +6696,7 @@ private:
             // mprotect(PROT_NONE) + ONE madvise over the whole 4 KiB*n range —
             // a single VMA split instead of n.
             for (size_t k = 0; k < n; ++k)
-                deferred_pending_[run[k]].store(false, std::memory_order_release);
+                if (deferred_pending_[run[k]].exchange(false, std::memory_order_acq_rel)) deferred_pending_n_.fetch_sub(1, std::memory_order_relaxed);
             void* base = vm_->pageAddress(run[0]);
             if (base) {
                 size_t bytes = n * kPageSize;
@@ -6791,7 +6876,9 @@ private:
         }
 
         // Rebuild chunk bitmap
-        { StepTimer st(pc_, kStepBitmap); rebuildChunkBitmap(committed); }
+        // The live-page bitmap is the state table's, kept by every store; a
+        // tick used to rebuild it here from every state byte up to the
+        // high-water mark (134M bytes on a 512 GiB arena, on this thread).
 
         // Reset per-worker tick counters
         int nw = active_workers_;
@@ -7364,9 +7451,9 @@ public:
         bucket_back_ = bootstrapArray<std::atomic<uint16_t>>(kBucketTableLen);
         bucket_kept_ = bootstrapArray<std::atomic<uint16_t>>(kBucketTableLen);
 
-        // Chunk bitmap
+        // Chunk bitmap: the state table's, kept by every state store.
         num_chunks_ = (max_pages + kChunkSize - 1) / kChunkSize;
-        live_chunks_ = bootstrapArray<uint64_t>(num_chunks_);
+        live_chunks_ = states_->liveWords();
 
         // Pre-allocate per-worker state
         size_t max_comp = CompressEngine::maxCompressedSizeAny(kPageSize);
@@ -7728,6 +7815,7 @@ public:
     }
 
     void start() {
+        ever_started_.store(true, std::memory_order_release);
         running_.store(true, std::memory_order_release);
         start_steady_time_ = std::chrono::steady_clock::now();
 
@@ -8224,90 +8312,6 @@ public:
     // the per-page lock infrastructure) and BEFORE we uninstall the
     // fault handler (decompression here doesn't fault, but we want to
     // be defensive — a fault during drain wouldn't be a no-op).
-    void drainAllForShutdown() {
-        if (!vm_ || !states_ || !locks_ || !engine_ || !store_) return;
-        size_t committed = vm_->committedPages();
-        for (size_t i = 0; i < committed; ++i) {
-            // tryLock to skip pages held by an in-flight tick we just
-            // told to stop; the coordinator will exit and we'll re-walk
-            // those after the join.
-            if (!locks_->tryLock(i)) continue;
-            PageState st = states_->get(i);
-            void* page_addr = vm_->pageAddress(i);
-            if (st == PageState::COMPRESSED_SHADOW) {
-                // A shadow page was never reclaimed, so its backing is still
-                // mapped and holds the application's LIVE bytes — which may be
-                // newer than the blob. Nothing faults on a write to a PROT_RW
-                // shadow page, so the blob goes stale silently; only Phase B's
-                // content_matches check ever notices, and a page that never
-                // reaches Phase B never gets checked.
-                //
-                // Restoring the blob here reverts those writes. Measured: a
-                // glibc stdout buffer flushed 228 of its 513 bytes as NUL at
-                // exit, deterministically, because the drain reinstated a
-                // snapshot taken five marker lines earlier
-                // (test_stdout_buffer_integrity_full).
-                //
-                // The live page wins, exactly as in handleFault's
-                // COMPRESSED_SHADOW case and in reclaimShadowRange()'s
-                // mismatch branch: drop the blob, keep the page. Deliberately
-                // no remapPages() fallback — that would discard the very bytes
-                // being preserved (see restorePageContents()).
-                if (page_addr)
-                    vm::protectPages(page_addr, kPageSize, true, true);
-                releaseBlob(i);
-                compressed_[i] = {};
-                if (shadow_tick_) shadow_tick_[i] = 0;
-                if (page_tier_) page_tier_[i] = kTierNone;
-                states_->set(i, PageState::ACTIVE);
-            } else if (st == PageState::COMPRESSED) {
-                CompressAlgo algo = compressed_[i].algorithm();
-                uint8_t sc = lookupSizeClass(i);
-                int slot = -1;
-                while ((slot = acquireFaultSlot()) < 0) {
-#if defined(__x86_64__)
-                    __builtin_ia32_pause();
-#elif defined(__aarch64__)
-                    asm volatile("yield");
-#endif
-                }
-                engine_->decompressWithDCtx(
-                    fault_slots_[slot].dctx,
-                    compressed_[i].data, fault_slots_[slot].buf,
-                    compressed_[i].compressedSize(), kPageSize, algo, sc);
-                restorePageContents(page_addr, fault_slots_[slot].buf);
-                releaseFaultSlot(slot);
-                releaseBlob(i);
-                compressed_[i] = {};
-                if (page_tier_) page_tier_[i] = kTierNone;
-                states_->set(i, PageState::ACTIVE);
-            } else if (st == PageState::ACTIVE_MONITORING) {
-                if (!vm::protectPages(page_addr, kPageSize, true, true)) {
-                    vm::remapPages(page_addr, kPageSize, true, true);
-                }
-                states_->set(i, PageState::ACTIVE);
-            }
-            locks_->unlock(i);
-        }
-        // A page's STATE is not proof of its protection. The fault handler
-        // deliberately repairs ACTIVE pages that are still protected — Phase
-        // 3's batched mprotect can overwrite a per-page PROT_RW restoration,
-        // so ACTIVE-but-not-writable is a race smash tolerates *because the
-        // handler is there*. stop() is about to uninstall that handler, after
-        // which the same skew kills the process: SIGSEGV/SEGV_ACCERR with no
-        // message, in whatever runs later (an atexit handler, a static
-        // destructor, anything that allocates during exit).
-        //
-        // The per-page walk above cannot see the skew, because it trusts the
-        // state. One mprotect over the whole contiguous arena does, and costs
-        // a single syscall on a range that is about to be torn down anyway.
-        // It only widens permissions, so a page mid-restore cannot lose.
-        // External pages (>= contigPages()) are the application's own
-        // mappings and are deliberately left alone.
-        size_t arena_pages = committed < vm_->contigPages() ? committed : vm_->contigPages();
-        if (arena_pages) vm::commitPages(vm_->pageAddress(0), arena_pages * kPageSize);
-    }
-
     void stop() {
         // Shutdown tracing for debugging (SMASH_SHUTDOWN_TRACE=1)
         static const bool trace = []{
@@ -8349,31 +8353,22 @@ public:
         stopNodeThreads();
         trace_msg("NUMA node group threads joined");
 #endif
-        // After threads are joined, drain compressed pages back to RW so
-        // post-shutdown faults (CPython __cxa_finalize, TLS destructors,
-        // mimalloc cleanup) hit ordinary memory instead of our about-to-
-        // be-uninstalled signal handler.
-        trace_msg("draining compressed pages...");
-        drainAllForShutdown();
-        trace_msg("drain complete");
+        // The compressed pages stay compressed and the fault handler stays
+        // installed: a post-shutdown access (CPython's __cxa_finalize, TLS
+        // destructors, mimalloc's cleanup) faults and is restored on the
+        // accessing thread, which needs no compressor thread. stop() used to
+        // decompress every compressed page here first, on this one thread --
+        // minutes of exit for tens of millions of pages, with nothing printed,
+        // for pages most of which nothing would touch again. A foreign fault
+        // still chains to the application's handler or the default
+        // disposition, as it always did. The blob stores and the spill
+        // mapping are kept for the same reason (the process is exiting; the
+        // spill file was unlinked at creation).
         // P3: write the profile file so future runs benefit from this
         // run's per-bucket ratio + cost observations.
         trace_msg("saving profile...");
         saveProfileFile();
         trace_msg("profile saved");
-        // Uninstall SIGSEGV/SIGBUS handlers; any further faults take the
-        // original disposition (SIG_DFL → terminate, the right behaviour
-        // for a real heap-use-after-free in the host application).
-        trace_msg("stopping fault handler...");
-        if (fault_handler_) fault_handler_->stop();
-        // Release the spill mapping + fd. drainAllForShutdown() already
-        // decompressed every spilled page back to RW and released its blob, so
-        // nothing references the mapping now. The file was unlinked at creation,
-        // so closing the fd frees its disk blocks. (BootstrapAlloc metadata is
-        // never freed — bounded and process is exiting.)
-        if (spill_map_) { munmap(spill_map_, spill_map_size_); spill_map_ = nullptr; }
-        if (spill_fd_ >= 0) { close(spill_fd_); spill_fd_ = -1; }
-        spill_.reset();
         trace_msg("stop() complete");
     }
 
@@ -8438,7 +8433,7 @@ public:
             // tryLock+recheck will observe the cleared bit (or skip the
             // page entirely because state is no longer COMPRESSED).
             if (deferred_pending_) {
-                deferred_pending_[page_idx].store(false, std::memory_order_release);
+                if (deferred_pending_[page_idx].exchange(false, std::memory_order_acq_rel)) deferred_pending_n_.fetch_sub(1, std::memory_order_relaxed);
             }
             void* page_addr = vm_->pageAddress(page_idx);
             CompressAlgo algo = compressed_[page_idx].algorithm();
@@ -8648,12 +8643,56 @@ public:
         }
     }
 
+    // Blobs the store refused and restores that waited for a VMA, so far
+    // (diagnostic; smash_resilience_info).
+    // What a tick's bookkeeping read (diagnostic; smash_tick_cost_info):
+    // page bits the deferred-madvise sweep scanned, pages read through
+    // /proc/self/mem for snapshots, and ticks run.
+    void tickCost(uint64_t* sweep_pages, uint64_t* memread_calls, uint64_t* ticks) const {
+        *sweep_pages = pc_.sweep_scan_pages.load(std::memory_order_relaxed);
+        *memread_calls = pc_.sc_memread_n.load(std::memory_order_relaxed);
+        *ticks = pc_.ticks.load(std::memory_order_relaxed);
+    }
+    void resilienceCounters(uint64_t* store_fail, uint64_t* restore_retries) const {
+        *store_fail = pc_.cp_store_fail.load(std::memory_order_relaxed);
+        *restore_retries = pc_.restore_retries.load(std::memory_order_relaxed);
+    }
+
+    // Pages released through the per-page walk and through the bulk path so
+    // far (diagnostic; smash_release_hook_info).
+    void releaseCounters(uint64_t* walked, uint64_t* bulk) const {
+        uint64_t w = 0, b = 0;
+        for (const auto& c : release_counters_) {
+            w += c.walked.load(std::memory_order_relaxed);
+            b += c.bulk.load(std::memory_order_relaxed);
+        }
+        *walked = w;
+        *bulk = b;
+    }
+
     // Release any compressed data for a range of pages (called during span
     // release). Returns true when no page was COMPRESSED — i.e. every page is
     // still mapped read/write-able (a PROT_READ page from monitoring faults
     // back through the ACTIVE path once reused) and backed by its original
     // frame, so the caller may reuse the run without restoring protection.
     bool releaseCompressedPages(size_t start_page, size_t num_pages) {
+        // No compressor thread has ever existed (SMASH_NO_COMPRESSOR=1, or a
+        // free before start()): the allocator's ACTIVE marks are the only
+        // per-page state there is, so put the bytes back to EMPTY in bulk
+        // and skip the walk. The walk was 16 384 lock/unlock pairs and ~15
+        // scattered stores per page for a 64 MiB block, paid in the very
+        // run meant to measure the allocator without the compressor.
+        // g_any_page_compressed guards the fork child, whose pages may still
+        // be COMPRESSED from the parent.
+        if (!ever_started_.load(std::memory_order_acquire) &&
+            !g_any_page_compressed.load(std::memory_order_relaxed)) {
+            states_->setRange(start_page, num_pages, PageState::EMPTY);
+            release_counters_[currentCpuShard(kReleaseShards)].bulk
+                .fetch_add(num_pages, std::memory_order_relaxed);
+            return true;
+        }
+        release_counters_[currentCpuShard(kReleaseShards)].walked
+            .fetch_add(num_pages, std::memory_order_relaxed);
         bool reusable = true;
         for (size_t i = start_page; i < start_page + num_pages; ++i) {
             locks_->lock(i);
@@ -8662,7 +8701,7 @@ public:
             // per-page lock; this just makes the bit consistent with the
             // observed state.
             if (deferred_pending_) {
-                deferred_pending_[i].store(false, std::memory_order_release);
+                if (deferred_pending_[i].exchange(false, std::memory_order_acq_rel)) deferred_pending_n_.fetch_sub(1, std::memory_order_relaxed);
             }
             PageState st = states_->get(i);
             if (st == PageState::COMPRESSED) reusable = false;

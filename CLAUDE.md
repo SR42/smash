@@ -42,7 +42,7 @@ codegen bug: [agents/sanitizers.md](agents/sanitizers.md).
 cd build && ctest --output-on-failure
 ```
 
-All 175 tests must pass; none are registered `DISABLED`. Run the suite **as root** too when touching the compressor: idle-page read tracking only exists with root (and `SMASH_WRITE_TRACK=yt` only with the youngtrace module loaded), and CI (`.github/workflows/ci.yml`, `ubuntu-latest` + `macos-latest`, every push and PR) runs unprivileged. After ctest, CI runs `bench/run_quick_ci.py` (`bench_rss` ≥30 %, `bench_sqlite --quick` ≥5 % RSS reduction).
+All 193 tests must pass; none are registered `DISABLED`. Run the suite **as root** too when touching the compressor: idle-page read tracking only exists with root (and `SMASH_WRITE_TRACK=yt` only with the youngtrace module loaded), and CI (`.github/workflows/ci.yml`, `ubuntu-latest` + `macos-latest`, every push and PR) runs unprivileged. After ctest, CI runs `bench/run_quick_ci.py` (`bench_rss` ≥30 %, `bench_sqlite --quick` ≥5 % RSS reduction).
 
 **Before changing a test or its threshold, read its entry in [agents/tests.md](agents/tests.md).** Thresholds encode measurements, several tests are probabilistic (one run is not a verdict), and some harness shapes (sharing a process between phases, `fork()` with smash threads running) reproduce the very symptom under test.
 
@@ -192,10 +192,15 @@ One line each; the incident and measurements behind each are in [agents/conventi
 - The fault handler handles ACTIVE (not just ACTIVE_MONITORING) pages, covering Phase 3's batched mprotect overwriting a per-page PROT_RW restore. A page's state is not proof of its protection.
 - ThreadCache `drain()`/`drainAll()` bucket pointers by `span->arena_id` before returning them to the right arena's slab.
 - Never put a page into the shared free map, a sub-arena's clean runs or the chunk pool unless it is fresh or was decommitted: `calloc` skips its memset for a block from there (`VmRegion::allocateLargePages`'s `zeroed`). A dirty source must report itself (`took_dirty`).
+- `SmashHeap()` and `SystemAllocFns::resolve()` must not reach the heap: anything they allocate, directly or through a libc call that does (glibc < 2.34's `dlsym` callocs), comes from `core/early_alloc.h`, and alloc8's `getHeap()` re-entered on the constructing thread aborts (patch 0003). Keep both windows (`early::Window`) around any new code there.
+- Every `Spinlock` the allocator owns must be in `SmashHeap::collectForkLocks()` (`util/fork_locks.h`): `lock()`/`unlock()` are what alloc8's atfork handlers call, and a lock left out is inherited held by a fork child whenever another thread held it at the clone. Page locks are the exception: never waited for (a fault handler holds one for microseconds), always reset in the child (`PageLockTable::resetForFork`), whether or not a tick was in flight.
+- A tick must not read anything proportional to the arena's high-water mark: the live bitmap is kept by `PageStateTable` on every state store, the deferred sweep returns when its pending count is 0. `stop()` never drains the compressed set: the handler stays installed through exit.
+- A wrapper that warms a buffer touches it with `touchByteWritable` (an atomic +0), never a read-then-write: the latter lost another thread's store to the byte.
+- smash's SIGSEGV/SIGBUS handler runs on the alternate stack smash gives each thread (`SA_ONSTACK`, `ensureAltStackForThread`); the application's `sigaltstack()` is recorded, not installed. `FaultHandler::start()` must never record its own handler as the chain target (a fork child calls it again).
 
 ## Dependencies
 
-- **alloc8**: Interposition framework (cloned via FetchContent at a pinned commit, `SMASH_ALLOC8_COMMIT` in CMakeLists.txt, with `patches/alloc8/*.patch` applied on top; override with `-DALLOC8_DIR=`, which warns for each patch that tree lacks). Fix alloc8 bugs with a patch there, never by editing `_deps/alloc8-src`; moving the pin means checking each patch still applies and is still needed.
+- **alloc8**: Interposition framework (cloned via FetchContent at a pinned commit, `SMASH_ALLOC8_COMMIT` in CMakeLists.txt, with `patches/alloc8/*.patch` applied on top — 0001 `aligned_alloc`/`pvalloc`, 0002 the `new_handler`, 0003 `getHeap()` re-entry aborts; override with `-DALLOC8_DIR=`, which warns for each patch that tree lacks). Fix alloc8 bugs with a patch there, never by editing `_deps/alloc8-src`; moving the pin means checking each patch still applies and is still needed.
 - **LZ4 v1.9.4**: Fast compression (fetched via CMake FetchContent)
 - **Zstandard v1.5.6**: Dictionary compression (fetched via CMake FetchContent)
 

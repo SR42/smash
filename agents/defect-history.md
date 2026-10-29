@@ -835,3 +835,232 @@ Guarded by `test_alloc_contract_{full,large_only}`'s `testNewHandler`
 ([tests.md](tests.md)); the library before failed 33 of its checks in each
 mode.
 
+
+## The release hook walked every page of every freed block with the compressor off (fixed 2026-10-29)
+
+`LargeAlloc::deallocate` hands every arena block to
+`CompressorThread::releaseCompressedPages`, which took each page's lock and
+reset some fifteen per-page arrays — 16 384 lock/unlock pairs and ~250 000
+scattered stores for a 64 MiB block — whether or not a compressor thread had
+ever existed. `SMASH_NO_COMPRESSOR=1` skips `start()` only, so the control an
+operator reaches for to measure the allocator alone paid the full walk; so did
+every free before `start()`. Now a free made before any compressor thread has
+started (`ever_started_`, latched by `start()` and kept by a fork child, whose
+`g_any_page_compressed` guards pages compressed in the parent) resets the
+page-state bytes in bulk and skips the walk: 7 µs against 137 µs per 8 MiB
+block. The walk with the compressor running is unchanged; the ideas for
+shrinking it (a span-level "ever compressed" bit set by the tick; CAS
+transitions so the free path need not take each page's lock) are open.
+`test_release_hook_{off,off_full,on}` ([tests.md](tests.md)); a mutant that
+always walks and one that always takes the bulk path each fail exactly the
+registrations they should.
+
+## One purger thread and no backpressure: a burst of frees held gigabytes dirty (fixed 2026-10-29)
+
+Each set's dirty runs are purged by one thread (the node's or the shared set's
+decommit thread), which a free past `SMASH_DIRTY_MAX_MIB` wakes. Churn that
+reallocates what it frees never needs it (1.2M frees/s on 8 threads, zero
+purges: each thread takes its own dirty run back), but a burst nothing takes
+— a working set shrinking, blocks freed on CPUs that never allocate — handed
+that one thread the whole burst with nothing bounding the dirty bytes but its
+`madvise` throughput: 8 threads each freeing 128 MiB against an 8 MiB cap put
+128 MiB dirty into one sub-arena, and would have put as much as they freed.
+A free that takes its sub-arena past twice the cap now purges the excess on
+the freeing thread, under the lock it already holds (`purgeSubArenaHoldingLock`,
+the madvise with the lock dropped), so no sub-arena is ever more than twice
+its cap plus one block over whatever the thread's backlog; the thread keeps
+the time decay and the under-2x case. The purge's victim sort is `std::sort`
+(it was an insertion sort under the lock). The 128 MiB bursts now peak at
+exactly the bound, 20 MiB, with 404 inline purges over 6 rounds; the slowest
+burst of 32 frees took 18 ms (its own madvise). `test_subarena_pressure{,_full}`;
+a mutant without the inline purge holds 128 MiB.
+
+## The constructor allocated and hung; glibc < 2.34's dlsym does (fixed 2026-10-29)
+
+alloc8's `HeapRedirect::getHeap()` parks every thread but the one
+constructing the heap until construction is done, and had no provision for
+the constructing thread coming back: an allocation from inside `SmashHeap()`
+spun for ever with nothing printed. glibc before 2.34 does exactly that —
+its `dlsym` callocs a per-thread dlerror record on a thread's first call, and
+the constructor's first `mmap` goes through smash's wrapper, which `dlsym`s
+its real target; RHEL 8 (2.28, the release floor), Ubuntu 20.04 and Debian 11
+(2.31) all hang at startup. The same calloc inside `SystemAllocFns::resolve`
+(no system calloc yet) resolved again, recursively, until the stack ran out.
+Reproduced with `tests/helpers/olddlsym_shim.c`, which gives this glibc's
+`dlsym` the old behaviour. Two parts: `core/early_alloc.h`, a 256 KiB static
+arena that serves malloc/calloc/memalign to a thread inside either window
+(`early::Window` in the constructor and in `resolve()`; one relaxed load on
+the malloc path when no thread is in one), with free a no-op and realloc and
+`malloc_usable_size` handled on the heap's foreign-pointer paths; and alloc8
+patch 0003, which makes `getHeap()` re-entered on the constructing thread
+abort with a message instead of spinning, for whatever the arena does not
+cover. On this glibc the arena serves three loader allocations made inside
+the fortified resolver's `dlopen(libc, RTLD_NOLOAD)`, 2.4 KiB.
+`test_early_alloc_old_dlsym{,_full}`: the library before hangs both; with the
+arena disabled the run aborts with alloc8's message.
+
+## The lazy-resolve guard was process-wide (fixed 2026-10-29)
+
+Every wrapper `dlsym`s its real target on first use behind a guard against
+dlsym recursing into the wrapper. The guard was one `std::atomic<bool>` for
+the process: while thread A's dlsym ran, thread B's first call to any other
+wrapper saw the flag, skipped its own dlsym and ran unresolved — a raw syscall
+without the EFAULT retry for the I/O wrappers, `MAP_FAILED` from `mmap`,
+`mmap64` and `mremap` (with a stale errno), -1 from `execvp`, `ENOSYS` from
+`posix_spawn`, nullptr from `fgets`. 128 threads starting together make the
+overlap routine. The guard is a `thread_local` now, the resolved pointer an
+atomic (every thread raced to write it), and the mmap family falls back to the
+raw syscall instead of failing. `test_lazy_resolve_race`, with
+`tests/helpers/slowdlsym_shim.c` (3 ms per dlsym) so the overlap is certain:
+the library before fails it every run (`mremap` MAP_FAILED, `fgets` nullptr).
+
+## The blob store had no cap, and a refused page was retried every tick (fixed 2026-10-29)
+
+`CompressStore` grew until `mmap` (or, for a node store, `mbind`) failed, and
+a page whose blob the store could not take went back to ACTIVE with its cold
+streak intact and no failure counted: selected, snapshotted, compressed and
+refused again on every tick, for ever, silently. `SMASH_BLOB_MAX_MIB` caps the
+bytes every store keeps resident (`g_blob_held_bytes`: below each region's
+bump pointer; a moved blob is compaction and never refused), a refusal backs
+off exactly like a ratio-gate failure (the cold streak restarts, the effective
+floor doubles) and the first one warns. `test_blob_cap`: 64 MiB of half-
+compressible data against an 8 MiB cap holds 8 MiB, and a window four times
+as long as the first sees fewer refusals than it (17 235 then 12 859, against
+42 194 then 102 872 for a mutant without the back-off).
+
+## A restore that could not get a VMA spun for ever (fixed 2026-10-29)
+
+A restore writes the page through `/proc/self/mem` and then `mprotect`s it
+PROT_RW, which splits a VMA; at `vm.max_map_count` that is ENOMEM, as were
+both fallbacks, and `restorePageContents` returned with the page still
+PROT_NONE + COMPRESSED — the faulting instruction re-executed at once and the
+thread spun at full speed, silently, until some other thread's unmap freed a
+VMA, or for ever. Worse, the fault handler then marked the page ACTIVE anyway,
+so once a VMA did come free the page came back without its data (the test's
+read-back of the pre-fix library returns the wrong byte). The restore now
+waits for a VMA in 5 ms steps for up to 2 s and then re-establishes the
+mapping and rewrites the data; if none comes it prints a FATAL line and
+aborts, since the blob cannot be put back. `test_vma_exhaust` fills the
+process to `vm.max_map_count` with one-page mappings of alternating
+protection and touches the middle of a fully compressed block: with a thread
+unmapping half the fillers 300 ms later the touch completes with 21 ms of CPU
+for the waiting thread (385 ms of wall time); with nothing unmapped the child
+aborts with the message inside 8 s where the library before spun on.
+
+## A stack overflow never reached an application's alternate-stack handler (fixed 2026-10-29)
+
+smash's handler was installed without `SA_ONSTACK` (deliberately: alternate
+stacks are often small, and the handler decompresses). So when a thread ran
+off the end of its stack the kernel had no stack to push smash's frame on and
+killed the process before any handler ran — the application's `SA_ONSTACK`
+handler, the one JVMs, Go, Rust and crash reporters rely on for exactly this,
+never saw the fault. The handler now has `SA_ONSTACK` and runs on a 256 KiB
+alternate stack smash gives every thread (`ensureAltStackForThread`, a raw
+`mmap` so `SMASH_TRACK_EXTERNAL` can never make a signal stack compressible;
+released on thread exit), and the application's chained handler runs on it
+too. The application's own `sigaltstack()` is interposed: recorded and
+reported back, never installed. Found on the way: `FaultHandler::start()` run
+a second time (a fork child restarts the compressor on its first thread
+creation) recorded the kernel's current handler — smash's own, inherited from
+the parent — as the one to chain foreign faults to, and every such fault in a
+child recursed into itself; the missing alternate stack had hidden it behind
+the crash. `start()` keeps the chain when the previous handler is its own.
+`test_altstack_{large_only,full}`: both overflow children died of SIGSEGV
+before, in the main thread with the application's stack registered and in a
+thread with none.
+
+## The warming touch lost concurrent stores (fixed 2026-10-29)
+
+Wrappers with no retry surface (`pthread_sigmask`, the affinity calls, stdio,
+`getcwd`) touch the first byte of each page of the buffer the kernel will
+read or write, so a compressed page is restored and a PROT_READ page made
+writable before the real call. The touch was `c = *p; *p = c`: a thread
+storing to that byte between the load and the store had its store undone,
+and the byte is the first of a page, as likely live data as any other in a
+shared large buffer. It is an atomic `+0` now (`touchByteWritable`), which
+faults exactly as a plain store does and is indivisible. `test_warm_pages_race`:
+a writer verifying its own stores to the first byte of a page while another
+thread `pthread_sigmask`s with a set on it lost 7 stores in 2 s before, none
+after.
+
+## fork() quiesced only the slabs and LargeAlloc (fixed 2026-10-29)
+
+alloc8 registers atfork handlers that call `SmashHeap::lock()` before the
+fork and `unlock()` in the parent and the child. `lock()` took the slab locks
+and LargeAlloc's; the child's `resetDecommitThreadForFork` re-initialised the
+sub-arena, pool, run-cache and chunk locks. Everything else — the span
+descriptor shards, the free maps, the node arenas' locks, the commit and NUMA
+init locks, the mid classes, the thread cache pool, the metadata arena's
+expand lock, the blob stores' shards, and the page locks — a child inherited
+as it was at the clone, and a lock another parent thread held then was held
+in the child by a thread that did not exist. The compressor's pause gave up
+after 50 ms with a tick in flight, with nothing reset for it. Stress did not
+show it (200 forks under 8 churning threads: 0 hung; the holds are tens of
+nanoseconds); a thread holding the span shards for 400 ms at the fork hangs
+every child. `lock()` now pauses the tick and takes every allocator lock
+(`util/fork_locks.h`: in rounds of trylock, so it cannot deadlock against the
+threads it waits out, bounded at 3 s), `unlock()` releases them, and
+`forkChild()` re-initialises them all plus every held page lock of the
+committed range. A tick stops at the next chunk once a fork is pending
+(`forEachLivePage`, the reclaim loop).
+`test_fork_{large_only,full,no_compressor}`: with the locks the old `lock()`
+left out held for 400 ms (`smash_debug_hold_locks`), `fork()` now takes
+350 ms and the child runs; a mutant with the old `lock()` forks in 1 ms and
+the child hangs, which is the compressor-off registration's job to catch (with
+a compressor, the holder also blocks the tick and the pause waits it out).
+
+**Page locks** are not in the set the prepare handler takes: a fault handler
+holds one for the microseconds of a decompress, a write through
+`/proc/self/mem` and an `mprotect`, and waiting for them would make every
+`fork()` wait on every faulting thread. The first version of this fix reset
+them in the child only when the tick pause had timed out (`fork_mid_tick_`),
+as if workers were the only holders. A clone inside a fault handler's window
+left the child's page `PROT_NONE`, still `COMPRESSED` with its blob, and its
+lock held by a thread that did not exist: the child's first read of it
+faulted and spun in `PageLockTable::lock()` for ever. A `SMASH_SOFTDIRTY=0`
+run of the suite hung 2 of 200 children this way (1200 standalone forks did
+not; the holds are microseconds). `forkChild()` now resets every held page
+lock unconditionally (`PageLockTable::resetForFork`: one word read per 8
+pages over the committed range, writes only to the held ones, owner slot
+too, so a thread the child creates that reuses a parent thread's `pthread_t`
+is not taken for the holder; `heldByThisThread` checks the flag before the
+owner). A clone after the `mprotect` and before the state store leaves a
+readable page with the right bytes marked `COMPRESSED` and its blob kept:
+nothing faults on it or sweeps it (the handler clears its deferred bit
+first), so it costs one blob. `test_fork_*`'s page-lock phase holds one
+compressed page's lock for 400 ms (`smash_debug_hold_page_lock`) while main
+forks and the child reads the page: the mid-tick-only mutant hangs all three
+children, the fix runs them.
+
+## Every tick read a byte per page of the arena's high-water mark, twice (fixed 2026-10-29)
+
+Each tick began with `rebuildChunkBitmap`: the state byte of every page from
+0 to the committed high-water mark, to learn which 64-page chunks hold a
+live page, and ended with `sweepDeferredMadvise` reading every page's
+deferred-madvise bit over the same range -- on the coordinator alone, 134 MB
+of reads per tick each on a 512 GiB arena that was once full, whatever is
+live now, and the sweep for nothing in the default deferred-reclaim mode,
+where the bit is never set. `PageStateTable` now keeps the live bitmap itself
+on every state store (`noteState` in `set`, `setRange`, `transition`), the
+compressor reads it in place (`liveWords()`; `rebuildChunkBitmap` is gone),
+and a count of pending pages (`deferred_pending_n_`) lets the sweep return
+at once when none is. `smash_tick_cost_info` exports the sweep's scanned
+pages, the memread calls and the tick count; `test_tick_scan` leaves a 1 GiB
+high-water mark behind 8 MiB live and requires three ticks to scan 0 page
+bits (262 144 per tick before), then checks the kept block still compresses
+and reads back, which is the bitmap being right.
+
+## exit() decompressed every compressed page before the handler came down (fixed 2026-10-29)
+
+`CompressorThread::stop()` called `drainAllForShutdown()`: every compressed
+page restored in place, one thread, a `pwrite` through `/proc/self/mem` and an
+`mprotect` each, before the fault handler was uninstalled and the spill
+mapping unmapped -- minutes of silent exit for tens of millions of pages, and
+every bit of it work the process was about to throw away. `stop()` now stops
+the threads and leaves the handler installed, the stores allocated and the
+pages compressed: an access after shutdown (an `atexit` handler, a static
+destructor) faults and is restored on the accessing thread, as during the
+run. `test_exit_drain`: a child compresses 1.5 GiB (364 314 pages), registers
+an `atexit` handler that reads 1 MiB of it back, and exits; the time from its
+"exiting" line to its end must be under 1 s and the handler must have seen
+the right bytes. 19 ms now; 2281 ms with the drain.

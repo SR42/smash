@@ -296,3 +296,33 @@ cannot peek (a peek covers one datagram): its buffers are touched first, so a
 wait that outlasts a tick can still lose one. Also not covered: `SO_PEEK_OFF`
 sockets (a peek advances their peek offset).
 
+
+## Kernel-side access the handler cannot see (2026-10-29, documented, not fixed)
+
+Everything above assumes the access to a compressed page comes either from an
+instruction (SIGSEGV, restored by the handler) or from a synchronous syscall
+made through libc (EFAULT, retried by the wrapper). Four kinds of access are
+neither, and smash has no answer for them yet:
+
+- **io_uring.** A read or write submitted through a ring completes on an
+  io-wq worker with the process's mm: a PROT_NONE page gives `-EFAULT` in the
+  CQE, asynchronously, with no wrapper to retry. Registered buffers
+  (`IORING_REGISTER_BUFFERS`) are pinned, see the next point.
+- **Pinned pages.** A page pinned by an RDMA memory registration, a
+  registered io_uring buffer, or an in-flight O_DIRECT transfer keeps its
+  physical frame through `mprotect(PROT_NONE)` + `MADV_DONTNEED`: the device
+  keeps writing the old frame while the process, on its next touch, gets the
+  decompressed copy. Silent divergence; nothing in smash detects a pin.
+- **Debuggers.** `ptrace`, `/proc/<pid>/mem` and `process_vm_readv` from
+  another process see a compressed heap page as unreadable or as zeros (the
+  wrapper for `process_vm_readv` covers the calling process's own buffers
+  only). gdb, py-spy and core dumps of a process under smash misreport its
+  compressed heap.
+- **`futex` on a heap word** (documented above): no libc symbol to interpose.
+
+In `SMASH_LARGE_ONLY=1` every I/O buffer over 1 MiB is a smash page, so the
+first two are the ones a 128-core NUMA deployment is likely to meet. The
+honest fix is to refuse to compress pinned ranges (a pin is visible to the
+kernel, not to us: detecting `io_uring_setup`/`ibv_reg_mr`-class activity and
+excluding their buffers is the direction) and to document the debugger
+limitation; neither is done.

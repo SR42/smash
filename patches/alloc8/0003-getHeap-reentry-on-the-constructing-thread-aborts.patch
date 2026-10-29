@@ -1,0 +1,46 @@
+diff --git a/include/alloc8/allocator_traits.h b/include/alloc8/allocator_traits.h
+index 2bee623..b5c56d1 100644
+--- a/include/alloc8/allocator_traits.h
++++ b/include/alloc8/allocator_traits.h
+@@ -4,9 +4,13 @@
+ #include "platform.h"
+ #include <atomic>
+ #include <cstddef>
++#include <cstdint>
++#include <cstdlib>
+ #include <cstring>
+ #include <new>
++#include <pthread.h>
+ #include <type_traits>
++#include <unistd.h>
+ 
+ #if __cplusplus >= 202002L
+ #include <concepts>
+@@ -106,15 +110,27 @@ public:
+   static AllocatorType* getHeap() {
+     alignas(AllocatorType) static char buffer[sizeof(AllocatorType)];
+     static std::atomic<int> state{0};  // 0=uninit, 1=initialising, 2=ready
++    static std::atomic<std::uintptr_t> constructor{0};  // pthread_self() of the thread in state 1
+     int s = state.load(std::memory_order_acquire);
+     if (s == 2) [[likely]]
+       return reinterpret_cast<AllocatorType*>(buffer);
+     // Slow path: first thread to flip 0→1 constructs; others spin until 2.
+     if (s == 0 && state.compare_exchange_strong(s, 1, std::memory_order_acq_rel)) {
++      constructor.store(reinterpret_cast<std::uintptr_t>(pthread_self()), std::memory_order_relaxed);
+       new (buffer) AllocatorType;
+       state.store(2, std::memory_order_release);
+       return reinterpret_cast<AllocatorType*>(buffer);
+     }
++    // The constructing thread asking for the heap it is constructing (its
++    // constructor allocated, directly or through a libc call that does) would
++    // wait here for itself, for ever and silently. Say so and stop instead.
++    if (constructor.load(std::memory_order_relaxed) == reinterpret_cast<std::uintptr_t>(pthread_self())) {
++      static const char msg[] =
++          "[alloc8] FATAL: the heap's constructor allocated through the heap it is "
++          "constructing (getHeap() re-entered on the constructing thread)\n";
++      (void)!::write(2, msg, sizeof(msg) - 1);
++      abort();
++    }
+     while (state.load(std::memory_order_acquire) != 2) {
+ #if defined(__x86_64__)
+       __builtin_ia32_pause();

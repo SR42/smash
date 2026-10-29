@@ -9,6 +9,7 @@
 #include "page_map.h"
 #include "size_classes.h"
 #include "../util/spinlock.h"
+#include "../util/fork_locks.h"
 #include "../util/intrusive_list.h"
 #include "../vm/platform_mem.h"
 #include "../vm/vm_region.h"
@@ -783,6 +784,7 @@ public:
 
     void lockSlab() SMASH_ACQUIRE(lock_) { lock_.lock(); }
     void unlockSlab() SMASH_RELEASE(lock_) { lock_.unlock(); }
+    void forkLocks(ForkLockSet& s) { s.add(lock_); s.add(pending_pool_lock_); s.add(mag_lock_); }
 };
 
 } // namespace smash

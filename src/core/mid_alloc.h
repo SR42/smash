@@ -32,6 +32,7 @@
 // returning an emptied chunk to the arena — see the note on reclaim below.
 #include "smash/config.h"
 #include "../util/spinlock.h"
+#include "../util/fork_locks.h"
 #include "../vm/vm_region.h"
 #include "../vm/page_state.h"
 #include "page_map.h"
@@ -53,6 +54,7 @@ inline constexpr int kNumMidClasses =
 
 class MidAlloc {
 public:
+    void forkLocks(ForkLockSet& s) { for (MidClass& c : classes_) s.add(c.lock); }
     void init(VmRegion* vm, PageStateTable* states, PageMap* page_map,
               bool (*release_hook)(size_t, size_t, void*) = nullptr,
               void* release_ctx = nullptr) {

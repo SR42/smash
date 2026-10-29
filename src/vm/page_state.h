@@ -11,6 +11,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <pthread.h>
 
 namespace smash {
@@ -40,14 +41,33 @@ class PageStateTable {
     // One bit per page: the allocator handed out a block on the page while
     // the compressor held it (see markAllocReopened).
     std::atomic<uint64_t>* alloc_reopened_ = nullptr;
+    // One bit per page: its state is not EMPTY. Kept here, by every store,
+    // so the compressor's tick can walk the pages that exist instead of
+    // reading every state byte up to the high-water mark first
+    // (rebuildChunkBitmap: 134M bytes a tick on a 512 GiB arena, on the
+    // coordinator alone). Advisory: a phase re-reads the state of each page
+    // the bitmap names, as it always had to (pages free mid-tick).
+    std::atomic<uint64_t>* live_ = nullptr;
     size_t num_pages_;
+
+    void noteState(size_t i, PageState st) {
+        auto& w = live_[i >> 6];
+        const uint64_t bit = uint64_t{1} << (i & 63);
+        const bool set = w.load(std::memory_order_relaxed) & bit;
+        if (st == PageState::EMPTY) { if (set) w.fetch_and(~bit, std::memory_order_relaxed); }
+        else if (!set) w.fetch_or(bit, std::memory_order_relaxed);
+    }
 
 public:
     void init(size_t num_pages) {
         num_pages_ = num_pages;
         states_ = bootstrapArray<std::atomic<uint8_t>>(num_pages);
         alloc_reopened_ = bootstrapArray<std::atomic<uint64_t>>((num_pages + 63) / 64);
+        live_ = bootstrapArray<std::atomic<uint64_t>>((num_pages + 63) / 64);
     }
+
+    // 64 pages per word, bit b of word w: page 64w + b is not EMPTY.
+    const std::atomic<uint64_t>* liveWords() const { return live_; }
 
     PageState get(size_t page_idx) const {
         return static_cast<PageState>(states_[page_idx].load(std::memory_order_acquire));
@@ -82,6 +102,7 @@ public:
 
     void set(size_t page_idx, PageState state) {
         states_[page_idx].store(static_cast<uint8_t>(state), std::memory_order_release);
+        noteState(page_idx, state);
         // Latch the global "some page is compressed" flag so the alloc-path
         // bitmap walk can skip its per-slot COMPRESSED check until this fires.
         if (state == PageState::COMPRESSED) [[unlikely]]
@@ -96,6 +117,20 @@ public:
         const auto v = static_cast<uint8_t>(state);
         for (size_t i = 0; i < num_pages; ++i)
             states_[first_page_idx + i].store(v, std::memory_order_release);
+        // The live bits, a word at a time.
+        for (size_t i = first_page_idx, end = first_page_idx + num_pages; i < end;) {
+            const size_t word_end = (i | 63) + 1;
+            const size_t stop = word_end < end ? word_end : end;
+            uint64_t mask = ~uint64_t{0};
+            if (stop - i < 64) mask = ((uint64_t{1} << (stop - i)) - 1) << (i & 63);
+            auto& w = live_[i >> 6];
+            if (state == PageState::EMPTY) {
+                if (w.load(std::memory_order_relaxed) & mask) w.fetch_and(~mask, std::memory_order_relaxed);
+            } else if ((w.load(std::memory_order_relaxed) & mask) != mask) {
+                w.fetch_or(mask, std::memory_order_relaxed);
+            }
+            i = stop;
+        }
         if (state == PageState::COMPRESSED) [[unlikely]]
             g_any_page_compressed.store(true, std::memory_order_relaxed);
     }
@@ -103,9 +138,11 @@ public:
     // CAS transition. Returns true on success.
     bool transition(size_t page_idx, PageState expected, PageState desired) {
         auto exp = static_cast<uint8_t>(expected);
-        return states_[page_idx].compare_exchange_strong(
+        const bool ok = states_[page_idx].compare_exchange_strong(
             exp, static_cast<uint8_t>(desired),
             std::memory_order_acq_rel, std::memory_order_acquire);
+        if (ok) noteState(page_idx, desired);
+        return ok;
     }
 
     size_t numPages() const { return num_pages_; }
@@ -139,6 +176,32 @@ public:
                 alignof(pthread_t)));
     }
 
+    // A fork child: every page lock held at the clone -- by a worker mid-tick,
+    // or by a thread inside the fault handler (lock, decompress, write,
+    // mprotect, unlock: microseconds, but 2 of 200 forks under 8 faulting
+    // threads landed inside) -- belongs to a thread that does not exist here.
+    // Only the forking thread does, and it holds none, so every set flag is
+    // cleared, owner too (a thread the child creates can reuse a parent
+    // thread's pthread_t, and heldByThisThread would then see itself).
+    // Reads a word per 8 pages over [0, n) and writes only the held ones, so
+    // the lock table's untouched pages stay shared with the parent. Returns
+    // how many were held.
+    size_t resetForFork(size_t n) {
+        static_assert(sizeof(std::atomic_flag) == 1, "the word scan reads one page lock per byte");
+        if (n > num_pages_) n = num_pages_;
+        size_t reset = 0;
+        const unsigned char* raw = reinterpret_cast<const unsigned char*>(locks_);
+        size_t i = 0;
+        for (; i + 8 <= n; i += 8) {
+            uint64_t w;
+            std::memcpy(&w, raw + i, sizeof w);
+            if (w == 0) continue;
+            for (size_t k = i; k < i + 8; ++k) reset += resetOneForFork(k);
+        }
+        for (; i < n; ++i) reset += resetOneForFork(i);
+        return reset;
+    }
+
     void lock(size_t page_idx) {
         while (locks_[page_idx].test_and_set(std::memory_order_acquire)) {
 #if defined(__x86_64__)
@@ -155,6 +218,13 @@ public:
         if (locks_[page_idx].test_and_set(std::memory_order_acquire)) return false;
         owners_[page_idx] = pthread_self();
         return true;
+    }
+
+    size_t resetOneForFork(size_t i) {
+        if (!locks_[i].test(std::memory_order_relaxed)) return 0;
+        owners_[i] = pthread_t{};
+        locks_[i].clear(std::memory_order_relaxed);
+        return 1;
     }
 
     void unlock(size_t page_idx) {
@@ -179,6 +249,7 @@ public:
         // some platforms but in practice 8-byte aligned. The test_and_set
         // earlier means the lock holder already wrote owners_[page_idx];
         // we're just reading the value back.)
+        if (!locks_[page_idx].test(std::memory_order_acquire)) return false;
         return pthread_equal(owners_[page_idx], pthread_self()) != 0;
     }
 };

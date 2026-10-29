@@ -12,6 +12,7 @@
     # chained handlers instead of replacing smash's (linux_syscall_wrappers.cpp)
     sigaction;
     __sigaction;
+    sigaltstack;
     signal;
     bsd_signal;
     ssignal;
@@ -90,6 +91,14 @@
     smash_in_arena;
     smash_page_info;
     smash_run_cache_info;
+    smash_release_hook_info;
+    smash_subarena_pressure;
+    smash_early_arena_info;
+    smash_resilience_info;
+    smash_debug_hold_locks;
+    smash_debug_hold_page_lock;
+    smash_tick_cost_info;
+    smash_blob_usage;
     smash_subarena_info;
     smash_shared_arena_info;
 

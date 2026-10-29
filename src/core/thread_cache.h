@@ -8,6 +8,7 @@
 #include "bootstrap_alloc.h"
 #include "size_classes.h"
 #include "../util/spinlock.h"
+#include "../util/fork_locks.h"
 #include "../util/double_free.h"
 
 #include <cstddef>
@@ -189,6 +190,7 @@ public:
         tc->pool_next = freelist_;
         freelist_ = tc;
     }
+    void forkLocks(ForkLockSet& s) { s.add(lock_); }
 };
 
 // Allocate a new ThreadCache from bootstrap memory

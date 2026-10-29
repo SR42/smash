@@ -24,10 +24,12 @@
 #endif
 #include "../core/bootstrap_alloc.h"
 #include "../util/spinlock.h"
+#include "../util/fork_locks.h"
 #include "../util/cpu_shard.h"
 #include "../util/exit_guard.h"
 #include "../util/park.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -651,6 +653,25 @@ public:
     // The process-exit guard (util/exit_guard.h) has to stop every thread
     // smash created, and this one is not the compressor's to stop.
     void stopBackgroundThread() { stopDecommitThread(); }
+
+    // Every lock of the region, for fork() (util/fork_locks.h).
+    void forkLocks(ForkLockSet& s) {
+        s.add(commit_lock_);
+        s.add(numa_init_lock_);
+        free_map_.forkLocks(s);
+        for (EntryShard& sh : entry_shards_) s.add(sh.lock);
+        for (RunCacheShard& sh : run_cache_) s.add(sh.lock);
+        auto one = [&](NodeArena& na) {
+            s.add(na.lock);
+            s.add(na.chunk_lock);
+            if (na.map_ready.load(std::memory_order_acquire)) na.map.forkLocks(s);
+            if (na.subs_ready.load(std::memory_order_acquire))
+                for (uint32_t i = 0; i < na.nsubs; ++i) s.add(na.subs[i].lock);
+        };
+        if (NodeArena* arenas = node_arenas_.load(std::memory_order_acquire))
+            for (uint32_t n = 0; n < vm::kMaxNumaNodes; ++n) one(arenas[n]);
+        if (NodeArena* shared = shared_set_.load(std::memory_order_acquire)) one(*shared);
+    }
 
     bool isTrackingMode() const { return tracking_mode_; }
 
@@ -1727,6 +1748,8 @@ private:
         std::atomic<size_t> dirty_published{0};   // for the purger's skip test and info
         std::atomic<uint64_t> purged_runs{0};
         std::atomic<uint32_t> purging{0};   // purges with runs out of the map
+        std::atomic<size_t> peak_dirty_pages{0};   // most ever dirty at once (info)
+        std::atomic<uint64_t> inline_purges{0};    // purges run by a freeing thread
     };
     static constexpr uint8_t kChunkUnowned = 0;   // chunk_sub_: none / node-level
     static constexpr uint8_t kChunkBig = 0xFF;    // a block larger than a chunk
@@ -2313,12 +2336,23 @@ private:
     void purgeSubArena(NodeArena& na, uint32_t s, bool all, bool whole_chunks_only = false) {
         SubArena& sa = na.subs[s];
         if (sa.dirty_published.load(std::memory_order_relaxed) == 0) return;
+        if (all) sa.lock.lock();
+        else if (!sa.lock.tryLock()) return;
+        purgeSubArenaHoldingLock(na, s, all, whole_chunks_only);
+    }
+
+    // The purge proper, with sa.lock held by the caller; releases it. Also
+    // run by a freeing thread (freeRunDirty) once its sub-arena is past twice
+    // the cap: one purger thread serves every sub-arena of a set, and with no
+    // backpressure a burst of frees that nothing reallocated held the whole
+    // burst dirty until that thread had madvised it all (8 threads freeing
+    // 256 MiB each: 2 GiB over the caps for as long as that took).
+    void purgeSubArenaHoldingLock(NodeArena& na, uint32_t s, bool all, bool whole_chunks_only) {
+        SubArena& sa = na.subs[s];
         struct Victim { size_t start, len; uint32_t stamp; };
         constexpr size_t kMaxVictims = 256;
         Victim runs[kMaxVictims];
         size_t n = 0;
-        if (all) sa.lock.lock();
-        else if (!sa.lock.tryLock()) return;
         const uint32_t now = stampNow();
         const uint64_t decay = dirtyDecayMs();
         const size_t cap = dirtyMaxPages();
@@ -2331,11 +2365,9 @@ private:
             runs[n++] = Victim{start, len, stamp};
         });
         // Oldest first.
-        for (size_t i = 1; i < n; ++i)
-            for (size_t j = i; j > 0 && static_cast<uint32_t>(now - runs[j].stamp) >
-                                        static_cast<uint32_t>(now - runs[j - 1].stamp); --j) {
-                const Victim t = runs[j]; runs[j] = runs[j - 1]; runs[j - 1] = t;
-            }
+        std::sort(runs, runs + n, [now](const Victim& a, const Victim& b) {
+            return static_cast<uint32_t>(now - a.stamp) > static_cast<uint32_t>(now - b.stamp);
+        });
         // Aged runs go whole; beyond the cap, oldest first, and the run that
         // crosses the cap only in part (its end) — freed blocks coalesce, so
         // purging whole runs would overshoot to nothing (16 x 8 MiB freed in
@@ -2416,20 +2448,33 @@ public:
         if (!set) return false;
         NodeArena& na = *set;
         const uint32_t s = static_cast<uint32_t>(o - 1);
+        SubArena& sa = na.subs[s];
         bool over = false;
-        {
-            LockGuard guard(na.subs[s].lock);
-            na.map.insertUnlocked(idx, num_pages, ownerDirty(s), kNodeChunkPages, stampNow());
-            na.subs[s].dirty_pages += num_pages;
-            na.subs[s].dirty_published.store(na.subs[s].dirty_pages, std::memory_order_relaxed);
+        sa.lock.lock();
+        na.map.insertUnlocked(idx, num_pages, ownerDirty(s), kNodeChunkPages, stampNow());
+        sa.dirty_pages += num_pages;
+        sa.dirty_published.store(sa.dirty_pages, std::memory_order_relaxed);
+        if (sa.dirty_pages > sa.peak_dirty_pages.load(std::memory_order_relaxed))
+            sa.peak_dirty_pages.store(sa.dirty_pages, std::memory_order_relaxed);
+        const size_t cap = dirtyMaxPages();
+        if (sa.dirty_pages > 2 * cap) {
+            // Past twice the cap the purger thread is behind (or this is a
+            // burst nothing reallocates): this thread purges its own excess
+            // before anyone sees the lock free, so no sub-arena ever holds
+            // more than twice its cap plus one block, however many threads
+            // free into it. The madvise runs with the lock dropped.
+            sa.inline_purges.fetch_add(1, std::memory_order_relaxed);
+            purgeSubArenaHoldingLock(na, s, /*all=*/false, /*whole_chunks_only=*/false);
+        } else {
             // Over the cap: the purger takes the oldest now, not at its next
             // 50 ms epoch — between epochs a fast churn otherwise held 4-6x
             // the cap dirty (smash_sim, 8 sub-arenas: 7-13 GiB against 2).
-            if (na.subs[s].dirty_pages > dirtyMaxPages() &&
+            if (sa.dirty_pages > cap &&
                 !subQueue(na).purge_now.load(std::memory_order_relaxed)) {
                 subQueue(na).purge_now.store(true, std::memory_order_seq_cst);
                 over = true;
             }
+            sa.lock.unlock();
         }
         // Woken after the lock is released: woken under it, the purger found
         // the lock held (it only tries it) and slept until the next epoch.
@@ -2625,6 +2670,20 @@ public:
         *purged_runs = p;
         return subarenasEnabled();
     }
+    // The most any one sub-arena has held dirty at once, and purges run by
+    // freeing threads (past twice the cap) so far.
+    bool subArenaPressure(uint64_t* peak_dirty_bytes, uint64_t* inline_purges) {
+        uint64_t peak = 0, inl = 0;
+        forEachSubSet([&](NodeArena& na, int) {
+            for (uint32_t s = 0; s < na.nsubs; ++s) {
+                peak = std::max<uint64_t>(peak, na.subs[s].peak_dirty_pages.load(std::memory_order_relaxed));
+                inl += na.subs[s].inline_purges.load(std::memory_order_relaxed);
+            }
+        });
+        *peak_dirty_bytes = peak * kPageSize;
+        *inline_purges = inl;
+        return subarenasEnabled();
+    }
 #else
     static bool subarenasEnabled() { return false; }
     void purgeNodeSubArenas(uint32_t, bool) {}
@@ -2643,6 +2702,10 @@ public:
     }
     bool subArenaInfo(uint64_t* dirty_bytes, uint64_t* purged_runs) {
         *dirty_bytes = *purged_runs = 0;
+        return false;
+    }
+    bool subArenaPressure(uint64_t* peak_dirty_bytes, uint64_t* inline_purges) {
+        *peak_dirty_bytes = *inline_purges = 0;
         return false;
     }
 #endif

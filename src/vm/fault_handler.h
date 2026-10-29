@@ -27,6 +27,7 @@
 #endif
 #ifdef __linux__
 #include <sys/syscall.h>
+#include <sys/mman.h>
 #endif
 #include "smash/config.h"
 #include "../util/safe_printf.h"  // signal-handler-safe snprintf
@@ -172,6 +173,15 @@ inline int aarch64EsrWriteBit(const void* reserved, size_t reserved_len) {
 #if defined(__linux__)
 inline __thread __attribute__((tls_model("initial-exec"))) int g_fault_depth = 0;
 inline int& faultDepth() { return g_fault_depth; }
+
+// This thread's alternate signal stack, owned by smash (ensureAltStackForThread),
+// and the one the application registered through the interposed sigaltstack(),
+// which smash records and reports back but does not install: smash's handler
+// runs on smash's stack, the application's chained handler then runs there too.
+inline __thread __attribute__((tls_model("initial-exec"))) void* g_altstack_base = nullptr;
+inline __thread __attribute__((tls_model("initial-exec"))) void* g_app_altstack_sp = nullptr;
+inline __thread __attribute__((tls_model("initial-exec"))) size_t g_app_altstack_size = 0;
+inline __thread __attribute__((tls_model("initial-exec"))) int g_app_altstack_flags = SS_DISABLE;
 #endif
 
 #if defined(__APPLE__) || defined(__linux__)
@@ -678,24 +688,125 @@ public:
         const char* nw = std::getenv("SMASH_NO_SIGACTION_WRAP");
         sigaction_wrap_disabled_ = nw && nw[0] == '1';
 
-        // No SA_ONSTACK, deliberately: smash's handler decompresses pages,
-        // and alternate signal stacks are often small (Rust gives every
-        // thread one of ~8 KiB). It runs on the faulting thread's own stack,
-        // as it always has — so a stack overflow still cannot reach an
-        // application's alternate-stack handler through smash.
+        // SA_ONSTACK, on an alternate stack smash gives every thread
+        // (ensureAltStackForThread: 256 KiB, mapped lazily, so a few pages
+        // resident). Without one, a stack overflow was fatal for every
+        // application whose own SIGSEGV handler runs on an alternate stack
+        // (JVM, Go, Rust, crash reporters): the kernel had no stack to push
+        // smash's frame on, so the handler smash would have chained to never
+        // ran. The application's stack is not used, because it is often too
+        // small for a handler that decompresses (Rust's is ~8 KiB): its
+        // sigaltstack() is interposed, recorded and reported back, and its
+        // chained handler runs on smash's stack.
+        ensureAltStackForThread();
         struct sigaction sa{};
         sa.sa_sigaction = signalHandler;
-        sa.sa_flags = SA_SIGINFO | SA_NODEFER;
+        sa.sa_flags = SA_SIGINFO | SA_NODEFER | SA_ONSTACK;
         sigemptyset(&sa.sa_mask);
 
+        // The handler installed before ours becomes the chain target -- unless
+        // it is ours already: start() runs again in a fork child (the child
+        // restarts the compressor on its first allocation), and recording
+        // smash's own handler as the one to pass foreign faults to made every
+        // such fault recurse into itself.
         struct sigaction prev{};
         sysSigaction(SIGSEGV, &sa, &prev);
-        writeChain(SIGSEGV, prev);
+        if (!isOurHandler(prev)) writeChain(SIGSEGV, prev);
         sysSigaction(SIGBUS, &sa, &prev);
-        writeChain(SIGBUS, prev);
+        if (!isOurHandler(prev)) writeChain(SIGBUS, prev);
         running_.store(true, std::memory_order_release);
         return true;
     }
+
+    static bool isOurHandler(const struct sigaction& sa) {
+        return (sa.sa_flags & SA_SIGINFO) && sa.sa_sigaction == &signalHandler;
+    }
+
+#if defined(__linux__)
+    static constexpr size_t kAltStackBytes = 256u << 10;
+
+    bool running() const { return running_.load(std::memory_order_acquire); }
+
+    // Give this thread smash's alternate signal stack, once. A stack the
+    // application had already registered is recorded (interposedSigaltstack
+    // reports it back) and replaced. Raw syscalls throughout: the mapping must
+    // not go through smash's mmap wrapper (SMASH_TRACK_EXTERNAL would make a
+    // signal stack compressible) and sigaltstack is interposed below.
+    static void ensureAltStackForThread() {
+        if (g_altstack_base) return;
+        stack_t cur{};
+        if (syscall(SYS_sigaltstack, nullptr, &cur) == 0 && !(cur.ss_flags & SS_DISABLE)) {
+            g_app_altstack_sp = cur.ss_sp;
+            g_app_altstack_size = cur.ss_size;
+            g_app_altstack_flags = 0;
+        }
+        void* m = reinterpret_cast<void*>(syscall(SYS_mmap, nullptr, kAltStackBytes,
+                                                  PROT_READ | PROT_WRITE,
+                                                  MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0));
+        if (m == MAP_FAILED) return;
+        stack_t ss{};
+        ss.ss_sp = m;
+        ss.ss_size = kAltStackBytes;
+        ss.ss_flags = 0;
+        if (syscall(SYS_sigaltstack, &ss, nullptr) != 0) {
+            syscall(SYS_munmap, m, kAltStackBytes);
+            return;
+        }
+        g_altstack_base = m;
+    }
+
+    // Thread exit: put the application's stack back (or none) and unmap ours.
+    static void releaseAltStackForThread() {
+        if (!g_altstack_base) return;
+        stack_t ss{};
+        if (g_app_altstack_flags != SS_DISABLE) {
+            ss.ss_sp = g_app_altstack_sp;
+            ss.ss_size = g_app_altstack_size;
+        } else {
+            ss.ss_flags = SS_DISABLE;
+        }
+        syscall(SYS_sigaltstack, &ss, nullptr);
+        syscall(SYS_munmap, g_altstack_base, kAltStackBytes);
+        g_altstack_base = nullptr;
+    }
+
+    // sigaltstack() for the application. On a thread with smash's stack the
+    // call is recorded and answered without touching the kernel's: `old`
+    // reports what the application registered last (SS_DISABLE if nothing),
+    // and smash's stack stays installed, so a stack overflow still reaches
+    // smash's handler and, through it, the application's. The kernel's
+    // checks are kept: a stack too small is ENOMEM.
+    static int interposedSigaltstack(const stack_t* ss, stack_t* old) {
+        if (!g_altstack_base) return static_cast<int>(syscall(SYS_sigaltstack, ss, old));
+        if (ss && !(ss->ss_flags & SS_DISABLE) && ss->ss_size < static_cast<size_t>(MINSIGSTKSZ)) {
+            errno = ENOMEM;
+            return -1;
+        }
+        if (old) {
+            stack_t prev{};
+            prev.ss_sp = g_app_altstack_sp;
+            prev.ss_size = g_app_altstack_size;
+            prev.ss_flags = g_app_altstack_flags;
+            std::memcpy(old, &prev, sizeof(prev));
+        }
+        if (ss) {
+            if (ss->ss_flags & SS_DISABLE) {
+                g_app_altstack_sp = nullptr;
+                g_app_altstack_size = 0;
+                g_app_altstack_flags = SS_DISABLE;
+            } else {
+                g_app_altstack_sp = ss->ss_sp;
+                g_app_altstack_size = ss->ss_size;
+                g_app_altstack_flags = 0;
+            }
+        }
+        return 0;
+    }
+#else
+    bool running() const { return running_.load(std::memory_order_acquire); }
+    static void ensureAltStackForThread() {}
+    static void releaseAltStackForThread() {}
+#endif
 
     // sigaction() for the application (smash exports it on Linux, and
     // __sigaction, signal, bsd_signal, ssignal, sysv_signal, sigset on top).
@@ -790,7 +901,7 @@ public:
 
         struct sigaction sa{};
         sa.sa_sigaction = signalHandler;
-        sa.sa_flags = SA_SIGINFO | SA_NODEFER;
+        sa.sa_flags = SA_SIGINFO | SA_NODEFER | SA_ONSTACK;
         sigemptyset(&sa.sa_mask);
         struct sigaction displaced{};
         sysSigaction(SIGSEGV, &sa, &displaced);

@@ -8,6 +8,7 @@
 #include "smash/config.h"
 #include "../vm/platform_mem.h"
 #include "../util/spinlock.h"
+#include "../util/fork_locks.h"
 
 #include <atomic>
 #include <cstddef>
@@ -150,6 +151,7 @@ class BootstrapAlloc {
     }
 
 public:
+    void forkLocks(ForkLockSet& s) { s.add(expand_lock_); }
     // Singleton instance, accessed on every free() via owns().  Profiling
     // showed this as 6.5% of free()'s CPU when not inlined; mark hot+inline
     // so the post-init fast path becomes a single relaxed-load + branch.

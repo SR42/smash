@@ -9,6 +9,7 @@
 #include "span.h"
 #include "page_map.h"
 #include "../util/spinlock.h"
+#include "../util/fork_locks.h"
 #include "../util/bitops.h"
 #include "../vm/platform_mem.h"
 #include "../vm/vm_region.h"
@@ -360,6 +361,7 @@ public:
 
     void lockAlloc() SMASH_ACQUIRE(lock_) { lock_.lock(); }
     void unlockAlloc() SMASH_RELEASE(lock_) { lock_.unlock(); }
+    void forkLocks(ForkLockSet& s) { s.add(lock_); }
 };
 
 } // namespace smash

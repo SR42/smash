@@ -660,6 +660,159 @@ add_smash_mode_test(test_numa_arena_churn_full       numa_arena_churn_test 0 600
 add_smash_mode_test(test_numa_arena_churn_large_only numa_arena_churn_test 1 600
                     "SMASH_VM_GIB=1")
 
+# Allocations made while smash is being set up (tests/early_alloc_test.cpp), with
+# helpers/olddlsym_shim.c preloaded after libsmash so dlsym() callocs as glibc
+# < 2.34's does. Without the early arena the process never started.
+if(NOT APPLE)
+  add_library(olddlsym_shim SHARED helpers/olddlsym_shim.c)
+  target_link_libraries(olddlsym_shim PRIVATE ${CMAKE_DL_LIBS})
+  add_executable(early_alloc_test early_alloc_test.cpp)
+  target_link_libraries(early_alloc_test PRIVATE ${CMAKE_DL_LIBS} Threads::Threads)
+  add_test(NAME test_early_alloc_old_dlsym COMMAND ${CMAKE_COMMAND} -E env
+    "LD_PRELOAD=$<TARGET_FILE:smash>:$<TARGET_FILE:olddlsym_shim>" "SMASH_LARGE_ONLY=1"
+    $<TARGET_FILE:early_alloc_test>)
+  add_test(NAME test_early_alloc_old_dlsym_full COMMAND ${CMAKE_COMMAND} -E env
+    "LD_PRELOAD=$<TARGET_FILE:smash>:$<TARGET_FILE:olddlsym_shim>" "SMASH_LARGE_ONLY=0"
+    $<TARGET_FILE:early_alloc_test>)
+  set_tests_properties(test_early_alloc_old_dlsym test_early_alloc_old_dlsym_full PROPERTIES TIMEOUT 60)
+endif()
+
+# Two threads' first calls to two wrapped functions at once
+# (tests/lazy_resolve_race_test.cpp), with helpers/slowdlsym_shim.c preloaded
+# after libsmash so the two dlsym()s overlap for certain.
+if(NOT APPLE)
+  add_library(slowdlsym_shim SHARED helpers/slowdlsym_shim.c)
+  target_link_libraries(slowdlsym_shim PRIVATE ${CMAKE_DL_LIBS})
+  add_executable(lazy_resolve_race_test lazy_resolve_race_test.cpp)
+  target_link_libraries(lazy_resolve_race_test PRIVATE ${CMAKE_DL_LIBS} Threads::Threads)
+  add_test(NAME test_lazy_resolve_race COMMAND ${CMAKE_COMMAND} -E env
+    "LD_PRELOAD=$<TARGET_FILE:smash>:$<TARGET_FILE:slowdlsym_shim>" "SMASH_LARGE_ONLY=1"
+    $<TARGET_FILE:lazy_resolve_race_test>)
+  set_tests_properties(test_lazy_resolve_race PROPERTIES TIMEOUT 60)
+endif()
+
+# A stack overflow reaches the application's alternate-stack SIGSEGV handler
+# through smash (tests/altstack_test.cpp): SA_ONSTACK on a per-thread stack
+# smash owns, sigaltstack() interposed.
+if(NOT APPLE)
+  add_executable(altstack_test altstack_test.cpp)
+  target_link_libraries(altstack_test PRIVATE ${CMAKE_DL_LIBS} Threads::Threads)
+  add_test(NAME test_altstack_large_only COMMAND ${CMAKE_COMMAND} -E env
+    "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=1" "SMASH_COLD_TIMEOUT_SEC=1"
+    "SMASH_DEFER_PHASES_MS=0" $<TARGET_FILE:altstack_test>)
+  add_test(NAME test_altstack_full COMMAND ${CMAKE_COMMAND} -E env
+    "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=0" "SMASH_COLD_TIMEOUT_SEC=1"
+    "SMASH_DEFER_PHASES_MS=0" $<TARGET_FILE:altstack_test>)
+  set_tests_properties(test_altstack_large_only test_altstack_full PROPERTIES TIMEOUT 120)
+endif()
+
+# The blob store's cap (SMASH_BLOB_MAX_MIB) and the back-off of a page the store
+# refused (tests/blob_cap_test.cpp).
+if(NOT APPLE)
+  add_executable(blob_cap_test blob_cap_test.cpp)
+  target_link_libraries(blob_cap_test PRIVATE ${CMAKE_DL_LIBS} Threads::Threads)
+  add_test(NAME test_blob_cap COMMAND ${CMAKE_COMMAND} -E env
+    "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=1" "SMASH_BLOB_MAX_MIB=8"
+    "SMASH_COLD_TIMEOUT_SEC=1" "SMASH_DEFER_PHASES_MS=0" "SMASH_CODEC=lz4"
+    $<TARGET_FILE:blob_cap_test>)
+  set_tests_properties(test_blob_cap PROPERTIES TIMEOUT 120)
+endif()
+
+# Restoring a compressed page at vm.max_map_count (tests/vma_exhaust_test.cpp):
+# wait for a VMA, then abort with a message rather than spin.
+if(NOT APPLE)
+  add_executable(vma_exhaust_test vma_exhaust_test.cpp)
+  target_link_libraries(vma_exhaust_test PRIVATE ${CMAKE_DL_LIBS} Threads::Threads)
+  add_test(NAME test_vma_exhaust COMMAND ${CMAKE_COMMAND} -E env
+    "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=1" "SMASH_COLD_TIMEOUT_SEC=1"
+    "SMASH_DEFER_PHASES_MS=0" "SMASH_PREFETCH_WINDOW=0" $<TARGET_FILE:vma_exhaust_test>)
+  set_tests_properties(test_vma_exhaust PROPERTIES TIMEOUT 180)
+endif()
+
+# fork() while other threads are inside the allocator (tests/fork_test.cpp).
+if(NOT APPLE)
+  add_executable(fork_test fork_test.cpp)
+  target_link_libraries(fork_test PRIVATE ${CMAKE_DL_LIBS} Threads::Threads)
+  add_test(NAME test_fork_large_only COMMAND ${CMAKE_COMMAND} -E env
+    "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=1" "SMASH_SUBARENAS=1"
+    "SMASH_COLD_TIMEOUT_SEC=1" "SMASH_DEFER_PHASES_MS=0" $<TARGET_FILE:fork_test>)
+  add_test(NAME test_fork_full COMMAND ${CMAKE_COMMAND} -E env
+    "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=0" "SMASH_SUBARENAS=1"
+    "SMASH_COLD_TIMEOUT_SEC=1" "SMASH_DEFER_PHASES_MS=0" $<TARGET_FILE:fork_test>)
+  add_test(NAME test_fork_no_compressor COMMAND ${CMAKE_COMMAND} -E env
+    "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=1" "SMASH_SUBARENAS=1"
+    "SMASH_NO_COMPRESSOR=1" $<TARGET_FILE:fork_test>)
+  set_tests_properties(test_fork_large_only test_fork_full test_fork_no_compressor
+                       PROPERTIES TIMEOUT 600)
+endif()
+
+# A tick reads live pages, not the whole high-water mark (tests/tick_scan_test.cpp).
+if(NOT APPLE)
+  add_executable(tick_scan_test tick_scan_test.cpp)
+  target_link_libraries(tick_scan_test PRIVATE ${CMAKE_DL_LIBS} Threads::Threads)
+  add_test(NAME test_tick_scan COMMAND ${CMAKE_COMMAND} -E env
+    "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=1" "SMASH_COLD_TIMEOUT_SEC=1"
+    "SMASH_DEFER_PHASES_MS=0" $<TARGET_FILE:tick_scan_test>)
+  set_tests_properties(test_tick_scan PROPERTIES TIMEOUT 120)
+endif()
+
+# exit() leaves the compressed set compressed and the handler installed
+# (tests/exit_drain_test.cpp).
+if(NOT APPLE)
+  add_executable(exit_drain_test exit_drain_test.cpp)
+  target_link_libraries(exit_drain_test PRIVATE ${CMAKE_DL_LIBS} Threads::Threads)
+  add_test(NAME test_exit_drain COMMAND ${CMAKE_COMMAND} -E env
+    "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=1" "SMASH_COLD_TIMEOUT_SEC=1"
+    "SMASH_DEFER_PHASES_MS=0" "SMASH_CODEC=lz4" $<TARGET_FILE:exit_drain_test>)
+  set_tests_properties(test_exit_drain PROPERTIES TIMEOUT 300)
+endif()
+
+# A wrapper's warming touch must not lose another thread's store
+# (tests/warm_pages_race_test.cpp).
+if(NOT APPLE)
+  add_executable(warm_pages_race_test warm_pages_race_test.cpp)
+  target_link_libraries(warm_pages_race_test PRIVATE ${CMAKE_DL_LIBS} Threads::Threads)
+  add_test(NAME test_warm_pages_race COMMAND ${CMAKE_COMMAND} -E env
+    "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=1" "SMASH_NO_COMPRESSOR=1"
+    $<TARGET_FILE:warm_pages_race_test>)
+  set_tests_properties(test_warm_pages_race PROPERTIES TIMEOUT 60)
+endif()
+
+# Dirty memory under bursts of frees nothing reallocates (tests/subarena_pressure_test.cpp):
+# a free past twice SMASH_DIRTY_MAX_MIB purges on the freeing thread.
+if(NOT APPLE)
+  add_executable(subarena_pressure_test subarena_pressure_test.cpp)
+  set_target_properties(subarena_pressure_test PROPERTIES CXX_STANDARD 20)
+  target_link_libraries(subarena_pressure_test PRIVATE ${CMAKE_DL_LIBS} Threads::Threads)
+  add_test(NAME test_subarena_pressure COMMAND ${CMAKE_COMMAND} -E env
+    "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=1" "SMASH_SUBARENAS=1"
+    "SMASH_NO_COMPRESSOR=1" "SMASH_DIRTY_MAX_MIB=8" "SMASH_DIRTY_DECAY_MS=500"
+    $<TARGET_FILE:subarena_pressure_test>)
+  add_test(NAME test_subarena_pressure_full COMMAND ${CMAKE_COMMAND} -E env
+    "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=0" "SMASH_SUBARENAS=1"
+    "SMASH_NO_COMPRESSOR=1" "SMASH_DIRTY_MAX_MIB=8" "SMASH_DIRTY_DECAY_MS=500"
+    $<TARGET_FILE:subarena_pressure_test>)
+  set_tests_properties(test_subarena_pressure test_subarena_pressure_full PROPERTIES TIMEOUT 180)
+endif()
+
+# The compressor's release hook on a large free (tests/release_hook_test.cpp).
+# One body, three registrations: with the compressor never started the pages
+# take the bulk path and none is walked; with it running every page is walked.
+if(NOT APPLE)
+  add_executable(release_hook_test release_hook_test.cpp)
+  set_target_properties(release_hook_test PROPERTIES CXX_STANDARD 20)
+  target_link_libraries(release_hook_test PRIVATE ${CMAKE_DL_LIBS})
+  set(_rh_env "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_SUBARENAS=1")
+  add_test(NAME test_release_hook_off COMMAND ${CMAKE_COMMAND} -E env ${_rh_env}
+    "SMASH_LARGE_ONLY=1" "SMASH_NO_COMPRESSOR=1" $<TARGET_FILE:release_hook_test>)
+  add_test(NAME test_release_hook_off_full COMMAND ${CMAKE_COMMAND} -E env ${_rh_env}
+    "SMASH_LARGE_ONLY=0" "SMASH_NO_COMPRESSOR=1" $<TARGET_FILE:release_hook_test>)
+  add_test(NAME test_release_hook_on COMMAND ${CMAKE_COMMAND} -E env ${_rh_env}
+    "SMASH_LARGE_ONLY=1" $<TARGET_FILE:release_hook_test>)
+  set_tests_properties(test_release_hook_off test_release_hook_off_full test_release_hook_on
+                       PROPERTIES TIMEOUT 120)
+endif()
+
 # Per-CPU cache of freed large runs (SMASH_RUN_CACHE_MIB, agents/design-run-cache.md).
 # One body, four registrations: off must mean off (every reused page faults, no
 # hits); on, in both heap modes; and on with SMASH_SOFTDIRTY=0, where Phase 3's

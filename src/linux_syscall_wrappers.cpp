@@ -61,7 +61,11 @@
 // Recursion guard: if dlsym triggers one of our wrappers, skip the
 // dlsym attempt and let the wrapper fall through to raw syscall().
 // This is safe because during early init no pages are compressed.
-static std::atomic<bool> g_resolving_syscalls{false};
+// Per thread: a process-wide flag made one thread's dlsym() hide another
+// thread's first call to a different wrapper, which then ran unresolved (a
+// raw syscall with no EFAULT retry, or MAP_FAILED from mmap) -- the norm, not
+// the exception, when 128 threads start together.
+static __attribute__((tls_model("initial-exec"))) constinit thread_local bool t_resolving_syscalls = false;
 
 // Global disable: SMASH_NO_SYSCALL_WRAP=1 makes all wrappers pass-through
 static const bool g_syscall_wrap_disabled = [] {
@@ -69,16 +73,19 @@ static const bool g_syscall_wrap_disabled = [] {
     return v && v[0] == '1';
 }();
 
-// Lazy-resolve a real function pointer via dlsym(RTLD_NEXT).
-// If we're in a dlsym recursion, leaves the pointer as nullptr
-// so the caller falls through to its raw syscall() path.
+// Lazy-resolve a real function pointer via dlsym(RTLD_NEXT). Only a dlsym
+// recursion on this same thread leaves the pointer nullptr, so the caller
+// falls through to its raw syscall() path. The resolved pointer is kept in an
+// atomic (every thread may race to write it); `real_name` is this call's copy.
 #define SMASH_LAZY_RESOLVE(fn_type, name) \
-    static fn_type real_##name = nullptr; \
+    static std::atomic<fn_type> real_##name##_slot{nullptr}; \
+    fn_type real_##name = real_##name##_slot.load(std::memory_order_relaxed); \
     if (__builtin_expect(!real_##name, 0)) { \
-        if (!g_resolving_syscalls.load(std::memory_order_relaxed)) { \
-            g_resolving_syscalls.store(true, std::memory_order_relaxed); \
+        if (!t_resolving_syscalls) { \
+            t_resolving_syscalls = true; \
             real_##name = reinterpret_cast<fn_type>(dlsym(RTLD_NEXT, #name)); \
-            g_resolving_syscalls.store(false, std::memory_order_relaxed); \
+            t_resolving_syscalls = false; \
+            if (real_##name) real_##name##_slot.store(real_##name, std::memory_order_relaxed); \
         } \
     }
 
@@ -260,7 +267,8 @@ static void* resolveFortified(void* libc, const char* name, const void* self_bas
 // dlsym allocates, and that allocation lands in smash's own malloc.
 __attribute__((constructor(102)))
 static void smash_resolve_fortified_syscalls() {
-    g_resolving_syscalls.store(true, std::memory_order_relaxed);
+    smash::early::Window early_window;   // dlsym may calloc (glibc < 2.34)
+    t_resolving_syscalls = true;
     Dl_info self{};
     const void* self_base =
         dladdr(reinterpret_cast<void*>(&smash_resolve_fortified_syscalls), &self)
@@ -280,7 +288,7 @@ static void smash_resolve_fortified_syscalls() {
     g_real_fread_chk = reinterpret_cast<decltype(g_real_fread_chk)>(resolveFortified(libc, "__fread_chk", self_base));
     // Intentionally no dlclose: the handle is RTLD_NOLOAD on a library that is
     // never unloaded, and dropping the refcount buys nothing.
-    g_resolving_syscalls.store(false, std::memory_order_relaxed);
+    t_resolving_syscalls = false;
 }
 
 SMASH_VISIBLE ssize_t __read_chk(int fd, void* buf, size_t count, size_t buflen) {
@@ -2346,11 +2354,17 @@ inline bool isTrackableMapping(int prot, int flags, size_t len) {
 
 }  // namespace
 
+// Unresolved (a dlsym recursion on this thread): the raw syscall. Returning
+// MAP_FAILED here failed an application's own mmap once, with a stale errno.
+static void* rawMmap(void* addr, size_t len, int prot, int flags, int fd, off64_t offset) {
+    return reinterpret_cast<void*>(syscall(SYS_mmap, addr, len, prot, flags, fd, offset));
+}
+
 SMASH_VISIBLE void* mmap(void* addr, size_t len, int prot, int flags, int fd, off_t offset) {
     using fn_t = void*(*)(void*, size_t, int, int, int, off_t);
     SMASH_LAZY_RESOLVE(fn_t, mmap);
-    if (!real_mmap) return MAP_FAILED;
-    void* ret = real_mmap(addr, len, prot, flags, fd, offset);
+    void* ret = real_mmap ? real_mmap(addr, len, prot, flags, fd, offset)
+                          : rawMmap(addr, len, prot, flags, fd, offset);
     if (ret == MAP_FAILED) return ret;
     if (!isTrackableMapping(prot, flags, len)) return ret;
     auto* vm = smash::g_smash_vm_region;
@@ -2361,9 +2375,9 @@ SMASH_VISIBLE void* mmap(void* addr, size_t len, int prot, int flags, int fd, of
 SMASH_VISIBLE int munmap(void* addr, size_t len) {
     using fn_t = int(*)(void*, size_t);
     SMASH_LAZY_RESOLVE(fn_t, munmap);
-    if (!real_munmap) return -1;
     auto* vm = smash::g_smash_vm_region;
     if (vm && addr && len) deregisterLinuxExternalRange(vm, addr, len);
+    if (!real_munmap) return static_cast<int>(syscall(SYS_munmap, addr, len));
     return real_munmap(addr, len);
 }
 
@@ -2371,8 +2385,8 @@ SMASH_VISIBLE int munmap(void* addr, size_t len) {
 SMASH_VISIBLE void* mmap64(void* addr, size_t len, int prot, int flags, int fd, off64_t offset) {
     using fn_t = void*(*)(void*, size_t, int, int, int, off64_t);
     SMASH_LAZY_RESOLVE(fn_t, mmap64);
-    if (!real_mmap64) return MAP_FAILED;
-    void* ret = real_mmap64(addr, len, prot, flags, fd, offset);
+    void* ret = real_mmap64 ? real_mmap64(addr, len, prot, flags, fd, offset)
+                            : rawMmap(addr, len, prot, flags, fd, offset);
     if (ret == MAP_FAILED) return ret;
     if (!isTrackableMapping(prot, flags, len)) return ret;
     auto* vm = smash::g_smash_vm_region;
@@ -2384,7 +2398,6 @@ SMASH_VISIBLE void* mmap64(void* addr, size_t len, int prot, int flags, int fd, 
 SMASH_VISIBLE void* mremap(void* old_addr, size_t old_size, size_t new_size, int flags, ...) {
     using fn_t = void*(*)(void*, size_t, size_t, int, ...);
     SMASH_LAZY_RESOLVE(fn_t, mremap);
-    if (!real_mremap) return MAP_FAILED;
 
     void* new_addr = nullptr;
     if (flags & MREMAP_FIXED) {
@@ -2395,7 +2408,9 @@ SMASH_VISIBLE void* mremap(void* old_addr, size_t old_size, size_t new_size, int
     }
 
     void* ret;
-    if (flags & MREMAP_FIXED) {
+    if (!real_mremap) {   // a dlsym recursion on this thread: the raw syscall
+        ret = reinterpret_cast<void*>(syscall(SYS_mremap, old_addr, old_size, new_size, flags, new_addr));
+    } else if (flags & MREMAP_FIXED) {
         ret = real_mremap(old_addr, old_size, new_size, flags, new_addr);
     } else {
         ret = real_mremap(old_addr, old_size, new_size, flags);
@@ -2907,6 +2922,13 @@ extern "C" int sigaction(int sig, const struct sigaction* act, struct sigaction*
 
 extern "C" int __sigaction(int sig, const struct sigaction* act, struct sigaction* oldact) noexcept {
     return smash::vm::FaultHandler::interposedSigaction(sig, act, oldact);
+}
+
+// The application's alternate signal stack is recorded, not installed: smash's
+// handler (SA_ONSTACK) runs on the stack smash gives each thread, and chains
+// the application's handler there (FaultHandler::interposedSigaltstack).
+extern "C" int sigaltstack(const stack_t* ss, stack_t* old) noexcept {
+    return smash::vm::FaultHandler::interposedSigaltstack(ss, old);
 }
 
 extern "C" __sighandler_t signal(int sig, __sighandler_t handler) noexcept {

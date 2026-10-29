@@ -31,6 +31,7 @@
 // thread; allocations of arena pages (a new slab span, a large block) are far
 // rarer than object allocations.
 #include "../util/spinlock.h"
+#include "../util/fork_locks.h"
 #include "platform_mem.h"
 
 #include <atomic>
@@ -42,6 +43,7 @@ namespace smash {
 
 class PageRunMap {
 public:
+    void forkLocks(ForkLockSet& s) { s.add(lock_); }
     static constexpr size_t kNone = ~size_t{0};
     // Owners: 0 shared, 1..kMaxNumaNodes the node arenas, then the
     // sub-arenas' dirty/clean pairs (vm_region.h), which must not alias a

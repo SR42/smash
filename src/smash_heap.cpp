@@ -251,6 +251,7 @@ constinit thread_local smash::ThreadCache* smash::g_thread_cache = nullptr;
 // smash_heap.h for what that guard costs and the GCC sanitizer bug it feeds.
 __attribute__((tls_model("initial-exec")))
 constinit thread_local int smash::g_full_mode_cached = -1;
+constinit thread_local int smash::early::t_early_depth = 0;
 
 // g_compressor_thread is now defined as inline thread_local in
 // compressor_thread.h (C++17 inline variable, single definition).
@@ -1328,9 +1329,28 @@ volatile int xxthread_created_flag = 0;
 // never asks the heap, so every calloc wrote every page it got (and in
 // passthrough mode bypassed libc's calloc). SmashHeap::calloc clears only what
 // is not zero already.
+// A thread inside one of the set-up windows of core/early_alloc.h (SmashHeap's
+// constructor on the constructing thread, SystemAllocFns::resolve) is served
+// from the early arena before getHeap() is asked for anything: getHeap() would
+// park the constructing thread for ever. free() of an early block is a no-op
+// and realloc()/getSize() of one are handled inside SmashHeap, where the
+// foreign-pointer paths are.
 struct SmashRedirect : alloc8::HeapRedirect<smash::SmashHeap> {
+    ALLOC8_ALWAYS_INLINE static void* malloc(size_t sz) {
+        if (smash::early::inWindow()) [[unlikely]] return smash::early::allocate(sz, 16);
+        return getHeap()->malloc(sz);
+    }
     ALLOC8_ALWAYS_INLINE static void* calloc(size_t count, size_t size) {
+        if (smash::early::inWindow()) [[unlikely]] {
+            size_t total = 0;
+            if (__builtin_mul_overflow(count, size, &total)) return nullptr;
+            return smash::early::allocate(total, 16);   // zero already
+        }
         return getHeap()->calloc(count, size);
+    }
+    ALLOC8_ALWAYS_INLINE static void* memalign(size_t alignment, size_t sz) {
+        if (smash::early::inWindow()) [[unlikely]] return smash::early::allocate(sz, alignment);
+        return getHeap()->memalign(alignment, sz);
     }
 };
 
@@ -1403,20 +1423,16 @@ static void smash_start_main_thread() {
 // ports), so this handler only matters on Linux. Registering it on both
 // platforms is harmless: the macOS atfork registration just never fires.
 extern "C" {
-static void smash_atfork_prepare() {
-    auto* heap = SmashRedirect::getHeap();
-    if (heap) heap->preparePauseForFork();
-}
-static void smash_atfork_parent() {
-    auto* heap = SmashRedirect::getHeap();
-    if (heap) heap->resumeAfterFork();
-}
+// The quiesce itself is SmashHeap::lock()/unlock(), which alloc8's own atfork
+// handlers call (prepare: xxmalloc_lock; parent and child: xxmalloc_unlock).
+static void smash_atfork_prepare() {}
+static void smash_atfork_parent() {}
 static void smash_atfork_child() {
     // The HeapRedirect singleton is already constructed by the time anyone is
     // forking — we accessed it on the very first malloc in the parent. Calling
     // getHeap() here doesn't allocate.
     auto* heap = SmashRedirect::getHeap();
-    if (heap) heap->resetForFork();
+    if (heap) heap->forkChild();
     // Drop the parent's thread registry: none of those threads exist here.
     smash::exit_guard::resetAfterFork();
 }
@@ -1467,6 +1483,20 @@ int smash_subarena_info(uint64_t* dirty_bytes, uint64_t* purged_runs) {
     return on ? 0 : -1;
 }
 
+// Diagnostic / test hook (not public API): the most bytes any one sub-arena
+// has held dirty at once, and purges run inline by freeing threads (a free
+// that takes its sub-arena past twice SMASH_DIRTY_MAX_MIB purges the excess
+// itself). 0 if sub-arenas are on, -1 if not.
+extern "C" __attribute__((visibility("default")))
+int smash_subarena_pressure(uint64_t* peak_dirty_bytes, uint64_t* inline_purges) {
+    uint64_t pk = 0, il = 0;
+    auto* heap = SmashRedirect::getHeap();
+    const bool on = heap && heap->subArenaPressure(&pk, &il);
+    if (peak_dirty_bytes) *peak_dirty_bytes = pk;
+    if (inline_purges) *inline_purges = il;
+    return on ? 0 : -1;
+}
+
 // Diagnostic / test hook (not public API): pages the shared arena has taken
 // from the compressible region (everything walked except NUMA node chunks),
 // and how many of them are free right now — its free map plus, with
@@ -1480,6 +1510,92 @@ int smash_shared_arena_info(size_t* used_pages, size_t* free_pages) {
     if (!heap) return -1;
     heap->sharedArenaInfo(used_pages, free_pages);
     return 0;
+}
+
+// Diagnostic / test hook (not public API): blocks and bytes the early arena
+// (core/early_alloc.h) has served to allocations made while smash was being
+// set up. Always 0.
+extern "C" __attribute__((visibility("default")))
+int smash_early_arena_info(uint64_t* blocks, uint64_t* bytes) {
+    if (blocks) *blocks = smash::early::g_arena_blocks.load(std::memory_order_relaxed);
+    if (bytes) *bytes = smash::early::g_arena_used.load(std::memory_order_relaxed);
+    return 0;
+}
+
+// Diagnostic / test hook (not public API): hold every allocator lock for `ms`
+// milliseconds on the calling thread, as a thread a fork catches inside the
+// allocator would (tests/fork_test.cpp). 0 on success.
+extern "C" __attribute__((visibility("default")))
+int smash_debug_hold_locks(unsigned ms) {
+    auto* heap = SmashRedirect::getHeap();
+    if (!heap) return -1;
+    heap->debugHoldLocks(ms);
+    return 0;
+}
+
+// Diagnostic / test hook (not public API): hold the lock of the page `ptr` is
+// on for `ms` on this thread, as a thread inside the fault handler does for
+// microseconds (tests/fork_test.cpp). 0 on success, -1 if `ptr` is not on an
+// arena page or compression is off.
+extern "C" __attribute__((visibility("default")))
+int smash_debug_hold_page_lock(const void* ptr, unsigned ms) {
+    auto* heap = SmashRedirect::getHeap();
+    return heap && heap->debugHoldPageLock(ptr, ms) ? 0 : -1;
+}
+
+// Diagnostic / test hook (not public API): what the compressor's ticks have
+// read so far -- page bits scanned by the deferred-madvise sweep, pages read
+// through /proc/self/mem for snapshots -- and how many ticks ran. 0 on
+// success, -1 without a compressor.
+extern "C" __attribute__((visibility("default")))
+int smash_tick_cost_info(uint64_t* sweep_pages, uint64_t* memread_calls, uint64_t* ticks) {
+    uint64_t sp = 0, mr = 0, t = 0;
+    auto* heap = SmashRedirect::getHeap();
+    const bool ok = heap && heap->tickCostInfo(&sp, &mr, &t);
+    if (sweep_pages) *sweep_pages = sp;
+    if (memread_calls) *memread_calls = mr;
+    if (ticks) *ticks = t;
+    return ok ? 0 : -1;
+}
+
+// Diagnostic / test hook (not public API): compressed pages the blob store
+// refused (SMASH_BLOB_MAX_MIB, or a region it could not map) and page
+// restores that had to wait for a VMA. 0 on success, -1 without a compressor.
+extern "C" __attribute__((visibility("default")))
+int smash_resilience_info(uint64_t* store_fail, uint64_t* restore_retries) {
+    uint64_t sf = 0, rr = 0;
+    auto* heap = SmashRedirect::getHeap();
+    const bool ok = heap && heap->resilienceInfo(&sf, &rr);
+    if (store_fail) *store_fail = sf;
+    if (restore_retries) *restore_retries = rr;
+    return ok ? 0 : -1;
+}
+
+// Diagnostic / test hook (not public API): bytes of blobs stored now (live)
+// and bytes the blob stores keep resident (held: below every region's bump
+// pointer), across every store. 0 on success, -1 without a compressor.
+extern "C" __attribute__((visibility("default")))
+int smash_blob_usage(size_t* live, size_t* held) {
+    size_t l = 0, h = 0;
+    auto* heap = SmashRedirect::getHeap();
+    const bool ok = heap && heap->blobUsage(&l, &h);
+    if (live) *live = l;
+    if (held) *held = h;
+    return ok ? 0 : -1;
+}
+
+// Diagnostic / test hook (not public API): pages of freed large blocks the
+// compressor's release hook has walked page by page, and pages it released in
+// bulk because no compressor thread had ever started (SMASH_NO_COMPRESSOR=1,
+// or a free before start()). 0 on success, -1 without a compressor.
+extern "C" __attribute__((visibility("default")))
+int smash_release_hook_info(uint64_t* walked_pages, uint64_t* bulk_pages) {
+    uint64_t w = 0, b = 0;
+    auto* heap = SmashRedirect::getHeap();
+    const bool ok = heap && heap->releaseHookInfo(&w, &b);
+    if (walked_pages) *walked_pages = w;
+    if (bulk_pages) *bulk_pages = b;
+    return ok ? 0 : -1;
 }
 
 // Diagnostic / test hook (not public API): hits served by the per-CPU run

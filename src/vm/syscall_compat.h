@@ -51,19 +51,28 @@ inline int formatTimestamp(char* buf, size_t cap) {
     return static_cast<int>(strftime(buf, cap, "%Y-%m-%d %H:%M:%S", &tm_buf));
 }
 
-// Proactive read-then-write of one byte per page in [buf, buf+len).
+// One write access to the byte at `p` that leaves its value alone: an atomic
+// read-modify-write of +0. A PROT_NONE page faults (the handler decompresses)
+// and a PROT_READ monitoring page faults back to PROT_RW, exactly as a plain
+// store would -- but a plain `c = *p; *p = c` lost another thread's store to
+// that byte in between (the first byte of a page of a shared buffer, in a
+// wrapper that was only warming it). The RMW is indivisible, so a concurrent
+// store lands before or after it, never under it.
+inline void touchByteWritable(uintptr_t p) {
+    __atomic_fetch_add(reinterpret_cast<unsigned char*>(p), 0, __ATOMIC_RELAXED);
+}
+
+// Proactive write touch of one byte per page in [buf, buf+len).
 // Used by wrappers that have no retry surface (intra-libSystem buffered I/O,
-// getcwd hooks). PROT_NONE pages fault on read → handler decompresses; the
-// write-back transitions PROT_READ monitoring pages back to PROT_RW.
+// getcwd hooks). PROT_NONE pages fault → handler decompresses; the write
+// transitions PROT_READ monitoring pages back to PROT_RW.
 inline void warmPages(const void* buf, size_t len, VmRegion* vm) {
     if (!buf || !len || !vm) return;
     auto base = reinterpret_cast<uintptr_t>(buf);
     auto end = base + len;
     for (auto p = base & ~(static_cast<uintptr_t>(kPageSize) - 1); p < end; p += kPageSize) {
         if (!vm->contains(p)) continue;
-        volatile char* vp = reinterpret_cast<volatile char*>(p);
-        char c = *vp;
-        *vp = c;
+        touchByteWritable(p);
     }
 }
 
@@ -82,9 +91,7 @@ inline void walkUnsizedForFault(const void* buf, size_t max_pages, VmRegion* vm)
     auto p = reinterpret_cast<uintptr_t>(buf) & ~(static_cast<uintptr_t>(kPageSize) - 1);
     for (size_t i = 0; i < max_pages; ++i, p += kPageSize) {
         if (!vm->contains(p) || vm->pageIndex(p) >= vm->committedPages()) return;
-        volatile char* vp = reinterpret_cast<volatile char*>(p);
-        char c = *vp;
-        *vp = c;
+        touchByteWritable(p);
     }
 }
 
@@ -341,9 +348,7 @@ inline void touchRangeWritable(void* p, size_t len) {
     const auto a = reinterpret_cast<uintptr_t>(p), end = a + len;
     for (uintptr_t q = a; q < end; q = (q & ~(uintptr_t{kPageSize} - 1)) + kPageSize) {
         if (!vm->contains(q)) continue;
-        volatile char* v = reinterpret_cast<volatile char*>(q);
-        const char c = *v;
-        *v = c;
+        touchByteWritable(q);
     }
 }
 

@@ -33,6 +33,7 @@
 #include "smash/config.h"
 #include "../vm/platform_mem.h"
 #include "../util/spinlock.h"
+#include "../util/fork_locks.h"
 
 #include <atomic>
 #include <cstddef>
@@ -41,6 +42,21 @@
 #include <cstring>
 
 namespace smash {
+
+// Bytes below the bump pointer of every region of every store: what the blob
+// stores keep resident. SMASH_BLOB_MAX_MIB caps it (0, the default: no cap);
+// a store that would cross the cap refuses the blob, and the page stays as it
+// was. Before the cap a store grew without bound, and before the failure path
+// in compressPage backed off, a refused page was re-selected every tick.
+inline std::atomic<size_t> g_blob_held_bytes{0};
+inline size_t blobMaxBytes() {
+    static const size_t cap = [] {
+        const char* v = std::getenv("SMASH_BLOB_MAX_MIB");
+        const long long mib = v ? std::atoll(v) : 0;
+        return mib > 0 ? static_cast<size_t>(mib) << 20 : size_t{0};
+    }();
+    return cap;
+}
 
 class CompressStore {
     // Pin mode for CompressStore regions — prevents the kernel from evicting
@@ -178,6 +194,8 @@ class CompressStore {
             vm::decommitPages(r->base + decommit_start,
                               r->capacity - decommit_start);
         }
+        g_blob_held_bytes.fetch_sub(r->offset.load(std::memory_order_relaxed) - kDataStart,
+                                    std::memory_order_relaxed);
         r->offset.store(kDataStart, std::memory_order_relaxed);
         r->draining.store(false, std::memory_order_relaxed);
         // live_bytes is already 0
@@ -226,12 +244,22 @@ class CompressStore {
     void* storeInto(bool moved, const void* data, size_t size, size_t* alloc_size,
                     size_t page_idx) {
         const size_t aligned_size = (size + 15) & ~15ULL;
+        // The cap: a new blob that would take the stores past it is refused
+        // (a moved one is compaction, not growth, and is never refused).
+        if (!moved) {
+            const size_t cap = blobMaxBytes();
+            if (cap && g_blob_held_bytes.load(std::memory_order_relaxed) + aligned_size > cap) {
+                *alloc_size = 0;
+                return nullptr;
+            }
+        }
         Shard& shard = shards_[page_idx % kCompressStoreShards];
         LockGuard guard(shard.lock);
         size_t actual_size = 0;
         void* ptr = bumpAlloc(shard, moved ? shard.survivor : shard.bump, aligned_size,
                               &actual_size);
         if (ptr) {
+            g_blob_held_bytes.fetch_add(actual_size, std::memory_order_relaxed);
             __builtin_memcpy(ptr, data, size);
             *alloc_size = actual_size;
             if (pin_mode_ == PinMode::kWillNeed)
@@ -243,6 +271,7 @@ class CompressStore {
     }
 
 public:
+    void forkLocks(ForkLockSet& s) { for (Shard& sh : shards_) s.add(sh.lock); }
     // node >= 0 binds every region of this store to that NUMA node (Linux).
     void init(int node = -1) {
         node_ = node;
