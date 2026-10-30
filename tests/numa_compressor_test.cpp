@@ -64,6 +64,7 @@ struct SmashNumaCompressorInfo {
     uint64_t pages_compressed;
     uint64_t off_node_compressions;
     void*    memory[8][4];
+    uint64_t helped_compressions;   // the node's queued pages compressed by other threads
 };
 
 using numa_fn = void* (*)(uint32_t, size_t);
@@ -174,10 +175,14 @@ static void checkGroup(info_fn info, int node, size_t evicted, const cpu_set_t& 
         fail("node %d: %llu of %llu compressions ran on a CPU outside the node", node,
              static_cast<unsigned long long>(in.off_node_compressions),
              static_cast<unsigned long long>(in.pages_compressed));
-    if (in.pages_compressed < evicted)
-        fail("node %d: the group counted %llu compressions, but %zu of the block's pages "
-             "left RSS, so another compressor took them", node,
-             static_cast<unsigned long long>(in.pages_compressed), evicted);
+    // Threads outside the group may drain the node's queue into the node's
+    // store (helped_compressions); those pages are counted here too. The
+    // blob placement check below is what guards where they went.
+    if (in.pages_compressed + in.helped_compressions < evicted)
+        fail("node %d: the group counted %llu compressions (+%llu by other threads), but %zu "
+             "of the block's pages left RSS, so another compressor took them", node,
+             static_cast<unsigned long long>(in.pages_compressed),
+             static_cast<unsigned long long>(in.helped_compressions), evicted);
 
     // Working memory: bound to the node, and on it wherever already touched.
     static const char* const kNames[4] = {"state", "page buffer", "compress buffer",

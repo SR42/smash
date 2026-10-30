@@ -101,6 +101,7 @@
     smash_numa_route_info;
     smash_tick_budget_info;
     smash_worker_balance_info;
+    smash_work_share_info;
     smash_write_tracker;
     smash_tick_cost_info;
     smash_blob_usage;

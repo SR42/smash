@@ -2298,6 +2298,11 @@ public:
         compressor_.numaRouteCounters(queued, queue_full);
         return true;
     }
+    bool workShareInfo(uint64_t* queue_helped, uint64_t* shared_by_node, uint64_t* units_helped) const {
+        if (!compression_inited_) return false;
+        compressor_.workShareCounters(queue_helped, shared_by_node, units_helped);
+        return true;
+    }
 
     bool tickCostInfo(uint64_t* sweep_pages, uint64_t* memread_calls, uint64_t* ticks) const {
         if (!compression_inited_) return false;

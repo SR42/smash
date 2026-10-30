@@ -1603,6 +1603,22 @@ int smash_numa_route_info(uint64_t* queued, uint64_t* queue_full) {
     return ok ? 0 : -1;
 }
 
+// Diagnostic / test hook (not public API): work shared across the compressor's
+// ownership split -- queued pages compressed into a node's store by a thread
+// outside its group, slices of the shared range taken by node group threads,
+// node arena units taken by threads outside the group
+// (tests/numa_work_sharing_test.cpp).
+extern "C" __attribute__((visibility("default")))
+int smash_work_share_info(uint64_t* queue_helped, uint64_t* shared_by_node, uint64_t* units_helped) {
+    uint64_t q = 0, s = 0, u = 0;
+    auto* heap = SmashRedirect::getHeap();
+    const bool ok = heap && heap->workShareInfo(&q, &s, &u);
+    if (queue_helped) *queue_helped = q;
+    if (shared_by_node) *shared_by_node = s;
+    if (units_helped) *units_helped = u;
+    return ok ? 0 : -1;
+}
+
 // Diagnostic / test hook (not public API): the write tracker in use
 // ("softdirty", "uffd", "none", "protread", "idle", "yt"; "none" before the
 // compressor starts).
@@ -1708,6 +1724,7 @@ struct SmashNumaCompressorInfo {
     uint64_t pages_compressed;
     uint64_t off_node_compressions; // compressions that ran off the node's CPUs
     void*    memory[8][4];          // per worker: state, page buf, compress buf, zstd ctx
+    uint64_t helped_compressions;   // this node's queued pages compressed by other threads
 };
 
 // 0 on success, -1 if `node` has no compressor group, -2 on a layout mismatch.
@@ -1723,6 +1740,7 @@ int smash_numa_compressor_info(uint32_t node, SmashNumaCompressorInfo* out) {
     __builtin_memcpy(out->tids, s.tids, sizeof(out->tids));
     out->pages_compressed = s.pages_compressed;
     out->off_node_compressions = s.off_node_compressions;
+    out->helped_compressions = s.helped_compressions;
     __builtin_memcpy(out->memory, s.memory, sizeof(out->memory));
     return 0;
 #else

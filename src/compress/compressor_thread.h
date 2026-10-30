@@ -708,6 +708,12 @@ class CompressorThread {
         // the queue full (compressed by the routing worker into that node's
         // store: numa_queue_full_routed), and the queue-full events.
         std::atomic<uint64_t> numa_queued{0}, numa_queue_full{0}, numa_queue_full_routed{0};
+        // Work shared across the ownership split (executePhase,
+        // executeNodePhase): queued pages a thread outside the node's group
+        // compressed into the node's store, slices of the shared range a
+        // group thread took, node units (phases 1-4 of a node arena chunk) a
+        // thread outside the group took.
+        std::atomic<uint64_t> numa_queue_helped{0}, shared_slices_by_node{0}, node_units_helped{0};
         std::atomic<uint64_t> sc_memread_us{0}, sc_memread_n{0}, sc_p2_mprotect_us{0},
                               sc_p3_mprotect_us{0}, sc_p4_us{0};
         std::atomic<uint64_t> phases_ms_total{0}, tick_ms_total{0};
@@ -1348,6 +1354,16 @@ class CompressorThread {
         size_t pending_node_pages[kPendingNodeCap];
         size_t pending_node_count = 0;
 
+        // Pages routed to another node's queue, staged per node and handed
+        // over kCompressBatch at a time as one aligned reservation
+        // (flushRouteStage). The queue is drained in batches of that size,
+        // and a batch must be one adjacent run or every page costs its own
+        // mprotect: with a slot taken per page, ten routers interleaved one
+        // queue page by page (3.4 pages per call, 128 before they shared the
+        // phase). Allocated on first use for numa_node_limit_ nodes.
+        uint32_t* route_stage = nullptr;         // [node][kCompressBatch]
+        uint16_t* route_stage_count = nullptr;   // [node]
+
         // Compress using worker's own contexts, shared engine's dictionaries
         size_t compress(const void* src, void* dst, size_t src_size,
                        size_t dst_capacity, CompressAlgo algo,
@@ -1396,7 +1412,18 @@ class CompressorThread {
         }
     };
 
-    CompressWorker workers_[kMaxCompressorWorkers];
+    // The default workers' state, allocated when a worker is first needed
+    // (ensureWorkerState): a CompressWorker is ~190 KiB, mostly bucket stats,
+    // and the pool is sized for a 128-core host. worker(id) is only valid
+    // for an allocated worker.
+    CompressWorker* workers_[kMaxCompressorWorkers] = {};
+    CompressWorker& worker(int id) { return *workers_[id]; }
+    const CompressWorker& worker(int id) const { return *workers_[id]; }
+    template<typename Fn>
+    void forEachDefaultWorker(Fn&& fn) {
+        for (int w = 0; w < kMaxCompressorWorkers; ++w)
+            if (workers_[w]) fn(*workers_[w]);
+    }
     size_t max_comp_size_ = 0;
     ZSTD_customMem zstd_custom_mem_{};
 
@@ -1410,8 +1437,38 @@ class CompressorThread {
         worker.zstd_cctx = ZSTD_createCCtx_advanced(custom_mem);
     }
 
+    // Start a new worker's bucket stats from `src`'s (worker 0's: a persisted
+    // profile and what the ticks so far learned), as a node group's workers
+    // do. Only buckets that hold something, so untouched ones stay untouched,
+    // and never the totals: they are summed over every worker (the saved
+    // profile's thrash rate, the budget's efficiency, the stats dump), so a
+    // copy would count each of the source's compressions once more per
+    // worker allocated after it (63 became 1953 over 31 workers).
+    static void seedBucketStats(CompressWorker& dst, const CompressWorker& src) {
+        constexpr size_t kBuckets = sizeof(CompressWorker::sc_stats) / sizeof(SizeClassStats);
+        unsigned char zero[sizeof(SizeClassStats)] = {};
+        for (size_t b = 0; b < kBuckets; ++b) {
+            const SizeClassStats& s = src.sc_stats[b];
+            if (__builtin_memcmp(&s, zero, sizeof(zero)) == 0) continue;
+            SizeClassStats& d = dst.sc_stats[b];
+            __builtin_memcpy(static_cast<void*>(&d), &s, sizeof(zero));
+            d.compress_count.store(0, std::memory_order_relaxed);
+            d.decompress_count.store(0, std::memory_order_relaxed);
+            d.bytes_saved_total.store(0, std::memory_order_relaxed);
+            d.time_cost_total_us.store(0, std::memory_order_relaxed);
+        }
+    }
+
     void ensureWorkerState(int worker_id) {
-        auto& w = workers_[worker_id];
+        if (!workers_[worker_id]) {
+            void* m = BootstrapAlloc::instance().allocate(sizeof(CompressWorker),
+                                                          alignof(CompressWorker));
+            if (!m) return;
+            auto* cw = new (m) CompressWorker();
+            if (worker_id != 0 && workers_[0]) seedBucketStats(*cw, *workers_[0]);
+            workers_[worker_id] = cw;
+        }
+        auto& w = *workers_[worker_id];
         if (w.page_buf) return;
         initWorkerState(w, max_comp_size_, zstd_custom_mem_);
     }
@@ -1786,7 +1843,7 @@ private:
         if (sc >= kTotalBucketsPerArena) return;
         size_t bidx = statsIndex(arena_id, sc);
         if (bidx < kBucketTableLen)
-            workers_[0].sc_stats[bidx].recordRedirty(rewritten);
+            worker(0).sc_stats[bidx].recordRedirty(rewritten);
     }
 
     // Whether two nearby pages belong to the same allocation. A slab span
@@ -2495,8 +2552,9 @@ private:
         // End-of-range flush.
         escalateBatch(esc, n_esc);
         flushCompress();
-        flushPhase2PendingProt(worker);
         flushNodeQueries(worker, pages_compressed);
+        flushRouteStages(worker, pages_compressed);
+        flushPhase2PendingProt(worker);
         pcAdd(pc_.p2_at_floor, n_at_floor);
         pcAdd(pc_.p2_escalated, n_escalated);
         pcAdd(pc_.p2_eligible, n_eligible);
@@ -2531,8 +2589,8 @@ private:
             return true;
         }
         if (node == worker.node) return false;
-        if (enqueueForNode(node, i)) return true;
-        worker.last_route_node = node;   // queue full or no group: the caller's page, that node's store
+        if (enqueueForNode(worker, node, i, pages_compressed)) return true;
+        worker.last_route_node = node;   // no group: the caller's page, that node's store
         return false;
 #else
         return false;
@@ -2568,25 +2626,32 @@ private:
             const int node = queried ? status[k] : -1;
             if (node >= 0 && static_cast<uint32_t>(node) < vm::kMaxNumaNodes && page_node_)
                 page_node_[page] = static_cast<uint8_t>(node + 1);
-            if (node < 0 || node == worker.node || !enqueueForNode(node, page)) {
-                // Its own node's store when that node has a group and the
-                // queue was full; this worker's otherwise.
+            if (node < 0 || node == worker.node ||
+                !enqueueForNode(worker, node, page, pages_compressed)) {
+                // Its own node's store when that node has a group; this
+                // worker's otherwise.
                 local_node[n_local] = (node >= 0 && node != worker.node) ? node : -1;
                 local[n_local++] = page;
             }
         }
-        // The pages this worker compresses itself (node unknown, its own, or
-        // that node's queue full — common while a large backlog drains) go
-        // through the same readable batches as phase 2's: compressed one by
-        // one here they each took two /proc/self/mem reads, 8.4M of the
-        // 28.2M compressions in one tick on a 128-core arm64 box.
+        compressLocalBatch(worker, local, local_node, n_local, pages_compressed);
+    }
+
+    // The pages a routing worker compresses itself (node unknown, its own,
+    // or that node's queue full — common while a large backlog drains) go
+    // through the same readable batches as phase 2's: compressed one by one
+    // they each took two /proc/self/mem reads, 8.4M of the 28.2M
+    // compressions in one tick on a 128-core arm64 box. nodes[k] is the node
+    // whose store takes the blob, -1 for this worker's own.
+    void compressLocalBatch(CompressWorker& worker, const size_t* pages, const int* nodes,
+                            size_t n, std::atomic<uint32_t>& pages_compressed) {
         const bool deferred_mode = isDeferredReclaimMode();
-        for (size_t b = 0; b < n_local; b += kCompressBatch) {
-            const size_t cnt = std::min(kCompressBatch, n_local - b);
+        for (size_t b = 0; b < n; b += kCompressBatch) {
+            const size_t cnt = std::min(kCompressBatch, n - b);
             bool readable[kCompressBatch] = {};
-            if (deferred_mode) makeReadableForSnapshot(&local[b], cnt, readable);
+            if (deferred_mode) makeReadableForSnapshot(&pages[b], cnt, readable);
             for (size_t k = 0; k < cnt; ++k) {
-                if (compressPageTo(local[b + k], worker, readable[k], local_node[b + k]))
+                if (compressPageTo(pages[b + k], worker, readable[k], nodes[b + k]))
                     pages_compressed.fetch_add(1, std::memory_order_relaxed);
                 if (worker.pending_pn_count >= CompressWorker::kPendingProtCap / 2 ||
                     worker.pending_ro_count >= CompressWorker::kPendingProtCap / 2)
@@ -2596,28 +2661,84 @@ private:
         flushPhase2PendingProt(worker);
     }
 
-    // Queue a page for `node`'s group. False when the node has no running group
-    // or its queue is full, and the caller then compresses the page itself.
-    bool enqueueForNode(int node, size_t page_idx) {
+    // Hand a page to `node`'s group. It is staged on the worker and reaches
+    // the queue with its neighbours (flushRouteStage); false only when the
+    // node has no running group (or the stage cannot be allocated), and the
+    // caller then compresses the page itself. A full queue is met at the
+    // flush, which compresses the overflow into the node's store.
+    bool enqueueForNode(CompressWorker& worker, int node, size_t page_idx,
+                        std::atomic<uint32_t>& pages_compressed) {
         if (node < 0 || static_cast<uint32_t>(node) >= numa_node_limit_) return false;
         NodeGroup* g = node_groups_[node];
         if (!g || g->threads_running == 0 || !g->queue) return false;
-        const size_t slot = g->queue_count.fetch_add(1, std::memory_order_relaxed);
-        if (slot >= g->queue_capacity) {
-            g->queue_count.store(g->queue_capacity, std::memory_order_relaxed);
-            // The caller compresses the page itself -- into this node's store
-            // (compressPageTo), never the shared one as before: a first cold
-            // wave past 256 MiB per node per tick put most blobs off-node.
-            pc_.numa_queue_full.fetch_add(1, std::memory_order_relaxed);
-            return false;
+        if (!worker.route_stage) {
+            auto& ba = BootstrapAlloc::instance();
+            worker.route_stage = static_cast<uint32_t*>(
+                ba.allocate(numa_node_limit_ * kCompressBatch * sizeof(uint32_t), 16));
+            worker.route_stage_count = static_cast<uint16_t*>(
+                ba.allocateZeroed(numa_node_limit_ * sizeof(uint16_t), 16));
+            if (!worker.route_stage || !worker.route_stage_count) {
+                worker.route_stage = nullptr;
+                worker.route_stage_count = nullptr;
+                return false;
+            }
         }
-        g->queue[slot] = static_cast<uint32_t>(page_idx);
-        pc_.numa_queued.fetch_add(1, std::memory_order_relaxed);
-        numa_queue_pending_.store(true, std::memory_order_release);
+        uint16_t& n = worker.route_stage_count[node];
+        worker.route_stage[static_cast<size_t>(node) * kCompressBatch + n] =
+            static_cast<uint32_t>(page_idx);
+        if (++n == kCompressBatch) flushRouteStage(worker, node, pages_compressed);
         return true;
+    }
+
+    // Move the worker's staged pages for `node` into its queue as one
+    // reservation of kCompressBatch slots, the tail of a short one filled
+    // with kQueueEmpty: every drain batch (drainQueueBatches) then starts at a
+    // reservation and holds one worker's adjacent pages. The pages past the
+    // queue's capacity are compressed here, into the node's store
+    // (compressPageTo), never the shared one as before: a first cold wave
+    // past 256 MiB per node per tick put most blobs off-node for good.
+    void flushRouteStage(CompressWorker& worker, int node, std::atomic<uint32_t>& pages_compressed) {
+        const size_t cnt = worker.route_stage_count[node];
+        if (cnt == 0) return;
+        worker.route_stage_count[node] = 0;
+        const uint32_t* staged = worker.route_stage + static_cast<size_t>(node) * kCompressBatch;
+        size_t fit = 0;
+        NodeGroup* g = node_groups_[node];
+        if (g && g->threads_running > 0 && g->queue) {
+            const size_t reserve = kCompressBatch;
+            const size_t slot = g->queue_count.fetch_add(reserve, std::memory_order_relaxed);
+            if (slot + reserve > g->queue_capacity)
+                g->queue_count.store(g->queue_capacity, std::memory_order_relaxed);
+            if (slot < g->queue_capacity) {
+                const size_t room = std::min(reserve, g->queue_capacity - slot);
+                fit = std::min(cnt, room);
+                for (size_t k = 0; k < fit; ++k) g->queue[slot + k] = staged[k];
+                for (size_t k = fit; k < room; ++k) g->queue[slot + k] = NodeGroup::kQueueEmpty;
+                pc_.numa_queued.fetch_add(fit, std::memory_order_relaxed);
+                numa_queue_pending_.store(true, std::memory_order_release);
+            }
+        }
+        if (fit == cnt) return;
+        pc_.numa_queue_full.fetch_add(cnt - fit, std::memory_order_relaxed);
+        size_t local[kCompressBatch];
+        int local_node[kCompressBatch];
+        size_t n_local = 0;
+        for (size_t k = fit; k < cnt; ++k) {
+            local_node[n_local] = node;
+            local[n_local++] = staged[k];
+        }
+        compressLocalBatch(worker, local, local_node, n_local, pages_compressed);
+    }
+
+    // End of a phase-2 range: every staged page reaches its queue.
+    void flushRouteStages(CompressWorker& worker, std::atomic<uint32_t>& pages_compressed) {
+        if (!worker.route_stage) return;
+        for (uint32_t n = 0; n < numa_node_limit_; ++n)
+            if (worker.route_stage_count[n]) flushRouteStage(worker, static_cast<int>(n), pages_compressed);
     }
 #else
     void flushNodeQueries(CompressWorker&, std::atomic<uint32_t>&) {}
+    void flushRouteStages(CompressWorker&, std::atomic<uint32_t>&) {}
 #endif
 
     // Apply (mprotect PROT_NONE + decommit) to a worker's accumulated
@@ -3939,8 +4060,10 @@ private:
         size_t new_alloc_size = 0;
         void* new_data = nullptr;
         bool spilled = false;
-        // A node worker's blob stays on its node, so it never spills.
-        if (cfg_spill_ && !worker.store && ensureSpillReady()) {
+        // A blob bound for a node store (a node worker's, or one this worker
+        // is draining a node queue into: route_store) stays on its node, so
+        // it never spills.
+        if (cfg_spill_ && !worker.store && !worker.route_store && ensureSpillReady()) {
             new_data = spill_.store(worker.compress_buf, new_comp_size,
                                     &new_alloc_size, page_idx);
             spilled = (new_data != nullptr);
@@ -4205,17 +4328,28 @@ private:
                                                  std::memory_order_relaxed);
             }
         } phase_timer{this, phase, phase_t0};
+        // Every compressor thread claims work from the same pools, in its own
+        // order of preference (executePhase, executeNodePhase); the cursors
+        // are reset before anyone is woken.
+        slice_cursor_.store(0, std::memory_order_relaxed);
 #if defined(__linux__)
-        // Node groups work their nodes' chunks on their own threads while the
-        // default workers below take everything else.
+        for (uint32_t n = 0; n < numa_node_limit_; ++n) {
+            if (NodeGroup* g = node_groups_[n]) {
+                g->unit_cursor.store(0, std::memory_order_relaxed);
+                g->queue_cursor.store(0, std::memory_order_relaxed);
+            }
+        }
+        // Phase 5 is the node queues alone: nothing to do when none was filled.
+        if (phase == 5 && !nodePhaseNeeded(5)) return;
         const bool numa = nodePhaseNeeded(phase);
         if (numa) startNodePhase(phase);
+#else
+        if (phase == 5) return;
 #endif
         // If helpers are not running (e.g., compressTick() called directly
         // in tests), fall back to single-threaded execution.
         int nw = active_workers_;
         bool helpers_active = running_.load(std::memory_order_relaxed) && nw > 1;
-        slice_cursor_.store(0, std::memory_order_relaxed);
         if (helpers_active) {
             current_phase_ = phase;
             helpers_pending_.store(static_cast<uint32_t>(nw - 1), std::memory_order_relaxed);
@@ -4242,35 +4376,69 @@ private:
 #endif
     }
 
-    void executePhase(int phase, int worker_id) {
-        PhaseClocks clocks(pc_, phase);
-        auto& w = workers_[worker_id];
-        const size_t end = std::min(slice_end_, w.range_end);
+    // ── Work pools ────────────────────────────────────────────────────────
+    // A phase's work is three kinds of pool, each claimed with an atomic
+    // cursor by whichever compressor thread asks next: the shared range in
+    // slices (slice_cursor_), each node group's arena chunks in units
+    // (NodeGroup::unit_cursor; phases 1-4) and each group's queue of routed
+    // pages in batches (NodeGroup::queue_cursor; phase 5). A default worker
+    // takes the shared range first, then helps the groups, the node its CPU
+    // is on first; a group thread takes its own node's pool first, then the
+    // shared range, then the other groups'. Blob placement never depends on
+    // who compresses: a queued page goes to its node's store wherever it is
+    // compressed (drainQueueBatches), and a node arena page met on a unit by
+    // another node's thread is routed to its node's queue (routeByNode).
+    // Before this, whichever side owned the heap carried the phase while the
+    // other idled at the barrier: an ordinary heap kept the default workers
+    // alone in phases 1-4 and the group threads alone in phase 5.
+
+    void runRange(int phase, CompressWorker& w, std::atomic<uint32_t>& eligible,
+                  std::atomic<uint32_t>& compressed, size_t a, size_t b) {
+        if (phase == 1) phase1Range(a, b);
+        else if (phase == 2) phase2Range(w, eligible, compressed, a, b);
+        else if (phase == 3) phase3Range(a, b);
+        else if (phase == 4) reclaimShadowRange(a, b);
+    }
+
+    // The slices of the shared range left this phase, run as fn(a, b);
+    // returns how many.
+    template<typename Fn>
+    size_t takeSharedSlices(Fn&& fn) {
+        const size_t end = slice_end_;
         const size_t step = slice_pages_ ? slice_pages_ : kSliceMinPages;
+        size_t n = 0;
         for (;;) {
             const size_t a = slice_cursor_.fetch_add(step, std::memory_order_relaxed);
             if (a >= end) break;
-            const size_t b = std::min(end, a + step);
-            if (phase == 1) {
-                phase1Range(a, b);
-            } else if (phase == 2) {
-                phase2Range(w, worker_pages_eligible_[worker_id],
-                            worker_pages_compressed_[worker_id], a, b);
-            } else if (phase == 3) {
-                phase3Range(a, b);
-            } else if (phase == 4) {
-                reclaimShadowRange(a, b);
-            }
+            fn(a, std::min(end, a + step));
+            ++n;
         }
+        return n;
+    }
+
+    void executePhase(int phase, int worker_id) {
+        PhaseClocks clocks(pc_, phase);
+        auto& w = worker(worker_id);
+        auto& eligible = worker_pages_eligible_[worker_id];
+        auto& compressed = worker_pages_compressed_[worker_id];
+#if defined(__linux__)
+        if (phase == 5) { helpNodeQueues(w, compressed); return; }
+#else
+        if (phase == 5) return;
+#endif
+        takeSharedSlices([&](size_t a, size_t b) { runRange(phase, w, eligible, compressed, a, b); });
+#if defined(__linux__)
+        helpNodeUnits(phase, w, eligible, compressed, -1);
+#endif
     }
 
     // True when `page` belongs to a NUMA node arena whose compressor group
-    // takes it this tick, so the default workers must leave it alone. Always
-    // false on a group's own threads (they are handed only their node's
-    // chunks) and when no group has work.
+    // takes it this tick, so a thread working the shared range must leave it
+    // alone: the group's chunks are a pool of their own (takeNodeUnits), and
+    // the thread working one of their units (tl_on_node_unit_) sees false.
     bool ownedByRunningNodeGroup(size_t page) const {
 #if defined(__linux__)
-        if (!numa_tick_active_ || tl_numa_worker_ || page >= vm_->contigPages()) return false;
+        if (!numa_tick_active_ || tl_on_node_unit_ || page >= vm_->contigPages()) return false;
         const int node = vm_->nodeOfPage(page);
         return node >= 0 && node_groups_[node] && node_groups_[node]->threads_running > 0;
 #else
@@ -4395,6 +4563,7 @@ private:
     // SMASH_NUMA_COMPRESSOR=0 leaves node pages to the default workers and the
     // shared store; SMASH_NUMA_WORKERS=N sets the threads per node.
     static constexpr int kMaxNodeWorkers = 8;
+    static constexpr size_t kNodeUnitsPerChunk = 8;   // 8 MiB units of a 64 MiB chunk
     static constexpr size_t kNodeWorkerStackBytes = 1024 * 1024;
 
     struct NodeGroup;
@@ -4423,10 +4592,23 @@ private:
         int threads_running = 0;
         uint32_t* chunks = nullptr;  // grid chunks this group works this tick
         size_t chunk_count = 0;
-        // Pages other workers handed to this node this tick (routeByNode).
+        // Pages other workers handed to this node this tick (routeByNode),
+        // in reservations of kCompressBatch slots; the unused tail of a
+        // reservation holds kQueueEmpty (flushRouteStage).
+        static constexpr uint32_t kQueueEmpty = ~0u;
         uint32_t* queue = nullptr;
         size_t queue_capacity = 0;
         std::atomic<size_t> queue_count{0};
+        // Work claiming within a phase, by any compressor thread (see
+        // executePhase): the next unit of this tick's chunks (phases 1-4)
+        // and the next queue entry (phase 5).
+        std::atomic<size_t> unit_cursor{0};
+        std::atomic<size_t> queue_cursor{0};
+        size_t unit_pages = 0;        // pages per unit this tick
+        size_t units_per_chunk = 1;
+        // This node's pages compressed into its store by threads outside the
+        // group (default workers, other groups' threads).
+        std::atomic<uint64_t> helped_compressions{0};
         NodeWorker workers[kMaxNodeWorkers];
     };
 
@@ -4442,6 +4624,9 @@ private:
     std::atomic<uint32_t> numa_work_gen_{0};  // futex word
     std::atomic<uint32_t> numa_pending_{0};   // futex word
     static inline thread_local bool tl_numa_worker_ = false;
+    // Set while a thread works a unit of a node group's chunks, so that
+    // ownedByRunningNodeGroup lets it at the pages (whoever's thread it is).
+    static inline thread_local bool tl_on_node_unit_ = false;
 
     static bool numaCompressorEnabled() {
         static const bool on = [] {
@@ -4522,22 +4707,14 @@ private:
 
         const ZSTD_customMem zstd_mem = {
             vm::NodeBumpAlloc::zstdAlloc, vm::NodeBumpAlloc::zstdFree, &g->mem};
-        constexpr size_t kBuckets =
-            sizeof(workers_[0].sc_stats) / sizeof(workers_[0].sc_stats[0]);
         for (int w = 0; w < want; ++w) {
             NodeWorker& nw = g->workers[w];
             void* wm = g->mem.allocate(sizeof(CompressWorker), alignof(CompressWorker));
             if (!wm) break;
             CompressWorker* cw = new (wm) CompressWorker();
             // Start from the default workers' bucket stats, which include any
-            // persisted profile. Copy only buckets that hold something, so
-            // untouched ones stay untouched.
-            unsigned char zero[sizeof(SizeClassStats)] = {};
-            for (size_t b = 0; b < kBuckets; ++b) {
-                if (__builtin_memcmp(&workers_[0].sc_stats[b], zero, sizeof(zero)) != 0)
-                    __builtin_memcpy(static_cast<void*>(&cw->sc_stats[b]),
-                                     &workers_[0].sc_stats[b], sizeof(zero));
-            }
+            // persisted profile (seedBucketStats: knowledge, not totals).
+            seedBucketStats(*cw, worker(0));
             cw->page_buf = g->mem.allocate(kPageSize, kPageSize);
             cw->compress_buf = g->mem.allocate(max_comp_size_, 16);
             cw->compress_buf2 = g->mem.allocate(max_comp_size_, 16);
@@ -4646,14 +4823,32 @@ private:
             numa_tick_active_ = true;
         }
         numa_committed_ = limit;
+        // A chunk is handed out in units (an eighth of it, aligned like the
+        // shared range's slices: chunk, watch group, scan slice) to whichever
+        // thread asks next (takeNodeUnits).
+        size_t align = std::max<size_t>(kChunkSize, kMaxWatchGroup);
+        if (scanTracker()) align = std::max(align, size_t{1} << sliceShift());
+        size_t unit = std::max(chunk_pages / kNodeUnitsPerChunk, align);
+        unit = (unit + align - 1) & ~(align - 1);
+        if (unit > chunk_pages) unit = chunk_pages;
+        for (uint32_t n = 0; n < numa_node_limit_; ++n) {
+            if (NodeGroup* g = node_groups_[n]) {
+                g->unit_pages = unit;
+                g->units_per_chunk = std::max<size_t>(1, chunk_pages / unit);
+            }
+        }
     }
 
-    // Phase 5 runs whenever a page was queued; the other phases only when a
-    // group owns arena chunks this tick.
+    // Phase 5 runs whenever a page was queued. The group threads join phases
+    // 1-4 when a group owns arena chunks this tick, or when the shared range
+    // has more slices than the default workers can start at once: they take
+    // the slices left after their own chunks (executeNodePhase).
     bool nodePhaseNeeded(int phase) const {
         if (numa_threads_running_ == 0) return false;
         if (phase == 5) return numa_queue_pending_.load(std::memory_order_acquire);
-        return numa_tick_active_;
+        if (numa_tick_active_) return true;
+        const size_t step = slice_pages_ ? slice_pages_ : kSliceMinPages;
+        return slice_end_ > step * static_cast<size_t>(std::max(1, active_workers_));
     }
 
     void startNodePhase(int phase) {
@@ -4672,78 +4867,144 @@ private:
         return g.pinned && cpu >= 0 && cpu < CPU_SETSIZE && CPU_ISSET(cpu, &g.cpus);
     }
 
-    void executeNodePhase(NodeWorker& nw, int phase) {
-        PhaseClocks clocks(pc_, phase);
-        const NodeGroup& g = *nw.group;
-        // Phase 5 is the queue of pages other workers handed to this node; the
-        // other phases are this node's own arena chunks.
-        if (phase == 5) { drainNodeQueue(nw); return; }
-        auto onNode = [&](int cpu) { return onNodeCpu(g, cpu); };
+    struct NodeUnitScope {
+        bool prev;
+        explicit NodeUnitScope(bool on) : prev(tl_on_node_unit_) { tl_on_node_unit_ = on; }
+        ~NodeUnitScope() { tl_on_node_unit_ = prev; }
+    };
+
+    // The units of `g`'s chunks left this phase, run as fn(a, b); how many.
+    template<typename Fn>
+    size_t takeNodeUnits(NodeGroup& g, Fn&& fn) {
         const size_t chunk_pages = VmRegion::kNodeChunkPages;
-        const size_t slices = static_cast<size_t>(g.threads_running);
-        const size_t slice = static_cast<size_t>(nw.index);
-        for (size_t k = 0; k < g.chunk_count; ++k) {
-            const size_t base = static_cast<size_t>(g.chunks[k]) * chunk_pages;
-            // Slice edges on kMaxWatchGroup pages, so a coarse-watching group
-            // is never split between two threads (chunks are 64-page
-            // multiples, so the last slice still ends at the chunk's end).
-            const size_t align = watch_group_ > 1 ? kMaxWatchGroup : 1;
-            const size_t start = base + (chunk_pages * slice / slices) / align * align;
-            const size_t end = std::min(
-                base + (chunk_pages * (slice + 1) / slices) / align * align, numa_committed_);
-            if (start >= end) continue;
-            if (phase == 1) {
-                phase1Range(start, end);
-            } else if (phase == 2) {
-                const int cpu_before = sched_getcpu();
-                const uint32_t before = nw.compressed.load(std::memory_order_relaxed);
-                phase2Range(*nw.worker, nw.eligible, nw.compressed, start, end);
-                const uint32_t done = nw.compressed.load(std::memory_order_relaxed) - before;
-                if (done == 0) continue;
-                nw.pages_compressed.fetch_add(done, std::memory_order_relaxed);
-                if (!onNode(cpu_before) || !onNode(sched_getcpu()))
-                    nw.off_node_compressions.fetch_add(done, std::memory_order_relaxed);
-            } else if (phase == 3) {
-                phase3Range(start, end);
-            } else if (phase == 4) {
-                reclaimShadowRange(start, end);
-            }
+        const size_t total = g.chunk_count * g.units_per_chunk;
+        size_t n = 0;
+        NodeUnitScope on_unit(true);
+        for (;;) {
+            const size_t u = g.unit_cursor.fetch_add(1, std::memory_order_relaxed);
+            if (u >= total) break;
+            const size_t base = static_cast<size_t>(g.chunks[u / g.units_per_chunk]) * chunk_pages;
+            const size_t a = base + (u % g.units_per_chunk) * g.unit_pages;
+            const size_t b = std::min(a + g.unit_pages, numa_committed_);
+            if (a >= b) continue;
+            fn(a, b);
+            ++n;
         }
+        return n;
     }
 
-    // Compress the pages other workers handed to this node. Each thread takes
-    // a contiguous slice of the queue, so the group shares it without a lock.
-    // Contiguous, not every n-th entry: the queue is filled in page order, and
-    // a slice keeps a thread's pages adjacent, so the pages it leaves in
-    // COMPRESSED_SHADOW are made readable one stretch per mprotect
-    // (flushShadowReadable). Strided, no two were adjacent: one call per page.
-    void drainNodeQueue(NodeWorker& nw) {
-        const NodeGroup& g = *nw.group;
-        if (!g.queue || g.threads_running <= 0) return;
+    // Compress what is left of `g`'s queue on `worker`, a batch at a time.
+    // The blobs go to g's store whoever's worker this is (route_store), so
+    // placement never depends on who drains. Returns the pages compressed.
+    // Batches, not one contiguous slice per thread as before. Each batch is
+    // one worker's reservation (flushRouteStage): adjacent pages, so one
+    // mprotect makes them readable and one leaves them COMPRESSED_SHADOW
+    // readable (flushShadowReadable); the reservation's unused tail is
+    // kQueueEmpty.
+    uint32_t drainQueueBatches(NodeGroup& g, CompressWorker& worker) {
+        if (!g.queue) return 0;
         size_t n = g.queue_count.load(std::memory_order_acquire);
         if (n > g.queue_capacity) n = g.queue_capacity;
-        const int cpu_before = sched_getcpu();
-        uint32_t done = 0;
-        const size_t threads = static_cast<size_t>(g.threads_running);
-        const size_t me = static_cast<size_t>(nw.index);
-        const size_t from = n * me / threads, to = n * (me + 1) / threads;
+        if (g.queue_cursor.load(std::memory_order_relaxed) >= n) return 0;
         const bool deferred_mode = isDeferredReclaimMode();
-        for (size_t b = from; b < to; b += kCompressBatch) {
-            const size_t cnt = std::min(kCompressBatch, to - b);
+        if (g.store != worker.store) {
+            worker.route_store = g.store;
+            worker.route_node = static_cast<int>(g.node);
+        }
+        uint32_t done = 0;
+        for (;;) {
+            const size_t b = g.queue_cursor.fetch_add(kCompressBatch, std::memory_order_relaxed);
+            if (b >= n) break;
+            const size_t take = std::min(kCompressBatch, n - b);
             size_t pages[kCompressBatch];
-            for (size_t k = 0; k < cnt; ++k) pages[k] = g.queue[b + k];
+            size_t cnt = 0;
+            for (size_t k = 0; k < take; ++k) {
+                const uint32_t v = g.queue[b + k];
+                if (v != NodeGroup::kQueueEmpty) pages[cnt++] = v;
+            }
+            if (cnt == 0) continue;
             bool readable[kCompressBatch] = {};
             if (deferred_mode) makeReadableForSnapshot(pages, cnt, readable);
             for (size_t k = 0; k < cnt; ++k) {
-                if (compressPage(pages[k], *nw.worker, readable[k])) ++done;
-                if (nw.worker->pending_pn_count >= CompressWorker::kPendingProtCap / 2 ||
-                    nw.worker->pending_ro_count >= CompressWorker::kPendingProtCap / 2)
-                    flushPhase2PendingProt(*nw.worker);
+                if (compressPage(pages[k], worker, readable[k])) ++done;
+                if (worker.pending_pn_count >= CompressWorker::kPendingProtCap / 2 ||
+                    worker.pending_ro_count >= CompressWorker::kPendingProtCap / 2)
+                    flushPhase2PendingProt(worker);
             }
         }
-        flushPhase2PendingProt(*nw.worker);
+        flushPhase2PendingProt(worker);
+        worker.route_store = nullptr;
+        worker.route_node = -1;
+        return done;
+    }
+
+    // The group a default worker helps first: the node its CPU is on.
+    int preferredHelpNode() const {
+        const int node = vm::nodeOfCurrentCpu();
+        return (node >= 0 && static_cast<uint32_t>(node) < numa_node_limit_) ? node : 0;
+    }
+
+    // Phase 5 on a thread outside the groups, or outside `skip`'s group: the
+    // queues from `from` on. The pages count for the caller's tick counter
+    // and the node's helped_compressions.
+    void helpNodeQueues(CompressWorker& worker, std::atomic<uint32_t>& compressed,
+                        int skip = -1, int from = -1) {
+        if (numa_threads_running_ == 0 || numa_node_limit_ == 0) return;
+        if (from < 0) from = preferredHelpNode();
+        for (uint32_t k = 0; k < numa_node_limit_; ++k) {
+            const uint32_t n = (static_cast<uint32_t>(from) + k) % numa_node_limit_;
+            NodeGroup* g = node_groups_[n];
+            if (!g || g->threads_running == 0 || static_cast<int>(n) == skip) continue;
+            const uint32_t done = drainQueueBatches(*g, worker);
+            if (done == 0) continue;
+            compressed.fetch_add(done, std::memory_order_relaxed);
+            g->helped_compressions.fetch_add(done, std::memory_order_relaxed);
+            pcAdd(pc_.numa_queue_helped, done);
+        }
+    }
+
+    // Phases 1-4 on a thread outside `skip`'s group: the units the groups
+    // have left, from `from` on.
+    void helpNodeUnits(int phase, CompressWorker& worker, std::atomic<uint32_t>& eligible,
+                       std::atomic<uint32_t>& compressed, int skip, int from = -1) {
+        if (!numa_tick_active_ || numa_node_limit_ == 0) return;
+        if (from < 0) from = preferredHelpNode();
+        for (uint32_t k = 0; k < numa_node_limit_; ++k) {
+            const uint32_t n = (static_cast<uint32_t>(from) + k) % numa_node_limit_;
+            NodeGroup* g = node_groups_[n];
+            if (!g || g->threads_running == 0 || static_cast<int>(n) == skip) continue;
+            const size_t units = takeNodeUnits(*g, [&](size_t a, size_t b) {
+                runRange(phase, worker, eligible, compressed, a, b);
+            });
+            if (units) pcAdd(pc_.node_units_helped, units);
+        }
+    }
+
+    void executeNodePhase(NodeWorker& nw, int phase) {
+        PhaseClocks clocks(pc_, phase);
+        NodeGroup& g = *nw.group;
+        CompressWorker& worker = *nw.worker;
+        const int node = static_cast<int>(g.node);
+        const int cpu_before = sched_getcpu();
+        const uint32_t before = nw.compressed.load(std::memory_order_relaxed);
+        if (phase == 5) {
+            // Its own queue first, then what is left of the others'.
+            nw.compressed.fetch_add(drainQueueBatches(g, worker), std::memory_order_relaxed);
+            helpNodeQueues(worker, nw.compressed, node, node + 1);
+        } else {
+            // Its own node's units, then the shared range (skipping every
+            // group's chunks, as a default worker does), then the others'.
+            takeNodeUnits(g, [&](size_t a, size_t b) {
+                runRange(phase, worker, nw.eligible, nw.compressed, a, b);
+            });
+            const size_t shared = takeSharedSlices([&](size_t a, size_t b) {
+                runRange(phase, worker, nw.eligible, nw.compressed, a, b);
+            });
+            if (shared) pcAdd(pc_.shared_slices_by_node, shared);
+            helpNodeUnits(phase, worker, nw.eligible, nw.compressed, node, node + 1);
+        }
+        const uint32_t done = nw.compressed.load(std::memory_order_relaxed) - before;
         if (done == 0) return;
-        nw.compressed.fetch_add(done, std::memory_order_relaxed);
         nw.pages_compressed.fetch_add(done, std::memory_order_relaxed);
         if (!onNodeCpu(g, cpu_before) || !onNodeCpu(g, sched_getcpu()))
             nw.off_node_compressions.fetch_add(done, std::memory_order_relaxed);
@@ -4799,6 +5060,7 @@ public:
         int32_t tids[kMaxNodeWorkers] = {};
         uint64_t pages_compressed = 0;
         uint64_t off_node_compressions = 0;
+        uint64_t helped_compressions = 0;  // this node's queued pages compressed by other threads
         // Per worker: worker state, page buffer, compress buffer, zstd context.
         void* memory[kMaxNodeWorkers][4] = {};
     };
@@ -4808,6 +5070,7 @@ public:
         const NodeGroup& g = *node_groups_[node];
         *out = NodeGroupStats{};
         out->workers = static_cast<uint32_t>(g.threads_running);
+        out->helped_compressions = g.helped_compressions.load(std::memory_order_relaxed);
         for (int w = 0; w < g.num_workers; ++w) {
             const NodeWorker& nw = g.workers[w];
             out->tids[w] = nw.tid.load(std::memory_order_acquire);
@@ -6369,7 +6632,7 @@ private:
                 bs += s.bytes_saved_total.load(std::memory_order_relaxed);
                 tc += s.time_cost_total_us.load(std::memory_order_relaxed);
             };
-            for (int w = 0; w < kMaxCompressorWorkers; ++w) add(workers_[w]);
+            forEachDefaultWorker(add);
             forEachNodeCompressWorker(add);
             uint32_t eff_x256 = 0;
             // Treat zero time_cost as "no signal" — let exploration keep going.
@@ -6387,15 +6650,16 @@ private:
                 worker.sc_stats[i].efficiency_x256 =
                     static_cast<uint16_t>(aggs[i].efficiency_x256);
             };
-            for (int w = 0; w < kMaxCompressorWorkers; ++w) publish(workers_[w]);
+            forEachDefaultWorker(publish);
             forEachNodeCompressWorker(publish);
         }
 
         // Default decision when budget knob is unset: COMPRESS for every
         // bucket past exploration. Keeps behavior unchanged from legacy.
         auto setHint = [&](size_t i, uint8_t hint) {
-            for (int w = 0; w < kMaxCompressorWorkers; ++w)
-                workers_[w].sc_stats[i].budget_decision_hint = hint;
+            forEachDefaultWorker([&](CompressWorker& worker) {
+                worker.sc_stats[i].budget_decision_hint = hint;
+            });
             forEachNodeCompressWorker([&](CompressWorker& worker) {
                 worker.sc_stats[i].budget_decision_hint = hint;
             });
@@ -6467,8 +6731,8 @@ private:
             for (size_t i = 0; i < total; ++i) {
                 size_t bucket_in_arena = i % kTotalBucketsPerArena;
                 if (bucket_in_arena < kNumClasses) continue;  // slab bucket
-                uint8_t hint = workers_[0].sc_stats[i].budget_decision_hint;
-                if (workers_[0].sc_stats[i].count >= 8) ++n_rank_lg;
+                uint8_t hint = worker(0).sc_stats[i].budget_decision_hint;
+                if (worker(0).sc_stats[i].count >= 8) ++n_rank_lg;
                 if (hint == SizeClassStats::kBudgetCompress) ++n_compress_lg;
                 else if (hint == SizeClassStats::kBudgetSkip) ++n_skip_lg;
                 else ++n_explore_lg;
@@ -7097,8 +7361,8 @@ private:
             slice_end_ = committed;
         }
         for (int w = 0; w < nw; ++w) {
-            workers_[w].range_start = 0;
-            workers_[w].range_end = committed;
+            worker(w).range_start = 0;
+            worker(w).range_end = committed;
         }
         // The tick's compression budget starts afresh.
         {
@@ -7268,7 +7532,7 @@ private:
         if (nproc >= 4) {
             floor = nproc / 16;
             if (floor < 2) floor = 2;
-            if (floor > kMaxCompressorWorkers) floor = kMaxCompressorWorkers;
+            if (floor > max_workers_) floor = max_workers_;
         }
         double loads[3] = {0.0, 0.0, 0.0};
         int busy = 0;
@@ -7282,6 +7546,7 @@ private:
     }
 
     int test_workers_ = 0;   // SMASH_TEST_WORKERS
+    int max_workers_ = kCompressorWorkers;   // SMASH_MAX_WORKERS; set in init()
     // SMASH_TEST_TICK_MS=N (tests only): start a tick every N ms instead of
     // every kCompressIntervalMs. Every tick still counts as at least one
     // nominal tick, so the whole pipeline -- cold timeout, shadow delay,
@@ -7328,7 +7593,7 @@ private:
 
         // Clamp to valid range
         if (n_needed < 1) n_needed = 1;
-        if (n_needed > kMaxCompressorWorkers) n_needed = kMaxCompressorWorkers;
+        if (n_needed > max_workers_) n_needed = max_workers_;
 
         // CPU-pressure cap. The compressor's worker threads compete with
         // application threads for cores; on a saturated machine, scaling up
@@ -7563,10 +7828,15 @@ public:
     // Test hook (test_compression's testReclaimRange): Phase B over one page
     // range, as one worker runs it, ignoring the reclaim delay.
     void reclaimShadowRangeForTest(size_t start, size_t end) { reclaimShadowRange(start, end, 0); }
+    // Test hook (test_compression's testNominalTicks): is page `i` watched for
+    // reads by a verified idle mark (escalateToDeepMonitoring)? It is then
+    // PROT_READ, not PROT_NONE.
+    bool idleWatchedForTest(size_t i) const { return idle_armed_ && idle_armed_[i]; }
     // Test hooks (test_compression's testInteriorBucketStats): one worker's
     // statistics of bucket (arena, sc), and the profile save.
-    SizeClassStats& bucketStatsForTest(int worker, uint8_t arena, uint8_t sc) {
-        return workers_[worker].sc_stats[statsIndex(arena, sc)];
+    SizeClassStats& bucketStatsForTest(int worker_id, uint8_t arena, uint8_t sc) {
+        ensureWorkerState(worker_id);
+        return worker(worker_id).sc_stats[statsIndex(arena, sc)];
     }
     void saveProfileFileForTest() { saveProfileFile(); }
 
@@ -7605,6 +7875,19 @@ public:
             test_tick_ms_ = std::max(0, std::atoi(tt));
         if (const char* tw = std::getenv("SMASH_TEST_WORKERS"); tw && *tw)
             test_workers_ = std::min(kMaxCompressorWorkers, std::max(0, std::atoi(tw)));
+        // The runtime worker cap: clamp(nproc / 4, 8, kMaxCompressorWorkers)
+        // unless SMASH_MAX_WORKERS says otherwise. Hosts of up to 32 CPUs get
+        // the 8 the pool used to be; a 128-core host gets 32. Every worker
+        // and helper thread up to the cap exists from start(), so a scale-up
+        // never calls pthread_create mid-run.
+        {
+            long nproc = sysconf(_SC_NPROCESSORS_ONLN);
+            if (nproc < 1) nproc = 1;
+            int cap = static_cast<int>(std::clamp<long>(nproc / 4, 8, kMaxCompressorWorkers));
+            if (const char* mw = std::getenv("SMASH_MAX_WORKERS"); mw && *mw)
+                cap = std::clamp(std::atoi(mw), 1, kMaxCompressorWorkers);
+            max_workers_ = std::max(cap, test_workers_);
+        }
         if (const char* j = std::getenv("SMASH_TEST_JITTER_US"); j && *j)
             vm::g_test_jitter_us.store(static_cast<uint32_t>(std::clamp(std::atoi(j), 0, 100000)),
                                        std::memory_order_relaxed);
@@ -7673,11 +7956,9 @@ public:
         // Pre-allocate state for the initial worker count only. Additional
         // workers get their state allocated lazily on first scale-up via
         // ensureWorkerState(), saving ~300KB per deferred worker at startup.
-        for (int w = 0; w < kCompressorWorkers; ++w) {
-            initWorkerState(workers_[w], max_comp, custom_mem);
-        }
         max_comp_size_ = max_comp;
         zstd_custom_mem_ = custom_mem;
+        for (int w = 0; w < kCompressorWorkers; ++w) ensureWorkerState(w);
 
         // Pre-allocate fault handler slots with per-slot DCtx
         for (int i = 0; i < kFaultSlotCount; ++i) {
@@ -7810,10 +8091,11 @@ public:
                 fclose(f);
                 return;
             }
-            for (int w = 0; w < kMaxCompressorWorkers; ++w) {
-                workers_[w].sc_stats[i].deserialize(rec);
-                workers_[w].sc_stats[i].persist_hint = rec.decision_hint;
-            }
+            // Workers allocated later copy worker 0's buckets (ensureWorkerState).
+            forEachDefaultWorker([&](CompressWorker& worker) {
+                worker.sc_stats[i].deserialize(rec);
+                worker.sc_stats[i].persist_hint = rec.decision_hint;
+            });
         }
 
         // Optional dictionary section. Each record is
@@ -7863,7 +8145,7 @@ public:
         // multi-node host is most of them (testInteriorBucketStats).
         SizeClassStats::Persist* mine = bootstrapArray<SizeClassStats::Persist>(total);
         for (size_t i = 0; i < total; ++i) {
-            const SizeClassStats* best = &workers_[0].sc_stats[i];
+            const SizeClassStats* best = &worker(0).sc_stats[i];
             uint64_t cc = 0, dc = 0;
             auto visit = [&](CompressWorker& wk) {
                 const auto& st = wk.sc_stats[i];
@@ -7871,7 +8153,7 @@ public:
                 cc += st.compress_count.load(std::memory_order_relaxed);
                 dc += st.decompress_count.load(std::memory_order_relaxed);
             };
-            for (int w = 0; w < kMaxCompressorWorkers; ++w) visit(workers_[w]);
+            forEachDefaultWorker(visit);
             forEachNodeCompressWorker(visit);
             best->serialize(&mine[i]);
             SizeClassStats::setThrash(&mine[i], cc, dc);
@@ -8111,10 +8393,12 @@ public:
         // disabling compression (see util/thread_stack.h).
         constexpr size_t kSmashThreadStack = 128 * 1024;
 
-        for (int w = 0; w < kMaxCompressorWorkers; ++w) ensureWorkerState(w);
+        // Only up to the runtime cap: the pool is sized for a 128-core host.
+        const int max_helpers = std::max(0, max_workers_ - 1);
+        for (int w = 0; w < max_workers_; ++w) ensureWorkerState(w);
         int created = 0;
         int helper_err = 0;
-        for (int i = 0; i < kMaxHelpers; ++i) {
+        for (int i = 0; i < max_helpers; ++i) {
             auto* ha = static_cast<HelperArg*>(
                 BootstrapAlloc::instance().allocate(sizeof(HelperArg), alignof(HelperArg)));
             ha->self = this;
@@ -8133,7 +8417,7 @@ public:
         // dispatch() waits for nw - 1 helpers: never more than exist (the
         // first tick runs before adaptWorkerCount() caps it).
         if (active_workers_ > created + 1) active_workers_ = created + 1;
-        if (created < kMaxHelpers) {
+        if (created < max_helpers) {
             char buf[160];
             int n = smash::safe_snprintf(buf, sizeof(buf),
                 "[smash WARN] created %d of %d compressor helper threads "
@@ -8346,7 +8630,8 @@ public:
                         " p4_release=%llu idle_scan=%llu (%llu calls, %llu pages, %llu words, %llu other idle)"
                         " yt_scan=%llu (%llu calls, %llu pages, cut=%llu, resumed=%llu, max_req_us=%llu,"
                         " node_hints=%llu)"
-                        " node_query=%llu (%llu calls, %llu pages)\n",
+                        " node_query=%llu (%llu calls, %llu pages)"
+                        " help=%llu/%llu/%llu\n",
                         v(pc.tick_ms_total), v(pc.phases_ms_total), v(pc.step_ms[kStepEfficiency]),
                         v(pc.step_ms[kStepVmaSync]), v(pc.step_ms[kStepBitmap]),
                         v(pc.step_ms[kStepNodeChunks]), v(pc.step_ms[kStepAdapt]),
@@ -8357,7 +8642,8 @@ public:
                         v(pc.idle_pages), v(pc.idle_words), v(pc.idle_other), v(pc.sc_yt_us) / 1000, v(pc.sc_yt_n), v(pc.yt_pages),
                         v(pc.yt_cut), v(pc.yt_resumed), v(pc.yt_req_max_us), v(pc.yt_node_hints),
                         v(pc.sc_nodeq_us) / 1000, v(pc.sc_nodeq_n),
-                        v(pc.nodeq_pages));
+                        v(pc.nodeq_pages), v(pc.numa_queue_helped),
+                        v(pc.shared_slices_by_node), v(pc.node_units_helped));
                 if (n >= static_cast<int>(sizeof(buf))) n = static_cast<int>(sizeof(buf)) - 1;
             }
             // Fault handler time per kind: count, mean, percentiles as the
@@ -8450,7 +8736,7 @@ public:
                 // and NUMA node-group workers alike: on a multi-node host the
                 // groups compress most pages, and a dump of the default
                 // workers alone showed nothing for them.
-                const SizeClassStats* best = &self->workers_[0].sc_stats[idx];
+                const SizeClassStats* best = &self->worker(0).sc_stats[idx];
                 uint32_t cc = 0, dc = 0;
                 auto visit = [&](const CompressWorker& wk) {
                     const auto& st = wk.sc_stats[idx];
@@ -8458,7 +8744,7 @@ public:
                     cc += st.compress_count.load(std::memory_order_relaxed);
                     dc += st.decompress_count.load(std::memory_order_relaxed);
                 };
-                for (int w = 0; w < kMaxCompressorWorkers; ++w) visit(self->workers_[w]);
+                self->forEachDefaultWorker(visit);
                 self->forEachNodeCompressWorker([&](CompressWorker& wk) { visit(wk); });
                 const auto& s = *best;
                 if (s.count == 0) continue;  // skip empty buckets
@@ -8771,10 +9057,10 @@ public:
             // across workers. A restore the allocator caused is time spent,
             // but not thrash (see PageStateTable::markAllocReopened).
             if (bidx < kBucketTableLen && !zero_blob) {
-                workers_[0].sc_stats[bidx].time_cost_total_us.fetch_add(
+                worker(0).sc_stats[bidx].time_cost_total_us.fetch_add(
                     dec_us, std::memory_order_relaxed);
                 if (!by_alloc)
-                    workers_[0].sc_stats[bidx].decompress_count.fetch_add(
+                    worker(0).sc_stats[bidx].decompress_count.fetch_add(
                         1, std::memory_order_relaxed);
             }
 
@@ -8885,6 +9171,12 @@ public:
     void numaRouteCounters(uint64_t* queued, uint64_t* queue_full) const {
         *queued = pc_.numa_queued.load(std::memory_order_relaxed);
         *queue_full = pc_.numa_queue_full.load(std::memory_order_relaxed);
+    }
+    void workShareCounters(uint64_t* queue_helped, uint64_t* shared_by_node,
+                           uint64_t* units_helped) const {
+        *queue_helped = pc_.numa_queue_helped.load(std::memory_order_relaxed);
+        *shared_by_node = pc_.shared_slices_by_node.load(std::memory_order_relaxed);
+        *units_helped = pc_.node_units_helped.load(std::memory_order_relaxed);
     }
     void snapshotCounters(uint64_t* direct, uint64_t* direct_faults, uint64_t* via_mem) const {
         *direct = pc_.cp_direct.load(std::memory_order_relaxed);

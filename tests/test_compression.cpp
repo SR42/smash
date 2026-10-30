@@ -469,8 +469,11 @@ static void testNominalTicks() {
     CHECK(states.get(idx) == PageState::ACTIVE_MONITORING,
           "nominal: after a 5 s tick the page was compressed (state %d) without the read watch",
           static_cast<int>(states.get(idx)));
-    CHECK(mapsPerms(page, perms) && perms[0] == '-',
-          "nominal: after a 5 s tick the page is not escalated to PROT_NONE (%s)", perms);
+    // Watched for reads either way: PROT_NONE, or as root a verified idle mark
+    // on a PROT_READ page. Which one depends on whether the kernel took the
+    // mark, i.e. whether the page has left the per-CPU LRU batch yet.
+    CHECK(mapsPerms(page, perms) && (perms[0] == '-' || compressor.idleWatchedForTest(idx)),
+          "nominal: after a 5 s tick the page is not watched for reads (%s, no idle mark)", perms);
     compressor.pretendNextTickAfterMs(5000);
     compressor.compressTick();                       // survived the read watch: compressed
     const PageState s3 = states.get(idx);

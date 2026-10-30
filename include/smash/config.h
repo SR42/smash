@@ -713,7 +713,8 @@ inline constexpr int kCompressorWorkers = 2;         // initial compression work
 inline constexpr int kCompressorWorkers = SMASH_COMPRESSOR_WORKERS;
 #endif
 #ifndef SMASH_MAX_COMPRESSOR_WORKERS
-inline constexpr int kMaxCompressorWorkers = 8;      // max workers (pre-allocated pool)
+inline constexpr int kMaxCompressorWorkers = 32;     // worker pool; the runtime cap is
+                                                     // SMASH_MAX_WORKERS (clamp(nproc/4, 8, 32))
 #else
 inline constexpr int kMaxCompressorWorkers = SMASH_MAX_COMPRESSOR_WORKERS;
 #endif

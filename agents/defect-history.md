@@ -1173,13 +1173,83 @@ eligible, however much:
 `SMASH_TICK_PAGE_BUDGET=N` reserves a slot per page before the work
 (`tick_reserved_`; a check-then-compress overshot by one per concurrent
 worker) and turns the rest away cold for the next tick; `test_tick_budget`:
-at most 1000 of 2048 per tick, against 2048 without. Still open from the
-same finding: the node groups and the default workers split the heap by
-ownership (node arena chunks against everything else), so when nearly all
-memory is node-bound the default workers only route in phase 2, and when
-none is the groups only drain their queues in phase 5; the worker cap
-(`kMaxCompressorWorkers`, `SMASH_MAX_COMPRESSOR_WORKERS` at build time) is
-unchanged.
+at most 1000 of 2048 per tick, against 2048 without. The ownership split
+between the node groups and the default workers, and the 8-worker pool, are
+the next section.
+
+## The node groups and the default workers idled through each other's phases, and the pool was 8 (fixed 2026-10-30)
+
+On a NUMA host the compressor's threads were split by ownership: node arena
+chunks to the node's group (each thread a static slice of each chunk),
+everything else to the default workers, and phase 5 -- the pages phase 2
+routed to each node's queue -- to the group alone, each thread a static
+slice of the queue. An ordinary heap carries no binding, so the default
+workers alone walked phases 1-4 while every group idled at the barrier, and
+in phase 5 the default workers idled while the groups compressed the whole
+cold set: on the 128-core box, 8 threads working and 8 waiting in every
+phase. The pool of default workers was a compile-time 8
+(`kMaxCompressorWorkers`), which the Little's-law estimate hit every tick
+there (`performance.md`: 724 s and 1448 s ticks).
+
+Now a phase's work is pools claimed with atomic cursors by whichever
+compressor thread asks next: the shared range in slices (as before), each
+group's chunks in 8 MiB units (`takeNodeUnits`, aligned like the slices)
+and each group's queue in `kCompressBatch` batches (`drainQueueBatches`).
+A default worker takes the shared range, then helps the groups, the node
+its CPU is on first; a group thread takes its own node's pool, then the
+shared range (skipping every group's chunks as a default worker does:
+`ownedByRunningNodeGroup` now keys on `tl_on_node_unit_`, not on which
+thread asks), then the other groups'. The groups are woken for phases 1-4
+whenever the shared range has more slices than the default workers can
+start at once. Placement never depends on who compresses: a thread draining
+another node's queue sets `route_store` to that node's store for the whole
+drain, and a node arena page met on a unit by another node's thread is
+routed to its node's queue. The spill path (`SMASH_SPILL`) honoured only
+`worker.store`, so a default worker's overflow-routed blob could have
+spilled off its node; it checks `route_store` too. `test_numa_work_sharing`
+(two default workers pinned to node 0, one thread per group, 256 MiB on
+node 1 under a 1 GiB high-water mark): 83 % of node 1's compressions by
+threads outside its group, 220 shared-range slices taken by group threads,
+0 of 65536 blobs off-node, against 0 and 0 with the split restored.
+`test_numa_compressor` counts `helped_compressions` with the group's own
+(its blob-placement check is what guards where helped blobs went).
+
+Sharing phase 2 broke the node queues' adjacency. `enqueueForNode` took one
+queue slot per page (`fetch_add(1)`), so threads routing at the same time
+interleaved a queue page by page; with the default workers alone routing
+that was rare, with every group thread routing too it was the rule, and
+phase 5's 256-page drain batches became runs of two or three pages:
+`test_phase3_batch` measured 3.4 pages per phase-2 `mprotect` (19018 calls
+for 65536 pages; 128 per call with the sharing mutated out or without
+groups). A routing worker now stages its pages per node
+(`CompressWorker::route_stage`) and `flushRouteStage` moves 256 at a time
+into one reservation of `kCompressBatch` slots, the unused tail of a short
+one (a range's end) filled with `NodeGroup::kQueueEmpty`, which
+`drainQueueBatches` skips: every drain batch starts at a reservation and is
+one worker's adjacent pages. The pages past the queue's capacity are met at
+the flush and compressed by the router into the node's store
+(`compressLocalBatch`, shared with `flushNodeQueries`), as the full-queue
+page was before. 128 pages per call again (127.8 at 2 GiB); the mutant that reserves a
+slot per page measures 4.1 and fails the test.
+
+The pool is 32, allocated lazily (`ensureWorkerState`: a `CompressWorker`
+is ~190 KiB, mostly bucket stats, so the array of 8 objects became
+pointers). A worker created later starts from worker 0's buckets, as a
+group's workers do -- `seedBucketStats`: the ratio window, the cost EMAs and
+the profile fields, never the four totals (`compress_count`,
+`decompress_count`, `bytes_saved_total`, `time_cost_total_us`). Those are
+summed over every worker by the saved profile's thrash rate, the budget's
+efficiency and the stats dump, and the first version copied them whole:
+`test_compression_bucket_stats`, whose sum walks all 32 worker slots,
+counted 63 compressions as 1953 (31 copies) and saved thrash rate 8/255
+`stable_cold=1` for a block restored whole. The group workers' copy had the
+same flaw, hidden because they are created in `start()` before any tick.
+The runtime cap is `SMASH_MAX_WORKERS`, default `clamp(nproc / 4, 8,
+32)`, so hosts of up to 32 CPUs are unchanged; every worker and helper
+thread up to the cap is created in `start()` (a `pthread_create` mid-tick
+is unsafe), and `SMASH_TEST_WORKERS` raises the cap with it.
+`test_worker_pool`: 12 workers asked for, 12 reported, 12 % on the busiest;
+8 reported with the old constant.
 
 ## realloc always copied (fixed 2026-10-29)
 

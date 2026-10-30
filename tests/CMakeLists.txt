@@ -793,6 +793,23 @@ if(NOT APPLE)
     $<TARGET_FILE:worker_balance_test>)
   set_tests_properties(test_worker_balance PROPERTIES TIMEOUT 120)
 
+  add_executable(worker_pool_test worker_pool_test.cpp)
+  target_link_libraries(worker_pool_test PRIVATE ${CMAKE_DL_LIBS})
+  add_test(NAME test_worker_pool COMMAND ${CMAKE_COMMAND} -E env
+    "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=1" "SMASH_COLD_TIMEOUT_SEC=1"
+    "SMASH_DEFER_PHASES_MS=0" "SMASH_TEST_WORKERS=12" "SMASH_NUMA_COMPRESSOR=0"
+    $<TARGET_FILE:worker_pool_test>)
+  set_tests_properties(test_worker_pool PROPERTIES TIMEOUT 180)
+
+  # Two memory nodes with CPUs: skips otherwise.
+  add_executable(numa_work_sharing_test numa_work_sharing_test.cpp)
+  target_link_libraries(numa_work_sharing_test PRIVATE ${CMAKE_DL_LIBS})
+  add_test(NAME test_numa_work_sharing COMMAND ${CMAKE_COMMAND} -E env
+    "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=1" "SMASH_COLD_TIMEOUT_SEC=1"
+    "SMASH_DEFER_PHASES_MS=0" "SMASH_TEST_WORKERS=2" "SMASH_NUMA_WORKERS=1"
+    $<TARGET_FILE:numa_work_sharing_test>)
+  set_tests_properties(test_numa_work_sharing PROPERTIES TIMEOUT 300)
+
   add_executable(realloc_test realloc_test.cpp)
   target_link_libraries(realloc_test PRIVATE ${CMAKE_DL_LIBS})
   add_test(NAME test_realloc_large_only COMMAND ${CMAKE_COMMAND} -E env
