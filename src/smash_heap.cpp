@@ -1548,6 +1548,71 @@ int smash_debug_hold_page_lock(const void* ptr, unsigned ms) {
 // through /proc/self/mem for snapshots -- and how many ticks ran. 0 on
 // success, -1 without a compressor.
 extern "C" __attribute__((visibility("default")))
+// Diagnostic / test hook (not public API): snapshot copies made directly
+// (scanning trackers), those whose read the fault handler had to make
+// possible first, and reads through /proc/self/mem (tests/idle_direct_snapshot_test.cpp).
+extern "C" __attribute__((visibility("default")))
+int smash_snapshot_info(uint64_t* direct, uint64_t* direct_faults, uint64_t* via_mem) {
+    uint64_t d = 0, f = 0, m = 0;
+    auto* heap = SmashRedirect::getHeap();
+    const bool ok = heap && heap->snapshotInfo(&d, &f, &m);
+    if (direct) *direct = d;
+    if (direct_faults) *direct_faults = f;
+    if (via_mem) *via_mem = m;
+    return ok ? 0 : -1;
+}
+
+// Diagnostic / test hook (not public API): SMASH_TICK_PAGE_BUDGET as read, the
+// most pages any tick compressed, and the eligible pages the budget turned
+// away (tests/tick_budget_test.cpp).
+extern "C" __attribute__((visibility("default")))
+int smash_tick_budget_info(uint64_t* budget, uint64_t* max_per_tick, uint64_t* turned_away) {
+    uint64_t b = 0, m = 0, t = 0;
+    auto* heap = SmashRedirect::getHeap();
+    const bool ok = heap && heap->tickBudgetInfo(&b, &m, &t);
+    if (budget) *budget = b;
+    if (max_per_tick) *max_per_tick = m;
+    if (turned_away) *turned_away = t;
+    return ok ? 0 : -1;
+}
+
+// Diagnostic / test hook (not public API): pages compressed by the default
+// workers over the run, in total and by the busiest one, and the active
+// worker count (tests/worker_balance_test.cpp).
+extern "C" __attribute__((visibility("default")))
+int smash_worker_balance_info(uint64_t* total, uint64_t* max_one_worker, uint32_t* workers) {
+    uint64_t t = 0, m = 0; uint32_t w = 0;
+    auto* heap = SmashRedirect::getHeap();
+    const bool ok = heap && heap->workerBalanceInfo(&t, &m, &w);
+    if (total) *total = t;
+    if (max_one_worker) *max_one_worker = m;
+    if (workers) *workers = w;
+    return ok ? 0 : -1;
+}
+
+// Diagnostic / test hook (not public API): pages handed to their node's
+// group queue, and pages that found that queue full (and were compressed by
+// the routing worker into the node's store) -- tests/numa_queue_overflow_test.cpp.
+extern "C" __attribute__((visibility("default")))
+int smash_numa_route_info(uint64_t* queued, uint64_t* queue_full) {
+    uint64_t q = 0, f = 0;
+    auto* heap = SmashRedirect::getHeap();
+    const bool ok = heap && heap->numaRouteInfo(&q, &f);
+    if (queued) *queued = q;
+    if (queue_full) *queue_full = f;
+    return ok ? 0 : -1;
+}
+
+// Diagnostic / test hook (not public API): the write tracker in use
+// ("softdirty", "uffd", "none", "protread", "idle", "yt"; "none" before the
+// compressor starts).
+extern "C" __attribute__((visibility("default")))
+const char* smash_write_tracker() {
+    auto* heap = SmashRedirect::getHeap();
+    return heap ? heap->writeTrackerName() : "none";
+}
+
+extern "C" __attribute__((visibility("default")))
 int smash_tick_cost_info(uint64_t* sweep_pages, uint64_t* memread_calls, uint64_t* ticks) {
     uint64_t sp = 0, mr = 0, t = 0;
     auto* heap = SmashRedirect::getHeap();

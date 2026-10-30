@@ -28,6 +28,14 @@
 //     written with "fast_codec": "lz4", and a zstd child then rewrites it
 //     with "zstd1" (a file measured with another codec is not reused);
 //   - every child reads its data back intact.
+//
+// A child that exits without reporting is shown in full: its last stdout
+// lines, and the file its stderr pointed at during the run (CODEC_ENV_LOG,
+// made by the parent), where smash's own words land. Its first line, "child:
+// pid N started", is flushed at once, so a silent exit is placed before or
+// after main. Five times (2026-10-15 to 2026-10-29, always as root in the
+// full suite, never on its own) a child of this test or of test_prefetch_env
+// exited 2 with nothing at all; the run's stderr was an unlinked file then.
 #include <cerrno>
 #include <climits>
 #include <cstdint>
@@ -78,16 +86,24 @@ size_t resident(const char* p) {
 }
 
 int child() {
+    // The first line, flushed: a child that exits with no output (see the
+    // header) either never got here or died after this.
+    std::printf("child: pid %d started\n", static_cast<int>(getpid()));
+    std::fflush(stdout);
+    // Its stderr for the run: the parent's file when it gave one
+    // (CODEC_ENV_LOG, kept and shown by the parent when the child does not
+    // report), else a private unlinked one.
+    const char* log_path = std::getenv("CODEC_ENV_LOG");
     char path[] = "/tmp/smash_codec_XXXXXX";
-    const int log = mkstemp(path);
+    const int log = log_path ? open(log_path, O_RDWR | O_CREAT | O_TRUNC, 0600) : mkstemp(path);
     if (log < 0) {
         // Says why: one child of test_codec_env, run as root mid-suite,
         // exited 2 with no output at all (twice; 30 of 30 runs on their own
         // passed). This is the only exit 2 in the child.
-        std::printf("child: mkstemp failed: %s\n", std::strerror(errno));
+        std::printf("child: %s failed: %s\n", log_path ? "open(CODEC_ENV_LOG)" : "mkstemp", std::strerror(errno));
         return 2;
     }
-    unlink(path);
+    if (!log_path) unlink(path);
     const int saved = dup(2);
     dup2(log, 2);
 
@@ -157,13 +173,32 @@ void showTail(const std::string& out) {
 
 struct Result { bool ok = false; std::string codec; size_t live = 0, resident = 0; int warned = 0, intact = 0; };
 
+// The file a child's stderr points at during its run (smash's stats line and
+// anything smash says), read back by the parent when the child does not report.
+std::string slurpFile(const char* path) {
+    std::string text;
+    const int fd = open(path, O_RDONLY);
+    if (fd < 0) return "(" + std::string(std::strerror(errno)) + ")";
+    char buf[8192];
+    for (ssize_t n; (n = read(fd, buf, sizeof(buf))) > 0;) text.append(buf, static_cast<size_t>(n));
+    close(fd);
+    return text;
+}
+
 Result run(const char* self, const char* env) {
     Result r;
+    char log[] = "/tmp/smash_codec_log_XXXXXX";
+    const int lfd = mkstemp(log);
+    if (lfd >= 0) close(lfd);
     // stderr too: smash reads SMASH_CODEC, and warns, before the child runs.
+    // The child's stderr goes to `log` for the run itself (CODEC_ENV_LOG).
     std::string cmd = std::string("timeout 90 env -u SMASH_CODEC -u SMASH_VERY_COLD_TICKS -u SMASH_CALIBRATION_FILE ") +
+                      (lfd >= 0 ? std::string("CODEC_ENV_LOG=") + log + " " : std::string()) +
                       env + " '" + self + "' child 2>&1";
     int st = 0;
     const std::string out = runChild(cmd, &st);
+    const std::string run_err = lfd >= 0 ? slurpFile(log) : "(no log file)";
+    if (lfd >= 0) unlink(log);
     char codec[64] = {0};
     for (size_t at = 0; at < out.size();) {
         const size_t end = out.find('\n', at);
@@ -179,7 +214,11 @@ Result run(const char* self, const char* env) {
     r.ok = r.ok && st == 0;
     std::printf("%-28s -> codec=%s blob live=%zu MiB, %zu pages resident, warned=%d, intact=%d (status %d)\n", env,
                 r.codec.c_str(), r.live, r.resident, r.warned, r.intact, st);
-    if (!r.ok) showTail(out);
+    if (!r.ok) {
+        showTail(out);
+        std::printf("    child's stderr during the run (last lines):\n");
+        showTail(run_err);
+    }
     return r;
 }
 

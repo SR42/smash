@@ -2503,6 +2503,87 @@ public:
     // clean runs and tail, and the chunk pool is fresh or was decommitted
     // before it got there (processDecommitEntry, purgeSubArena); a dirty run
     // is neither, and a decommit may not zero (vm::decommitZeroes).
+    // realloc: give the run [base, base + pages) `extra` more pages right
+    // behind it, if they are free -- the shared arena's bump pointer or a free
+    // run of the shared map, or in a sub-arena chunk the chunk's unused tail
+    // or a free run (dirty or clean) of that sub-arena. False, with nothing
+    // changed, for anything else: a node arena's block, a block larger than
+    // a chunk (its release returns whole chunks), a run crossing the chunk
+    // boundary, pages that are not free. The caller sets the new pages'
+    // states. Pages taken from a dirty run are dirty, which realloc's new
+    // tail may be.
+    bool tryExtendRun(void* base, size_t pages, size_t extra) {
+        if (tracking_mode_ || extra == 0) return false;
+        const auto a = reinterpret_cast<uintptr_t>(base);
+        if (!inContigArena(a)) return false;
+        const size_t idx = pageIndex(a);
+        const size_t end = idx + pages;
+        if (end + extra > contig_pages_ || end + extra < end) return false;
+        if (nodeOfPage(idx) >= 0) return false;
+        if (subarenasEnabled()) {
+            auto* owners = chunk_sub_.load(std::memory_order_acquire);
+            const uint8_t o = owners ? owners[chunkOfPage(idx)].load(std::memory_order_acquire)
+                                     : kChunkUnowned;
+            if (o == kChunkBig) return false;
+            if (o != kChunkUnowned) {
+                if (chunkOfPage(end + extra - 1) != chunkOfPage(idx)) return false;
+                NodeArena* set = subSetOfPage(idx);
+                if (!set || !set->subs_ready.load(std::memory_order_acquire)) return false;
+                NodeArena& na = *set;
+                const uint32_t s = static_cast<uint32_t>(o - 1);
+                if (s >= na.nsubs) return false;
+                SubArena& sa = na.subs[s];
+                LockGuard guard(sa.lock);
+                if (sa.cur == end && end + extra <= sa.end) {
+                    sa.cur = end + extra;
+                    return true;
+                }
+                size_t len = 0;
+                uint32_t own = 0, stamp = 0;
+                if (na.map.runAtUnlocked(end, &len, &own, &stamp) &&
+                    (own == ownerDirty(s) || own == ownerClean(s)) && len >= extra &&
+                    na.map.removeRunUnlocked(end, len, own)) {
+                    if (len > extra)
+                        na.map.insertUnlocked(end + extra, len - extra, own, kNodeChunkPages, stamp);
+                    if (own == ownerDirty(s)) {
+                        sa.dirty_pages -= extra;
+                        sa.dirty_published.store(sa.dirty_pages, std::memory_order_relaxed);
+                    }
+                    return true;
+                }
+                return false;
+            }
+        }
+        // The shared arena: the block is the last one carved, or a free run
+        // of the shared map starts right behind it.
+        {
+            size_t cur = end;
+            if (next_page_.compare_exchange_strong(cur, end + extra, std::memory_order_acq_rel)) {
+                ensureCommitted(end + extra);   // as allocatePages does for fresh pages
+                return true;
+            }
+        }
+        LockGuard guard(free_map_.lock());
+        size_t len = 0;
+        uint32_t own = 0, stamp = 0;
+        if (free_map_.runAtUnlocked(end, &len, &own, &stamp) && own == kSharedOwner &&
+            len >= extra && free_map_.removeRunUnlocked(end, len, own)) {
+            if (len > extra) free_map_.insertUnlocked(end + extra, len - extra, own, 0, stamp);
+            return true;
+        }
+        return false;
+    }
+
+    // realloc: a block larger than a sub-arena chunk returns whole chunks on
+    // release, so its tail cannot be given back page by page.
+    bool runIsChunkBig(void* base) const {
+        if (!subarenasEnabled()) return false;
+        const auto a = reinterpret_cast<uintptr_t>(base);
+        if (!inContigArena(a)) return false;
+        auto* owners = chunk_sub_.load(std::memory_order_acquire);
+        return owners && owners[chunkOfPage(pageIndex(a))].load(std::memory_order_acquire) == kChunkBig;
+    }
+
     void* allocateLargePages(size_t num_pages, bool* zeroed = nullptr) {
         bool took_dirty = false;
         void* p = nullptr;

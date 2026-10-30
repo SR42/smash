@@ -12,6 +12,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include "../util/park.h"
+#include "../util/spinlock.h"
 #include <pthread.h>
 
 namespace smash {
@@ -148,46 +150,76 @@ public:
     size_t numPages() const { return num_pages_; }
 };
 
-// Per-page spinlock table for compression synchronization.
-// Fine-grained: one atomic_flag per page, plus an owner-TID slot so the
-// fault handler can detect when the current thread already holds the
-// lock (and bail out instead of self-deadlocking on the spinlock).
+// Per-page lock table for compression synchronization.
+// Fine-grained: one byte per page (0 free, 1 held, 2 held with a waiter
+// parked), plus an owner-TID slot so the fault handler can detect when the
+// current thread already holds the lock (and bail out instead of
+// self-deadlocking).
+//
+// A waiter spins for about the microseconds a normal hold lasts (a restore:
+// decompress, a write through /proc/self/mem, an mprotect) and then parks on
+// a futex: the wait words are a small hashed table (util/park.h), the unlock
+// of a lock whose byte says 2 bumps the page's word and wakes everyone on it.
+// Before, the byte was a test-and-set spun on for ever, and it is faulting
+// application threads that wait on it: a thread waiting a second for a
+// stalled holder burnt a CPU for that second, 128 of them 128 CPUs. The
+// protocol is the three-state mutex with the futex word kept apart: a waiter
+// reads the word, then exchanges the byte to 2; if that found the lock free
+// it owns it, otherwise it sleeps while the word is unchanged. An unlock
+// that ran in between saw the 2, so it changed the word, and the sleep
+// returns at once. Waiters parked on a colliding word wake spuriously and
+// re-check.
 //
 // Portability: pthread_t is available on both Linux and macOS, compares
-// with pthread_equal. The owner slot is a plain (non-atomic) pthread_t —
+// with pthread_equal. The owner slot is a plain (non-atomic) pthread_t --
 // only the lock owner reads/writes it, so no atomicity needed beyond the
-// release fence implied by atomic_flag.clear().
+// release fence implied by the byte's release store.
 class PageLockTable {
-    std::atomic_flag* locks_;
+    std::atomic<uint8_t>* locks_;
     pthread_t* owners_;
     size_t num_pages_;
+    static constexpr size_t kWaitWords = 1024;
+    std::atomic<uint32_t>* wait_words_;
+    // About 20 us of read-spinning before parking (pause/yield is tens of
+    // nanoseconds): longer than a restore, shorter than anything worth a
+    // CPU.
+    static constexpr unsigned kSpinBeforePark = 1000;
+
+    std::atomic<uint32_t>& waitWord(size_t page_idx) {
+        return wait_words_[(page_idx * 0x9E3779B97F4A7C15ull >> 54) & (kWaitWords - 1)];
+    }
 
 public:
     void init(size_t num_pages) {
         num_pages_ = num_pages;
-        // atomic_flag is 1 byte; bootstrap returns zeroed memory (= clear state)
-        locks_ = static_cast<std::atomic_flag*>(
+        // bootstrap returns zeroed memory (= free state)
+        locks_ = static_cast<std::atomic<uint8_t>*>(
             BootstrapAlloc::instance().allocateZeroed(
-                num_pages * sizeof(std::atomic_flag),
-                alignof(std::atomic_flag)));
+                num_pages * sizeof(std::atomic<uint8_t>),
+                alignof(std::atomic<uint8_t>)));
         owners_ = static_cast<pthread_t*>(
             BootstrapAlloc::instance().allocateZeroed(
                 num_pages * sizeof(pthread_t),
                 alignof(pthread_t)));
+        wait_words_ = static_cast<std::atomic<uint32_t>*>(
+            BootstrapAlloc::instance().allocateZeroed(
+                kWaitWords * sizeof(std::atomic<uint32_t>),
+                alignof(std::atomic<uint32_t>)));
     }
 
     // A fork child: every page lock held at the clone -- by a worker mid-tick,
     // or by a thread inside the fault handler (lock, decompress, write,
     // mprotect, unlock: microseconds, but 2 of 200 forks under 8 faulting
     // threads landed inside) -- belongs to a thread that does not exist here.
-    // Only the forking thread does, and it holds none, so every set flag is
+    // Only the forking thread does, and it holds none, so every held byte is
     // cleared, owner too (a thread the child creates can reuse a parent
     // thread's pthread_t, and heldByThisThread would then see itself).
     // Reads a word per 8 pages over [0, n) and writes only the held ones, so
     // the lock table's untouched pages stay shared with the parent. Returns
-    // how many were held.
+    // how many were held. No thread is parked in the child, so the wait
+    // words need nothing.
     size_t resetForFork(size_t n) {
-        static_assert(sizeof(std::atomic_flag) == 1, "the word scan reads one page lock per byte");
+        static_assert(sizeof(std::atomic<uint8_t>) == 1, "the word scan reads one page lock per byte");
         if (n > num_pages_) n = num_pages_;
         size_t reset = 0;
         const unsigned char* raw = reinterpret_cast<const unsigned char*>(locks_);
@@ -203,54 +235,72 @@ public:
     }
 
     void lock(size_t page_idx) {
-        while (locks_[page_idx].test_and_set(std::memory_order_acquire)) {
-#if defined(__x86_64__)
-            __builtin_ia32_pause();
-#elif defined(__aarch64__)
-            asm volatile("yield");
-#endif
+        std::atomic<uint8_t>& b = locks_[page_idx];
+        if (tryAcquire(b)) { owners_[page_idx] = pthread_self(); return; }
+        for (;;) {
+            // Read-spin (no RMW: the line stays shared while it is held).
+            for (unsigned i = 0; i < kSpinBeforePark; ++i) {
+                if (b.load(std::memory_order_relaxed) == 0 && tryAcquire(b)) {
+                    owners_[page_idx] = pthread_self();
+                    return;
+                }
+                spinRelax();
+            }
+            // Park. The word is read before the byte is marked: an unlock
+            // between the two sees the mark and changes the word.
+            std::atomic<uint32_t>& w = waitWord(page_idx);
+            const uint32_t seq = w.load(std::memory_order_acquire);
+            if (b.exchange(2, std::memory_order_acquire) == 0) {
+                owners_[page_idx] = pthread_self();
+                return;
+            }
+            park(w, seq);
         }
-        owners_[page_idx] = pthread_self();
     }
 
     // Non-blocking lock attempt. Returns true if lock was acquired.
     bool tryLock(size_t page_idx) {
-        if (locks_[page_idx].test_and_set(std::memory_order_acquire)) return false;
+        if (!tryAcquire(locks_[page_idx])) return false;
         owners_[page_idx] = pthread_self();
         return true;
     }
 
     size_t resetOneForFork(size_t i) {
-        if (!locks_[i].test(std::memory_order_relaxed)) return 0;
+        if (locks_[i].load(std::memory_order_relaxed) == 0) return 0;
         owners_[i] = pthread_t{};
-        locks_[i].clear(std::memory_order_relaxed);
+        locks_[i].store(0, std::memory_order_relaxed);
         return 1;
     }
 
     void unlock(size_t page_idx) {
-        // Clear owner before releasing the flag — otherwise another thread
+        // Clear owner before releasing the byte -- otherwise another thread
         // can grab the lock, write a new owner, and then we'd clobber it.
         owners_[page_idx] = pthread_t{};
-        locks_[page_idx].clear(std::memory_order_release);
+        if (locks_[page_idx].exchange(0, std::memory_order_release) == 2) {
+            std::atomic<uint32_t>& w = waitWord(page_idx);
+            w.fetch_add(1, std::memory_order_release);
+            unpark(w, 0x7fffffff);
+        }
     }
 
     // Used by the fault handler to detect self-recursion. compressPage
     // holds the lock while doing memcpy after PROT_READ; if the memcpy
     // SIGSEGVs (TLB inconsistency or smash state-machine bug), the
     // signal is delivered to the same thread, and handleFault must NOT
-    // call lock() again — that would self-deadlock on the non-recursive
-    // spinlock. Returns true if THIS thread is the current lock owner.
+    // call lock() again -- that would self-deadlock on the non-recursive
+    // lock. Returns true if THIS thread is the current lock owner.
     bool heldByThisThread(size_t page_idx) const {
-        // Read order: check the flag is set, then read owner. If flag is
+        // Read order: check the byte is set, then read owner. If the byte is
         // clear, no one holds the lock; owner read is racy but irrelevant.
-        // If flag is set and owner equals pthread_self(), it's us.
-        // (We assume pthread_t reads are atomic enough on the architectures
-        // we care about — pointer-sized on Linux glibc, opaque struct on
-        // some platforms but in practice 8-byte aligned. The test_and_set
-        // earlier means the lock holder already wrote owners_[page_idx];
-        // we're just reading the value back.)
-        if (!locks_[page_idx].test(std::memory_order_acquire)) return false;
+        // If it is set and owner equals pthread_self(), it's us.
+        if (locks_[page_idx].load(std::memory_order_acquire) == 0) return false;
         return pthread_equal(owners_[page_idx], pthread_self()) != 0;
+    }
+
+private:
+    static bool tryAcquire(std::atomic<uint8_t>& b) {
+        uint8_t expected = 0;
+        return b.compare_exchange_strong(expected, 1, std::memory_order_acquire, std::memory_order_relaxed);
     }
 };
 

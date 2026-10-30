@@ -278,6 +278,13 @@ inline void warmupEnvStatics() {
     (void)vm::madvMode();
 }
 
+// The page (index + 1, 0 for none) a compressor worker is copying directly
+// for its snapshot. A direct read of an ACTIVE page that an earlier reclaim
+// left PROT_NONE faults on the worker, which holds the page's lock; the
+// handler, seeing both, makes the page PROT_RW and lets the read run instead
+// of treating the fault as the state-machine error it would otherwise be.
+inline __attribute__((tls_model("initial-exec"))) constinit thread_local size_t t_snapshot_page_plus1 = 0;
+
 class CompressorThread {
     // ── Shared state ──────────────────────────────────────────────────────
     VmRegion* vm_ = nullptr;
@@ -694,6 +701,13 @@ class CompressorThread {
         // phase 3's arming, phase 4's release (madvise + mprotect) and
         // look-ahead arming. Says which calls the "blocked" time of
         // [smash phase time] waits in.
+        // Direct snapshot copies (scanning trackers), and those the handler
+        // had to make readable first.
+        std::atomic<uint64_t> cp_direct{0}, cp_direct_faults{0};
+        // NUMA routing: pages queued for their node's group, pages that found
+        // the queue full (compressed by the routing worker into that node's
+        // store: numa_queue_full_routed), and the queue-full events.
+        std::atomic<uint64_t> numa_queued{0}, numa_queue_full{0}, numa_queue_full_routed{0};
         std::atomic<uint64_t> sc_memread_us{0}, sc_memread_n{0}, sc_p2_mprotect_us{0},
                               sc_p3_mprotect_us{0}, sc_p4_us{0};
         std::atomic<uint64_t> phases_ms_total{0}, tick_ms_total{0};
@@ -966,8 +980,14 @@ class CompressorThread {
     static constexpr int kFaultSlotCount = 128;  // Enough for many concurrent faults + prefetch
     FaultSlot fault_slots_[kFaultSlotCount]{};
 
+    // Every acquisition used to start its scan at slot 0: concurrent faults
+    // all hammered the first slots' `used` lines and walked past each
+    // other's. The scan starts at a rotating offset instead.
+    std::atomic<unsigned> fault_slot_next_{0};
     int acquireFaultSlot() {
-        for (int i = 0; i < kFaultSlotCount; ++i) {
+        const unsigned start = fault_slot_next_.fetch_add(1, std::memory_order_relaxed);
+        for (int k = 0; k < kFaultSlotCount; ++k) {
+            const int i = static_cast<int>((start + static_cast<unsigned>(k)) % kFaultSlotCount);
             bool expected = false;
             if (fault_slots_[i].used.compare_exchange_strong(
                     expected, true, std::memory_order_acquire))
@@ -1284,6 +1304,15 @@ class CompressorThread {
         // worker leaves both unset: the shared store, no node affinity.
         CompressStore* store = nullptr;
         int node = -1;
+        // Set around one compressPage call for a page whose own node's queue
+        // was full: the blob goes to that node's store (route_store,
+        // route_node) instead of this worker's. Blob placement must never
+        // depend on queue capacity.
+        CompressStore* route_store = nullptr;
+        int route_node = -1;
+        // routeByNode's verdict for the page it just declined to queue: the
+        // node whose store the caller should compress it into (-1: none).
+        int last_route_node = -1;
         // ROI stats indexed by (arena_id, bucket).  Arena routing produces
         // structurally-homogeneous pages; aggregating stats across arenas
         // would wash out that homogeneity, so each arena gets its own
@@ -1629,6 +1658,33 @@ private:
     // Per-worker counters for the current tick (reset each tick)
     std::atomic<uint32_t> worker_pages_eligible_[kMaxCompressorWorkers]{};
     std::atomic<uint32_t> worker_pages_compressed_[kMaxCompressorWorkers]{};
+    // Lifetime totals per worker (balance diagnostics: smash_worker_balance_info).
+    uint64_t worker_total_compressed_[kMaxCompressorWorkers]{};
+    // Dynamic slices: each phase's range [0, slice_end_) is handed out in
+    // slices of slice_pages_ to whichever worker asks next (executePhase),
+    // instead of a static per-worker partition. With the partition, a heap
+    // whose live pages sat in one worker's eighth had that worker carry the
+    // phase while seven idled at the barrier. A slice is a multiple of the
+    // chunk and of kMaxWatchGroup (coarse watching needs a group inside one
+    // call), at least kSliceMinPages, and about 1/16 of a worker's share so
+    // the imbalance is bounded at a slice.
+    static constexpr size_t kSliceMinPages = 4096;   // 16 MiB
+    // A yt run's node past its first member is verified by sampling one page
+    // per kYtSampleStride with move_pages, at most kYtSampleMax per call
+    // (ytMarkItem).
+    static constexpr uint64_t kYtSampleStride = 64;  // 256 KiB
+    static constexpr size_t kYtSampleMax = 256;
+    std::atomic<size_t> slice_cursor_{0};
+    size_t slice_pages_ = kSliceMinPages;
+    size_t slice_end_ = 0;
+    // SMASH_TICK_PAGE_BUDGET: pages one tick may compress (0: no limit); the
+    // tick's count, the most any tick compressed, and the eligible pages the
+    // budget turned away (they stay cold and are offered next tick).
+    uint64_t cfg_tick_page_budget_ = 0;
+    std::atomic<uint64_t> tick_reserved_{0};     // budget slots taken this tick
+    std::atomic<uint64_t> tick_compressed_{0};   // pages stored this tick
+    std::atomic<uint64_t> tick_compressed_max_{0};
+    std::atomic<uint64_t> budget_turned_away_{0};
 
     // Exponential moving averages (fixed-point: multiply by 256 to avoid float)
     // EMA update: ema = ema + (sample - ema) / 4   (α = 1/4, ~4-tick response)
@@ -2161,6 +2217,7 @@ private:
         // Compression candidates, compressed in batches so each batch's
         // snapshots need no system call (makeReadableForSnapshot).
         size_t cmp[kCompressBatch];
+        int cmp_node[kCompressBatch];   // the node whose store takes the blob (-1: this worker's)
         size_t n_cmp = 0;
         const bool deferred_mode = isDeferredReclaimMode();
         auto flushCompress = [&] {
@@ -2168,7 +2225,7 @@ private:
             bool readable[kCompressBatch] = {};
             if (deferred_mode) makeReadableForSnapshot(cmp, n_cmp, readable);
             for (size_t k = 0; k < n_cmp; ++k) {
-                if (!compressPage(cmp[k], worker, readable[k])) continue;
+                if (!compressPageTo(cmp[k], worker, readable[k], cmp_node[k])) continue;
                 pages_compressed.fetch_add(1, std::memory_order_relaxed);
                 // Periodic flush so the pending list doesn't get too long
                 // and so the cap is never hit inside a hot inner loop.
@@ -2424,10 +2481,12 @@ private:
                 // Hand the page to its own node's group when that is not this
                 // worker. routeByNode also defers pages whose node is still
                 // unknown to the end-of-range batch below.
+                worker.last_route_node = -1;
                 const bool routed = routeByNode(worker, i, pages_compressed);
                 if (routed) {
                     ++n_routed;
                 } else {
+                    cmp_node[n_cmp] = worker.last_route_node;
                     cmp[n_cmp++] = i;
                     if (n_cmp == kCompressBatch) flushCompress();
                 }
@@ -2472,7 +2531,9 @@ private:
             return true;
         }
         if (node == worker.node) return false;
-        return enqueueForNode(node, i);
+        if (enqueueForNode(node, i)) return true;
+        worker.last_route_node = node;   // queue full or no group: the caller's page, that node's store
+        return false;
 #else
         return false;
 #endif
@@ -2500,14 +2561,19 @@ private:
         pcAdd(pc_.sc_nodeq_n, 1);
         pcAdd(pc_.nodeq_pages, n);
         size_t local[CompressWorker::kPendingNodeCap];
+        int local_node[CompressWorker::kPendingNodeCap];
         size_t n_local = 0;
         for (size_t k = 0; k < n; ++k) {
             const size_t page = worker.pending_node_pages[k];
             const int node = queried ? status[k] : -1;
             if (node >= 0 && static_cast<uint32_t>(node) < vm::kMaxNumaNodes && page_node_)
                 page_node_[page] = static_cast<uint8_t>(node + 1);
-            if (node < 0 || node == worker.node || !enqueueForNode(node, page))
+            if (node < 0 || node == worker.node || !enqueueForNode(node, page)) {
+                // Its own node's store when that node has a group and the
+                // queue was full; this worker's otherwise.
+                local_node[n_local] = (node >= 0 && node != worker.node) ? node : -1;
                 local[n_local++] = page;
+            }
         }
         // The pages this worker compresses itself (node unknown, its own, or
         // that node's queue full — common while a large backlog drains) go
@@ -2520,7 +2586,7 @@ private:
             bool readable[kCompressBatch] = {};
             if (deferred_mode) makeReadableForSnapshot(&local[b], cnt, readable);
             for (size_t k = 0; k < cnt; ++k) {
-                if (compressPage(local[b + k], worker, readable[k]))
+                if (compressPageTo(local[b + k], worker, readable[k], local_node[b + k]))
                     pages_compressed.fetch_add(1, std::memory_order_relaxed);
                 if (worker.pending_pn_count >= CompressWorker::kPendingProtCap / 2 ||
                     worker.pending_ro_count >= CompressWorker::kPendingProtCap / 2)
@@ -2539,9 +2605,14 @@ private:
         const size_t slot = g->queue_count.fetch_add(1, std::memory_order_relaxed);
         if (slot >= g->queue_capacity) {
             g->queue_count.store(g->queue_capacity, std::memory_order_relaxed);
+            // The caller compresses the page itself -- into this node's store
+            // (compressPageTo), never the shared one as before: a first cold
+            // wave past 256 MiB per node per tick put most blobs off-node.
+            pc_.numa_queue_full.fetch_add(1, std::memory_order_relaxed);
             return false;
         }
         g->queue[slot] = static_cast<uint32_t>(page_idx);
+        pc_.numa_queued.fetch_add(1, std::memory_order_relaxed);
         numa_queue_pending_.store(true, std::memory_order_release);
         return true;
     }
@@ -3026,6 +3097,16 @@ private:
             locks_->unlock(page_idx);
             return false;
         }
+        // SMASH_TICK_PAGE_BUDGET: a slot is reserved before the work (a
+        // check-then-compress let concurrent workers overshoot by one each);
+        // past the budget the page stays as it is, cold streak intact, and is
+        // offered again next tick.
+        if (cfg_tick_page_budget_ &&
+            tick_reserved_.fetch_add(1, std::memory_order_relaxed) >= cfg_tick_page_budget_) {
+            budget_turned_away_.fetch_add(1, std::memory_order_relaxed);
+            locks_->unlock(page_idx);
+            return false;
+        }
 
         // Mark as compressing
         states_->set(page_idx, PageState::COMPRESSING);
@@ -3192,6 +3273,7 @@ private:
 
         void* page_addr = vm_->pageAddress(page_idx);
         bool snapshot_via_mem = false;
+        bool scan_rw = false;   // a scanning tracker's ACTIVE page: PROT_RW, copied directly
         // External pages may have been untracked between state check and here
         if (!page_addr) {
             states_->set(page_idx, PageState::EMPTY);
@@ -3228,9 +3310,25 @@ private:
             // is copied directly: it is not writable, so a write faults and
             // waits on the lock held here, and nothing can land during the
             // copy — no /proc/self/mem read and no verify.
-            const bool direct = readable && st == PageState::ACTIVE_MONITORING;
+            // Under a scanning tracker (idle, yt) nothing is protected before
+            // compression: the page is ACTIVE and PROT_RW, and the pread
+            // bought nothing a memcpy does not (neither stops a write; Phase
+            // B's compare under PROT_READ catches one) at a mmap_lock and a
+            // page pin per call, twice per page: memread=709400 ms in one
+            // tick on a 128-core box. Copied directly, snapshot and verify.
+            // The page is announced in t_snapshot_page_plus1 for the one
+            // case it is not readable (an ACTIVE page an earlier reclaim
+            // left PROT_NONE, untouched since): the read faults and the
+            // handler makes it PROT_RW (handleFault).
+            scan_rw = scanTracker() && st == PageState::ACTIVE;
+            const bool direct = (readable && st == PageState::ACTIVE_MONITORING) || scan_rw;
             if (direct) {
+                if (scan_rw) {
+                    pc_.cp_direct.fetch_add(1, std::memory_order_relaxed);
+                    t_snapshot_page_plus1 = page_idx + 1;
+                }
                 __builtin_memcpy(worker.page_buf, page_addr, kPageSize);
+                t_snapshot_page_plus1 = 0;
             } else {
                 snapshot_via_mem = readPageViaMem(page_addr, worker.page_buf);
             }
@@ -3247,9 +3345,13 @@ private:
             // between our memcpy and the eventual PROT_NONE — the blob
             // would be stale and decompress-on-fault would silently revert
             // the writer's update. Re-read and compare; abort on mismatch.
-            if (!direct && fixavEnabled()) {
+            if ((!direct || scan_rw) && fixavEnabled()) {
                 alignas(64) uint8_t verify_buf[kPageSize];
-                if (!readPageViaMem(page_addr, verify_buf)) {
+                if (scan_rw) {
+                    t_snapshot_page_plus1 = page_idx + 1;
+                    __builtin_memcpy(verify_buf, page_addr, kPageSize);
+                    t_snapshot_page_plus1 = 0;
+                } else if (!readPageViaMem(page_addr, verify_buf)) {
                     // The page must be readable here; the fallback above made it so.
                     if (!vm::protectPages(page_addr, kPageSize, true, true)) {
                         states_->set(page_idx, PageState::ACTIVE);
@@ -3589,6 +3691,7 @@ private:
             compressed_[page_idx].set(stored, comp_size, alloc_size, algo);
         }
         pc_.cp_stored.fetch_add(1, std::memory_order_relaxed);
+        tick_compressed_.fetch_add(1, std::memory_order_relaxed);
         if (page_tier_) {
             page_tier_[page_idx] = is_fast_tier ? kTierFast : kTierDeep;
         }
@@ -3603,7 +3706,7 @@ private:
             // Still PROT_NONE (escalated): made readable in a batch by the
             // caller's flush. If the list is full the page just stays
             // PROT_NONE — a read then faults and drops the blob, which is safe.
-            if (snapshot_via_mem && worker.pending_ro_count < CompressWorker::kPendingProtCap)
+            if ((snapshot_via_mem || scan_rw) && worker.pending_ro_count < CompressWorker::kPendingProtCap)
                 worker.pending_ro_pages[worker.pending_ro_count++] = page_idx;
         } else {
             // P2 chunking: batch the mprotect(PROT_NONE) of just-compressed
@@ -4112,6 +4215,7 @@ private:
         // in tests), fall back to single-threaded execution.
         int nw = active_workers_;
         bool helpers_active = running_.load(std::memory_order_relaxed) && nw > 1;
+        slice_cursor_.store(0, std::memory_order_relaxed);
         if (helpers_active) {
             current_phase_ = phase;
             helpers_pending_.store(static_cast<uint32_t>(nw - 1), std::memory_order_relaxed);
@@ -4141,15 +4245,22 @@ private:
     void executePhase(int phase, int worker_id) {
         PhaseClocks clocks(pc_, phase);
         auto& w = workers_[worker_id];
-        if (phase == 1) {
-            phase1Range(w.range_start, w.range_end);
-        } else if (phase == 2) {
-            phase2Range(w, worker_pages_eligible_[worker_id],
-                        worker_pages_compressed_[worker_id], w.range_start, w.range_end);
-        } else if (phase == 3) {
-            phase3Range(w.range_start, w.range_end);
-        } else if (phase == 4) {
-            reclaimShadowRange(w.range_start, w.range_end);
+        const size_t end = std::min(slice_end_, w.range_end);
+        const size_t step = slice_pages_ ? slice_pages_ : kSliceMinPages;
+        for (;;) {
+            const size_t a = slice_cursor_.fetch_add(step, std::memory_order_relaxed);
+            if (a >= end) break;
+            const size_t b = std::min(end, a + step);
+            if (phase == 1) {
+                phase1Range(a, b);
+            } else if (phase == 2) {
+                phase2Range(w, worker_pages_eligible_[worker_id],
+                            worker_pages_compressed_[worker_id], a, b);
+            } else if (phase == 3) {
+                phase3Range(a, b);
+            } else if (phase == 4) {
+                reclaimShadowRange(a, b);
+            }
         }
     }
 
@@ -4170,6 +4281,7 @@ private:
 
     // The store a worker's blobs go to: its node's store, or the shared one.
     CompressStore* workerStore(const CompressWorker& worker) const {
+        if (worker.route_store) return worker.route_store;
         return worker.store ? worker.store : store_;
     }
 
@@ -4198,8 +4310,38 @@ private:
     // Record which store took the blob (0 = the shared store).
     void noteBlobStore(size_t page_idx, const CompressWorker& worker) {
         if (!blob_node_) return;
+        if (worker.route_store && worker.route_node >= 0) {
+            blob_node_[page_idx] = static_cast<uint8_t>(worker.route_node + 1);
+            return;
+        }
         blob_node_[page_idx] = (worker.store && worker.node >= 0)
             ? static_cast<uint8_t>(worker.node + 1) : 0;
+    }
+    // The store of `node`'s group, for a page that node's queue could not
+    // take this tick; nullptr when the node has no running group.
+    CompressStore* nodeStoreFor(int node) const {
+#if defined(__linux__)
+        if (node < 0 || static_cast<uint32_t>(node) >= numa_node_limit_) return nullptr;
+        NodeGroup* g = node_groups_[node];
+        return (g && g->threads_running > 0) ? g->store : nullptr;
+#else
+        (void)node;
+        return nullptr;
+#endif
+    }
+    // compressPage for a page routed to `node` whose queue was full: the blob
+    // goes to that node's store. `node` < 0 is this worker's ordinary call.
+    bool compressPageTo(size_t page_idx, CompressWorker& worker, bool readable, int node) {
+        CompressStore* dst = node >= 0 ? nodeStoreFor(node) : nullptr;
+        if (dst && dst != worker.store) {
+            worker.route_store = dst;
+            worker.route_node = node;
+            pc_.numa_queue_full_routed.fetch_add(1, std::memory_order_relaxed);
+        }
+        const bool ok = compressPage(page_idx, worker, readable);
+        worker.route_store = nullptr;
+        worker.route_node = -1;
+        return ok;
     }
 
     // The faulting thread is about to place this page: a restore allocates it
@@ -5895,19 +6037,71 @@ private:
             for (uint64_t x = s; x < e; x += kPageSize) ytMarkPage((x - base) / kPageSize);
             return 0;
         }
-        // The node is exact for a single item and for a run's first member;
-        // past that only a guess.
-        const uint64_t exact_end = (w & yt::kItemRun)
-            ? addr + (uint64_t{1} << ((w & yt::kItemSizeMask) >> yt::kItemSizeShift)) * kPageSize
-            : e;
-        const uint8_t h = static_cast<uint8_t>(node + 1);
+        // The node is exact for a single item and for a run's first member:
+        // the module keys a run by size and class, not node, and reports the
+        // first page's. Past the first member it used to be a guess that
+        // filled every unhinted page, and a hinted page is never queried:
+        // two 16 MiB blocks first touched on different nodes, adjacent in
+        // the arena, came back as one run, every page of the second was
+        // hinted with the first's node, and 0 of its 4096 blobs landed on
+        // its node (test_numa_compressor_yt_hints on claudepc). The rest of
+        // a run is checked instead: one move_pages of one page per
+        // kYtSampleStride (and the run's last page), each sample exact, and
+        // the pages between two samples take their node only when the two
+        // agree; those between samples that do not stay unknown for Phase
+        // 2's batch query, which asks about every page. Cost 1/64 of that
+        // batch, resolution 64 pages: a node change and back inside 64
+        // pages still mishints, and costs locality, never correctness.
+        const uint64_t member_pages = (w & yt::kItemRun)
+            ? uint64_t{1} << ((w & yt::kItemSizeMask) >> yt::kItemSizeShift) : n;
+        const uint64_t exact_end = std::min(e, addr + member_pages * kPageSize);
         uint64_t hinted = 0;
-        for (uint64_t x = s; x < e; x += kPageSize) {
-            const size_t i = (x - base) / kPageSize;
-            if (!ytMarkPage(i) || page_node_[i] == h) continue;
-            if (x >= exact_end && page_node_[i] != 0) continue;
-            page_node_[i] = h;
-            ++hinted;
+        auto hint = [&](uint64_t from, uint64_t to, int nd, bool exact) {
+            if (nd < 0 || static_cast<uint64_t>(nd) >= numa_node_limit_) return;
+            const uint8_t h = static_cast<uint8_t>(nd + 1);
+            for (uint64_t x = from; x < to; x += kPageSize) {
+                const size_t i = (x - base) / kPageSize;
+                if (!ytMarkPage(i) || page_node_[i] == h) continue;
+                if (!exact && page_node_[i] != 0) continue;
+                page_node_[i] = h;
+                ++hinted;
+            }
+        };
+        hint(s, exact_end, static_cast<int>(node), true);
+        // The rest of the run: accessed in any case, hinted only as verified.
+        // An item that starts below the arena (s > addr) has its first member,
+        // and maybe more, outside it.
+        const uint64_t rest = std::max(s, exact_end);
+        for (uint64_t x = rest; x < e; x += kPageSize) ytMarkPage((x - base) / kPageSize);
+        if (rest >= e) return hinted;
+        const uint64_t stride = std::max<uint64_t>(member_pages, kYtSampleStride) * kPageSize;
+        const uint64_t last = e - kPageSize;
+        // The node of the page before `seg`: the first member's when it is
+        // inside the arena, else unknown until the first sample.
+        int prev_node = exact_end >= s ? static_cast<int>(node) : -1;
+        for (uint64_t seg = rest; seg < e;) {
+            void* addrs[kYtSampleMax];
+            int status[kYtSampleMax];
+            size_t cnt = 0;
+            uint64_t pos = seg;
+            do {
+                pos = std::min(pos + stride, last);
+                addrs[cnt] = reinterpret_cast<void*>(pos);
+                status[cnt++] = -1;
+            } while (cnt < kYtSampleMax && pos < last);
+            const uint64_t q0 = monoNs();
+            const bool queried = syscall(SYS_move_pages, 0, cnt, addrs, nullptr, status, 0) == 0;
+            pcAdd(pc_.sc_nodeq_us, (monoNs() - q0) / 1000);
+            pcAdd(pc_.sc_nodeq_n, 1);
+            pcAdd(pc_.nodeq_pages, cnt);
+            for (size_t k = 0; k < cnt; ++k) {
+                const uint64_t at = reinterpret_cast<uint64_t>(addrs[k]);
+                const int nd = queried ? status[k] : -1;
+                if (nd >= 0 && nd == prev_node) hint(seg, at, nd, false);
+                hint(at, at + kPageSize, nd, true);
+                prev_node = nd;
+                seg = at + kPageSize;
+            }
         }
         return hinted;
     }
@@ -6887,22 +7081,31 @@ private:
             worker_pages_compressed_[w].store(0, std::memory_order_relaxed);
         }
 
-        // Partition page range across active workers.
-        // If helpers are not running, worker 0 gets the entire range.
-        bool helpers_active = running_.load(std::memory_order_relaxed) && nw > 1;
-        if (helpers_active) {
-            size_t per_worker = committed / nw;
-            // Coarse watching needs every group inside one worker's range.
-            if (watch_group_ > 1) per_worker = (per_worker + kMaxWatchGroup - 1) & ~(kMaxWatchGroup - 1);
-            for (int w = 0; w < nw; ++w) {
-                const size_t a = std::min(committed, w * per_worker);
-                const size_t b = std::min(committed, (w + 1) * per_worker);
-                workers_[w].range_start = a;
-                workers_[w].range_end = (w == nw - 1) ? committed : b;
-            }
-        } else {
-            workers_[0].range_start = 0;
-            workers_[0].range_end = committed;
+        // The page range is handed out in slices to whichever worker asks
+        // next (executePhase), not partitioned statically: see slice_pages_.
+        {
+            const size_t share = committed / static_cast<size_t>(nw > 0 ? nw : 1);
+            size_t sl = std::max(kSliceMinPages, share / 16);
+            // A scanning tracker's slice (1 << sliceShift(): 128 MiB for yt
+            // at the default buffer) must sit inside one phase slice, or the
+            // slice edge cuts the request: 9216-page slices made 7399-page yt
+            // requests of a 32768-page slice (test_yt_tracker_slices).
+            size_t align = std::max<size_t>(kChunkSize, kMaxWatchGroup);
+            if (scanTracker()) align = std::max(align, size_t{1} << sliceShift());
+            sl = (sl + align - 1) & ~(align - 1);
+            slice_pages_ = sl;
+            slice_end_ = committed;
+        }
+        for (int w = 0; w < nw; ++w) {
+            workers_[w].range_start = 0;
+            workers_[w].range_end = committed;
+        }
+        // The tick's compression budget starts afresh.
+        {
+            tick_reserved_.store(0, std::memory_order_relaxed);
+            const uint64_t last = tick_compressed_.exchange(0, std::memory_order_relaxed);
+            if (last > tick_compressed_max_.load(std::memory_order_relaxed))
+                tick_compressed_max_.store(last, std::memory_order_relaxed);
         }
 #if defined(__linux__)
         { StepTimer st(pc_, kStepNodeChunks); assignNodeChunks(committed); }
@@ -7095,7 +7298,9 @@ private:
         uint32_t total_compressed = 0;
         for (int w = 0; w < nw; ++w) {
             total_eligible += worker_pages_eligible_[w].load(std::memory_order_relaxed);
-            total_compressed += worker_pages_compressed_[w].load(std::memory_order_relaxed);
+            const uint32_t c = worker_pages_compressed_[w].load(std::memory_order_relaxed);
+            total_compressed += c;
+            worker_total_compressed_[w] += c;
         }
 
         // Per-worker throughput (avoid division by zero)
@@ -7797,6 +8002,8 @@ public:
         cfg_test_tick_delay_ms_ = v ? std::atoi(v) : 0;
         v = std::getenv("SMASH_TEST_NO_MEM_SNAPSHOT");
         cfg_test_no_mem_snapshot_ = v && v[0] == '1';
+        v = std::getenv("SMASH_TICK_PAGE_BUDGET");
+        cfg_tick_page_budget_ = v ? static_cast<uint64_t>(std::max(0LL, std::atoll(v))) : 0;
         v = std::getenv("SMASH_VMA_MARGIN");
         cfg_vma_margin_ = v ? std::atol(v) : 8192L;
         v = std::getenv("SMASH_SPILL");
@@ -8413,7 +8620,19 @@ public:
         // runs on that same thread; calling locks_->lock(page_idx)
         // would self-deadlock on the non-recursive spinlock.  Detect
         // and bail so the SIGSEGV propagates with a real backtrace.
-        if (locks_->heldByThisThread(page_idx)) return false;
+        if (locks_->heldByThisThread(page_idx)) {
+            // The worker's own direct snapshot read (t_snapshot_page_plus1)
+            // of a page that is not readable: make it so and let the read
+            // run. Loosening protection under the lock cannot fault anyone.
+            if (t_snapshot_page_plus1 == page_idx + 1) {
+                void* page_addr = vm_->pageAddress(page_idx);
+                if (page_addr && vm::protectPages(page_addr, kPageSize, true, true)) {
+                    pc_.cp_direct_faults.fetch_add(1, std::memory_order_relaxed);
+                    return true;
+                }
+            }
+            return false;
+        }
 
         locks_->lock(page_idx);
 
@@ -8648,6 +8867,31 @@ public:
     // What a tick's bookkeeping read (diagnostic; smash_tick_cost_info):
     // page bits the deferred-madvise sweep scanned, pages read through
     // /proc/self/mem for snapshots, and ticks run.
+    void tickBudgetCounters(uint64_t* budget, uint64_t* max_per_tick, uint64_t* turned_away) const {
+        *budget = cfg_tick_page_budget_;
+        const uint64_t cur = tick_compressed_.load(std::memory_order_relaxed);
+        const uint64_t mx = tick_compressed_max_.load(std::memory_order_relaxed);
+        *max_per_tick = std::max(cur, mx);
+        *turned_away = budget_turned_away_.load(std::memory_order_relaxed);
+    }
+    void workerBalance(uint64_t* total, uint64_t* max_one, uint32_t* workers) const {
+        uint64_t t = 0, m = 0;
+        for (int w = 0; w < kMaxCompressorWorkers; ++w) {
+            t += worker_total_compressed_[w];
+            m = std::max(m, worker_total_compressed_[w]);
+        }
+        *total = t; *max_one = m; *workers = static_cast<uint32_t>(active_workers_);
+    }
+    void numaRouteCounters(uint64_t* queued, uint64_t* queue_full) const {
+        *queued = pc_.numa_queued.load(std::memory_order_relaxed);
+        *queue_full = pc_.numa_queue_full.load(std::memory_order_relaxed);
+    }
+    void snapshotCounters(uint64_t* direct, uint64_t* direct_faults, uint64_t* via_mem) const {
+        *direct = pc_.cp_direct.load(std::memory_order_relaxed);
+        *direct_faults = pc_.cp_direct_faults.load(std::memory_order_relaxed);
+        *via_mem = pc_.sc_memread_n.load(std::memory_order_relaxed);
+    }
+    const char* trackerName() const { return writeTrackerName(write_tracker_); }
     void tickCost(uint64_t* sweep_pages, uint64_t* memread_calls, uint64_t* ticks) const {
         *sweep_pages = pc_.sweep_scan_pages.load(std::memory_order_relaxed);
         *memread_calls = pc_.sc_memread_n.load(std::memory_order_relaxed);

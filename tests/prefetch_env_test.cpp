@@ -45,6 +45,10 @@ size_t resident(const unsigned char* p) {
 }
 
 int child() {
+    // Flushed at once: a child that exits without reporting (it has, as root
+    // in the full suite; see test_codec_env) is placed before or after main.
+    std::printf("child: pid %d started\n", static_cast<int>(getpid()));
+    std::fflush(stdout);
     auto* b = static_cast<unsigned char*>(malloc(kLen));
     for (size_t p = 0; p < kPages; ++p)
         for (size_t i = 0; i < kPage; ++i) b[p * kPage + i] = want(p, i);

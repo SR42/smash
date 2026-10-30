@@ -2157,6 +2157,17 @@ public:
             return nullptr;
         }
         size_t old_size = blockSize(sp);
+        // In place when it can be: a large block shrinks by releasing its
+        // tail, grows into free pages behind it, or just changes size within
+        // its pages (LargeAlloc::resizeInPlace); a small or mid block stays
+        // where it is when the new size fits and uses more than half of it.
+        // Every realloc used to be malloc + memcpy + free, so shrinking a
+        // 1 GiB block to 512 MiB copied 512 MiB and briefly held 1.5 GiB.
+        if (sp->is_large) {
+            if (large_alloc_.resizeInPlace(sp, size)) return old_ptr;
+        } else if (size <= old_size && size * 2 > old_size) {
+            return old_ptr;
+        }
         void* new_ptr = this->malloc(size);
         if (new_ptr) {
             __builtin_memcpy(new_ptr, old_ptr, old_size < size ? old_size : size);
@@ -2266,6 +2277,28 @@ public:
     void sharedArenaInfo(size_t* used, size_t* free_pages) {
         vm_region_.sharedArenaInfo(used, free_pages);
     }
+    bool snapshotInfo(uint64_t* direct, uint64_t* direct_faults, uint64_t* via_mem) const {
+        if (!compression_inited_) return false;
+        compressor_.snapshotCounters(direct, direct_faults, via_mem);
+        return true;
+    }
+    const char* writeTrackerName() const { return compression_inited_ ? compressor_.trackerName() : "none"; }
+    bool tickBudgetInfo(uint64_t* budget, uint64_t* max_per_tick, uint64_t* turned_away) const {
+        if (!compression_inited_) return false;
+        compressor_.tickBudgetCounters(budget, max_per_tick, turned_away);
+        return true;
+    }
+    bool workerBalanceInfo(uint64_t* total, uint64_t* max_one, uint32_t* workers) const {
+        if (!compression_inited_) return false;
+        compressor_.workerBalance(total, max_one, workers);
+        return true;
+    }
+    bool numaRouteInfo(uint64_t* queued, uint64_t* queue_full) const {
+        if (!compression_inited_) return false;
+        compressor_.numaRouteCounters(queued, queue_full);
+        return true;
+    }
+
     bool tickCostInfo(uint64_t* sweep_pages, uint64_t* memread_calls, uint64_t* ticks) const {
         if (!compression_inited_) return false;
         compressor_.tickCost(sweep_pages, memread_calls, ticks);

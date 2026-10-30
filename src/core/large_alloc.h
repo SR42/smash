@@ -5,6 +5,10 @@
 // direct mmap for oversized alignments or when the VmRegion is full.
 #pragma once
 
+#if defined(__linux__)
+#include <sys/mman.h>   // mremap
+#endif
+
 #include "smash/config.h"
 #include "span.h"
 #include "page_map.h"
@@ -314,6 +318,56 @@ public:
     }
 #endif
 
+    // realloc: resize `span`'s block where it is. Shrinking by whole pages
+    // releases the tail the way a free would (release hook, sub-arena, run
+    // cache, decommit queue -- or munmap outside the arena); growing takes
+    // the pages behind the block if they are free (VmRegion::tryExtendRun,
+    // or an in-place mremap outside the arena); a size that fits the pages
+    // the block has just changes its size. False, with nothing changed, when
+    // the block cannot be resized where it is: the caller copies, as every
+    // realloc of a smash block used to.
+    bool resizeInPlace(Span* span, size_t new_size) {
+        const size_t new_bytes = roundUp(new_size, kPageSize);
+        if (new_bytes < new_size || new_bytes / kPageSize > UINT32_MAX) return false;
+        const uint32_t new_pages = static_cast<uint32_t>(new_bytes / kPageSize);
+        const uint32_t old_pages = span->page_count;
+        auto* base = static_cast<char*>(span->base);
+        const bool arena = vm_region_ && vm_region_->inContigArena(reinterpret_cast<uintptr_t>(base));
+        if (new_pages == old_pages) {
+            span->large_size = new_size;
+            return true;
+        }
+        if (new_pages < old_pages) {
+            if (arena && vm_region_->runIsChunkBig(base)) return false;
+            if (arena) releaseArenaRun(base + size_t{new_pages} * kPageSize, old_pages - new_pages);
+            else vm::unmapPages(base + size_t{new_pages} * kPageSize, size_t{old_pages - new_pages} * kPageSize);
+            span->page_count = new_pages;
+            span->large_size = new_size;
+            return true;
+        }
+        const uint32_t extra = new_pages - old_pages;
+        if (arena) {
+            if (!vm_region_->tryExtendRun(base, old_pages, extra)) return false;
+            if (page_states_) {
+                const size_t idx = vm_region_->pageIndex(reinterpret_cast<uintptr_t>(base));
+                for (uint32_t p = old_pages; p < new_pages; ++p)
+                    page_states_->set(idx + p, PageState::ACTIVE);
+            }
+        } else {
+#if defined(__linux__)
+            // In place only: a moved mapping would need the page map and
+            // the span re-pointed, which the copy path already does.
+            void* r = mremap(base, size_t{old_pages} * kPageSize, new_bytes, 0);
+            if (r == MAP_FAILED || r != base) return false;
+#else
+            return false;
+#endif
+        }
+        span->page_count = new_pages;
+        span->large_size = new_size;
+        return true;
+    }
+
     void deallocate(Span* span) {
         void* base = span->base;
         size_t num_pages = span->page_count;
@@ -333,26 +387,28 @@ public:
         // later re-mints as base_+idx*kPageSize — past the arena end (#84).
         // Only pages actually placed in the contiguous arena go back to it.
         if (vm_region_ && vm_region_->inContigArena(reinterpret_cast<uintptr_t>(base))) {
-            bool reusable = true;   // no compressor: nothing ever changed protection
-            if (release_hook_) {
-                size_t idx = vm_region_->pageIndex(reinterpret_cast<uintptr_t>(base));
-                reusable = release_hook_(idx, num_pages, release_ctx_);
-            }
-            // A run with no compressed page may be parked for reuse by this
-            // CPU (SMASH_RUN_CACHE_MIB); anything else goes the ordinary way,
-            // which restores protection and decommits.
-            // A never-compressed run of a sub-arena chunk goes straight back
-            // to its sub-arena, dirty (SMASH_SUBARENAS); otherwise the per-CPU
-            // run cache may park it (SMASH_RUN_CACHE_MIB); anything else goes
-            // the ordinary way, which restores protection and decommits.
-            if (!(reusable && vm_region_->freeRunDirty(base, num_pages)) &&
-                !vm_region_->cacheFreedRun(base, num_pages, reusable))
-                vm_region_->releasePages(base, num_pages, reusable);
+            releaseArenaRun(base, num_pages);
         } else {
             vm::unmapPages(base, num_pages * kPageSize);
         }
 
         recycleSpanDescriptor(span);
+    }
+
+    // An arena run of a freed block, or the tail a realloc shrank off one.
+    void releaseArenaRun(void* base, size_t num_pages) {
+        bool reusable = true;   // no compressor: nothing ever changed protection
+        if (release_hook_) {
+            size_t idx = vm_region_->pageIndex(reinterpret_cast<uintptr_t>(base));
+            reusable = release_hook_(idx, num_pages, release_ctx_);
+        }
+        // A never-compressed run of a sub-arena chunk goes straight back
+        // to its sub-arena, dirty (SMASH_SUBARENAS); otherwise the per-CPU
+        // run cache may park it (SMASH_RUN_CACHE_MIB); anything else goes
+        // the ordinary way, which restores protection and decommits.
+        if (!(reusable && vm_region_->freeRunDirty(base, num_pages)) &&
+            !vm_region_->cacheFreedRun(base, num_pages, reusable))
+            vm_region_->releasePages(base, num_pages, reusable);
     }
 
     size_t getSize(Span* span) const {

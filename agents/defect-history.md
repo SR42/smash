@@ -1064,3 +1064,158 @@ run. `test_exit_drain`: a child compresses 1.5 GiB (364 314 pages), registers
 an `atexit` handler that reads 1 MiB of it back, and exits; the time from its
 "exiting" line to its end must be under 1 s and the handler must have seen
 the right bytes. 19 ms now; 2281 ms with the drain.
+
+## A thread waiting for a page lock spun for as long as the holder held it (fixed 2026-10-29)
+
+`PageLockTable` was a test-and-set byte per page spun on without bound, and
+the threads that wait on it are faulting application threads: whoever reads a
+page while another thread restores it, every thread when a worker holds the
+lock in the non-deferred mode, 128 readers of one hot page as it comes back.
+A holder stalled for a second (a `pwrite` through `/proc/self/mem` waiting
+on reclaim, a `move_pages`, a debugger) cost a CPU per waiter for that
+second. The byte is now three-state (free, held, held with a parked waiter)
+and a waiter read-spins for about 20 µs -- longer than a restore -- then
+parks on a futex: 1024 hashed wait words (`util/park.h`), the word read
+before the byte is marked 2, so an unlock in between (which sees the 2,
+bumps the word and wakes everyone on it) makes the sleep return at once;
+colliding waiters wake spuriously and re-check. The fault-slot scan also
+starts at a rotating offset instead of slot 0, where every concurrent fault
+used to collide. `test_page_lock_park`: 16 threads waiting out a 1 s hold
+cost 0.01 s of CPU and run 1 ms after the release; the library before,
+5.21 s of CPU on 8 CPUs.
+
+## Under the idle and yt trackers every snapshot was two reads through /proc/self/mem (fixed 2026-10-29)
+
+`compressPage` read a candidate page through `/proc/self/mem` so that a
+watched page (PROT_READ, or PROT_NONE after escalation) could be copied
+without an `mprotect`, and read it that way again to verify the copy. Under
+a scanning tracker (`SMASH_WRITE_TRACK=idle|yt`) nothing is ever protected
+before compression: the page is ACTIVE and PROT_RW, the pread stopped no
+write a memcpy would not have (the shadow window's content compare under
+PROT_READ, Phase B, is what catches one in every mode), and each pread took
+`mmap_lock` and pinned the page -- `memread=709400 ms` in one tick on the
+128-core box, two per page. The batch that makes protread candidates
+readable for a direct copy never applied, since it keys on
+ACTIVE_MONITORING, which only Phase 3 sets and Phase 3 is skipped under a
+scanning tracker. A scanning tracker's ACTIVE page is now copied directly,
+snapshot and verify, and the page is still queued for the shadow window's
+PROT_READ. The one page a worker cannot read directly is an ACTIVE page an
+earlier reclaim left PROT_NONE and nothing touched since (idle, so a
+candidate): the worker announces the page it is copying
+(`t_snapshot_page_plus1`), and the handler, which used to treat a fault from
+the thread holding the page's own lock as a state-machine error, makes that
+page PROT_RW and lets the read run. `test_idle_direct_snapshot` (root): 0
+reads for 16 384 pages, 16 PROT_NONE pages resolved through the handler;
+the keep-pread mutant reads twice per page.
+
+## An ordinary page whose node queue was full had its blob stored off-node (fixed 2026-10-29)
+
+Phase 2 hands each eligible ordinary-heap page to its node's compressor group
+through a per-node queue of 64K entries (256 MiB) per tick. When the queue
+was full `enqueueForNode` returned false, indistinguishable from "no group",
+and the routing worker compressed the page itself into the SHARED store: the
+blob landed on whatever node that worker ran on and stayed there for as long
+as the page stayed compressed, and nothing counted the overflow. The first
+cold wave of a large process (512 GiB on the 128-core box) overflows every
+node's queue every tick, so most of its blobs were off-node. The routing
+worker still compresses an overflowed page itself, but into the page's own
+node's store (`compressPageTo` sets `route_store`/`route_node` around the
+call; `workerStore` and `noteBlobStore` honour them), so blob placement no
+longer depends on queue capacity; `smash_numa_route_info` counts queued
+pages and queue-full events. `test_numa_queue_overflow` (two nodes, workers
+pinned to node 0, 512 MiB first-touched on node 1): 0 of 131072 blobs
+off-node; the shared-store mutant 65536, exactly the overflow.
+
+## A yt run's node was guessed for every member (fixed 2026-10-29)
+
+With `SMASH_YT_NODE_HINTS=1` a youngtrace scan sets `page_node_` from each
+item's node bits. The module keys a run (consecutive present pages of one
+size) by size and class only and reports the first page's node, so past the
+first member the node was a guess, and `ytMarkItem` filled every unhinted
+page of the run with it. A hinted page is never queried, so the guess stuck:
+two 16 MiB blocks first touched on nodes 0 and 1, adjacent in the arena, came
+back as one 8192-page run, every page of the second was hinted node 0, and 0
+of its 4096 blobs landed on its node ("16384 pages hinted, 0 move_pages
+queries"; `test_numa_compressor_yt_hints` failed on claudepc from 2026-10-26,
+passing once when the blocks were not one run). Fix: the rest of a run is
+checked with one `move_pages` call per run (at most 256 pages a call) over
+one page per 64 (`kYtSampleStride`, or per member when members are larger)
+and the run's last page; each sample is exact, the pages between two samples
+take their node only when both agree, and the pages between two that
+disagree stay unknown for Phase 2's batch query. Cost 1/64 of that batch;
+samples count under `node_query=`. Verified as root on claudepc, three runs
+each: fixed 319 pages queried of 8192 and every blob on its node; the
+`yt-run-guess` mutant fails all three as before. Resolution 64 pages: a node
+change and back inside 64 pages still mishints, costing locality only.
+
+## Static per-worker ranges and no tick budget (fixed 2026-10-29)
+
+Each phase split the committed range into one static slice per active
+worker (`committed / nw`). A heap whose live pages sat in one worker's slice
+-- the usual shape after a large free, or any live set at the bottom of a
+512 GiB arena -- was scanned, compressed, monitored and reclaimed by that one
+thread while the others idled at the barrier; `performance.md` records ticks
+of 724 s and 1448 s on the 128-core box. `dispatch()` now resets a slice
+cursor and `executePhase` takes slices of `slice_pages_` (16 MiB, or a
+sixteenth of a worker's share, chunk- and watch-group-aligned, and under a
+scanning tracker a multiple of its scan slice too) until the
+range is spent, so the imbalance is bounded at one slice; the per-phase
+range functions were already self-contained per call (their flushes run at
+the end of each). `test_worker_balance`: four workers, 128 MiB live at the
+bottom of 1 GiB: 25 % each, against 100 % on worker 0 with one slice per
+worker. The first version aligned slices to the chunk only, and a slice edge
+cut every yt request (Phase 1 asks the module about the due scan slices
+inside its range): `test_yt_tracker_slices` as root on claudepc, one worker,
+147456 pages committed, got 9216-page slices and 7399-page requests of a
+32768-page scan slice. A phase slice is now also a multiple of
+`1 << sliceShift()` under `idle` and `yt`. And a tick compressed everything
+eligible, however much:
+`SMASH_TICK_PAGE_BUDGET=N` reserves a slot per page before the work
+(`tick_reserved_`; a check-then-compress overshot by one per concurrent
+worker) and turns the rest away cold for the next tick; `test_tick_budget`:
+at most 1000 of 2048 per tick, against 2048 without. Still open from the
+same finding: the node groups and the default workers split the heap by
+ownership (node arena chunks against everything else), so when nearly all
+memory is node-bound the default workers only route in phase 2, and when
+none is the groups only drain their queues in phase 5; the worker cap
+(`kMaxCompressorWorkers`, `SMASH_MAX_COMPRESSOR_WORKERS` at build time) is
+unchanged.
+
+## realloc always copied (fixed 2026-10-29)
+
+`SmashHeap::realloc` of any smash-owned block was malloc + memcpy + free,
+whatever the sizes: shrinking a 1 GiB block to 512 MiB copied 512 MiB and
+held 1.5 GiB until the free, growing a buffer copied it however much free
+room followed it, and realloc to the same size copied too. In place now
+(strictly less memory than before: the copy's second block never exists). A
+large block: a new size within its pages just changes `large_size`; fewer
+pages release the tail exactly as a free would (`LargeAlloc::releaseArenaRun`,
+factored out of `deallocate`: release hook, sub-arena dirty run, run cache,
+decommit queue; `munmap` outside the arena), except for a block larger than
+a sub-arena chunk, whose release returns whole chunks (`runIsChunkBig`:
+copy path); more pages are taken from behind the block when they are free
+(`VmRegion::tryExtendRun`: the shared arena's bump pointer by CAS, a free
+run of the shared map, a sub-arena chunk's unused tail or one of its dirty
+or clean runs under the sub-arena's lock, never across a chunk boundary or
+in a node arena; `mremap` in place outside the arena), and set ACTIVE. A
+small or mid block stays where it is when the new size fits and uses more
+than half of it. `test_realloc_{large_only,subarenas,full}`: same pointer
+for the in-place cases, the data intact, the tail's pages back in the arena;
+the library before moved every one.
+
+The first version of `tryExtendRun`'s bump-pointer path moved `next_page_`
+and nothing else; `allocatePages` also calls `ensureCommitted`, and
+`kCommitChunkPages` is 0, so the commit watermark is exactly the bump
+pointer. The grown tail sat above it, PROT_NONE: every first touch faulted
+and the handler's ACTIVE path made the page PROT_RW, so nothing showed --
+until the next fresh allocation's `ensureCommitted` swept `mprotect(PROT_RW)`
+from the old watermark over the tail, whose pages were by then compressed and
+dropped. Reads returned zeros without a fault (state still COMPRESSED), writes
+landed on memory the compressor owned and were lost at the next drop, and a
+later restore brought the old blob back. Found by
+`test_integrity_stress_small_heap` as root on claudepc, 1 run of 13: 21 wrong
+units, all in 51-87 of one block, grown at round 18432 (the test reallocs
+every 512 rounds), zeros first, then versions behind. The path now commits
+the tail like `allocatePages`; `test_realloc_commit` reads the compressed,
+dropped tail back after a 1 MiB malloc: intact, against 1024 zero pages with
+the line removed.

@@ -44,6 +44,7 @@ namespace smash {
 class PageRunMap {
 public:
     void forkLocks(ForkLockSet& s) { s.add(lock_); }
+    Spinlock& lock() { return lock_; }   // for the *Unlocked walkers
     static constexpr size_t kNone = ~size_t{0};
     // Owners: 0 shared, 1..kMaxNumaNodes the node arenas, then the
     // sub-arenas' dirty/clean pairs (vm_region.h), which must not alias a

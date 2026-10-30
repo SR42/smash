@@ -754,6 +754,58 @@ if(NOT APPLE)
     "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=1" "SMASH_COLD_TIMEOUT_SEC=1"
     "SMASH_DEFER_PHASES_MS=0" $<TARGET_FILE:tick_scan_test>)
   set_tests_properties(test_tick_scan PROPERTIES TIMEOUT 120)
+
+  add_executable(page_lock_park_test page_lock_park_test.cpp)
+  target_link_libraries(page_lock_park_test PRIVATE ${CMAKE_DL_LIBS} Threads::Threads)
+  add_test(NAME test_page_lock_park COMMAND ${CMAKE_COMMAND} -E env
+    "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=1" "SMASH_COLD_TIMEOUT_SEC=1"
+    "SMASH_DEFER_PHASES_MS=0" $<TARGET_FILE:page_lock_park_test>)
+  set_tests_properties(test_page_lock_park PROPERTIES TIMEOUT 120)
+
+  # Root only (CAP_SYS_ADMIN for the idle bitmap): skips otherwise.
+  add_executable(idle_direct_snapshot_test idle_direct_snapshot_test.cpp)
+  target_link_libraries(idle_direct_snapshot_test PRIVATE ${CMAKE_DL_LIBS})
+  add_test(NAME test_idle_direct_snapshot COMMAND ${CMAKE_COMMAND} -E env
+    "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=1" "SMASH_WRITE_TRACK=idle"
+    "SMASH_COLD_TIMEOUT_SEC=1" "SMASH_DEFER_PHASES_MS=0" $<TARGET_FILE:idle_direct_snapshot_test>)
+  set_tests_properties(test_idle_direct_snapshot PROPERTIES TIMEOUT 300)
+
+  # Two memory nodes with CPUs: skips otherwise.
+  add_executable(numa_queue_overflow_test numa_queue_overflow_test.cpp)
+  target_link_libraries(numa_queue_overflow_test PRIVATE ${CMAKE_DL_LIBS})
+  add_test(NAME test_numa_queue_overflow COMMAND ${CMAKE_COMMAND} -E env
+    "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=1" "SMASH_COLD_TIMEOUT_SEC=1"
+    "SMASH_DEFER_PHASES_MS=0" $<TARGET_FILE:numa_queue_overflow_test>)
+  set_tests_properties(test_numa_queue_overflow PROPERTIES TIMEOUT 300)
+
+  add_executable(tick_budget_test tick_budget_test.cpp)
+  target_link_libraries(tick_budget_test PRIVATE ${CMAKE_DL_LIBS})
+  add_test(NAME test_tick_budget COMMAND ${CMAKE_COMMAND} -E env
+    "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=1" "SMASH_COLD_TIMEOUT_SEC=1"
+    "SMASH_DEFER_PHASES_MS=0" "SMASH_TICK_PAGE_BUDGET=1000" $<TARGET_FILE:tick_budget_test>)
+  set_tests_properties(test_tick_budget PROPERTIES TIMEOUT 120)
+
+  add_executable(worker_balance_test worker_balance_test.cpp)
+  target_link_libraries(worker_balance_test PRIVATE ${CMAKE_DL_LIBS})
+  add_test(NAME test_worker_balance COMMAND ${CMAKE_COMMAND} -E env
+    "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=1" "SMASH_COLD_TIMEOUT_SEC=1"
+    "SMASH_DEFER_PHASES_MS=0" "SMASH_TEST_WORKERS=4" "SMASH_NUMA_COMPRESSOR=0"
+    $<TARGET_FILE:worker_balance_test>)
+  set_tests_properties(test_worker_balance PROPERTIES TIMEOUT 120)
+
+  add_executable(realloc_test realloc_test.cpp)
+  target_link_libraries(realloc_test PRIVATE ${CMAKE_DL_LIBS})
+  add_test(NAME test_realloc_large_only COMMAND ${CMAKE_COMMAND} -E env
+    "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=1" $<TARGET_FILE:realloc_test>)
+  add_test(NAME test_realloc_subarenas COMMAND ${CMAKE_COMMAND} -E env
+    "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=1" "SMASH_SUBARENAS=1" $<TARGET_FILE:realloc_test>)
+  add_test(NAME test_realloc_full COMMAND ${CMAKE_COMMAND} -E env
+    "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=0" $<TARGET_FILE:realloc_test>)
+  add_test(NAME test_realloc_commit COMMAND ${CMAKE_COMMAND} -E env
+    "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=1" "SMASH_COLD_TIMEOUT_SEC=1" "REALLOC_COMMIT_CASE=1"
+    $<TARGET_FILE:realloc_test>)
+  set_tests_properties(test_realloc_large_only test_realloc_subarenas test_realloc_full PROPERTIES TIMEOUT 60)
+  set_tests_properties(test_realloc_commit PROPERTIES TIMEOUT 150)
 endif()
 
 # exit() leaves the compressed set compressed and the handler installed
