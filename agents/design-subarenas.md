@@ -69,7 +69,9 @@ A sub-arena owns:
 - **whole 64 MiB node chunks**, carved from the node as today (so `mbind`
   binding and `node_of_chunk_` are unchanged); a per-chunk record of which
   sub-arena owns it;
-- **two sets of free-run bins — dirty and clean** — in the node's `PageRunMap`;
+- **two sets of free-run bins — dirty and clean** — in the node's `PageRunMap`
+  (as designed; since 2026-10-31 one set, with a dirty bit per page, see
+  "Dirty and clean runs merged" at the end);
 - a **chunk tail** (`cur`, `end`) like today's `NodeArena`;
 - **one lock**, covering its bins, its tail and its dirty accounting;
 - dirty-byte counters and an **LRU of dirty runs** (for decay).
@@ -286,3 +288,31 @@ memory freed by one sub-arena is not stranded there.
   map (`smash_sim`, 6 threads, 1-70 MiB blocks: 16.6 / 18.1 GiB vs 11.3 / 4.2
   GiB, shared / node): each keeps partly used chunks and up to its dirty cap.
   It is address space, not RSS; size `SMASH_VM_GIB` with that margin.
+
+## Dirty and clean runs merged (2026-10-31)
+
+The two owners per sub-arena are gone: one set of bins, and a dirty bit per page
+in the map with a dirty count per run. Everything above that says "dirty run" or
+"clean run" now means pages of a run. What the split cost: a purge left a dirty
+head and a clean tail for good, so a chunk with nothing live could stay in pieces
+no request fitted, and the sub-arenas carved fresh chunks next to free pages.
+`takeMixedFromSubLocked`, which looked across them once the region was full, is
+gone with it.
+
+| churn, 8 threads, real pages, `SMASH_DIRTY_MAX_MIB=64` | old | merged |
+|---|---|---|
+| 1-13 MiB, 16 live per thread | 33k blocks/s, 60 faults/block | 67k, 21 |
+| 4-32 MiB, 8 live per thread | 2.8k, 870 | 7.6k, 290 |
+| 1-3 MiB, 16 live per thread (all reuse) | 0.8-1.2M, 0 | 0.8-1.3M, 0 |
+
+`smash_sim`, arena walked for the same churn: 2.31 → 1.50 GiB (1-3 MiB, 64 live per
+thread) and 13.25 → 8.25 GiB (1-13 MiB, 256 live). There is no preference for dirty
+pages any more other than the bins' LIFO order, which was the risk; the table is the
+check. A partial purge still cuts a run's end, by dirty pages (`cutForLastDirtyUnlocked`),
+and a run that gives up all of them is decommitted whole, clean pages included: a
+madvise over pages with nothing behind them costs little.
+
+A whole-chunk run is not purged early to pool it (the design's "purge whole chunks
+preferentially"): that overshoots a cap to nothing, which `test_subarena_on` checks.
+It goes to the pool when the purge reaches its last dirty page.
+

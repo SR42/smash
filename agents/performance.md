@@ -411,6 +411,10 @@ no madvise).
 
 ## Every malloc/free cycle over 16 KiB costs ~10 µs (open defect)
 
+Under `SMASH_LARGE_ONLY=1` the band below `SMASH_LARGE_ALLOC_VM_THRESHOLD` is
+glibc's since 2026-10-31 (`largeOnlySystemSize`); what follows still holds in full
+mode, and at or above the threshold on the paths the sections above describe.
+
 Measured 2026-09-20 while chasing a report of ~1.6% CPU in `xxfree`. A block
 larger than `kMaxSmallSize` that is freed and reallocated goes to the kernel
 **every time**, in both modes. One block, allocated and freed in a loop

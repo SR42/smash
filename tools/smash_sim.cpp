@@ -75,6 +75,7 @@ struct Options {
     long dirty_max_mib = -1;
     uint64_t os_call_ns = 0;
     bool check = true;
+    double max_walked_gib = 0;   // --max-walked-gib: fail past this
     bool pin = false;         // run thread t on the CPUs of node t % nodes
     uint64_t seed = 1;
 };
@@ -118,7 +119,7 @@ void usage() {
         "                 [--sizes 1M,2M:3,...] [--live K] [--numa F] [--cold F]\n"
         "                 [--cross-free F] [--run-cache-mib M] [--os-call-ns NS]\n"
         "                 [--subarenas S] [--decay-ms MS] [--dirty-max-mib M]\n"
-        "                 [--no-check] [--pin] [--seed X]\n");
+        "                 [--no-check] [--pin] [--seed X] [--max-walked-gib G]\n");
     std::exit(2);
 }
 
@@ -142,6 +143,7 @@ void parseArgs(int argc, char** argv) {
         else if (a == "--dirty-max-mib") opt.dirty_max_mib = std::atol(next());
         else if (a == "--os-call-ns") opt.os_call_ns = std::strtoull(next(), nullptr, 10);
         else if (a == "--no-check") opt.check = false;
+        else if (a == "--max-walked-gib") opt.max_walked_gib = std::atof(next());
         else if (a == "--pin") opt.pin = true;
         else if (a == "--seed") opt.seed = std::strtoull(next(), nullptr, 10);
         else usage();
@@ -599,6 +601,11 @@ int main(int argc, char** argv) {
                     "nodes after everything was freed — %zd pages unaccounted for\n",
                     bump, shared_free, carved_total,
                     static_cast<ssize_t>(bump) - static_cast<ssize_t>(shared_free + carved_total));
+        ++failures;
+    }
+    if (opt.max_walked_gib > 0 && static_cast<double>(bump * kPageSize) / (1ull << 30) > opt.max_walked_gib) {
+        std::printf("FAIL: %.2f GiB of the arena walked, limit %.2f\n",
+                    static_cast<double>(bump * kPageSize) / (1ull << 30), opt.max_walked_gib);
         ++failures;
     }
     if (g_double_handout) { std::printf("FAIL: %" PRIu64 " pages handed to two live blocks\n", g_double_handout.load()); ++failures; }

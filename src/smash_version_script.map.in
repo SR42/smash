@@ -96,6 +96,7 @@
     smash_early_arena_info;
     smash_resilience_info;
     smash_debug_hold_locks;
+    smash_fork_lock_info;
     smash_debug_hold_page_lock;
     smash_snapshot_info;
     smash_numa_route_info;

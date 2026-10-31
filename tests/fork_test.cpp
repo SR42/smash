@@ -191,6 +191,23 @@ int main(int argc, char** argv) {
     }
     g_stop.store(true);
     for (auto& t : th) t.join();
+    // Every lock must have fit the set, sub-arenas and all by now: one left out
+    // is not taken at the fork, and the child can inherit its data half done.
+    {
+        using lock_info_fn = int (*)(size_t*, int*);
+        auto lock_info = reinterpret_cast<lock_info_fn>(dlsym(RTLD_DEFAULT, "smash_fork_lock_info"));
+        size_t locks = 0;
+        int full = 1;
+        if (!lock_info || lock_info(&locks, &full) != 0) {
+            std::fprintf(stderr, "FAIL: smash_fork_lock_info not exported\n");
+            return 1;
+        }
+        std::printf("fork: %zu locks in the set, full=%d\n", locks, full);
+        if (full) {
+            std::fprintf(stderr, "FAIL: the fork lock set is full (%zu): later locks are not taken at a fork\n", locks);
+            return 1;
+        }
+    }
     std::printf("fork: %d forks, %d hung, %d bad exits\n", forks, hung, bad);
     if (hung || bad) {
         std::fprintf(stderr, "FAIL: %d children hung, %d exited badly\n", hung, bad);

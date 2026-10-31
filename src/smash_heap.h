@@ -326,6 +326,18 @@ inline bool isPassthroughMode() {
     return passthrough;
 }
 
+// Large-only: does a block of `size` bytes belong to the system allocator?
+// Up to largeOnlyThreshold(), and the band above the slab's sizes and below
+// the compressible ones (LargeAlloc's test is the block's pages against
+// largeAllocVmThreshold()). Nothing in that band is ever compressed, so a
+// mapping per malloc bought nothing and cost a syscall pair, a fault per page
+// and a TLB shootdown per block. SMASH_MID_BINS=1 keeps the band in the arena.
+inline bool largeOnlySystemSize(size_t size) {
+    if (size <= largeOnlyThreshold()) return true;
+    if (size <= kMaxSmallSize || midBinsEnabled()) return false;
+    return size <= largeAllocVmThreshold() - kPageSize;
+}
+
 // One-shot cache of "full mode" (= not compress-only, not large-only, no
 // eager-zero, not passthrough).  If any of those env-var modes is on, the
 // malloc fast path has to bypass to the slow path; if none, the fast path
@@ -1209,13 +1221,22 @@ public:
     }
     // Diagnostic / test hook: hold the locks a fork used to leave behind for
     // `ms` on this thread, as a thread caught mid-operation by a fork would.
-    // Its own set: fork_locks_ belongs to the forking thread.
+    // Its own set: fork_locks_ belongs to the forking thread. Static for its
+    // size; the tests run one holder at a time.
     void debugHoldLocks(unsigned ms) {
-        ForkLockSet held;
+        static ForkLockSet held;
         collectForkLocks(held, /*all=*/false);
         held.lockAll();
         usleep(ms * 1000u);
         held.unlockAll();
+    }
+    // Diagnostic / test hook: how many locks a fork would take now, and whether
+    // the set is full, which would mean some were left out.
+    void forkLockInfo(size_t* count, int* full) {
+        static ForkLockSet probe;
+        collectForkLocks(probe);
+        *count = probe.size();
+        *full = probe.full();
     }
     // Diagnostic / test hook: hold the page lock of the page `ptr` is on for
     // `ms`, as a thread inside the fault handler would. False if `ptr` is
@@ -1591,9 +1612,10 @@ public:
         if (size == 0) size = 1;
 
         // Large-only mode: allocations <= largeOnlyThreshold() pass through
-        // to system malloc. Default threshold is kMaxSmallSize (16 KB) —
-        // overridable via SMASH_LARGE_ONLY_THRESHOLD env var.
-        if (isLargeOnlyMode() && size <= largeOnlyThreshold()) {
+        // to system malloc (default kMaxSmallSize, 16 KB, overridable via
+        // SMASH_LARGE_ONLY_THRESHOLD), and so does the band below the
+        // compressible sizes (largeOnlySystemSize).
+        if (isLargeOnlyMode() && largeOnlySystemSize(size)) {
             // Lazy-resolve system malloc if not done yet (can happen during
             // very early init before our constructor runs).
             if (!g_system_alloc.malloc) g_system_alloc.resolve();
@@ -1931,7 +1953,7 @@ public:
 
         if (size == 0) size = 1;
         // Large-only: small aligned allocs go to system allocator
-        if (isLargeOnlyMode() && size <= largeOnlyThreshold()) {
+        if (isLargeOnlyMode() && largeOnlySystemSize(size)) {
             // Lazy-resolve if needed
             if (!g_system_alloc.posix_memalign) g_system_alloc.resolve();
             if (g_system_alloc.posix_memalign) {
@@ -2079,7 +2101,7 @@ public:
             return nullptr;
         }
         // Large-only: small callocs go to system allocator
-        if (isLargeOnlyMode() && total <= largeOnlyThreshold() && g_system_alloc.calloc) {
+        if (isLargeOnlyMode() && largeOnlySystemSize(total) && g_system_alloc.calloc) {
             return g_system_alloc.calloc(count, size);
         }
         // A large block whose pages read as zero already (a fresh mapping, or
@@ -2153,6 +2175,18 @@ public:
             : page_map_.get(addr);
         if (!sp) {
             if (!g_system_alloc.realloc) g_system_alloc.resolve();
+            // A system block growing to a compressible size moves to the arena
+            // once: left with glibc, a buffer grown by realloc was never
+            // compressed, whatever size it reached.
+            if (isLargeOnlyMode() && size > kMaxSmallSize && !largeOnlySystemSize(size) &&
+                g_system_alloc.malloc_size && g_system_alloc.free) {
+                const size_t old_usable = g_system_alloc.malloc_size(old_ptr);
+                void* new_ptr = this->malloc(size);
+                if (!new_ptr) return nullptr;
+                __builtin_memcpy(new_ptr, old_ptr, old_usable < size ? old_usable : size);
+                g_system_alloc.free(old_ptr);
+                return new_ptr;
+            }
             if (g_system_alloc.realloc) return g_system_alloc.realloc(old_ptr, size);
             return nullptr;
         }

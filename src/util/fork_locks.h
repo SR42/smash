@@ -27,9 +27,16 @@
 namespace smash {
 
 class ForkLockSet {
-    // Slabs (arenas x classes x 3), mid classes, span and entry and run-cache
-    // shards (256 each), sub-arenas (64 per set), node arenas, store shards.
-    static constexpr size_t kMax = 4096;
+    // Slabs (arenas x classes x 3: 13824 at 128 arenas), mid classes, span and
+    // entry and run-cache shards (256 each), node arenas (2 x kMaxNumaNodes),
+    // sub-arenas (64 per set), store shards. A lock that does not fit is not
+    // taken, and the child can inherit whatever it was protecting half done:
+    // at 4096 the node arenas filled the set, so the shared sub-arenas', the
+    // compressor's and the metadata arena's locks were never in it, and a child
+    // crashed on a size bin caught between its head and its bitmap
+    // (test_fork_no_compressor). The array is in .bss and only what is used
+    // gets touched. smash_fork_lock_info and fork_test check it does not fill.
+    static constexpr size_t kMax = 32768;
     Spinlock* locks_[kMax];
     size_t n_ = 0;
     size_t held_ = 0;

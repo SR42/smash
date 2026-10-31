@@ -66,7 +66,19 @@ int main() {
     const unsigned long long want = total * 3 / 4;
     const unsigned long long want_released = total * 9 / 10;
     unsigned long long armed = 0, calls = 0, p2 = 0, released = 0, mr_ms = 0, mr_calls = 0;
+    // PHASE3_HOT_STRIDE_MIB: keep one page per that many MiB hot. A compressor
+    // slice then routes a count that is no multiple of the queue's reservation,
+    // so its last flush is short. PHASE3_MIN_P2_PER_CALL raises phase 2's check.
+    const char* stride_env = std::getenv("PHASE3_HOT_STRIDE_MIB");
+    const size_t stride_blocks = stride_env ? static_cast<size_t>(std::atoi(stride_env)) / 4 : 0;
+    const char* p2_env = std::getenv("PHASE3_MIN_P2_PER_CALL");
+    unsigned long long min_p2 = p2_env ? static_cast<unsigned long long>(std::atoll(p2_env)) : 32;
+    // The raised check is about the node queues' batches: one node has none.
+    if (access("/sys/devices/system/node/node1", F_OK) != 0) min_p2 = 32;
     for (int i = 0; i < 480 && (armed < want || released < want_released); ++i) {
+        if (stride_blocks)
+            for (size_t b = 0; b < blocks.size(); b += stride_blocks)
+                blocks[b][ps * 7] = static_cast<char>(i);
         raise(SIGUSR2);
         usleep(250 * 1000);
         const std::string log = slurp(fd);
@@ -105,7 +117,7 @@ int main() {
                     want_released);
         return 1;
     }
-    if (p2 * 32 > released) {
+    if (p2 * min_p2 > released) {
         std::printf("FAIL: phase 2 (escalation and compression snapshot) used an mprotect call "
                     "per %.1f pages\n", static_cast<double>(released) / static_cast<double>(p2));
         return 1;

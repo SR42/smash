@@ -33,11 +33,12 @@ pages (`--cold`), which is what decides whether a run may enter the run cache.
   decommit queue drained, every page a node arena carved is free again, and the
   walked arena equals shared free + node carved.
 - **Sub-arena free lists** (with `--subarenas`), before and after a full
-  purge, holding every sub-arena lock: every dirty or clean run lies in one
-  chunk its sub-arena owns, no page is listed twice across dirty runs, clean
-  runs, tails and the chunk pool, each owner's counter equals its runs, and
+  purge, holding every sub-arena lock: every run lies in one chunk its
+  sub-arena owns, no page is listed twice across runs, tails and the chunk
+  pool, each owner's counter equals its runs, each run's dirty count equals its
+  bits and the sub-arena's count their sum, no dirty bit is set outside a run, and
   (for the shared arena's set) no run of the shared free map lies in a chunk
-  a sub-arena owns; after the purge, no clean run covers a whole chunk (it
+  a sub-arena owns; after the purge, no wholly clean run covers a whole chunk (it
   should be in the pool); and
   nothing is dirty after the purge (which also waits for the purger's
   in-flight runs, so the leak check cannot race it).
@@ -63,7 +64,7 @@ smash_sim [--threads N] [--seconds S] [--nodes K] [--arena-gib G]
           [--sizes 1M,2M:3,...] [--live K] [--numa F] [--cold F]
           [--cross-free F] [--run-cache-mib M] [--os-call-ns NS]
           [--subarenas S] [--decay-ms MS] [--dirty-max-mib M]
-          [--no-check] [--pin] [--seed X]
+          [--no-check] [--pin] [--seed X] [--max-walked-gib G]
 ```
 
 - `--sizes` is a list with optional weights (`1M:5,8M:1`); each thread picks
@@ -79,6 +80,8 @@ smash_sim [--threads N] [--seconds S] [--nodes K] [--arena-gib G]
   S per node; 0 = one per CPU of the real node. `--decay-ms` and
   `--dirty-max-mib` set `SMASH_DIRTY_DECAY_MS` / `SMASH_DIRTY_MAX_MIB`.
 - `--no-check` skips the ownership shadow for maximum rate.
+- `--max-walked-gib G` fails the run if the arena was walked past G
+  (`test_smash_sim_walk_*`).
 - `--pin` runs thread t on the CPUs of node t % nodes, so every allocation is
   node-local. Without it, threads allocate on node t % nodes from wherever the
   scheduler puts them, and the locks and queue heads they touch may live on

@@ -5,6 +5,11 @@
 // kernel gives huge pages to everyone (so the off-case cannot be verified) and
 // under `never` to no one. The test skips otherwise rather than asserting
 // something the policy, not smash, decides.
+//
+// SMASH_THP=0 is checked under any policy: the arena must be MADV_NOHUGEPAGE
+// (VmFlags nh), the way out of huge pages on a host whose policy is `always`.
+// Without it the arena must not be: SMASH_WRITE_TRACK=idle used to set it too.
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -31,10 +36,43 @@ bool policyIsMadvise() {
     return std::strstr(buf, "[madvise]") != nullptr;
 }
 
+// VmFlags of the mapping holding p, from /proc/self/smaps.
+bool mappingHasFlag(const void* p, const char* flag) {
+    FILE* f = std::fopen("/proc/self/smaps", "r");
+    if (!f) return false;
+    char line[512];
+    bool in = false, has = false;
+    const auto a = reinterpret_cast<uintptr_t>(p);
+    while (std::fgets(line, sizeof(line), f)) {
+        unsigned long lo, hi;
+        char c;
+        if (std::sscanf(line, "%lx-%lx %c", &lo, &hi, &c) == 3) { in = a >= lo && a < hi; continue; }
+        if (in && !std::strncmp(line, "VmFlags:", 8)) { has = std::strstr(line, flag) != nullptr; break; }
+    }
+    std::fclose(f);
+    return has;
+}
+
 }  // namespace
 
 int main() {
     setvbuf(stdout, nullptr, _IONBF, 0);
+    {
+        const char* v = std::getenv("SMASH_THP");
+        const bool want_nh = v && v[0] == '0';
+        auto* q = static_cast<unsigned char*>(std::malloc(8u << 20));
+        if (!q) { std::fprintf(stderr, "FAIL: malloc\n"); return 1; }
+        q[0] = 1;
+        const bool nh = mappingHasFlag(q, " nh");
+        std::printf("thp_arena_test: SMASH_THP=%s, SMASH_WRITE_TRACK=%s: arena %s MADV_NOHUGEPAGE\n", v ? v : "(unset)",
+                    std::getenv("SMASH_WRITE_TRACK") ? std::getenv("SMASH_WRITE_TRACK") : "(unset)", nh ? "is" : "is not");
+        std::free(q);
+        if (nh != want_nh) {
+            std::fprintf(stderr, "FAIL: the arena %s MADV_NOHUGEPAGE\n", nh ? "is" : "is not");
+            return 1;
+        }
+        if (want_nh) { std::printf("thp_arena_test: all checks passed\n"); return 0; }
+    }
     if (!policyIsMadvise()) {
         std::printf("SKIP: host THP policy is not [madvise]; the off-case cannot be distinguished\n");
         return 0;

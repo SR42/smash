@@ -357,7 +357,14 @@ if(NOT APPLE)
   add_test(NAME test_thp_arena_on COMMAND ${CMAKE_COMMAND} -E env
     "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=0" "SMASH_THP=1"
     $<TARGET_FILE:thp_arena_test>)
-  set_tests_properties(test_thp_arena_off test_thp_arena_on PROPERTIES TIMEOUT 120)
+  add_test(NAME test_thp_arena_never COMMAND ${CMAKE_COMMAND} -E env
+    "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=0" "SMASH_THP=0"
+    $<TARGET_FILE:thp_arena_test>)
+  add_test(NAME test_thp_arena_idle COMMAND ${CMAKE_COMMAND} -E env
+    "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=0" "SMASH_WRITE_TRACK=idle"
+    $<TARGET_FILE:thp_arena_test>)
+  set_tests_properties(test_thp_arena_off test_thp_arena_on test_thp_arena_never test_thp_arena_idle
+    PROPERTIES TIMEOUT 120)
 endif()
 
 # ── Runtime large-alloc threshold ───────────────────────────────────────────
@@ -742,7 +749,11 @@ if(NOT APPLE)
   add_test(NAME test_fork_no_compressor COMMAND ${CMAKE_COMMAND} -E env
     "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=1" "SMASH_SUBARENAS=1"
     "SMASH_NO_COMPRESSOR=1" $<TARGET_FILE:fork_test>)
-  set_tests_properties(test_fork_large_only test_fork_full test_fork_no_compressor
+  # The most locks a process can have: the fork lock set must still hold them.
+  add_test(NAME test_fork_many_arenas COMMAND ${CMAKE_COMMAND} -E env
+    "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=0" "SMASH_SUBARENAS=1" "SMASH_NUM_ARENAS=128"
+    $<TARGET_FILE:fork_test>)
+  set_tests_properties(test_fork_large_only test_fork_full test_fork_no_compressor test_fork_many_arenas
                        PROPERTIES TIMEOUT 600)
 endif()
 
@@ -752,8 +763,11 @@ if(NOT APPLE)
   target_link_libraries(tick_scan_test PRIVATE ${CMAKE_DL_LIBS} Threads::Threads)
   add_test(NAME test_tick_scan COMMAND ${CMAKE_COMMAND} -E env
     "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=1" "SMASH_COLD_TIMEOUT_SEC=1"
-    "SMASH_DEFER_PHASES_MS=0" $<TARGET_FILE:tick_scan_test>)
-  set_tests_properties(test_tick_scan PROPERTIES TIMEOUT 120)
+    "SMASH_DEFER_PHASES_MS=0" "SMASH_STATS_SIGNAL=1" $<TARGET_FILE:tick_scan_test>)
+  add_test(NAME test_tick_scan_subarenas COMMAND ${CMAKE_COMMAND} -E env
+    "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=1" "SMASH_COLD_TIMEOUT_SEC=1" "SMASH_SUBARENAS=1"
+    "SMASH_DEFER_PHASES_MS=0" "SMASH_STATS_SIGNAL=1" $<TARGET_FILE:tick_scan_test>)
+  set_tests_properties(test_tick_scan test_tick_scan_subarenas PROPERTIES TIMEOUT 120)
 
   add_executable(page_lock_park_test page_lock_park_test.cpp)
   target_link_libraries(page_lock_park_test PRIVATE ${CMAKE_DL_LIBS} Threads::Threads)
@@ -809,6 +823,27 @@ if(NOT APPLE)
     "SMASH_DEFER_PHASES_MS=0" "SMASH_TEST_WORKERS=2" "SMASH_NUMA_WORKERS=1"
     $<TARGET_FILE:numa_work_sharing_test>)
   set_tests_properties(test_numa_work_sharing PROPERTIES TIMEOUT 300)
+
+  # Where the (16 KiB, 1 MiB) band goes (large_only_band_test.cpp).
+  add_executable(large_only_band_test large_only_band_test.cpp)
+  target_link_libraries(large_only_band_test PRIVATE ${CMAKE_DL_LIBS})
+  add_test(NAME test_large_only_band COMMAND ${CMAKE_COMMAND} -E env
+    "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=1" "BAND_EXPECT=system"
+    $<TARGET_FILE:large_only_band_test>)
+  add_test(NAME test_large_only_band_subarenas COMMAND ${CMAKE_COMMAND} -E env
+    "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=1" "SMASH_SUBARENAS=1" "BAND_EXPECT=system"
+    $<TARGET_FILE:large_only_band_test>)
+  add_test(NAME test_large_only_band_mid_bins COMMAND ${CMAKE_COMMAND} -E env
+    "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=1" "SMASH_MID_BINS=1" "BAND_EXPECT=arena"
+    $<TARGET_FILE:large_only_band_test>)
+  add_test(NAME test_large_only_band_threshold COMMAND ${CMAKE_COMMAND} -E env
+    "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=1" "SMASH_LARGE_ALLOC_VM_THRESHOLD=16384" "BAND_EXPECT=arena"
+    $<TARGET_FILE:large_only_band_test>)
+  add_test(NAME test_large_only_band_full COMMAND ${CMAKE_COMMAND} -E env
+    "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=0" "BAND_EXPECT=mapped"
+    $<TARGET_FILE:large_only_band_test>)
+  set_tests_properties(test_large_only_band test_large_only_band_subarenas test_large_only_band_mid_bins
+    test_large_only_band_threshold test_large_only_band_full PROPERTIES TIMEOUT 60)
 
   add_executable(realloc_test realloc_test.cpp)
   target_link_libraries(realloc_test PRIVATE ${CMAKE_DL_LIBS})
@@ -914,6 +949,15 @@ if(NOT APPLE)
     "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=1" "SMASH_SOFTDIRTY=0"
     "SMASH_STATS_SIGNAL=1" "SMASH_DEFER_PHASES_MS=0" $<TARGET_FILE:phase3_batch_test>)
   set_tests_properties(test_phase3_batch PROPERTIES TIMEOUT 150)
+  # Short flushes: one page per 16 MiB stays hot, so each slice routes a count
+  # that is no multiple of the queue's 256-slot reservation. Padded, a batch
+  # holds one reservation: 240 pages per phase 2 mprotect; unpadded, every later
+  # reservation straddles two batches: 181-185 (agents/tests.md).
+  add_test(NAME test_phase3_batch_short COMMAND ${CMAKE_COMMAND} -E env
+    "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=1" "SMASH_SOFTDIRTY=0"
+    "SMASH_COLD_TIMEOUT_SEC=1" "SMASH_STATS_SIGNAL=1" "SMASH_DEFER_PHASES_MS=0" "PHASE3_HOT_STRIDE_MIB=16" "PHASE3_MIN_P2_PER_CALL=210"
+    $<TARGET_FILE:phase3_batch_test>)
+  set_tests_properties(test_phase3_batch_short PROPERTIES TIMEOUT 150 RUN_SERIAL TRUE)
   # 2 GiB: more than four NUMA nodes' compressor queues (64K pages each)
   # hold, so pages are also compressed locally by flushNodeQueries — which
   # skipped the readable batches (655360 snapshot reads for 524288 pages).
@@ -1276,7 +1320,7 @@ if(NOT APPLE)
     if(track STREQUAL "yt")
       list(APPEND cases thp slices mmap whole)
     else()
-      list(APPEND cases workers)
+      list(APPEND cases workers thp freed)
     endif()
     foreach(case ${cases})
       set(extra "")
@@ -1287,6 +1331,14 @@ if(NOT APPLE)
       elseif(case STREQUAL "workers")
         # Four workers scanning: each must have its own open bitmap.
         set(extra "SMASH_TEST_WORKERS=4")
+        set(part tracker)
+      elseif(case STREQUAL "thp" AND track STREQUAL "idle")
+        # On huge pages: a folio's pages are read and marked at its head.
+        set(extra "SMASH_THP=1" "SMASH_IDLE_SCAN_TICKS=1" "IDLE_WANT_HUGE=1")
+        set(part tracker)
+      elseif(case STREQUAL "freed")
+        # 8 GiB allocated and freed: no scan calls for pages nothing lives on.
+        set(extra "SMASH_IDLE_SCAN_TICKS=1" "IDLE_FREED_MIB=8192")
         set(part tracker)
       elseif(case STREQUAL "thp")
         # Huge pages, and 640-page requests whose edges split them.
@@ -1305,7 +1357,7 @@ if(NOT APPLE)
         set(extra "SMASH_YT_WHOLE=1" "IDLE_SPAN_MIB=512")
         set(part tracker)
       elseif(case STREQUAL "fallback" AND track STREQUAL "idle")
-        set(extra "SMASH_THP=1")
+        set(extra "SMASH_KPAGEFLAGS=/nonexistent/kpageflags")
       elseif(case STREQUAL "fallback")
         set(extra "SMASH_YT_DEVICE=/nonexistent/youngtrace/scanner")
       endif()
@@ -1462,6 +1514,17 @@ if(NOT APPLE)
     test_subarena_exhaust_big test_subarena_exhaust_mixed PROPERTIES TIMEOUT 120)
 endif()
 
+# A sub-arena's dirty and clean runs merge (subarena_merge_test.cpp).
+if(NOT APPLE)
+  add_executable(subarena_merge_test subarena_merge_test.cpp)
+  set_target_properties(subarena_merge_test PROPERTIES CXX_STANDARD 20)
+  target_link_libraries(subarena_merge_test PRIVATE ${CMAKE_DL_LIBS})
+  add_test(NAME test_subarena_merge COMMAND ${CMAKE_COMMAND} -E env
+    "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=1" "SMASH_SUBARENAS=1"
+    "SMASH_DIRTY_DECAY_MS=500" "SMASH_NO_COMPRESSOR=1" $<TARGET_FILE:subarena_merge_test>)
+  set_tests_properties(test_subarena_merge PROPERTIES TIMEOUT 60)
+endif()
+
 # smash_sim (tools/smash_sim.cpp): drives the real large-block allocator —
 # LargeAlloc, VmRegion's shared and node arenas, the free map, the decommit
 # queue, the run cache, the span pools — with the page-level OS calls stubbed
@@ -1490,6 +1553,17 @@ if(NOT APPLE)
   target_compile_options(smash_sim PRIVATE -fvisibility=default -gdwarf-4 -fno-lto)
   target_link_options(smash_sim PRIVATE -fno-lto)
   set_target_properties(smash_sim PROPERTIES CXX_STANDARD 20)
+  # Fresh region goes last: 512 MiB live with a slow madvise must not walk the
+  # arena (the queue lagged and every miss carved: all 64 GiB in 8 s).
+  set(_sim_walk --threads 8 --seconds 6 --arena-gib 64 --sizes 1M,2M,3M --live 32 --cold 0.5
+      --os-call-ns 200000 --seed 7 --max-walked-gib 16)
+  add_test(NAME test_smash_sim_walk_shared COMMAND $<TARGET_FILE:smash_sim> ${_sim_walk} --numa 0)
+  add_test(NAME test_smash_sim_walk_subarenas COMMAND $<TARGET_FILE:smash_sim> ${_sim_walk} --numa 0
+    --subarenas 0 --dirty-max-mib 4 --decay-ms 20)
+  add_test(NAME test_smash_sim_walk_node_subarenas COMMAND $<TARGET_FILE:smash_sim> ${_sim_walk} --numa 1
+    --subarenas 0 --dirty-max-mib 4 --decay-ms 20)
+  set_tests_properties(test_smash_sim_walk_shared test_smash_sim_walk_subarenas
+    test_smash_sim_walk_node_subarenas PROPERTIES TIMEOUT 120)
   add_test(NAME test_smash_sim_smoke COMMAND ${CMAKE_COMMAND} -E env
     $<TARGET_FILE:smash_sim> --threads 8 --seconds 2 --nodes 4 --arena-gib 4
     --cold 0.1 --cross-free 0.2 --numa 0.7)

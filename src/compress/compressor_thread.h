@@ -735,7 +735,7 @@ class CompressorThread {
         // scan did not ask about (a word read makes the kernel check all 64
         // of its pages: walk the mappings of each one marked idle).
         std::atomic<uint64_t> sc_idle_us{0}, sc_idle_n{0}, idle_pages{0};
-        std::atomic<uint64_t> idle_words{0}, idle_other{0};
+        std::atomic<uint64_t> idle_words{0}, idle_other{0}, idle_pagemap{0};
         // SMASH_WRITE_TRACK=yt: phase 1's youngtrace requests, cumulative us,
         // requests, pages they covered, and requests that failed or were cut.
         std::atomic<uint64_t> sc_yt_us{0}, sc_yt_n{0}, yt_pages{0}, yt_cut{0};
@@ -914,6 +914,7 @@ class CompressorThread {
     // ensureIdleReadFds() probes both conditions; on failure idle_read_ok_ stays
     // false and we fall back to the existing PROT_NONE read-arm, byte-identical.
     [[maybe_unused]] int page_idle_fd_ = -1;     // /sys/kernel/mm/page_idle/bitmap
+    [[maybe_unused]] int kpageflags_fd_ = -1;    // /proc/kpageflags, SMASH_WRITE_TRACK=idle
     [[maybe_unused]] int idle_read_ok_ = -1;     // -1 unprobed, 0 unavailable, 1 active
 
     // Per page: 1 iff escalateToDeepMonitoring() armed it through the idle
@@ -1626,6 +1627,7 @@ public:
         // page_idle bitmap fd is process-global (not /proc/self), but re-probe
         // in the child since PFNs and privilege may differ; reset the cache.
         if (page_idle_fd_ >= 0)  { close(page_idle_fd_);  page_idle_fd_ = -1; }
+        if (kpageflags_fd_ >= 0) { close(kpageflags_fd_); kpageflags_fd_ = -1; }
         idle_read_ok_ = -1;
         // The youngtrace descriptors' open files are shared with the parent,
         // and each holds one scan's output: the child opens its own.
@@ -5731,10 +5733,14 @@ private:
     //
     // A page whose mark did not take (not on the LRU yet, the shared zero
     // page) reads "not idle" and counts as accessed: never compressed early,
-    // at worst a scan late. A transparent huge page answers only through its
-    // head PFN, so its other 511 pages would read accessed for ever: the
-    // arena is MADV_NOHUGEPAGE in this mode (VmRegion) and SMASH_THP=1
-    // refuses it.
+    // at worst a scan late. A page of a large folio answers only through the
+    // folio's head (the kernel's page_idle_get_folio returns nothing for a
+    // tail), with every page table entry of the folio behind that one bit, so
+    // every page of it is read and marked at the head (idleFolioHeads). The
+    // arena keeps the host's THP setting; it used to be MADV_NOHUGEPAGE in this
+    // mode, so an idle-tracked heap faulted 4 KiB at a time and ran on 4 KiB
+    // TLB entries. On huge pages the scan is also 17x cheaper per page
+    // (claudepc, 1 GiB: 70 ns against 1.2 us): one bit answers for 512 pages.
     //
     // Cost, measured as root on an x86 VM (1 GiB of 4 KiB pages, bitmap words
     // coalesced into runs): pagemap 14 ns, mark 80 ns, read 81 ns per page;
@@ -5778,11 +5784,48 @@ private:
         return k == 1 || ((page_idx >> sliceShift()) + tick_counter_) % k == 0;
     }
 
+    // One THP "enabled" file's choice ("always [madvise] never"): does it let
+    // the arena have large folios? `madvised`: SMASH_THP=1 hinted the arena.
+    // A per-size file's "inherit" means whatever the top-level file says.
+    static bool thpEnabledAllows(const char* path, bool madvised, bool top) {
+        const int fd = open(path, O_RDONLY | O_CLOEXEC);
+        if (fd < 0) return false;
+        char buf[64];
+        const ssize_t n = read(fd, buf, sizeof(buf) - 1);
+        close(fd);
+        if (n <= 0) return false;
+        buf[n] = '\0';
+        const char* b = std::strchr(buf, '[');
+        if (!b) return false;
+        if (std::strncmp(b, "[always]", 8) == 0) return true;
+        if (std::strncmp(b, "[madvise]", 9) == 0) return madvised;
+        if (std::strncmp(b, "[inherit]", 9) == 0) return top;
+        return false;
+    }
+
+    // Can this arena hold a folio of more than one page? Reading a large
+    // folio's flags cost a scan of 4 KiB pages 45 % more (claudepc: 0.85 to
+    // 1.25 us per page), so a host that cannot have them does not pay it.
+    // Asked once; a THP setting changed later only makes a page read accessed.
+    static bool arenaMayHoldLargeFolios() {
+        const char* hint = std::getenv("SMASH_THP");
+        if (hint && hint[0] == '0') return false;   // the arena is MADV_NOHUGEPAGE
+        const bool madvised = hint && hint[0] == '1';
+        static constexpr const char* kTop = "/sys/kernel/mm/transparent_hugepage/enabled";
+        const bool top = thpEnabledAllows(kTop, madvised, false);
+        if (top) return true;
+        // Per-size settings of multi-size THP (Linux 6.8 and later); 8 KiB..2 MiB.
+        for (unsigned kb = 8; kb <= 2048; kb *= 2) {
+            char path[96];
+            smash::safe_snprintf(path, sizeof(path), "/sys/kernel/mm/transparent_hugepage/hugepages-%ukB/enabled", kb);
+            if (thpEnabledAllows(path, madvised, top)) return true;
+        }
+        return false;
+    }
+
     bool probeIdleTracker() {
         const char* why = nullptr;
-        if (const char* t = std::getenv("SMASH_THP"); t && t[0] == '1') {
-            why = "SMASH_THP=1 is set, and the bitmap reports a huge page through its first 4 KiB only";
-        } else if (!ensurePagemapFd()) {
+        if (!ensurePagemapFd()) {
             why = "/proc/self/pagemap cannot be opened";
         } else {
             // A page of our own, written so it is resident: a PFN of 0 means
@@ -5803,6 +5846,14 @@ private:
                        (page_idle_fd_ = open("/sys/kernel/mm/page_idle/bitmap", O_RDWR | O_CLOEXEC)) < 0) {
                 why = "/sys/kernel/mm/page_idle/bitmap cannot be opened read-write (root-only by default; "
                       "needs CONFIG_IDLE_PAGE_TRACKING)";
+            } else {
+                // SMASH_KPAGEFLAGS: tests, to make this refusal happen as root.
+                const char* kpf = std::getenv("SMASH_KPAGEFLAGS");
+                if (kpageflags_fd_ >= 0) { close(kpageflags_fd_); kpageflags_fd_ = -1; }
+                if (kpf || arenaMayHoldLargeFolios()) {
+                    kpageflags_fd_ = open(kpf ? kpf : "/proc/kpageflags", O_RDONLY | O_CLOEXEC);
+                    if (kpageflags_fd_ < 0) why = "/proc/kpageflags cannot be read";
+                }
             }
         }
         if (!why) return true;
@@ -5827,11 +5878,70 @@ private:
         return fd >= 0 ? fd : page_idle_fd_;
     }
 
+    // Replace each page of a large folio by the folio's head. `ent` is sorted
+    // by PFN and stays so: a folio is contiguous, so heads rise with their
+    // pages. The flags come in one read per kWin PFNs, so a cold 2 MiB folio
+    // costs a read and a heap of 4 KiB pages about as much as its pagemap
+    // read did. A failed read leaves the PFNs alone, and a tail reads "not
+    // idle": at worst a page is taken for accessed, never for idle.
+    template <typename Ent> void idleFolioHeads(Ent* ent, size_t ne) {
+        constexpr size_t kWin = 1024;
+        constexpr uint64_t kHead = 1ULL << 15, kTail = 1ULL << 16;   // KPF_COMPOUND_*
+        uint64_t flags[kWin];
+        for (size_t r = 0; r < ne;) {
+            const uint64_t lo = ent[r].pfn;
+            size_t q = r + 1;
+            while (q < ne && ent[q].pfn - lo < kWin) ++q;
+            const uint64_t span = ent[q - 1].pfn - lo + 1;
+            if (pread(kpageflags_fd_, flags, span * sizeof(uint64_t), static_cast<off_t>(lo * sizeof(uint64_t))) !=
+                static_cast<ssize_t>(span * sizeof(uint64_t))) {
+                r = q;
+                continue;
+            }
+            uint64_t head = ~uint64_t{0};   // of the folio the walk is in
+            if (flags[0] & kTail) {
+                // The window opens inside a folio: its head is behind it, at
+                // most a PMD's worth away.
+                const uint64_t back = lo < kWin / 2 ? lo : kWin / 2;
+                uint64_t before[kWin / 2];
+                if (back && pread(kpageflags_fd_, before, back * sizeof(uint64_t),
+                                  static_cast<off_t>((lo - back) * sizeof(uint64_t))) ==
+                                static_cast<ssize_t>(back * sizeof(uint64_t))) {
+                    for (uint64_t b = back; b-- > 0;) {
+                        if (before[b] & kHead) { head = lo - back + b; break; }
+                        if (!(before[b] & kTail)) break;
+                    }
+                }
+            }
+            size_t x = r;
+            for (uint64_t p = lo; p < lo + span; ++p) {
+                const uint64_t f = flags[p - lo];
+                if (f & kHead) head = p;
+                else if (!(f & kTail)) head = ~uint64_t{0};
+                for (; x < q && ent[x].pfn == p; ++x)
+                    if ((f & kTail) && head != ~uint64_t{0}) ent[x].pfn = head;
+            }
+            r = q;
+        }
+    }
+
+    // Any page of [i, i + n) that is not EMPTY? The live bitmap has a bit per
+    // page, kept on every state store.
+    bool anyLivePages(size_t i, size_t n) const {
+        const size_t last = (i + n - 1) >> kChunkBits;
+        for (size_t c = i >> kChunkBits; c <= last && c < num_chunks_; ++c)
+            if (live_chunks_[c].load(std::memory_order_relaxed)) return true;
+        return false;
+    }
+
     // Phase 1's scan of [start, end): sets accessed_ for every due, resident
     // ACTIVE page whose idle mark is gone, then marks them all idle again.
     // Batched: one pagemap read per kBatch pages, and one read and one write
     // per run of nearby bitmap words (PFNs of neighbouring pages are often
     // close). A failed bitmap read counts every page in the run as accessed.
+    // Address space with nothing live costs no system call: freed pages stay
+    // below the arena's high-water mark for good, and a scan of them cost the
+    // pagemap read each.
     void idleScan(size_t start, size_t end) {
         constexpr size_t kBatch = 1024;
         constexpr uint64_t kRunMax = 256;    // words per bitmap read/write
@@ -5841,16 +5951,18 @@ private:
         uint64_t words[kRunMax];
         const uint64_t t0 = monoNs();
         const int bitmap_fd = idleBitmapFd();
-        uint64_t calls = 0, pages = 0, nwords = 0, other = 0;
+        uint64_t calls = 0, pages = 0, nwords = 0, other = 0, pagemap_reads = 0;
         size_t i = start;
         while (i < end) {
             const size_t slice_end = std::min(end, ((i >> kIdleSliceShift) + 1) << kIdleSliceShift);
             if (!idleSliceDue(i)) { i = slice_end; continue; }
             const size_t n = std::min(kBatch, slice_end - i);
+            if (!anyLivePages(i, n)) { i += n; continue; }
             void* base = vm_->pageAddress(i);
             const off_t off = static_cast<off_t>(reinterpret_cast<uintptr_t>(base) / kPageSize *
                                                  sizeof(uint64_t));
             ++calls;
+            ++pagemap_reads;
             const ssize_t got = pread(pagemap_fd_, pm, n * sizeof(uint64_t), off);
             const size_t have = got > 0 ? static_cast<size_t>(got) / sizeof(uint64_t) : 0;
             size_t ne = 0;
@@ -5868,6 +5980,7 @@ private:
             }
             pages += ne;
             std::sort(ent, ent + ne, [](const Ent& a, const Ent& b) { return a.pfn < b.pfn; });
+            if (ne && kpageflags_fd_ >= 0) { ++calls; idleFolioHeads(ent, ne); }
             for (size_t r = 0; r < ne;) {
                 // A run: entries whose words lie within kRunMax words of the
                 // first, with at most one empty word between neighbours.
@@ -5892,7 +6005,7 @@ private:
                     const uint64_t w = ent[x].pfn / 64 - w0;
                     if (!read_ok || !((words[w] >> (ent[x].pfn % 64)) & 1))
                         accessed_[i + ent[x].off].store(true, std::memory_order_relaxed);
-                    else
+                    else if (x == r || ent[x].pfn != ent[x - 1].pfn)   // a folio's pages share a bit
                         --idle_bits;
                 }
                 other += idle_bits;
@@ -5910,6 +6023,7 @@ private:
         pcAdd(pc_.idle_pages, pages);
         pcAdd(pc_.idle_words, nwords);
         pcAdd(pc_.idle_other, other);
+        pcAdd(pc_.idle_pagemap, pagemap_reads);
     }
 
     // ── SMASH_WRITE_TRACK=yt ──────────────────────────────────────────────
@@ -8557,7 +8671,7 @@ public:
         int n = smash::safe_snprintf(buf, sizeof(buf),
             "[smash stats] [%s] pid=%d committed=%zu  active=%zu  monitor=%zu"
             "  compressing=%zu  compressed=%zu  shadow=%zu  empty=%zu"
-            "  tier_up=%llu/%llu  spilled=%zu  zero=%llu  zero_now=%zu  bump=%zu"
+            "  tier_up=%llu/%llu  spilled=%zu  zero=%llu  zero_now=%zu  bump=%zu  arena_free=%zu"
             "  reheat=%llu  track=%s  codec=%s  cold_arenas=%u  boot=%zu/%zuMiB(%zu regions)"
             "  rss=%zuMiB  blob=%zu/%zuMiB(%zu regions, %zu draining, %lluMiB moved)\n",
             ts, (int)getpid(), total, active, monitor, compressing, compressed,
@@ -8566,7 +8680,7 @@ public:
             (unsigned long long)tier_attempts,
             spilled,
             (unsigned long long)self->zero_pages_.load(std::memory_order_relaxed),
-            zero_now, raw_bump,
+            zero_now, raw_bump, self->vm_->arenaFreePagesSnapshot(),
             (unsigned long long)g_reheat_events.load(std::memory_order_relaxed),
             writeTrackerName(self->write_tracker_),
             ROIConfig::instance().fastCodecName(),
@@ -8627,7 +8741,7 @@ public:
                         " | tick ms total=%llu phases=%llu efficiency=%llu vma_sync=%llu"
                         " bitmap=%llu node_chunks=%llu adapt=%llu dict=%llu sweep=%llu"
                         " | syscall ms memread=%llu (%llu calls) p2_mprotect=%llu p3_mprotect=%llu"
-                        " p4_release=%llu idle_scan=%llu (%llu calls, %llu pages, %llu words, %llu other idle)"
+                        " p4_release=%llu idle_scan=%llu (%llu calls, %llu pages, %llu words, %llu other idle, %llu pagemap)"
                         " yt_scan=%llu (%llu calls, %llu pages, cut=%llu, resumed=%llu, max_req_us=%llu,"
                         " node_hints=%llu)"
                         " node_query=%llu (%llu calls, %llu pages)"
@@ -8639,7 +8753,7 @@ public:
                         v(pc.sc_memread_us) / 1000, v(pc.sc_memread_n),
                         v(pc.sc_p2_mprotect_us) / 1000, v(pc.sc_p3_mprotect_us) / 1000,
                         v(pc.sc_p4_us) / 1000, v(pc.sc_idle_us) / 1000, v(pc.sc_idle_n),
-                        v(pc.idle_pages), v(pc.idle_words), v(pc.idle_other), v(pc.sc_yt_us) / 1000, v(pc.sc_yt_n), v(pc.yt_pages),
+                        v(pc.idle_pages), v(pc.idle_words), v(pc.idle_other), v(pc.idle_pagemap), v(pc.sc_yt_us) / 1000, v(pc.sc_yt_n), v(pc.yt_pages),
                         v(pc.yt_cut), v(pc.yt_resumed), v(pc.yt_req_max_us), v(pc.yt_node_hints),
                         v(pc.sc_nodeq_us) / 1000, v(pc.sc_nodeq_n),
                         v(pc.nodeq_pages), v(pc.numa_queue_helped),

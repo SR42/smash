@@ -14,14 +14,19 @@
 //      64 x 16 MiB with one 8 MiB block kept; after three ticks
 //      smash_tick_cost_info must show the sweep scanned no pages (nothing
 //      is pending) -- before the fix it scanned 262144 per tick
-//   2. the kept block still compresses and reads back (the live bitmap the
+//   2. the stats line says how much of what was walked is free: bump= against
+//      arena_free= (SMASH_STATS_SIGNAL=1), the whole 1 GiB of it here, sub-arenas
+//      or not
+//   3. the kept block still compresses and reads back (the live bitmap the
 //      phases now rely on is right)
 #include <chrono>
+#include <csignal>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <dlfcn.h>
+#include <string>
 #include <thread>
 #include <unistd.h>
 #include <vector>
@@ -58,6 +63,42 @@ int main() {
     }
     uint64_t sweep1 = 0, mem1 = 0, t1 = 0;
     cost(&sweep1, &mem1, &t1);
+
+    // bump= and arena_free= on the stats line, read from a file stderr points at.
+    {
+        char path[] = "/tmp/smash_tickscan_XXXXXX";
+        const int fd = mkstemp(path);
+        if (fd < 0) { std::fprintf(stderr, "FAIL: mkstemp\n"); return 1; }
+        unlink(path);
+        const int saved = dup(2);
+        dup2(fd, 2);
+        raise(SIGUSR2);
+        std::string log;
+        for (int waited = 0; waited < 5000 && log.find("arena_free=") == std::string::npos; waited += 100) {
+            usleep(100000);
+            char buf[8192];
+            const ssize_t n = pread(fd, buf, sizeof(buf) - 1, 0);
+            if (n > 0) log.assign(buf, static_cast<size_t>(n));
+        }
+        dup2(saved, 2);
+        close(saved);
+        close(fd);
+        const size_t b = log.find(" bump="), f = log.find(" arena_free=");
+        if (b == std::string::npos || f == std::string::npos) {
+            std::fprintf(stderr, "FAIL: no bump= and arena_free= on the stats line: %s\n", log.c_str());
+            ++failures;
+        } else {
+            const unsigned long long bump = std::strtoull(log.c_str() + b + 6, nullptr, 10),
+                                     fr = std::strtoull(log.c_str() + f + 12, nullptr, 10);
+            std::printf("stats line: bump=%llu pages, arena_free=%llu pages\n", bump, fr);
+            const unsigned long long want = (900ull << 20) / ps;
+            if (bump < want || fr < want) {
+                std::fprintf(stderr, "FAIL: 1 GiB walked and freed, the stats line says bump=%llu arena_free=%llu pages\n",
+                             bump, fr);
+                ++failures;
+            }
+        }
+    }
     std::printf("tick_scan: %llu ticks; sweep scanned %llu page bits (1 GiB high-water mark = %zu pages)\n",
                 static_cast<unsigned long long>(t1 - t0), static_cast<unsigned long long>(sweep1 - sweep0),
                 (1u << 30) / ps);

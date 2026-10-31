@@ -68,10 +68,13 @@ compressible data:
 | 320 KB / 512 KB / 768 KB | 0/8 | **100%** — untouched by the compressor |
 | 1 MiB and above | 8/8 | 0% |
 
-Same result in full mode and large-only. So a workload whose memory sits in
-16 KiB–1 MiB blocks pays all of smash's overhead — including the ~10 µs
-malloc/free cycle in [performance.md](performance.md) — and gets **zero** RSS reduction on
-that memory. The comment on the constant explains the policy ("typically
+Same result in full mode and large-only. Under `SMASH_LARGE_ONLY=1` the band is
+glibc's (`largeOnlySystemSize`, 2026-10-31): a churned 320 KiB block costs 0 page
+faults against 80 as a mapping of its own. In full mode, which has no glibc path
+for it, a workload whose memory sits in 16 KiB–1 MiB blocks still pays the ~10 µs
+malloc/free cycle in [performance.md](performance.md) and gets **zero** RSS reduction on
+that memory; `SMASH_MID_BINS=1` is the alternative there and stays opt-in because
+64-thread churn measured slower with it (5.6 → 8.7 s). The comment on the constant explains the policy ("typically
 internal engine buffers accessed frequently; compressing them causes
 decompression storms"), which is a real risk, but it is a blanket rule rather
 than a cold/hot decision, and smash's own cold detection already exists to make
@@ -250,8 +253,7 @@ block past `kMaxSmallSize` is cleared only when `LargeAlloc::allocate` cannot
 vouch that its pages read as zero: a fresh mapping (below
 `SMASH_LARGE_ALLOC_VM_THRESHOLD`, or an arena miss) and an arena run that was
 never used or was decommitted are not written, so `calloc(1, 256 MiB)` costs no
-RSS until the pages are touched, as with glibc. A sub-arena's dirty run, a
-span that includes one and a run-cache hit are cleared, and so is every arena
+RSS until the pages are touched, as with glibc. A block with a page marked dirty in a sub-arena's free runs and a run-cache hit are cleared, and so is every arena
 run under `SMASH_MADV_FREE=1` or `SMASH_NO_DECOMMIT=1`, whose decommit keeps
 the bytes. The invariant this rests on is in
 [conventions.md](conventions.md); the history in

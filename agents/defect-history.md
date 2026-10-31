@@ -1289,3 +1289,88 @@ every 512 rounds), zeros first, then versions behind. The path now commits
 the tail like `allocatePages`; `test_realloc_commit` reads the compressed,
 dropped tail back after a 1 MiB malloc: intact, against 1024 zero pages with
 the line removed.
+
+## The 16 KiB-1 MiB band was a mapping per malloc under large-only (fixed 2026-10-31)
+
+The band sits between the slab's top size and the compressible threshold.
+`SMASH_LARGE_ONLY=1` handed everything below 16 KiB to glibc and everything above
+it to `LargeAlloc`, which sends sizes below the threshold to `mmap`: never
+compressed, and every block a syscall pair, a fault per page and a TLB shootdown,
+serialized on `mmap_lock`. Nothing argued for that; it was what was left between
+two allocators. The band is glibc's now (`largeOnlySystemSize`), whose dynamic mmap
+threshold and bins serve a churned 320 KiB block with 0 faults against 80. A system
+block that `realloc` grows to a compressible size moves to the arena once, or a
+buffer grown from small would have stayed resident for ever (it did, from 16 KiB,
+before this too). Full mode has no glibc path for the band and keeps its mappings;
+`SMASH_MID_BINS=1` stays opt-in there, 64-thread churn having measured slower with
+it. Whether this explains the slowdown on the 128-core application is not known.
+
+## Fresh region was taken before freed pages on their way back (fixed 2026-10-31)
+
+`allocateOnSubArena` carved a chunk once the runs it could see missed, and waited
+for frees in flight only after the region was out; `allocatePages` bumped likewise.
+A run in the decommit queue or out of the map for a purge's madvise is invisible
+to that check, so a purger behind the frees became address space, and the bump
+pointer never retreats. `smash_sim` with 512 MiB live, half the frees cold and a
+200 us OS call walked **all of a 64 GiB arena in 8 s**, on the shared path, and
+on the sub-arena paths once the drain was removed from them. A miss now drains the
+queue itself first, and sub-arenas wait up to 2 ms for purges in flight: 1.4-2.9 GiB
+walked, and throughput did not suffer (shared 13.7k to 25.7k operations per
+second; the sub-arena cases 29k to 35k and 70k to 75k). This is the
+mechanism that fits "the arena grows while RSS stays the same" reported from the
+128-core box; it has not been measured there. `test_smash_sim_walk_*`.
+
+## Free-run search: an unbounded walk, and dirty and clean runs that never merged (fixed 2026-10-31)
+
+Bins above 64 pages were one per power of two, so a request met runs shorter than
+itself and walked them first-fit under the lock: 10000 runs of 65 pages and a request
+for 66 walked all 10000 on each miss, on each sibling. Now four bins per power of two
+and at most `kTakeScan` runs of the own bin, then the next non-empty bin, whose runs all
+fit. A bounded miss costs fresh region at worst; `takeAny` / `kScanAll` is for when
+there is none.
+
+Each sub-arena had a dirty and a clean owner, whose runs could not merge. A purge split
+a run into a dirty head and a clean tail for good, and a chunk of nothing but free
+pages served nothing longer than its longest run of one kind. Runs hold both now, with
+a bit per page and a count per run. The measurements, and what became of
+`takeMixedFromSubLocked`, are in [design-subarenas.md](design-subarenas.md); the short
+form is twice the throughput at a third of the faults on mixed sizes and 35 % less
+address space walked, with no loss where blocks reuse exactly. No preference for dirty
+pages remains but the bins' LIFO order, which was the risk the measurement was for.
+
+## The idle tracker forbade huge pages, and scanned freed address space (fixed 2026-10-31)
+
+`SMASH_WRITE_TRACK=idle` put `MADV_NOHUGEPAGE` on the arena because the bitmap answers
+for a large folio through its head alone: `page_idle_get_folio` returns nothing for a
+tail, so 511 pages of each huge page read accessed for ever. So a heap under this tracker
+faulted 4 KiB at a time. The scan now reads `/proc/kpageflags` and takes each page of
+a large folio to its head, which also covers a folio that is mapped in part, the state a
+partial purge or compression leaves it in until memory pressure splits it. On huge pages
+one bit answers for 512 pages: 70 ns per page against 1.2 us on claudepc. The flags read
+adds 45 % to a scan of 4 KiB pages, so it happens only where the host's THP or mTHP
+settings let the arena hold large folios. A host on `always` now gets huge pages under
+this tracker, with what that costs a sparse workload (22x RSS, see allocation-paths.md);
+`SMASH_THP=0` forbids them. Not measured on the arm64 6.6 kernel the tracker was written
+for: x86 6.8 only.
+
+The scan also read pagemap for every 1024 pages of the range whether or not anything
+lived there. Freed address space stays below the high-water mark for good, so it cost
+2048 reads per tick per 8 GiB ever walked. Batches with nothing live are now skipped.
+
+## A fork left the shared sub-arenas', compressor's and metadata arena's locks out (fixed 2026-10-31)
+
+`ForkLockSet` held 4096 locks and `add()` dropped the rest without a word. The fork
+fix of 2026-10-29 (304da9f) listed 2 x `kMaxNumaNodes` = 2048 node-arena locks ahead of
+the shared set's sub-arenas, the compressor's and `BootstrapAlloc`'s, so with the slabs and
+shards the set was full before it got to them: the prepare handler never took them, and
+the child inherited whatever they were protecting. It was found when the free-run changes
+of the next batch made a child crash often enough to see: `test_fork_no_compressor`,
+SIGSEGV in about 1 run in 14 at `tags_[0xFFFFFFFF]`, a size bin whose head had been cleared
+and whose bitmap bit had not. A check run under the prepare handler found that state with
+every lock in the set held and `lockAll` successful, which is what pointed at the set.
+The committed library has the same full set and did not crash in 40 runs, so the window
+was there before; why the later code hits it more often was not established.
+`smash_debug_hold_locks` holds the same truncated set, so the test's rounds with the locks
+held could not have noticed. The limit is 32768, against 16953 at 128 arenas; 0 of 60
+runs after the fix, and `fork_test` fails if the set ever fills.
+

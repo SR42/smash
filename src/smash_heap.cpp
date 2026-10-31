@@ -1526,6 +1526,14 @@ int smash_early_arena_info(uint64_t* blocks, uint64_t* bytes) {
 // milliseconds on the calling thread, as a thread a fork catches inside the
 // allocator would (tests/fork_test.cpp). 0 on success.
 extern "C" __attribute__((visibility("default")))
+int smash_fork_lock_info(size_t* count, int* full) {
+    auto* heap = SmashRedirect::getHeap();
+    if (!heap || !count || !full) return -1;
+    heap->forkLockInfo(count, full);
+    return 0;
+}
+
+extern "C" __attribute__((visibility("default")))
 int smash_debug_hold_locks(unsigned ms) {
     auto* heap = SmashRedirect::getHeap();
     if (!heap) return -1;

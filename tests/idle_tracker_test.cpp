@@ -15,14 +15,19 @@
 // the same traffic, the two hot blocks must take no fault at all (no
 // decompression, no shadow, no monitor fault: nothing watched, nothing hot
 // compressed), Phase 3 must arm nothing, the scan must have covered pages,
-// the arena must be MADV_NOHUGEPAGE (VmFlags nh), and every byte must read
-// back. Run with the default scan period (a slice every 4 ticks), where the
-// scan must cover no more than its 1/4 share of the arena per tick, and with
-// SMASH_IDLE_SCAN_TICKS=1 (every tick).
+// and every byte must read back. Run with the default scan period (a slice
+// every 4 ticks), where the scan must cover no more than its 1/4 share of the
+// arena per tick, and with SMASH_IDLE_SCAN_TICKS=1 (every tick).
 //
-// yt (the module loaded, root): the same, minus the MADV_NOHUGEPAGE check (a
-// huge page is one item there, which is conservative, so the arena keeps the
-// host's THP setting), plus no cut request: every request must fit the
+// idle with SMASH_THP=1 (IDLE_WANT_HUGE=1): the same on huge pages, which the
+// arena must really hold before the blocks go cold (AnonHugePages; skips where
+// the host has THP off). The bitmap answers for a folio through its head alone,
+// so a tracker reading each page's own bit took the 511 others for accessed,
+// and the idle block never left RSS. And with 8 GiB allocated and freed first
+// (IDLE_FREED_MIB): address space with nothing live costs the scan no system
+// call, over the window it may make no more than IDLE_MAX_CALLS_PER_TICK.
+//
+// yt (the module loaded, root): the same, plus no cut request: every request must fit the
 // module's buffer. And once with SMASH_THP=1 and 640-page requests
 // (SMASH_YT_REQ_PAGES), so request edges split huge pages: a huge page has
 // one accessed bit, which the first request covering it clears, so the part
@@ -42,7 +47,7 @@
 // committed page.
 //
 // IDLE_PART=fallback (any user): the tracker must refuse - idle with
-// SMASH_THP=1, yt with SMASH_YT_DEVICE naming no device - say why on stderr,
+// SMASH_KPAGEFLAGS naming no file, yt with SMASH_YT_DEVICE naming no device - say why on stderr,
 // and fall back to page protection, which still compresses the idle block.
 #include <algorithm>
 #include <atomic>
@@ -105,11 +110,40 @@ unsigned long long field(const std::string& log, const char* key) {
     return std::strtoull(log.c_str() + at + std::strlen(key), nullptr, 10);
 }
 
+// "idle_scan=T (C calls, P pages, W words, O other idle, R pagemap)": R.
+unsigned long long idlePagemapReads(const std::string& log) {
+    const size_t at = log.rfind("idle_scan=");
+    if (at == std::string::npos) return ~0ull;
+    const size_t o = log.find(" other idle, ", at);
+    if (o == std::string::npos) return ~0ull;
+    return std::strtoull(log.c_str() + o + 13, nullptr, 10);
+}
+
 std::string trackOf(const std::string& log) {
     const size_t at = log.rfind("track=");
     if (at == std::string::npos) return "";
     const size_t e = log.find_first_of(" \n", at);
     return log.substr(at + 6, e - at - 6);
+}
+
+// AnonHugePages of the mapping holding p, from /proc/self/smaps, in KiB.
+size_t anonHugeKib(const void* p) {
+    FILE* f = std::fopen("/proc/self/smaps", "r");
+    if (!f) return 0;
+    char line[512];
+    bool in = false;
+    const auto a = reinterpret_cast<uintptr_t>(p);
+    size_t out = 0;
+    while (std::fgets(line, sizeof(line), f)) {
+        unsigned long lo, hi;
+        if (std::sscanf(line, "%lx-%lx ", &lo, &hi) == 2 && std::strchr(line, '-') < std::strchr(line, ' ')) {
+            in = a >= lo && a < hi;
+            continue;
+        }
+        if (in && std::strncmp(line, "AnonHugePages:", 14) == 0) { out = std::strtoull(line + 14, nullptr, 10); break; }
+    }
+    std::fclose(f);
+    return out;
 }
 
 // VmFlags of the mapping holding p, from /proc/self/smaps.
@@ -218,6 +252,10 @@ int main() {
     const int saved = dup(2);
     dup2(g_log, 2);
 
+    // High-water mark: address space walked once and free for good after that.
+    const char* freed_env = std::getenv("IDLE_FREED_MIB");
+    if (freed_env) free(malloc(static_cast<size_t>(std::atoi(freed_env)) << 20));
+
     auto* cold = static_cast<char*>(malloc(kCold));
     auto* wr = static_cast<char*>(malloc(kHot));
     auto* rd = static_cast<char*>(malloc(kHot));
@@ -228,6 +266,17 @@ int main() {
     const char* span_env = std::getenv("IDLE_SPAN_MIB");
     const size_t span = span_env ? static_cast<size_t>(std::atoi(span_env)) << 20 : 0;
     void* untouched = span ? malloc(span) : nullptr;
+
+    // Huge pages must be what the blocks are on, or this case tests nothing.
+    if (std::getenv("IDLE_WANT_HUGE")) {
+        const size_t huge = anonHugeKib(cold);
+        std::printf("arena AnonHugePages after filling the blocks: %zu KiB\n", huge);
+        if (huge < 16 * 1024) {
+            dup2(saved, 2);
+            std::printf("SKIP: the arena holds no huge pages (THP off on this host?)\n");
+            return 0;
+        }
+    }
 
     std::atomic<bool> stop{false};
     std::thread hot([&] {
@@ -265,7 +314,7 @@ int main() {
     if (part == "fallback") {
         if (track != "protread") fail("track=" + track + ", want protread after the refusal");
         const char* why = yt() ? "SMASH_WRITE_TRACK=yt unavailable: /nonexistent/youngtrace/scanner cannot be opened"
-                               : "SMASH_WRITE_TRACK=idle unavailable: SMASH_THP=1";
+                               : "SMASH_WRITE_TRACK=idle unavailable: ";
         if (after.find(why) == std::string::npos) fail(std::string("no warning: ") + why);
         if (failures) return 1;
         std::printf("idle_tracker_test (fallback): all checks passed\n");
@@ -294,7 +343,7 @@ int main() {
     if (f_mon != 0) fail("monitor faults: pages were watched");
     if (armed != 0) fail("Phase 3 armed pages");
     if (pages == 0 || pages == ~0ull) fail("the idle scan covered no pages");
-    if (!yt() && flags.find(" nh") == std::string::npos) fail("the arena is not MADV_NOHUGEPAGE");
+    if (flags.find(" nh") != std::string::npos) fail("the arena is MADV_NOHUGEPAGE");
     if (cut != 0) fail("youngtrace requests failed or were cut: cut=" + std::to_string(cut));
     if (yt()) {
         const char* m = std::getenv("SMASH_YT_MMAP");
@@ -316,6 +365,16 @@ int main() {
                 d_ticks, committed, k);
     if (k > 1 && d_pages > committed * (d_ticks / k + 2))
         fail("the scan covered more than 1/K of the arena per tick");
+    if (!yt() && freed_env) {
+        const unsigned long long d_reads = idlePagemapReads(after) - idlePagemapReads(before);
+        const unsigned long long per_tick = d_ticks ? d_reads / d_ticks : d_reads;
+        std::printf("pagemap reads over the window: %llu in %llu ticks (%llu per tick), %llu pages committed\n",
+                    d_reads, d_ticks, per_tick, committed);
+        // The 64 MiB live is 16 reads per tick; the 8 GiB nothing lives on
+        // would be 2048 more.
+        if (idlePagemapReads(after) == ~0ull) fail("no pagemap reads on the stats line");
+        else if (per_tick > 100) fail("the idle scan reads address space with nothing live on it");
+    }
     // A request covers a whole due slice (IDLE_SPAN_MIB, one worker, so no
     // range edge cuts one): on average more than half a slice, where 64 MiB
     // slices gave at most 16384 pages a request.
@@ -358,7 +417,7 @@ int main() {
             std::sscanf(after.c_str() + at, "idle_scan=%llu (%llu calls, %llu pages, %llu words, %llu other idle)",
                         &ms, &calls, &pg, &words, &other) != 5)
             fail("no \"idle_scan=ms (N calls, P pages, W words, O other idle)\" on the stats line");
-        else if (words * 64 < pg)
+        else if (words * 64 < pg && !std::getenv("IDLE_WANT_HUGE"))   // on huge pages one bit answers for 512
             fail("bitmap words read: " + std::to_string(words) + " for " + std::to_string(pg) + " pages");
         else
             std::printf("bitmap: %llu words read for %llu pages, %llu other idle pages in them\n", words, pg, other);
