@@ -2317,6 +2317,10 @@ public:
         return true;
     }
     const char* writeTrackerName() const { return compression_inited_ ? compressor_.trackerName() : "none"; }
+    int thpUnitInfo(uint64_t* compressed, uint64_t* reclaimed, uint64_t* restored, uint64_t* rolled_back) const {
+        if (!compression_inited_) return -1;
+        return compressor_.unitCounters(compressed, reclaimed, restored, rolled_back);
+    }
     bool tickBudgetInfo(uint64_t* budget, uint64_t* max_per_tick, uint64_t* turned_away) const {
         if (!compression_inited_) return false;
         compressor_.tickBudgetCounters(budget, max_per_tick, turned_away);

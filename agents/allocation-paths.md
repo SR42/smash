@@ -55,6 +55,47 @@ smash's page management depends on (measured directly — EINVAL, EINVAL,
 ENOMEM), so backing the arena with `MAP_HUGETLB` would require the compressor
 to work in 2 MiB units end to end.
 
+**`SMASH_THP_UNIT=1` keeps them (opt-in, `idle` tracking only, 2026-11-02).**
+What splits a cold huge page is not compression itself but the size of the
+calls: the shadow window's `mprotect(PROT_READ)` over the stretches one flush
+holds, Phase B's runs of 32 (`mprotect`, `madvise`), and the restore's 4 KiB
+`mprotect`. Any of them over part of a PMD splits it. Measured on the bare
+kernel (x86, 6.8): `mprotect` of a whole aligned 2 MiB keeps the huge mapping,
+`MADV_DONTNEED` of it frees the huge page whole, a 2 MiB write through
+`/proc/self/mem` into the dropped, PROT_NONE range allocates a new huge page,
+and `mprotect(PROT_RW)` of the whole 2 MiB keeps it. And the trap: **one 4 KiB
+written into a dropped huge range allocates all 2 MiB** (RSS +2 MiB for one
+page, still there after that page's `mprotect` split it). Per page, smash never
+hits it, because the runs have already split the range: 5 kB of RSS per one-byte
+read with huge pages on or off (claudepc, root, `idle`).
+
+So the option does every step over the whole 2 MiB. The idle scan marks a unit
+whose 512 pages are resident and share one folio head (`kUnitHuge`, from the
+`idleFolioHeads` it already does); Phase 2 compresses its 512 pages or none
+(`compressUnit`: a page that fails rolls the unit back, never protected, so it
+stays one huge page; the ratio gate is the unit's, so one incompressible page
+does not hold back 511 good ones) and arms the shadow window with one
+`mprotect`; Phase B checks every page against its blob and drops the unit with
+one `madvise` and one `mprotect` (`reclaimUnit`); and a fault anywhere in it
+restores all 512 pages through `/proc/self/mem` while still PROT_NONE, then one
+`mprotect` (`restoreUnit`). Prefetch never restores a page of such a unit, and a
+free that touches one drops its mark. The arena base is 2 MiB-aligned for it
+(`reservePagesAligned`), so units are page indices `[u << 9, +512)`.
+
+Measured as root on claudepc (`test_thp_unit_*`): 64 MiB, 32 units, cold; a
+one-byte read in each of 4 units brings back exactly those 4, each a huge page
+(AnonHugePages 0 → 8192 KiB, 2048 pages resident, none of the other units);
+without the option the same reads bring back 20 pages of 4 KiB and no huge
+page. The cost is the other side of the same number: 2 MiB of RSS and 512
+decompressions on the faulting thread per cold unit touched, where a sparse
+reader got 4 KiB. Measured as root on claudepc, a one-byte read of a cold unit
+takes a median 630 us (lz4; 641 zstd-1; 524-933 over 32 units) against 26 us
+(29) for the per-page restore with its default prefetch of two neighbours a
+side, on data that compresses to almost nothing: most of it is 512 writes
+through `/proc/self/mem` and the kernel zeroing the new huge page, so real data
+adds its decompression on top. It pays for data that comes back hot and dense; for sparse
+reads of cold data it is the 22× above, per fault.
+
 ## Which allocation sizes are actually compressed
 
 `kLargeAllocVmThreshold` (1 MiB) decides this, and the effect is absolute:

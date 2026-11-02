@@ -559,7 +559,9 @@ public:
             const size_t requested = region_size;
             constexpr size_t kFloor = size_t{256} << 20;
             for (;;) {
-                base_ = static_cast<char*>(vm::reservePages(region_size));
+                // 2 MiB-aligned: huge pages and SMASH_THP_UNIT's units line
+                // up with page indices.
+                base_ = static_cast<char*>(vm::reservePagesAligned(region_size, size_t{2} << 20));
                 if (base_ || region_size / 2 < kFloor) break;
                 region_size = region_size / 2 / kPageSize * kPageSize;
             }
@@ -596,9 +598,12 @@ public:
             // 0 after one compress/read-back cycle. The hint is therefore
             // worth something only for pages that stay hot.
             {
+                // SMASH_THP_UNIT=1 asks for huge pages too, unless SMASH_THP=0.
                 const char* v = std::getenv("SMASH_THP");
-                if (v && v[0] == '1') (void)::madvise(base_, region_size, MADV_HUGEPAGE);
-                else if (v && v[0] == '0') (void)::madvise(base_, region_size, MADV_NOHUGEPAGE);
+                const char* u = std::getenv("SMASH_THP_UNIT");
+                if (v && v[0] == '0') (void)::madvise(base_, region_size, MADV_NOHUGEPAGE);
+                else if ((v && v[0] == '1') || (u && u[0] == '1'))
+                    (void)::madvise(base_, region_size, MADV_HUGEPAGE);
             }
 #endif
             vm::setVmBounds(base_, region_size);

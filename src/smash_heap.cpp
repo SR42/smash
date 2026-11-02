@@ -1636,6 +1636,22 @@ const char* smash_write_tracker() {
     return heap ? heap->writeTrackerName() : "none";
 }
 
+// Diagnostic / test hook (not public API): SMASH_THP_UNIT's units compressed,
+// reclaimed, restored and rolled back as one. Returns 1 when the option is in
+// effect, 0 when it is not, -1 before the compressor exists
+// (tests/thp_unit_test.cpp).
+extern "C" __attribute__((visibility("default")))
+int smash_thp_unit_info(uint64_t* compressed, uint64_t* reclaimed, uint64_t* restored, uint64_t* rolled_back) {
+    uint64_t c = 0, r = 0, s = 0, b = 0;
+    auto* heap = SmashRedirect::getHeap();
+    const int on = heap ? heap->thpUnitInfo(&c, &r, &s, &b) : -1;
+    if (compressed) *compressed = c;
+    if (reclaimed) *reclaimed = r;
+    if (restored) *restored = s;
+    if (rolled_back) *rolled_back = b;
+    return on;
+}
+
 extern "C" __attribute__((visibility("default")))
 int smash_tick_cost_info(uint64_t* sweep_pages, uint64_t* memread_calls, uint64_t* ticks) {
     uint64_t sp = 0, mr = 0, t = 0;

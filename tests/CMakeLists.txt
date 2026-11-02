@@ -365,6 +365,31 @@ if(NOT APPLE)
     $<TARGET_FILE:thp_arena_test>)
   set_tests_properties(test_thp_arena_off test_thp_arena_on test_thp_arena_never test_thp_arena_idle
     PROPERTIES TIMEOUT 120)
+
+  # SMASH_THP_UNIT=1: a huge page compressed and restored as one unit
+  # (thp_unit_test.cpp). Root and the idle tracker, or they skip; _off is the
+  # same checks expecting today's split restore, _userconf the unit part under
+  # a 128-core deployment's settings, _fallback (any user) the refusal.
+  add_executable(thp_unit_test thp_unit_test.cpp)
+  set_target_properties(thp_unit_test PROPERTIES CXX_STANDARD 20)
+  target_link_libraries(thp_unit_test PRIVATE ${CMAKE_DL_LIBS} Threads::Threads)
+  set(_thp_unit_env "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=1" "SMASH_WRITE_TRACK=idle"
+    "SMASH_COLD_TIMEOUT_SEC=1")
+  foreach(part unit mixed syscall fork shrink)
+    add_test(NAME test_thp_unit_${part} COMMAND ${CMAKE_COMMAND} -E env ${_thp_unit_env}
+      "SMASH_THP_UNIT=1" "THP_UNIT_PART=${part}" $<TARGET_FILE:thp_unit_test>)
+    list(APPEND _thp_unit_tests test_thp_unit_${part})
+  endforeach()
+  add_test(NAME test_thp_unit_off COMMAND ${CMAKE_COMMAND} -E env ${_thp_unit_env}
+    "SMASH_THP=1" "THP_UNIT_EXPECT=split" $<TARGET_FILE:thp_unit_test>)
+  add_test(NAME test_thp_unit_userconf COMMAND ${CMAKE_COMMAND} -E env ${_thp_unit_env}
+    "SMASH_THP_UNIT=1" "SMASH_CODEC=lz4" "SMASH_SUBARENAS=1" "SMASH_DIRTY_MAX_MIB=64" "SMASH_SOFTDIRTY=0"
+    "SMASH_STATS_SIGNAL=1" $<TARGET_FILE:thp_unit_test>)
+  add_test(NAME test_thp_unit_fallback COMMAND ${CMAKE_COMMAND} -E env
+    "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=1" "SMASH_THP_UNIT=1" "THP_UNIT_PART=fallback"
+    $<TARGET_FILE:thp_unit_test>)
+  set_tests_properties(${_thp_unit_tests} test_thp_unit_off test_thp_unit_userconf test_thp_unit_fallback
+    PROPERTIES TIMEOUT 420)
 endif()
 
 # ── Runtime large-alloc threshold ───────────────────────────────────────────

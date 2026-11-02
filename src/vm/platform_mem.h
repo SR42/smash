@@ -175,6 +175,26 @@ inline void* reservePages(size_t size) {
 #endif
 }
 
+// reservePages() at an address that is a multiple of `align` (a power of
+// two): the arena's 2 MiB units line up with transparent huge pages only if
+// its base does (SMASH_THP_UNIT counts units from page index 0). Reserves
+// `align` more and gives back the ends. A kernel that already aligns large
+// anonymous mappings (Linux 6.7+) leaves nothing at the front.
+inline void* reservePagesAligned(size_t size, size_t align) {
+#if defined(__linux__)
+    void* p = reservePages(size + align);
+    if (!p) return nullptr;
+    const auto a = reinterpret_cast<uintptr_t>(p);
+    const uintptr_t b = (a + align - 1) & ~(uintptr_t{align} - 1);
+    if (b > a) rawMunmap(p, b - a);
+    if (const size_t tail = (a + size + align) - (b + size)) rawMunmap(reinterpret_cast<void*>(b + size), tail);
+    return reinterpret_cast<void*>(b);
+#else
+    (void)align;
+    return reservePages(size);
+#endif
+}
+
 // Map read/write address space whose pages the kernel backs lazily on first
 // touch. Same RSS behaviour as reservePages() followed by commitPages() — an
 // untouched page costs nothing either way — but with no commit step, so a
