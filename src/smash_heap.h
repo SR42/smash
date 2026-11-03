@@ -2321,6 +2321,10 @@ public:
         if (!compression_inited_) return -1;
         return compressor_.unitCounters(compressed, reclaimed, restored, rolled_back);
     }
+    int idleScanInfo(uint64_t* pagemap_reads, uint64_t* pages, uint64_t* ticks) const {
+        if (!compression_inited_) return -1;
+        return compressor_.idleScanCounters(pagemap_reads, pages, ticks);
+    }
     bool tickBudgetInfo(uint64_t* budget, uint64_t* max_per_tick, uint64_t* turned_away) const {
         if (!compression_inited_) return false;
         compressor_.tickBudgetCounters(budget, max_per_tick, turned_away);

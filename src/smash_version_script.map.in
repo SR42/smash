@@ -106,6 +106,7 @@
     smash_write_tracker;
     smash_tick_cost_info;
     smash_thp_unit_info;
+    smash_idle_scan_info;
     smash_blob_usage;
     smash_subarena_info;
     smash_shared_arena_info;

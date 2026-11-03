@@ -9808,6 +9808,14 @@ public:
         return unit_mode_ ? 1 : 0;
     }
     const char* trackerName() const { return writeTrackerName(write_tracker_); }
+    // The idle tracker's pagemap reads and pages scanned so far, and ticks;
+    // 1 when the tracker is `idle`, else 0 (smash_idle_scan_info).
+    int idleScanCounters(uint64_t* pagemap_reads, uint64_t* pages, uint64_t* ticks) const {
+        *pagemap_reads = pc_.idle_pagemap.load(std::memory_order_relaxed);
+        *pages = pc_.idle_pages.load(std::memory_order_relaxed);
+        *ticks = pc_.ticks.load(std::memory_order_relaxed);
+        return write_tracker_ == WriteTracker::kIdle ? 1 : 0;
+    }
     void tickCost(uint64_t* sweep_pages, uint64_t* memread_calls, uint64_t* ticks) const {
         *sweep_pages = pc_.sweep_scan_pages.load(std::memory_order_relaxed);
         *memread_calls = pc_.sc_memread_n.load(std::memory_order_relaxed);

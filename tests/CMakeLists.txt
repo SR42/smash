@@ -128,6 +128,11 @@ set_tests_properties(test_compression_reclaim_range PROPERTIES
 add_test(NAME test_compression_bucket_stats COMMAND test_compression bucketstats)
 set_tests_properties(test_compression_bucket_stats PROPERTIES
   ENVIRONMENT "SMASH_COLD_TICKS=2;SMASH_SOFTDIRTY=0;SMASH_FIXAV=0")
+# A worker allocated late copies worker 0's knowledge of each bucket, never
+# its totals (testSeedBucketStats).
+add_test(NAME test_compression_seed_stats COMMAND test_compression seedstats)
+set_tests_properties(test_compression_seed_stats PROPERTIES
+  ENVIRONMENT "SMASH_COLD_TICKS=2;SMASH_SOFTDIRTY=0;SMASH_FIXAV=0")
 add_test(NAME test_compression_cold_max COMMAND test_compression coldmax)
 set_tests_properties(test_compression_cold_max PROPERTIES
   ENVIRONMENT "SMASH_COLD_TICKS=300;SMASH_SOFTDIRTY=0;SMASH_FIXAV=0")
@@ -848,6 +853,35 @@ if(NOT APPLE)
     "SMASH_DEFER_PHASES_MS=0" "SMASH_TEST_WORKERS=2" "SMASH_NUMA_WORKERS=1"
     $<TARGET_FILE:numa_work_sharing_test>)
   set_tests_properties(test_numa_work_sharing PROPERTIES TIMEOUT 300)
+
+  # A loaded profile reaches the workers allocated after it: the rest of the
+  # pool, and the node groups (seed_profile_test.cpp; _groups skips without
+  # two memory nodes with CPUs).
+  add_executable(seed_profile_test seed_profile_test.cpp)
+  target_link_libraries(seed_profile_test PRIVATE ${CMAKE_DL_LIBS})
+  add_test(NAME test_seed_profile_workers COMMAND ${CMAKE_COMMAND} -E env
+    "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=1" "SMASH_COLD_TIMEOUT_SEC=1"
+    "SMASH_DEFER_PHASES_MS=0" "SMASH_TEST_WORKERS=8" "SMASH_NUMA_COMPRESSOR=0"
+    $<TARGET_FILE:seed_profile_test>)
+  add_test(NAME test_seed_profile_groups COMMAND ${CMAKE_COMMAND} -E env
+    "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=1" "SMASH_COLD_TIMEOUT_SEC=1"
+    "SMASH_DEFER_PHASES_MS=0" "SMASH_TEST_WORKERS=1" "SEED_GROUPS=1"
+    $<TARGET_FILE:seed_profile_test>)
+  set_tests_properties(test_seed_profile_workers test_seed_profile_groups PROPERTIES TIMEOUT 180)
+
+  # The idle tracker reads the pagemap of live pages only (idle_scan_live_test.cpp;
+  # root only, skips otherwise).
+  add_executable(idle_scan_live_test idle_scan_live_test.cpp)
+  target_link_libraries(idle_scan_live_test PRIVATE ${CMAKE_DL_LIBS})
+  add_test(NAME test_idle_scan_live COMMAND ${CMAKE_COMMAND} -E env
+    "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=1" "SMASH_WRITE_TRACK=idle"
+    "SMASH_IDLE_SCAN_TICKS=1" "SMASH_COLD_TIMEOUT_SEC=60" "SMASH_DEFER_PHASES_MS=0"
+    $<TARGET_FILE:idle_scan_live_test>)
+  add_test(NAME test_idle_scan_live_subarenas COMMAND ${CMAKE_COMMAND} -E env
+    "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=1" "SMASH_WRITE_TRACK=idle" "SMASH_SUBARENAS=1"
+    "SMASH_IDLE_SCAN_TICKS=1" "SMASH_COLD_TIMEOUT_SEC=60" "SMASH_DEFER_PHASES_MS=0"
+    $<TARGET_FILE:idle_scan_live_test>)
+  set_tests_properties(test_idle_scan_live test_idle_scan_live_subarenas PROPERTIES TIMEOUT 120)
 
   # Where the (16 KiB, 1 MiB) band goes (large_only_band_test.cpp).
   add_executable(large_only_band_test large_only_band_test.cpp)

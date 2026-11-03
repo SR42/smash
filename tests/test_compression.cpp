@@ -1013,6 +1013,67 @@ static void testInteriorBucketStats() {
           "want %d, 0", rec[1].thrash_rate, rec[1].stable_cold, 80 * 255 / 100);
 }
 
+// A worker allocated after worker 0 starts from worker 0's knowledge of each
+// bucket (ratio window, cost EMAs, the persisted hints a profile loads into
+// the workers that exist then), never from its totals: every reader sums
+// those over all workers, and a copy counted worker 0's compressions once
+// more per late worker (63 became 1953 over 31 workers).
+static void testSeedBucketStats() {
+    VmRegion vm;
+    vm.init(64 * kPageSize);
+    PageStateTable states;
+    states.init(vm.totalPages());
+    PageLockTable locks;
+    locks.init(vm.totalPages());
+    CompressStore store;
+    store.init();
+    CompressEngine engine;
+    engine.init();
+    CompressorThread compressor;
+    compressor.init(&vm, &states, &locks, &store, &engine);
+
+    constexpr uint8_t kArena = 1, kSc = 3;
+    auto& w0 = compressor.bucketStatsForTest(0, kArena, kSc);
+    w0.count = 12;
+    w0.head = 12;
+    for (int i = 0; i < 12; ++i) w0.ratios[i] = 200;
+    w0.sum = 12 * 200;
+    w0.cost_ema_x16[0] = 1600;
+    w0.cost_count[0] = 9;
+    w0.persist_hint = 1;
+    w0.profile_stable_cold = 1;
+    w0.profile_best_tier = 0;
+    w0.compress_count.store(63);
+    w0.decompress_count.store(21);
+    w0.bytes_saved_total.store(123456);
+    w0.time_cost_total_us.store(777);
+
+    // The last worker of the pool: allocated now, by this call.
+    const auto& late = compressor.bucketStatsForTest(kMaxCompressorWorkers - 1, kArena, kSc);
+    fprintf(stderr, "seed stats: late worker count %u sum %u cost %u/%u hint %u stable %u tier %u; "
+            "totals %llu %llu %llu %llu\n", late.count, late.sum, late.cost_ema_x16[0], late.cost_count[0],
+            late.persist_hint, late.profile_stable_cold, late.profile_best_tier,
+            (unsigned long long)late.compress_count.load(), (unsigned long long)late.decompress_count.load(),
+            (unsigned long long)late.bytes_saved_total.load(), (unsigned long long)late.time_cost_total_us.load());
+    CHECK(late.count == 12 && late.head == 12 && late.sum == 12 * 200 && late.ratios[11] == 200,
+          "seed stats: a late worker's ratio window is %u samples, sum %u; want worker 0's 12, %u",
+          late.count, late.sum, 12 * 200);
+    CHECK(late.cost_ema_x16[0] == 1600 && late.cost_count[0] == 9,
+          "seed stats: a late worker's cost EMA %u (%u samples); want worker 0's 1600 (9)",
+          late.cost_ema_x16[0], late.cost_count[0]);
+    CHECK(late.persist_hint == 1 && late.profile_stable_cold == 1 && late.profile_best_tier == 0,
+          "seed stats: a late worker's profile hints %u/%u/%u; want worker 0's 1/1/0",
+          late.persist_hint, late.profile_stable_cold, late.profile_best_tier);
+    CHECK(late.compress_count.load() == 0, "seed stats: a late worker starts with %llu compressions, want 0",
+          (unsigned long long)late.compress_count.load());
+    CHECK(late.decompress_count.load() == 0, "seed stats: a late worker starts with %llu decompressions, want 0",
+          (unsigned long long)late.decompress_count.load());
+    CHECK(late.bytes_saved_total.load() == 0, "seed stats: a late worker starts with %llu bytes saved, want 0",
+          (unsigned long long)late.bytes_saved_total.load());
+    CHECK(late.time_cost_total_us.load() == 0, "seed stats: a late worker starts with %llu us spent, want 0",
+          (unsigned long long)late.time_cost_total_us.load());
+}
+
 static void testReleaseCompressedPages() {
     VmRegion vm;
     vm.init(64 * kPageSize);
@@ -1057,6 +1118,11 @@ static void testReleaseCompressedPages() {
 int main(int argc, char** argv) {
     if (argc > 1 && strcmp(argv[1], "bucketstats") == 0) {
         testInteriorBucketStats();
+        fprintf(stderr, failures ? "compression: %d failures\n" : "compression: all tests passed\n", failures);
+        return failures ? 1 : 0;
+    }
+    if (argc > 1 && strcmp(argv[1], "seedstats") == 0) {
+        testSeedBucketStats();
         fprintf(stderr, failures ? "compression: %d failures\n" : "compression: all tests passed\n", failures);
         return failures ? 1 : 0;
     }

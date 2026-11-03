@@ -1652,6 +1652,21 @@ int smash_thp_unit_info(uint64_t* compressed, uint64_t* reclaimed, uint64_t* res
     return on;
 }
 
+// Diagnostic / test hook (not public API): the idle tracker's pagemap reads
+// and pages scanned so far, and the ticks run. Returns 1 when the tracker is
+// `idle`, 0 when it is another, -1 before the compressor exists
+// (tests/idle_scan_live_test.cpp).
+extern "C" __attribute__((visibility("default")))
+int smash_idle_scan_info(uint64_t* pagemap_reads, uint64_t* pages, uint64_t* ticks) {
+    uint64_t r = 0, p = 0, t = 0;
+    auto* heap = SmashRedirect::getHeap();
+    const int on = heap ? heap->idleScanInfo(&r, &p, &t) : -1;
+    if (pagemap_reads) *pagemap_reads = r;
+    if (pages) *pages = p;
+    if (ticks) *ticks = t;
+    return on;
+}
+
 extern "C" __attribute__((visibility("default")))
 int smash_tick_cost_info(uint64_t* sweep_pages, uint64_t* memread_calls, uint64_t* ticks) {
     uint64_t sp = 0, mr = 0, t = 0;
