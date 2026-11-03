@@ -34,6 +34,7 @@
 // baseline or under LD_PRELOAD=libsmash.so. RSS is measured out-of-process
 // (forked monitor) to avoid allocator interference. Deterministic PRNG.
 
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -118,6 +119,25 @@ static void printUsage(const char* prog) {
 static int g_cmd_pipe[2] = {-1, -1};
 static int g_rss_pipe[2] = {-1, -1};
 
+// A failed or short transfer on the monitor's pipes ends the run: the parent
+// used to record an RSS of 0 for a sample whose read failed.
+static void pipeWriteAll(int fd, const void* p, size_t n) {
+    ssize_t r;
+    do r = write(fd, p, n); while (r < 0 && errno == EINTR);
+    if (r != static_cast<ssize_t>(n)) {
+        fprintf(stderr, "RSS monitor pipe: wrote %zd of %zu bytes (%s)\n", r, n, r < 0 ? strerror(errno) : "short");
+        _exit(1);
+    }
+}
+static void pipeReadAll(int fd, void* p, size_t n) {
+    ssize_t r;
+    do r = read(fd, p, n); while (r < 0 && errno == EINTR);
+    if (r != static_cast<ssize_t>(n)) {
+        fprintf(stderr, "RSS monitor pipe: read %zd of %zu bytes (%s)\n", r, n, r < 0 ? strerror(errno) : "short");
+        _exit(1);
+    }
+}
+
 static size_t getRSSBytesForPid(pid_t pid) {
 #if defined(__APPLE__)
     struct rusage_info_v4 ri;
@@ -159,7 +179,7 @@ static size_t getRSSBytesForPid(pid_t pid) {
         ssize_t n = read(g_cmd_pipe[0], &cmd, 1);
         if (n <= 0 || cmd == 'Q') _exit(0);
         size_t rss = getRSSBytesForPid(target_pid);
-        write(g_rss_pipe[1], &rss, sizeof(rss));
+        pipeWriteAll(g_rss_pipe[1], &rss, sizeof(rss));
     }
 }
 
@@ -175,15 +195,15 @@ static void startRssMonitor() {
 
 static size_t requestRSS() {
     char cmd = 'M';
-    write(g_cmd_pipe[1], &cmd, 1);
+    pipeWriteAll(g_cmd_pipe[1], &cmd, 1);
     size_t rss = 0;
-    read(g_rss_pipe[0], &rss, sizeof(rss));
+    pipeReadAll(g_rss_pipe[0], &rss, sizeof(rss));
     return rss;
 }
 
 static void stopRssMonitor() {
     char cmd = 'Q';
-    write(g_cmd_pipe[1], &cmd, 1);
+    (void)!write(g_cmd_pipe[1], &cmd, 1);   // the child may be gone already
     close(g_cmd_pipe[1]);
     close(g_rss_pipe[0]);
     wait(nullptr);

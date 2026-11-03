@@ -1551,11 +1551,6 @@ int smash_debug_hold_page_lock(const void* ptr, unsigned ms) {
     return heap && heap->debugHoldPageLock(ptr, ms) ? 0 : -1;
 }
 
-// Diagnostic / test hook (not public API): what the compressor's ticks have
-// read so far -- page bits scanned by the deferred-madvise sweep, pages read
-// through /proc/self/mem for snapshots -- and how many ticks ran. 0 on
-// success, -1 without a compressor.
-extern "C" __attribute__((visibility("default")))
 // Diagnostic / test hook (not public API): snapshot copies made directly
 // (scanning trackers), those whose read the fault handler had to make
 // possible first, and reads through /proc/self/mem (tests/idle_direct_snapshot_test.cpp).
@@ -1667,6 +1662,10 @@ int smash_idle_scan_info(uint64_t* pagemap_reads, uint64_t* pages, uint64_t* tic
     return on;
 }
 
+// Diagnostic / test hook (not public API): what the compressor's ticks have
+// read so far -- page bits scanned by the deferred-madvise sweep, pages read
+// through /proc/self/mem for snapshots -- and how many ticks ran. 0 on
+// success, -1 without a compressor.
 extern "C" __attribute__((visibility("default")))
 int smash_tick_cost_info(uint64_t* sweep_pages, uint64_t* memread_calls, uint64_t* ticks) {
     uint64_t sp = 0, mr = 0, t = 0;

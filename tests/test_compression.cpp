@@ -1074,6 +1074,49 @@ static void testSeedBucketStats() {
           (unsigned long long)late.time_cost_total_us.load());
 }
 
+// init() initializes the function-local statics that read the environment
+// (warmupClassStatics), so none of them first runs getenv later, inside a
+// tick or a fault. The warm-up used to call getenv itself, which initialized
+// none of them: each took whatever the environment held at its first use.
+// Each variable is set before init() and changed after it; the value in
+// effect must be the first. Its own process: these statics live for good.
+static void testWarmStatics() {
+    setenv("SMASH_PROTECT_CHUNK_PAGES", "7", 1);
+    setenv("SMASH_P2_CHUNK", "0", 1);
+    setenv("SMASH_SOFTDIRTY", "0", 1);
+    setenv("SMASH_IDLE_READ_TRACK", "0", 1);
+    setenv("SMASH_CPU_PRESSURE_CAP", "0", 1);
+    VmRegion vm;
+    vm.init(64 * kPageSize);
+    PageStateTable states;
+    states.init(vm.totalPages());
+    PageLockTable locks;
+    locks.init(vm.totalPages());
+    CompressStore store;
+    store.init();
+    CompressEngine engine;
+    engine.init();
+    CompressorThread compressor;
+    compressor.init(&vm, &states, &locks, &store, &engine);
+    setenv("SMASH_PROTECT_CHUNK_PAGES", "9", 1);
+    setenv("SMASH_P2_CHUNK", "1", 1);
+    setenv("SMASH_SOFTDIRTY", "1", 1);
+    setenv("SMASH_IDLE_READ_TRACK", "1", 1);
+    setenv("SMASH_CPU_PRESSURE_CAP", "1", 1);
+
+    size_t chunk = 0;
+    bool p2 = true, sd = true, cap = true;
+    int idle_mode = 0;
+    CompressorThread::envStaticsForTest(&chunk, &p2, &sd, &idle_mode, &cap);
+    fprintf(stderr, "warm statics: protect chunk %zu, p2 chunk %d, softdirty %d, idle read mode %d, "
+            "cpu pressure cap %d\n", chunk, p2, sd, idle_mode, cap);
+    CHECK(chunk == 7, "warm statics: SMASH_PROTECT_CHUNK_PAGES in effect %zu, want 7 (set before init)", chunk);
+    CHECK(!p2, "warm statics: SMASH_P2_CHUNK=0 set before init is not in effect");
+    CHECK(!sd, "warm statics: SMASH_SOFTDIRTY=0 set before init is not in effect");
+    CHECK(idle_mode == -1, "warm statics: SMASH_IDLE_READ_TRACK mode %d, want -1 (0 set before init)", idle_mode);
+    CHECK(!cap, "warm statics: SMASH_CPU_PRESSURE_CAP=0 set before init is not in effect");
+}
+
 static void testReleaseCompressedPages() {
     VmRegion vm;
     vm.init(64 * kPageSize);
@@ -1118,6 +1161,11 @@ static void testReleaseCompressedPages() {
 int main(int argc, char** argv) {
     if (argc > 1 && strcmp(argv[1], "bucketstats") == 0) {
         testInteriorBucketStats();
+        fprintf(stderr, failures ? "compression: %d failures\n" : "compression: all tests passed\n", failures);
+        return failures ? 1 : 0;
+    }
+    if (argc > 1 && strcmp(argv[1], "warmstatics") == 0) {
+        testWarmStatics();
         fprintf(stderr, failures ? "compression: %d failures\n" : "compression: all tests passed\n", failures);
         return failures ? 1 : 0;
     }

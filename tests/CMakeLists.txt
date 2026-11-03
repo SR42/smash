@@ -133,6 +133,9 @@ set_tests_properties(test_compression_bucket_stats PROPERTIES
 add_test(NAME test_compression_seed_stats COMMAND test_compression seedstats)
 set_tests_properties(test_compression_seed_stats PROPERTIES
   ENVIRONMENT "SMASH_COLD_TICKS=2;SMASH_SOFTDIRTY=0;SMASH_FIXAV=0")
+# init() initializes the statics that read the environment; a variable
+# changed after it is not seen (testWarmStatics). The test sets its own.
+add_test(NAME test_compression_warm_statics COMMAND test_compression warmstatics)
 add_test(NAME test_compression_cold_max COMMAND test_compression coldmax)
 set_tests_properties(test_compression_cold_max PROPERTIES
   ENVIRONMENT "SMASH_COLD_TICKS=300;SMASH_SOFTDIRTY=0;SMASH_FIXAV=0")

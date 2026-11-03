@@ -82,17 +82,20 @@ int main() {
     for (size_t obj_size : obj_sizes) {
         uint8_t sc = static_cast<uint8_t>(obj_size <= 128 ? obj_size / 16 - 1 : 8);
 
-        // Train dictionary for this "size class"
+        // Train dictionary for this "size class". The allocator trains none by
+        // default (kDictTrainSamples is 0), so the bench uses its own count:
+        // with the allocator's, the zstd+dict row ran without a dictionary.
+        constexpr int kSamples = 64;
         auto* sample_buf = static_cast<char*>(
             BootstrapAlloc::instance().allocate(
-                static_cast<size_t>(kDictTrainSamples) * kPageSize, kPageSize));
-        size_t sample_sizes[kDictTrainSamples];
-        for (int i = 0; i < kDictTrainSamples; ++i) {
+                static_cast<size_t>(kSamples) * kPageSize, kPageSize));
+        size_t sample_sizes[kSamples];
+        for (int i = 0; i < kSamples; ++i) {
             fillStructuredPage(sample_buf + static_cast<size_t>(i) * kPageSize,
                               static_cast<uint8_t>(i), obj_size);
             sample_sizes[i] = kPageSize;
         }
-        engine.trainDictionary(sc, sample_buf, sample_sizes, kDictTrainSamples);
+        engine.trainDictionary(sc, sample_buf, sample_sizes, kSamples);
 
         // Test page
         auto* test_page = static_cast<char*>(

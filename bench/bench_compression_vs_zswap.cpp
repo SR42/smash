@@ -26,6 +26,10 @@
 // also drops for pages the kernel compresses — but the kernel only acts under
 // memory pressure, so we use MADV_PAGEOUT (Linux) or memory pressure
 // simulation to trigger it.
+//
+// The ratio columns are measured in-process, by compressing the same live
+// pages with each codec: LZ4 stands in for zswap's default compressor. The
+// kernel's own zswap statistics (debugfs, root only) are not read.
 
 #include <chrono>
 #include <cmath>
@@ -78,32 +82,6 @@ static size_t getCurrentRSSBytes() {
 #endif
 }
 
-// ── zswap stats (Linux only) ─────────────────────────────────────────────────
-
-struct ZswapStats {
-    size_t stored_pages;
-    size_t pool_total_size;
-};
-
-static ZswapStats readZswapStats() {
-    ZswapStats s{};
-#if defined(__linux__)
-    auto readVal = [](const char* path) -> size_t {
-        int fd = open(path, O_RDONLY);
-        if (fd < 0) return 0;
-        char buf[64];
-        ssize_t n = read(fd, buf, sizeof(buf) - 1);
-        close(fd);
-        if (n <= 0) return 0;
-        buf[n] = '\0';
-        return strtoull(buf, nullptr, 10);
-    };
-    s.stored_pages = readVal("/sys/kernel/debug/zswap/stored_pages");
-    s.pool_total_size = readVal("/sys/kernel/debug/zswap/pool_total_size");
-#endif
-    return s;
-}
-
 // ── Force pages into OS compressor ───────────────────────────────────────────
 
 #if defined(__linux__)
@@ -117,9 +95,9 @@ static bool zswapEnabled() {
     int fd = open("/sys/module/zswap/parameters/enabled", O_RDONLY);
     if (fd < 0) return false;
     char c = 'N';
-    read(fd, &c, 1);
+    const bool got = read(fd, &c, 1) == 1;
     close(fd);
-    return c == 'Y' || c == 'y';
+    return got && (c == 'Y' || c == 'y');
 }
 #elif defined(__APPLE__)
 static void forcePageout(void* addr, size_t len) {

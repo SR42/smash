@@ -63,7 +63,7 @@ static void fillKVLike(void* page, int variant, std::mt19937& rng) {
     constexpr size_t kObjSize = 128;  // key(32) + value(96)
     for (size_t off = 0; off + kObjSize <= kPageSize; off += kObjSize) {
         // Key: "user:" prefix + numeric ID
-        snprintf(reinterpret_cast<char*>(p + off), 32, "user:%08x", rng());
+        snprintf(reinterpret_cast<char*>(p + off), 32, "user:%08x", static_cast<unsigned>(rng()));
         // Value: JSON-ish payload with repeated structure
         int age = static_cast<int>(rng() % 100);
         snprintf(reinterpret_cast<char*>(p + off + 32), 96,

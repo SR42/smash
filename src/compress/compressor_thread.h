@@ -4037,11 +4037,7 @@ private:
             // correctness concern (a decompress race on a mid-batch page) is
             // closed by restorePageContents()'s populate-before-readable fix.
             // SMASH_P2_CHUNK=0 reverts to per-page mprotect for comparison.
-            static const bool p2_chunk = []{
-                const char* v = std::getenv("SMASH_P2_CHUNK");
-                return !v || v[0] != '0';
-            }();
-            if (p2_chunk) {
+            if (p2ChunkEnabled()) {
                 states_->set(page_idx, PageState::COMPRESSED);
                 if (worker.pending_pn_count < CompressWorker::kPendingProtCap) {
                     worker.pending_pn_pages[worker.pending_pn_count++] = page_idx;
@@ -5654,6 +5650,15 @@ private:
         pcAdd(pc_.rc_vma_stop, n_vma_stop);
     }
 
+    // SMASH_P2_CHUNK (default on): phase 2 batches its mprotects (compressPage).
+    static bool p2ChunkEnabled() {
+        static const bool on = []{
+            const char* v = std::getenv("SMASH_P2_CHUNK");
+            return !v || v[0] != '0';
+        }();
+        return on;
+    }
+
     // ── Soft-dirty access tracking (Linux only) ───────────────────────────
     //
     // Replaces Phase 3 mprotect-based write monitoring. Pros:
@@ -5938,17 +5943,21 @@ private:
     // — redacted to 0 without CAP_SYS_ADMIN. Cached: idle_read_ok_ in {0,1}.
     // SMASH_IDLE_READ_TRACK: unset/AUTO ⇒ use iff probe passes; 0 ⇒ force off;
     // 1 ⇒ force on (still requires probe; warns to stderr if it can't).
-    bool ensureIdleReadFds() {
-#ifdef __linux__
-        if (idle_read_ok_ >= 0) return idle_read_ok_ == 1;
-        idle_read_ok_ = 0;  // assume unavailable until proven otherwise
-
+    static int idleReadTrackMode() {
         static const int mode = []{
             const char* v = std::getenv("SMASH_IDLE_READ_TRACK");
             if (!v) return 0;                  // AUTO
             if (v[0] == '0') return -1;        // force off
             return 1;                          // force on
         }();
+        return mode;
+    }
+    bool ensureIdleReadFds() {
+#ifdef __linux__
+        if (idle_read_ok_ >= 0) return idle_read_ok_ == 1;
+        idle_read_ok_ = 0;  // assume unavailable until proven otherwise
+
+        const int mode = idleReadTrackMode();
         if (mode == -1) return false;
         if (!ensurePagemapFd()) return false;  // need pagemap for PFNs
 
@@ -8003,12 +8012,15 @@ private:
     //
     // Cheap, cached: re-evaluated at most every kCpuPressureSampleTicks
     // ticks. Behind SMASH_CPU_PRESSURE_CAP=0 to allow ablation.
-    int cpuPressureWorkerCap() {
+    static bool cpuPressureCapEnabled() {
         static const bool enabled = []{
             const char* v = std::getenv("SMASH_CPU_PRESSURE_CAP");
             return !(v && v[0] == '0');
         }();
-        if (!enabled) return 0;
+        return enabled;
+    }
+    int cpuPressureWorkerCap() {
+        if (!cpuPressureCapEnabled()) return 0;
 
         static const long nproc_cached = []{
             long n = sysconf(_SC_NPROCESSORS_ONLN);
@@ -8795,12 +8807,24 @@ public:
         v = std::getenv("SMASH_SPILL_MAX_MB");
         cfg_spill_max_mb_ = v ? std::atol(v) : 1024L;
         cfg_spill_dir_ = std::getenv("SMASH_SPILL_DIR");  // may be null
-        // Touch remaining statics to force their initialization:
-        (void)std::getenv("SMASH_PROTECT_CHUNK_PAGES");
-        (void)std::getenv("SMASH_P2_CHUNK");
-        (void)std::getenv("SMASH_SOFTDIRTY");
-        (void)std::getenv("SMASH_IDLE_READ_TRACK");
-        (void)std::getenv("SMASH_CPU_PRESSURE_CAP");
+        // The function-local statics that read the environment, initialized
+        // here by calling their functions: reading the variable alone (what
+        // this did) initialized none of them, and each was read at its first
+        // use instead.
+        (void)protectChunkPages();
+        (void)p2ChunkEnabled();
+        (void)isSoftDirtyEnabled();
+        (void)idleReadTrackMode();
+        (void)cpuPressureCapEnabled();
+    }
+    // Test hook (test_compression's testWarmStatics): the values those statics hold.
+    static void envStaticsForTest(size_t* protect_chunk, bool* p2_chunk, bool* softdirty,
+                                  int* idle_read_mode, bool* cpu_pressure_cap) {
+        *protect_chunk = protectChunkPages();
+        *p2_chunk = p2ChunkEnabled();
+        *softdirty = isSoftDirtyEnabled();
+        *idle_read_mode = idleReadTrackMode();
+        *cpu_pressure_cap = cpuPressureCapEnabled();
     }
 
     void start() {
