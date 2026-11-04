@@ -1657,6 +1657,11 @@ public:
         return classSize(span->size_class);
     }
 
+    // Large blocks placed with direct mmap (below kLargeAllocVmThreshold, or
+    // in large-only mode) live outside the contiguous arena and are only
+    // registered in page_map_; xxowns() must recognise them.
+    bool hasPageMapSpan(uintptr_t addr) const { return page_map_.get(addr) != nullptr; }
+
     // Diagnostic / test hook: the arena a smash-managed pointer was routed to,
     // or -1 for a non-smash pointer (foreign, or large-only passthrough).
     // Backs the exported smash_arena_for(); the arena-routing regression test

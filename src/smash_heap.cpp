@@ -1346,7 +1346,10 @@ extern "C" bool xxowns(const void* ptr) {
     // ownership: exclude externally-tracked pages from xxowns.
     if (vm->isTrackingMode())
         return vm->contains(addr);   // compress-only: hash IS the allocator
-    return vm->inContigArena(addr);  // full mode: only smash's own arena
+    if (vm->inContigArena(addr)) return true;  // full mode: smash's own arena
+    // ...or a large block smash mmap'd itself (registered in page_map_).
+    auto* heap = SmashRedirect::getHeap();
+    return heap && heap->hasPageMapSpan(addr);
 }
 
 // ── Start compressor from constructor ─────────────────────────────────────────

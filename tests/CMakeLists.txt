@@ -273,6 +273,42 @@ else()
 endif()
 set_tests_properties(test_arena_routing PROPERTIES TIMEOUT 30)
 
+# Large-block ownership regression: blocks smash mmaps directly (16 KiB < size
+# < kLargeAllocVmThreshold, and every large block in large-only mode) sit
+# outside the contiguous arena; xxowns() must still claim them or alloc8
+# forwards realloc/malloc_size/free to the system allocator (malloc_size 0,
+# realloc reads past the block -> SIGSEGV; crashed every Rust program).
+# Interposed, both modes, no compressor needed.
+add_executable(large_realloc_test large_realloc_test.cpp)
+set_target_properties(large_realloc_test PROPERTIES CXX_STANDARD 20)
+foreach(lo 0 1)
+  if(lo)
+    set(_name test_large_realloc_large_only)
+  else()
+    set(_name test_large_realloc)
+  endif()
+  if(APPLE)
+    add_test(
+      NAME ${_name}
+      COMMAND ${CMAKE_COMMAND} -E env
+        "DYLD_INSERT_LIBRARIES=$<TARGET_FILE:smash>"
+        "DYLD_FORCE_FLAT_NAMESPACE=1"
+        "MallocNanoZone=0"
+        "SMASH_LARGE_ONLY=${lo}"
+        $<TARGET_FILE:large_realloc_test>
+    )
+  else()
+    add_test(
+      NAME ${_name}
+      COMMAND ${CMAKE_COMMAND} -E env
+        "LD_PRELOAD=$<TARGET_FILE:smash>"
+        "SMASH_LARGE_ONLY=${lo}"
+        $<TARGET_FILE:large_realloc_test>
+    )
+  endif()
+  set_tests_properties(${_name} PROPERTIES TIMEOUT 30)
+endforeach()
+
 # Syscall EFAULT-retry test: allocates a buffer, forces compression, then
 # issues real syscalls (read/writev/readv) directly on the compressed
 # buffer. Verifies that the EFAULT-driven retry path in syscall_compat.h
