@@ -24,6 +24,7 @@
 #include <dlfcn.h>
 #if defined(__linux__)
 #include <sched.h>   // sched_getcpu (vDSO) for CPU-indexed arena routing
+#include <link.h>    // dl_iterate_phdr: image table for the call-site hash
 #endif
 #if defined(__APPLE__)
 #include <mach-o/dyld.h>
@@ -485,7 +486,7 @@ class SmashHeap {
 
     // ── ASLR-resilient call-site hash cache ─────────────────────────────────
     // Maps (return_address >> 12) -> stable offset within shared object.
-    // dladdr() is expensive (~12ns), so we cache results. The cache is
+    // Resolving the image base is not free (see imageBaseFor), so we cache. The cache is
     // direct-mapped for minimal overhead on the hot path (~2ns vs 0.5ns for
     // the original hash).
     //
@@ -519,12 +520,120 @@ class SmashHeap {
         return stableCallsiteHashSlow(ra, slot);
     }
 
+    // ── Image table: return address -> image base, without dladdr ─────────
+    // dladdr() searches the image's symbol table for the closest symbol. We
+    // only need the image base (dli_fbase), and for a large image (rustc's
+    // librustc_driver) that search costs microseconds; with tens of thousands
+    // of allocation sites it dominated rustc's run time (5-6x slowdown).
+    // Instead keep a sorted table of loaded images' executable ranges and
+    // binary-search it. Rebuilt (from BootstrapAlloc, never malloc) only when
+    // an address falls outside every known image, e.g. after dlopen; old
+    // tables are leaked so concurrent readers never see freed memory.
+    struct ImageRange { uintptr_t lo, hi, base; };
+    struct ImageTable { size_t n; ImageRange r[1]; };
+    std::atomic<ImageTable*> image_table_{nullptr};
+    Spinlock image_table_lock_;
+
+    static void sortRanges(ImageRange* r, size_t n) {
+        for (size_t i = 1; i < n; ++i) {           // insertion sort; n ~ 1e3, rare
+            ImageRange x = r[i];
+            size_t j = i;
+            while (j > 0 && r[j - 1].lo > x.lo) { r[j] = r[j - 1]; --j; }
+            r[j] = x;
+        }
+    }
+
+#if defined(__linux__)
+    struct PhdrCollect { ImageRange* out; size_t cap; size_t n; };
+    static int collectPhdr(struct dl_phdr_info* info, size_t, void* arg) {
+        auto* c = static_cast<PhdrCollect*>(arg);
+        uintptr_t first = UINTPTR_MAX;
+        for (int i = 0; i < info->dlpi_phnum; ++i)
+            if (info->dlpi_phdr[i].p_type == PT_LOAD && info->dlpi_phdr[i].p_vaddr < first)
+                first = info->dlpi_phdr[i].p_vaddr;
+        if (first == UINTPTR_MAX) return 0;
+        // dladdr's dli_fbase is the map start: load bias + lowest PT_LOAD vaddr.
+        uintptr_t base = info->dlpi_addr + (first & ~uintptr_t(4095));
+        for (int i = 0; i < info->dlpi_phnum; ++i) {
+            const auto& ph = info->dlpi_phdr[i];
+            if (ph.p_type != PT_LOAD || !(ph.p_flags & PF_X)) continue;
+            if (c->n < c->cap)
+                c->out[c->n++] = {info->dlpi_addr + ph.p_vaddr,
+                                  info->dlpi_addr + ph.p_vaddr + ph.p_memsz, base};
+        }
+        return 0;
+    }
+#endif
+
+    [[gnu::noinline]]
+    ImageTable* rebuildImageTable() {
+        LockGuard guard(image_table_lock_);
+#if defined(__APPLE__)
+        size_t cap = _dyld_image_count() + 64;
+#else
+        size_t cap = 0;
+        dl_iterate_phdr([](struct dl_phdr_info* info, size_t, void* arg) {
+            for (int i = 0; i < info->dlpi_phnum; ++i)
+                if (info->dlpi_phdr[i].p_type == PT_LOAD) ++*static_cast<size_t*>(arg);
+            return 0;
+        }, &cap);
+        cap += 64;
+#endif
+        auto* t = static_cast<ImageTable*>(BootstrapAlloc::instance().allocate(
+            sizeof(ImageTable) + cap * sizeof(ImageRange), alignof(ImageTable)));
+        if (!t) return image_table_.load(std::memory_order_acquire);
+        size_t n = 0;
+#if defined(__APPLE__)
+        uint32_t count = _dyld_image_count();
+        for (uint32_t i = 0; i < count && n < cap; ++i) {
+            auto* hdr = reinterpret_cast<const struct mach_header_64*>(_dyld_get_image_header(i));
+            if (!hdr) continue;
+            unsigned long size = 0;
+            uint8_t* text = getsegmentdata(hdr, "__TEXT", &size);
+            if (!text || !size) continue;
+            uintptr_t lo = reinterpret_cast<uintptr_t>(text);
+            t->r[n++] = {lo, lo + size, reinterpret_cast<uintptr_t>(hdr)};
+        }
+#else
+        PhdrCollect c{t->r, cap, 0};
+        dl_iterate_phdr(collectPhdr, &c);
+        n = c.n;
+#endif
+        sortRanges(t->r, n);
+        t->n = n;
+        image_table_.store(t, std::memory_order_release);
+        return t;
+    }
+
+    static uintptr_t findImageBase(const ImageTable* t, uintptr_t ra) {
+        if (!t) return 0;
+        size_t lo = 0, hi = t->n;
+        while (lo < hi) {                          // last range with r.lo <= ra
+            size_t mid = (lo + hi) / 2;
+            if (t->r[mid].lo <= ra) lo = mid + 1; else hi = mid;
+        }
+        if (lo == 0) return 0;
+        const ImageRange& r = t->r[lo - 1];
+        return ra < r.hi ? r.base : 0;
+    }
+
+    uintptr_t imageBaseFor(uintptr_t ra) {
+        ImageTable* t = image_table_.load(std::memory_order_acquire);
+        if (uintptr_t b = findImageBase(t, ra)) return b;
+        return findImageBase(rebuildImageTable(), ra);   // new image (dlopen)?
+    }
+
     [[gnu::noinline]]
     uint32_t stableCallsiteHashSlow(uintptr_t ra, size_t slot) {
-        Dl_info info{};
         uint32_t hash = 0;
-        if (dladdr(reinterpret_cast<void*>(ra), &info) && info.dli_fbase) {
-            uintptr_t base = reinterpret_cast<uintptr_t>(info.dli_fbase);
+        uintptr_t base = imageBaseFor(ra);
+        if (!base) {
+            // Not in any image's code we enumerated: fall back to dladdr.
+            Dl_info info{};
+            if (dladdr(reinterpret_cast<void*>(ra), &info) && info.dli_fbase)
+                base = reinterpret_cast<uintptr_t>(info.dli_fbase);
+        }
+        if (base) {
             uintptr_t offset = ra - base;
             // Full-avalanche integer hash: even offsets differing by 0x20
             // produce completely different outputs. The old offset^(offset>>16)
