@@ -147,6 +147,14 @@ extern __attribute__((tls_model("initial-exec")))
 extern __attribute__((tls_model("initial-exec")))
     thread_local uintptr_t g_arena_stack_base;
 
+// Per-thread memo of callsiteArena()'s result, keyed on (ra, size class); see
+// callsiteArena(). Namespace scope (not a function-local static) so the
+// inlined hit path and the out-of-line miss path share it.
+struct ArenaMemo { uintptr_t key; uint8_t base; bool valid; };
+inline constexpr size_t kArenaMemoSlots = 256;  // power of 2
+extern __attribute__((tls_model("initial-exec")))
+    thread_local ArenaMemo g_arena_memo[kArenaMemoSlots];
+
 // Resolve the thread's true stack base once and cache it in g_arena_stack_base.
 // Cold: only the first allocation per thread (plus any reentrant allocations the
 // query itself makes) reaches here.
@@ -656,7 +664,32 @@ class SmashHeap {
 
     Slab& slab(uint8_t arena, uint8_t sc) { return slabs_[arena * kNumClasses + sc]; }
 
+    // Hot path: the memo hit, inlined into malloc. Everything else (hashing,
+    // stable call-site resolution, tracing) is in callsiteArenaSlow(), so the
+    // malloc fast path no longer pays that function's frame setup, callee-saved
+    // register spills and stack-protector canary on every call (x86-64 perf:
+    // callsiteArena was 13% of malloc+free cycles, almost all prologue/epilogue).
+    [[gnu::always_inline]]
     uint8_t callsiteArena(uint8_t sc, uintptr_t ra) {
+#if !defined(SMASH_ABLATION_NO_CALLSITE_ARENA) && !defined(SMASH_NO_ARENA_MEMO)
+        const uintptr_t memo_key = ra ^ (static_cast<uintptr_t>(sc) << 56);
+        const size_t memo_slot =
+            (memo_key * 0x9E3779B97F4A7C15ULL >> 56) & (kArenaMemoSlots - 1);
+        const ArenaMemo& memo = g_arena_memo[memo_slot];
+        if (memo.valid && memo.key == memo_key) [[likely]] {
+            uint8_t base = memo.base;
+            if constexpr (kColdArenaFeedback) {
+                if (cold_bias_[base * kNumClasses + sc].load(std::memory_order_relaxed))
+                    return static_cast<uint8_t>(base + getNumArenas());
+            }
+            return base;
+        }
+#endif
+        return callsiteArenaSlow(sc, ra);
+    }
+
+    [[gnu::noinline, gnu::cold]]
+    uint8_t callsiteArenaSlow(uint8_t sc, uintptr_t ra) {
 #ifdef SMASH_ABLATION_NO_CALLSITE_ARENA
         (void)ra;
         uint8_t base = 0;
@@ -673,18 +706,12 @@ class SmashHeap {
         // varies with recursion depth at the same call site, a rare corner we
         // accept — the arena is a compression-homogeneity hint, not correctness).
         // The cold-bias check below is intentionally NOT memoized (must stay live).
-        struct ArenaMemo { uintptr_t key; uint8_t base; bool valid; };
-        static constexpr size_t kArenaMemoSlots = 256;  // power of 2
-        // initial-exec: libsmash is LD_PRELOAD'd, so its TLS is in the startup
-        // reservation. Without this, a function-static thread_local uses the
-        // local-dynamic model → a __tls_get_addr call on every malloc (callgrind:
-        // 1.23 M calls = 9% of instructions came from exactly this).
-        static __attribute__((tls_model("initial-exec")))
-            thread_local ArenaMemo s_arena_memo[kArenaMemoSlots];
+        // (Memo hit is handled inline in callsiteArena(); this re-check is
+        // the miss path's own lookup so it can fill the same slot below.)
         const uintptr_t memo_key = ra ^ (static_cast<uintptr_t>(sc) << 56);
         const size_t memo_slot =
             (memo_key * 0x9E3779B97F4A7C15ULL >> 56) & (kArenaMemoSlots - 1);
-        ArenaMemo& memo = s_arena_memo[memo_slot];
+        ArenaMemo& memo = g_arena_memo[memo_slot];
         if (memo.valid && memo.key == memo_key) [[likely]] {
             uint8_t base = memo.base;
             if constexpr (kColdArenaFeedback) {

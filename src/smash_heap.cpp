@@ -265,6 +265,9 @@ thread_local uint32_t smash::g_free_cache_skip = 0;
 __attribute__((tls_model("initial-exec")))
 thread_local uintptr_t smash::g_arena_stack_base = 0;
 
+__attribute__((tls_model("initial-exec")))
+thread_local smash::ArenaMemo smash::g_arena_memo[smash::kArenaMemoSlots] = {};
+
 // ── Syscall interposition for kernel buffer compatibility ────────────────────
 //
 // Kernel syscalls access userspace buffers directly without triggering SIGSEGV.
