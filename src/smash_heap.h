@@ -92,6 +92,12 @@ extern PageLockTable* g_smash_page_locks_for_external;
 // Without this, the compiler emits __tls_get_addr indirections for
 // every static-local thread_local in an inline function, costing one
 // dependent indirect call per TLS access on the hot path.
+// Per-thread memo of callsiteArena()'s result, keyed on (ra, size class); see
+// callsiteArena(). Shared by the inlined hit path and the out-of-line miss
+// path: a thread_local below, or a ThreadState field on macOS arm64.
+struct ArenaMemo { uintptr_t key; uint8_t base; bool valid; };
+inline constexpr size_t kArenaMemoSlots = 256;  // power of 2
+
 #include "util/tsd_slot.h"
 #if defined(SMASH_USE_TSD)
 #if !defined(ALLOC8_HAS_CALLER_RA_HOOK)
@@ -116,6 +122,9 @@ struct ThreadState {
     uint32_t free_cache_skip = 0;
     uint64_t magic = kThreadStateMagic; // identifies our object in the slot
     ThreadState* next_free = nullptr;   // free-list link after thread exit
+    // callsiteArena() memo, read on every small malloc. Last, so the hot
+    // scalars above share cache lines; zeroed (all invalid) on (re)use.
+    ArenaMemo arena_memo[kArenaMemoSlots] = {};
 };
 static_assert(offsetof(ThreadState, caller_ra) == 0, "caller_ra must be first");
 
@@ -139,6 +148,7 @@ void threadStateAtforkChild();
 #define g_free_cache_gen   (::smash::threadState()->free_cache_gen)
 #define g_free_cache_skip  (::smash::threadState()->free_cache_skip)
 #define g_arena_stack_base (::smash::threadState()->arena_stack_base)
+#define g_arena_memo       (::smash::threadState()->arena_memo)
 #else
 extern __attribute__((tls_model("initial-exec")))
     thread_local ThreadCache* g_thread_cache;
@@ -196,13 +206,10 @@ extern __attribute__((tls_model("initial-exec")))
     thread_local uintptr_t g_arena_stack_base;
 #endif  // SMASH_USE_TSD
 
-// Per-thread memo of callsiteArena()'s result, keyed on (ra, size class); see
-// callsiteArena(). Namespace scope (not a function-local static) so the
-// inlined hit path and the out-of-line miss path share it.
-struct ArenaMemo { uintptr_t key; uint8_t base; bool valid; };
-inline constexpr size_t kArenaMemoSlots = 256;  // power of 2
+#if !defined(SMASH_USE_TSD)
 extern __attribute__((tls_model("initial-exec")))
     thread_local ArenaMemo g_arena_memo[kArenaMemoSlots];
+#endif
 
 // Resolve the thread's true stack base once and cache it in g_arena_stack_base.
 // Cold: only the first allocation per thread (plus any reentrant allocations the
