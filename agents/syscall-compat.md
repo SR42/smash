@@ -62,6 +62,44 @@ objdump -T <caller-binary> | grep <symbol>          # the version a caller asks 
 nm -D --with-symbol-versions libsmash.so | grep <symbol>   # must list that version too
 ```
 
+## Wrappers exported at the wrong version (swept 2026-11-05)
+
+A reference binds `name@VERSION`, the default version the system library gave
+`name` when the caller was linked, and ld.so binds it only to a definition of
+that version. A wrapper exported at the base version alone is skipped and the
+system's function runs, without the EFAULT handling. This was fixed one symbol
+at a time (`recvmmsg`/`sendmmsg`, `aligned_alloc`, the `__*_chk` family,
+`clock_nanosleep`, the 2.33 stat set) and never swept. A sweep of every
+function libsmash defined against glibc 2.39 and libstdc++ found **20 still
+wrong** on x86-64:
+
+| glibc / libstdc++ default | functions |
+| --- | --- |
+| `GLIBC_2.3` | `getxattr`, `lgetxattr`, `fgetxattr`, `listxattr`, `llistxattr`, `flistxattr` |
+| `GLIBC_2.4` | `ppoll`, `readlinkat`, `__fxstatat`, `__fxstatat64` |
+| `GLIBC_2.6` | `epoll_pwait` (exported at `GLIBC_2.3.2`, which glibc never gave it) |
+| `GLIBC_2.10`, `2.11`, `2.13` | `accept4`, `execvpe`, `prlimit64` |
+| `GLIBC_2.15` | `posix_spawn`, `posix_spawnp` |
+| `GLIBC_2.25`, `2.26` | `getrandom`, `reallocarray` |
+| `CXXABI_1.3.11` | the aligned nothrow `operator delete` and `delete[]` (alloc8 defines them; the version script hid them) |
+
+On aarch64 only `getrandom` and `reallocarray` are above the `GLIBC_2.17`
+baseline. Three were harmless in practice — glibc's `reallocarray` and
+libstdc++'s aligned nothrow deletes reach smash's `realloc`/`free` through the
+PLT (measured for `reallocarray`) — and the other 17 lost the wrapper. Each now
+has an `_NN` alias with `.symver` in `linux_syscall_wrappers.cpp`, listed alone
+in the version script (never the bare name at the same version: the self-jump
+trap); `epoll_pwait_232` is gone.
+
+`test_symbol_versions` keeps it swept: in-process, from the dynamic symbol and
+version tables of every loaded object (`dl_iterate_phdr`), every function
+libsmash defines — exported or hidden — that a system library exports at a
+default version must be exported by libsmash at that version (174 compared:
+libc and libstdc++; the vDSO is skipped, programs do not link against it).
+Then 12 references this binary makes above the base version must resolve into
+libsmash (`dladdr`), and the same names through `dlvsym` at libc's version.
+Against the library before: 44 failures (all 20, then 12 and 12).
+
 ## _FORTIFY_SOURCE and the `__*_chk` aliases
 
 glibc's fortify headers rewrite a call whose destination object size is known at compile time into the `__*_chk` alias: `read(fd, buf, n)` becomes `__read_chk(fd, buf, n, sizeof buf)`. The plain symbol is then never referenced, so interposing `read` alone misses the call and the kernel's EFAULT goes straight back to the application. `_FORTIFY_SOURCE` is on by default on Ubuntu, Fedora and RHEL, and any read into a fixed-size buffer qualifies — measured with plain `gcc -O2` and no sanitizer, a read/pread/recv into a `char buf[4096]` emits `__read_chk`/`__pread_chk`/`__recv_chk`, and only `-U_FORTIFY_SOURCE` brings the plain names back. It surfaced as `test_syscall_efault` failing only under UBSan, because instrumentation made the object size knowable.

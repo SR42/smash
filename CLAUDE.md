@@ -42,7 +42,7 @@ codegen bug: [agents/sanitizers.md](agents/sanitizers.md).
 cd build && ctest --output-on-failure
 ```
 
-All 238 tests must pass; none are registered `DISABLED`. Run the suite **as root** too when touching the compressor: idle-page read tracking only exists with root (and `SMASH_WRITE_TRACK=yt` only with the youngtrace module loaded), and CI (`.github/workflows/ci.yml`, `ubuntu-latest` + `macos-latest`, every push and PR) runs unprivileged. After ctest, CI runs `bench/run_quick_ci.py` (`bench_rss` ≥30 %, `bench_sqlite --quick` ≥5 % RSS reduction).
+All 239 tests must pass; none are registered `DISABLED`. Run the suite **as root** too when touching the compressor: idle-page read tracking only exists with root (and `SMASH_WRITE_TRACK=yt` only with the youngtrace module loaded), and CI (`.github/workflows/ci.yml`, `ubuntu-latest` + `macos-latest`, every push and PR) runs unprivileged. After ctest, CI runs `bench/run_quick_ci.py` (`bench_rss` ≥30 %, `bench_sqlite --quick` ≥5 % RSS reduction).
 
 **Before changing a test or its threshold, read its entry in [agents/tests.md](agents/tests.md).** Thresholds encode measurements, several tests are probabilistic (one run is not a verdict), and some harness shapes (sharing a process between phases, `fork()` with smash threads running) reproduce the very symptom under test.
 
@@ -113,7 +113,7 @@ bench/                  Benchmarks (throughput, compression ratio, RSS, latency)
 
 ## Syscall & Buffered I/O Compatibility
 
-See [agents/syscall-compat.md](agents/syscall-compat.md) for details on EFAULT-driven decompress-and-retry, DYLD interposition limitations, buffered-I/O carve-outs, and the full list of interposed functions per platform. It also records two things worth knowing before adding a wrapper: a wrapper exported only at the base glibc version never runs when glibc versions that symbol (the caller binds the versioned one), and a measured audit of which syscalls still return `EFAULT` when their buffer is on a compressed page.
+See [agents/syscall-compat.md](agents/syscall-compat.md) for details on EFAULT-driven decompress-and-retry, DYLD interposition limitations, buffered-I/O carve-outs, and the full list of interposed functions per platform. It also records two things worth knowing before adding a wrapper: a wrapper exported only at the base glibc version never runs when glibc versions that symbol (the caller binds the versioned one: `test_symbol_versions` compares every function libsmash defines with the default version the loaded system libraries give it, so a new wrapper at the wrong version fails it), and a measured audit of which syscalls still return `EFAULT` when their buffer is on a compressed page.
 
 The EFAULT retry is only safe when the kernel did nothing. An out-parameter the kernel writes **after** acting (`wait4`/`waitid` status, `accept`/`recvfrom` address, `recvmsg`'s `msghdr` and control data, `sendfile` offset, `sendmmsg` `msg_len`, old mask/limit, `nanosleep` `rem`) goes to the kernel as a **stack copy** when it is on a smash page (`withOut`, `withAddrOut`, `recvmsgOut`), never retried: the retry reaped, accepted, received, sent or slept a second time (`test_syscall_side_effect`). `read` on an `eventfd`/`signalfd`/`timerfd`/`inotify`/tty can still lose what it consumed (its data buffer cannot be bounced).
 

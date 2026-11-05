@@ -2276,9 +2276,6 @@ SMASH_VISIBLE int epoll_wait_232(int epfd, struct epoll_event* events, int maxev
     return epoll_wait(epfd, events, maxevents, timeout);
 }
 
-SMASH_VISIBLE int epoll_pwait_232(int epfd, struct epoll_event* events, int maxevents, int timeout, const sigset_t* sigmask) {
-    return epoll_pwait(epfd, events, maxevents, timeout, sigmask);
-}
 
 // ── fstat versioned aliases (GLIBC_2.33) ────────────────────────────────────
 // glibc 2.34 re-versioned fstat/fstat64 from GLIBC_2.2.5 to GLIBC_2.33 to
@@ -2539,7 +2536,6 @@ SMASH_VISIBLE void* mremap(void* old_addr, size_t old_size, size_t new_size, int
 
 // Create version aliases: epoll_wait_232 -> epoll_wait@GLIBC_2.3.2
 __asm__(".symver epoll_wait_232,epoll_wait@GLIBC_2.3.2");
-__asm__(".symver epoll_pwait_232,epoll_pwait@GLIBC_2.3.2");
 __asm__(".symver fstat_233,fstat@GLIBC_2.33");
 __asm__(".symver fstat64_233,fstat64@GLIBC_2.33");
 __asm__(".symver stat_233,stat@GLIBC_2.33");
@@ -2554,6 +2550,24 @@ __asm__(".symver preadv_210,preadv@GLIBC_2.10");
 __asm__(".symver pwritev_210,pwritev@GLIBC_2.10");
 __asm__(".symver preadv2_226,preadv2@GLIBC_2.26");
 __asm__(".symver pwritev2_226,pwritev2@GLIBC_2.26");
+__asm__(".symver ppoll_24,ppoll@GLIBC_2.4");
+__asm__(".symver readlinkat_24,readlinkat@GLIBC_2.4");
+__asm__(".symver __fxstatat_24,__fxstatat@GLIBC_2.4");
+__asm__(".symver __fxstatat64_24,__fxstatat64@GLIBC_2.4");
+__asm__(".symver epoll_pwait_26,epoll_pwait@GLIBC_2.6");
+__asm__(".symver accept4_210,accept4@GLIBC_2.10");
+__asm__(".symver execvpe_211,execvpe@GLIBC_2.11");
+__asm__(".symver prlimit64_213,prlimit64@GLIBC_2.13");
+__asm__(".symver getxattr_23,getxattr@GLIBC_2.3");
+__asm__(".symver lgetxattr_23,lgetxattr@GLIBC_2.3");
+__asm__(".symver fgetxattr_23,fgetxattr@GLIBC_2.3");
+__asm__(".symver listxattr_23,listxattr@GLIBC_2.3");
+__asm__(".symver llistxattr_23,llistxattr@GLIBC_2.3");
+__asm__(".symver flistxattr_23,flistxattr@GLIBC_2.3");
+__asm__(".symver posix_spawn_215,posix_spawn@GLIBC_2.15");
+__asm__(".symver posix_spawnp_215,posix_spawnp@GLIBC_2.15");
+__asm__(".symver getrandom_225,getrandom@GLIBC_2.25");
+__asm__(".symver reallocarray_226,reallocarray@GLIBC_2.26");
 
 // ══════════════════════════════════════════════════════════════════════════════
 // TBB scalable_allocator interposition
@@ -2816,6 +2830,80 @@ SMASH_VISIBLE int posix_spawnp(pid_t* pid, const char* file,
     return real_posix_spawnp(pid, file, file_actions, attrp, argv, envp);
 }
 
+// ── Versioned aliases for wrappers glibc versions above the base ────────────
+// A caller binds the version glibc defined a function at when the caller was
+// linked, and ld.so binds that reference only to a definition of the same
+// version. These were exported at the base version alone, so
+// getrandom@GLIBC_2.25, accept4@GLIBC_2.10, ppoll@GLIBC_2.4, ... went
+// straight to glibc and their EFAULT handling never ran (and epoll_pwait was
+// exported at GLIBC_2.3.2, a version glibc never gave it). The version script
+// lists only these `_NN` names, never the bare name at the same version (the
+// self-jump trap). A version below aarch64's GLIBC_2.17 baseline is harmless
+// there: nothing binds it. symbol_version_test compares every function
+// libsmash exports with the default version the system libraries give it.
+SMASH_VISIBLE int ppoll_24(struct pollfd* fds, nfds_t nfds, const struct timespec* tmo_p,
+                           const sigset_t* sigmask) {
+    return ppoll(fds, nfds, tmo_p, sigmask);
+}
+SMASH_VISIBLE ssize_t readlinkat_24(int dirfd, const char* path, char* buf, size_t bufsize) {
+    return readlinkat(dirfd, path, buf, bufsize);
+}
+SMASH_VISIBLE int __fxstatat_24(int ver, int dirfd, const char* path, struct stat* st, int flags) {
+    return __fxstatat(ver, dirfd, path, st, flags);
+}
+SMASH_VISIBLE int __fxstatat64_24(int ver, int dirfd, const char* path, struct stat64* st, int flags) {
+    return __fxstatat64(ver, dirfd, path, st, flags);
+}
+SMASH_VISIBLE int epoll_pwait_26(int epfd, struct epoll_event* events, int maxevents, int timeout,
+                                 const sigset_t* sigmask) {
+    return epoll_pwait(epfd, events, maxevents, timeout, sigmask);
+}
+SMASH_VISIBLE int accept4_210(int sockfd, struct sockaddr* addr, socklen_t* addrlen, int flags) {
+    return accept4(sockfd, addr, addrlen, flags);
+}
+SMASH_VISIBLE int execvpe_211(const char* file, char* const argv[], char* const envp[]) {
+    return execvpe(file, argv, envp);
+}
+SMASH_VISIBLE int prlimit64_213(pid_t pid, enum __rlimit_resource resource,
+                                const struct rlimit64* new_limit, struct rlimit64* old_limit) {
+    return prlimit64(pid, resource, new_limit, old_limit);
+}
+SMASH_VISIBLE ssize_t getxattr_23(const char* path, const char* name, void* value, size_t size) {
+    return getxattr(path, name, value, size);
+}
+SMASH_VISIBLE ssize_t lgetxattr_23(const char* path, const char* name, void* value, size_t size) {
+    return lgetxattr(path, name, value, size);
+}
+SMASH_VISIBLE ssize_t fgetxattr_23(int fd, const char* name, void* value, size_t size) {
+    return fgetxattr(fd, name, value, size);
+}
+SMASH_VISIBLE ssize_t listxattr_23(const char* path, char* list, size_t size) {
+    return listxattr(path, list, size);
+}
+SMASH_VISIBLE ssize_t llistxattr_23(const char* path, char* list, size_t size) {
+    return llistxattr(path, list, size);
+}
+SMASH_VISIBLE ssize_t flistxattr_23(int fd, char* list, size_t size) {
+    return flistxattr(fd, list, size);
+}
+SMASH_VISIBLE int posix_spawn_215(pid_t* pid, const char* path, const void* file_actions,
+                                  const void* attrp, char* const argv[], char* const envp[]) {
+    return posix_spawn(pid, path, file_actions, attrp, argv, envp);
+}
+SMASH_VISIBLE int posix_spawnp_215(pid_t* pid, const char* file, const void* file_actions,
+                                   const void* attrp, char* const argv[], char* const envp[]) {
+    return posix_spawnp(pid, file, file_actions, attrp, argv, envp);
+}
+SMASH_VISIBLE ssize_t getrandom_225(void* buf, size_t buflen, unsigned int flags) {
+    return getrandom(buf, buflen, flags);
+}
+// alloc8's reallocarray, at the version glibc 2.26 introduced it at. Harmless
+// before (glibc's own calls realloc through the PLT, which is smash's), but
+// the sweep demands every replaced function match.
+SMASH_VISIBLE void* reallocarray_226(void* ptr, size_t nmemb, size_t size) {
+    return reallocarray(ptr, nmemb, size);
+}
+
 } // extern "C"
 
 // ─── C++ OPERATOR NEW/DELETE VERSIONED ALIASES ─────────────────────────────────
@@ -2941,6 +3029,12 @@ SMASH_VISIBLE void* _ZnamSt11align_val_tRKSt9nothrow_t_CXXABI_1_3_11(
     void* ptr = xxmemalign(al, sz);
     return ptr ? ptr : newRetryNothrow(sz, al);
 }
+// The aligned nothrow deletes, which the runtime calls when a constructor
+// throws out of an aligned nothrow new.
+SMASH_VISIBLE void  _ZdlPvSt11align_val_tRKSt9nothrow_t_CXXABI_1_3_11(void* p, size_t, const void*)
+    { if (p) xxfree(p); }
+SMASH_VISIBLE void  _ZdaPvSt11align_val_tRKSt9nothrow_t_CXXABI_1_3_11(void* p, size_t, const void*)
+    { if (p) xxfree(p); }
 }
 
 // .symver directives create versioned symbol aliases.
@@ -2967,6 +3061,8 @@ __asm__(".symver _ZdlPvmSt11align_val_t_CXXABI_1_3_11,_ZdlPvmSt11align_val_t@CXX
 __asm__(".symver _ZdaPvmSt11align_val_t_CXXABI_1_3_11,_ZdaPvmSt11align_val_t@CXXABI_1.3.11");
 __asm__(".symver _ZnwmSt11align_val_tRKSt9nothrow_t_CXXABI_1_3_11,_ZnwmSt11align_val_tRKSt9nothrow_t@CXXABI_1.3.11");
 __asm__(".symver _ZnamSt11align_val_tRKSt9nothrow_t_CXXABI_1_3_11,_ZnamSt11align_val_tRKSt9nothrow_t@CXXABI_1.3.11");
+__asm__(".symver _ZdlPvSt11align_val_tRKSt9nothrow_t_CXXABI_1_3_11,_ZdlPvSt11align_val_tRKSt9nothrow_t@CXXABI_1.3.11");
+__asm__(".symver _ZdaPvSt11align_val_tRKSt9nothrow_t_CXXABI_1_3_11,_ZdaPvSt11align_val_tRKSt9nothrow_t@CXXABI_1.3.11");
 
 
 // ── Signal handler installation ─────────────────────────────────────────────

@@ -1120,6 +1120,15 @@ if(NOT APPLE)
   add_smash_mode_test(test_getcwd_large_only getcwd_test 1 60)
 endif()
 
+# Every function libsmash replaces must be exported at the version callers
+# bind: compared, in-process, with the default version each loaded system
+# library (libc, libstdc++, libm, ...) gives it (symbol_version_test.cpp).
+if(NOT APPLE)
+  add_executable(symbol_version_test symbol_version_test.cpp)
+  target_link_libraries(symbol_version_test PRIVATE ${CMAKE_DL_LIBS})
+  add_smash_mode_test(test_symbol_versions symbol_version_test 1 60)
+endif()
+
 # Sleeping application threads must not pin the compressor to one worker
 # (worker_cap_test.cpp).
 if(NOT APPLE)

@@ -18,9 +18,9 @@
 // with a raw pread into it -> EFAULT), everything else on the stack, and
 // checks the call did its work exactly once and reported it. The precondition
 // is proved on the raw kernel entry first: a raw wait4 into the block reaps
-// the child and returns EFAULT. accept4 and prlimit64 are called through
-// dlsym (checked to resolve into libsmash): glibc versions them above the
-// base version smash exports them at, so a direct call binds glibc's.
+// the child and returns EFAULT. Every call is checked to bind libsmash's
+// wrapper (accept4 and prlimit64 bound glibc's until they were exported at
+// the versions glibc gives them: test_symbol_versions).
 #include <cerrno>
 #include <csignal>
 #include <cstdio>
@@ -479,9 +479,8 @@ void maskCase(const char* name, Mask fn) {
 }
 
 void prlimitCase() {
-    using fn_t = int (*)(pid_t, __rlimit_resource, const rlimit64*, rlimit64*);
-    auto fn = reinterpret_cast<fn_t>(dlsym(RTLD_DEFAULT, "prlimit64"));
-    if (!inLibsmash(reinterpret_cast<void*>(fn))) { FAIL("prlimit64: dlsym does not resolve into libsmash"); return; }
+    auto fn = &prlimit64;
+    if (!inLibsmash(reinterpret_cast<void*>(fn))) { FAIL("prlimit64: does not bind libsmash's wrapper"); return; }
     rlimit64 cur{};
     fn(0, RLIMIT_NOFILE, nullptr, &cur);
     rlimit64 lower = cur;
@@ -555,13 +554,26 @@ int main() {
         return wait3(reinterpret_cast<int*>(b), 0, reinterpret_cast<struct rusage*>(b + 64));
     });
 
-    acceptCase("accept", [](int l, sockaddr* a, socklen_t* al) { return accept(l, a, al); }, false);
+    // Each call as this binary binds it must be libsmash's wrapper.
     {
-        using fn_t = int (*)(int, sockaddr*, socklen_t*, int);
-        auto fn = reinterpret_cast<fn_t>(dlsym(RTLD_DEFAULT, "accept4"));
-        if (!inLibsmash(reinterpret_cast<void*>(fn))) FAIL("accept4: dlsym does not resolve into libsmash");
-        else acceptCase("accept4", [fn](int l, sockaddr* a, socklen_t* al) { return fn(l, a, al, SOCK_CLOEXEC); }, true);
+        const struct { const char* name; void* fn; } bound[] = {
+            {"wait4", reinterpret_cast<void*>(&wait4)}, {"waitid", reinterpret_cast<void*>(&waitid)},
+            {"waitpid", reinterpret_cast<void*>(&waitpid)}, {"wait", reinterpret_cast<void*>(&wait)},
+            {"wait3", reinterpret_cast<void*>(&wait3)}, {"accept", reinterpret_cast<void*>(&accept)},
+            {"accept4", reinterpret_cast<void*>(&accept4)}, {"recvfrom", reinterpret_cast<void*>(&recvfrom)},
+            {"__recvfrom_chk", reinterpret_cast<void*>(&__recvfrom_chk)},
+            {"recvmsg", reinterpret_cast<void*>(&recvmsg)}, {"sendfile", reinterpret_cast<void*>(&sendfile)},
+            {"sendmmsg", reinterpret_cast<void*>(&sendmmsg)}, {"sigprocmask", reinterpret_cast<void*>(&sigprocmask)},
+            {"pthread_sigmask", reinterpret_cast<void*>(&pthread_sigmask)},
+            {"prlimit64", reinterpret_cast<void*>(&prlimit64)}, {"nanosleep", reinterpret_cast<void*>(&nanosleep)},
+            {"clock_nanosleep", reinterpret_cast<void*>(&clock_nanosleep)},
+        };
+        for (const auto& b : bound)
+            if (!inLibsmash(b.fn)) FAIL("%s does not bind libsmash's wrapper", b.name);
     }
+
+    acceptCase("accept", [](int l, sockaddr* a, socklen_t* al) { return accept(l, a, al); }, false);
+    acceptCase("accept4", [](int l, sockaddr* a, socklen_t* al) { return accept4(l, a, al, SOCK_CLOEXEC); }, true);
 
     tcpRecvfromCase("recvfrom", [](int s, char* buf, size_t n, sockaddr* f, socklen_t* fl) {
         return recvfrom(s, buf, n, 0, f, fl);
