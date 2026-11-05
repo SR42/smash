@@ -86,7 +86,7 @@ namespace smash {
 
 void* ThreadCache::refill(uint8_t sc, uint8_t arena, Slab* slab) {
     // Batch-allocate from slab into the arena-specific lane
-    auto& c = caches_[idx(arena, sc)];
+    auto c = lane(idx(arena, sc));
     size_t batch = kThreadCacheBatchSize;
     if (batch > static_cast<size_t>(kPerLaneDepth)) batch = kPerLaneDepth;
 
@@ -95,7 +95,7 @@ void* ThreadCache::refill(uint8_t sc, uint8_t arena, Slab* slab) {
     if (Slab::magazineEnabled()) {
         size_t got = slab->allocateBatchMag(c.ptrs);
         if (got > 0) {
-            c.count = static_cast<uint32_t>(got - 1);
+            c.count = static_cast<uint16_t>(got - 1);
             return c.ptrs[got - 1];
         }
     }
@@ -104,7 +104,7 @@ void* ThreadCache::refill(uint8_t sc, uint8_t arena, Slab* slab) {
     if (got == 0) return nullptr;
 
     // Return one, keep the rest in cache
-    c.count = static_cast<uint32_t>(got - 1);
+    c.count = static_cast<uint16_t>(got - 1);
     return c.ptrs[got - 1];
 }
 
@@ -120,38 +120,18 @@ namespace {
 // drain — and (2) re-resolved every pointer's span a second time inside
 // deallocateBatch. n is bounded by kThreadCacheMaxPerClass (cache capacity),
 // so all buffers are statically sized.
-void drainRangeToSlabs(void** ptrs, size_t start, size_t n,
-                       uint8_t sc, Slab* all_slabs, PageMap* page_map) {
-    if (n == 0) return;
-    const int total_arenas = getTotalArenas();
+// Span of a small-object pointer: the flat contiguous-arena table when the
+// pointer is in it (one load), else the PageMap radix walk.
+inline Span* resolveSpanForDrain(PageMap* page_map, void* p) {
+    const uintptr_t a = reinterpret_cast<uintptr_t>(p);
+    const uintptr_t off = a - g_fast_span_table.base;
+    if (off < g_fast_span_table.size)
+        return g_fast_span_table.table[off >> kPageShift].load(std::memory_order_acquire);
+    return page_map->get(a);
+}
 
-    Span* spans[kThreadCacheMaxPerClass];
-    uint8_t arenas[kThreadCacheMaxPerClass];
-    uint32_t counts[kTotalArenas]{};
-    for (size_t i = 0; i < n; ++i) {
-        Span* span = page_map->get(reinterpret_cast<uintptr_t>(ptrs[start + i]));
-        // arena_id is in [0, getTotalArenas()) when cold-arena feedback is on.
-        uint8_t arena = (span && !span->is_large) ? span->arena_id : 0;
-        if (arena >= total_arenas) arena = 0;  // defensive
-        spans[i] = span;
-        arenas[i] = arena;
-        counts[arena]++;
-    }
-
-    // Prefix sums → per-arena offsets, then scatter into arena-contiguous order.
-    uint32_t offsets[kTotalArenas];
-    uint32_t cursor[kTotalArenas];
-    uint32_t acc = 0;
-    for (int a = 0; a < total_arenas; ++a) { offsets[a] = acc; cursor[a] = acc; acc += counts[a]; }
-
-    void* out_ptrs[kThreadCacheMaxPerClass];
-    Span* out_spans[kThreadCacheMaxPerClass];
-    for (size_t i = 0; i < n; ++i) {
-        const uint32_t pos = cursor[arenas[i]]++;
-        out_ptrs[pos] = ptrs[start + i];
-        out_spans[pos] = spans[i];
-    }
-
+// Hand one arena's resolved batch to its slab.
+void dispatchToSlab(Slab& slab, void** ptrs, Span** spans, size_t n) {
     // SMASH_DEFER_FREE (default on): on slab-lock contention, push the resolved
     // batch onto the slab's lock-free pending stack instead of blocking. The
     // next lock holder applies it. Removes the per-arena slab lock from the
@@ -166,44 +146,89 @@ void drainRangeToSlabs(void** ptrs, size_t start, size_t n,
         defer_free = (!v || v[0] != '0') ? 1 : 0;
         defer_free_cached.store(defer_free, std::memory_order_relaxed);
     }
-    const bool mag = Slab::magazineEnabled();
+    // Magazine fast path: stash the freed batch in the lock-free depot for a
+    // peer thread's next refill. Falls through to the real free path only if
+    // the depot is full (bounds memory).
+    if (Slab::magazineEnabled() && slab.deallocateBatchMag(ptrs, spans, n))
+        return;
+    if (defer_free)
+        slab.deallocateBatchDeferred(ptrs, spans, n);
+    else
+        slab.deallocateBatchResolved(ptrs, spans, n);
+}
+
+// Return the `n` pointers at `ptrs[start..start+n)` to their arenas' slabs for
+// size class `sc`. Resolves each span exactly once. The common case -- every
+// pointer from one arena (a lane holds one arena unless arenas outnumber
+// lanes) -- goes straight to that slab; otherwise group by arena with a
+// counting sort into small fixed-size stack buffers and dispatch one batch
+// per non-empty arena. n is bounded by kThreadCacheMaxPerClass (cache
+// capacity), so all buffers are statically sized.
+void drainRangeToSlabs(void** ptrs, size_t start, size_t n,
+                       uint8_t sc, Slab* all_slabs, PageMap* page_map) {
+    if (n == 0) return;
+    const int total_arenas = getTotalArenas();
+
+    Span* spans[kThreadCacheMaxPerClass];
+    uint8_t arenas[kThreadCacheMaxPerClass];
+    bool one_arena = true;
+    for (size_t i = 0; i < n; ++i) {
+        Span* span = resolveSpanForDrain(page_map, ptrs[start + i]);
+        // arena_id is in [0, getTotalArenas()) when cold-arena feedback is on.
+        uint8_t arena = (span && !span->is_large) ? span->arena_id : 0;
+        if (arena >= total_arenas) arena = 0;  // defensive
+        spans[i] = span;
+        arenas[i] = arena;
+        one_arena &= (arena == arenas[0]);
+    }
+    if (one_arena) {
+        dispatchToSlab(all_slabs[arenas[0] * kNumClasses + sc], ptrs + start, spans, n);
+        return;
+    }
+
+    uint32_t counts[kTotalArenas]{};
+    for (size_t i = 0; i < n; ++i) counts[arenas[i]]++;
+    // Prefix sums → per-arena offsets, then scatter into arena-contiguous order.
+    uint32_t offsets[kTotalArenas];
+    uint32_t cursor[kTotalArenas];
+    uint32_t acc = 0;
+    for (int a = 0; a < total_arenas; ++a) { offsets[a] = acc; cursor[a] = acc; acc += counts[a]; }
+
+    void* out_ptrs[kThreadCacheMaxPerClass];
+    Span* out_spans[kThreadCacheMaxPerClass];
+    for (size_t i = 0; i < n; ++i) {
+        const uint32_t pos = cursor[arenas[i]]++;
+        out_ptrs[pos] = ptrs[start + i];
+        out_spans[pos] = spans[i];
+    }
     for (int a = 0; a < total_arenas; ++a) {
         if (counts[a] == 0) continue;
-        Slab& slab = all_slabs[a * kNumClasses + sc];
-        // Magazine fast path: stash the freed batch in the lock-free depot for a
-        // peer thread's next refill. Falls through to the real free path only if
-        // the depot is full (bounds memory).
-        if (mag &&
-            slab.deallocateBatchMag(out_ptrs + offsets[a], out_spans + offsets[a], counts[a]))
-            continue;
-        if (defer_free)
-            slab.deallocateBatchDeferred(out_ptrs + offsets[a], out_spans + offsets[a], counts[a]);
-        else
-            slab.deallocateBatchResolved(out_ptrs + offsets[a], out_spans + offsets[a], counts[a]);
+        dispatchToSlab(all_slabs[a * kNumClasses + sc],
+                       out_ptrs + offsets[a], out_spans + offsets[a], counts[a]);
     }
 }
 
 } // namespace
 
 void ThreadCache::drain(uint8_t sc, uint8_t arena, Slab* all_slabs, PageMap* page_map) {
-    auto& c = caches_[idx(arena, sc)];
+    auto c = lane(idx(arena, sc));
     // Drain half the lane
     size_t to_drain = c.count / 2;
     if (to_drain == 0) to_drain = c.count;
     const size_t start = c.count - to_drain;
     drainRangeToSlabs(c.ptrs, start, to_drain, sc, all_slabs, page_map);
-    c.count = static_cast<uint32_t>(start);
+    c.count = static_cast<uint16_t>(start);
 }
 
 void ThreadCache::drainAll(Slab* all_slabs, PageMap* page_map) {
-    // Sweep every (lane, size class) — pointers live in caches_[lane*kNumClasses+sc]
+    // Sweep every (lane, size class) — pointers live in lane(ln*kNumClasses+sc)
     // for lane = arena & (kCacheLanes-1). The old loop covered only lane 0's
     // classes (i < kNumClasses), leaking every non-zero-lane pointer on thread
     // teardown. drainRangeToSlabs re-resolves each span's true arena, so passing
     // sc alone is sufficient for correct routing back to the slabs.
-    for (int lane = 0; lane < kCacheLanes; ++lane) {
+    for (int ln = 0; ln < kCacheLanes; ++ln) {
         for (int sc = 0; sc < kNumClasses; ++sc) {
-            auto& c = caches_[lane * kNumClasses + sc];
+            auto c = this->lane(ln * kNumClasses + sc);
             if (c.count > 0) {
                 drainRangeToSlabs(c.ptrs, 0, c.count, static_cast<uint8_t>(sc), all_slabs, page_map);
                 c.count = 0;
@@ -243,26 +268,11 @@ thread_local smash::ThreadCache* smash::g_thread_cache = nullptr;
 __attribute__((tls_model("initial-exec")))
 thread_local int smash::g_full_mode_cached = -1;
 
+__attribute__((tls_model("initial-exec")))
+thread_local smash::ThreadCache* smash::g_fast_tc = nullptr;
+
 // g_compressor_thread is now defined as inline thread_local in
 // compressor_thread.h (C++17 inline variable, single definition).
-
-// free()-path last-span cache (see smash_heap.h). Starts empty: the [base,end)
-// range is [0,0) so no address can hit it before the first resolve, and the
-// sentinel generation never matches the live one.
-__attribute__((tls_model("initial-exec")))
-thread_local smash::Span* smash::g_free_cache_span = nullptr;
-
-__attribute__((tls_model("initial-exec")))
-thread_local uintptr_t smash::g_free_cache_base = 0;
-
-__attribute__((tls_model("initial-exec")))
-thread_local uintptr_t smash::g_free_cache_end = 0;
-
-__attribute__((tls_model("initial-exec")))
-thread_local uint64_t smash::g_free_cache_gen = ~0ULL;
-
-__attribute__((tls_model("initial-exec")))
-thread_local uint32_t smash::g_free_cache_skip = 0;
 
 __attribute__((tls_model("initial-exec")))
 thread_local uintptr_t smash::g_arena_stack_base = 0;
@@ -1323,13 +1333,102 @@ volatile int xxthread_created_flag = 0;
 
 using SmashRedirect = alloc8::HeapRedirect<smash::SmashHeap>;
 
+// Lean entry points for xxmalloc / xxfree. The common case -- a small
+// object served from, or returned to, this thread's cache -- is handled here
+// with a single per-thread gate (g_fast_tc, published only when that is valid)
+// and no call; anything else tail-calls the full SmashHeap path, which
+// handles every mode, first call, refill, drain and large block exactly as
+// before. Keeping the fallbacks out of line lets the fast path run without
+// saving callee-saved registers.
+struct SmashFastRedirect : SmashRedirect {
+    [[gnu::noinline]] static void* mallocFull(size_t sz) { return SmashRedirect::malloc(sz); }
+    [[gnu::noinline]] static void freeFull(void* p) { SmashRedirect::free(p); }
+
+    [[gnu::always_inline]] static void* malloc(size_t sz) {
+        using namespace smash;
+        ThreadCache* tc = g_fast_tc;
+        if (tc && sz - 1 < kMaxSmallSize) [[likely]] {
+#if defined(SMASH_USE_TSD)
+            const auto ra = reinterpret_cast<uintptr_t>(threadState()->caller_ra);
+#else
+            const auto ra = reinterpret_cast<uintptr_t>(alloc8_caller_ra);
+#endif
+            const uint8_t sc = sizeToClass(sz);
+            const uintptr_t key = ra ^ (static_cast<uintptr_t>(sc) << 56);
+            const size_t slot = (key * 0x9E3779B97F4A7C15ULL >> 56) & (kArenaMemoSlots - 1);
+            const ArenaMemo& m = g_arena_memo[slot];
+            if (ra && m.valid && m.key == key) [[likely]] {
+                if (void* p = tc->allocate(sc, m.base)) [[likely]] return p;
+            }
+        }
+        return mallocFull(sz);
+    }
+
+    [[gnu::noinline]] static void* callocFull(size_t n, size_t sz) { return SmashRedirect::calloc(n, sz); }
+    [[gnu::noinline]] static void* reallocFull(void* p, size_t sz) { return SmashRedirect::realloc(p, sz); }
+
+    // Small calloc: the lean malloc plus a memset of the object.
+    static void* calloc(size_t n, size_t sz) {
+        using namespace smash;
+        size_t total;
+        if (!__builtin_mul_overflow(n, sz, &total) && g_fast_tc &&
+            total - 1 < kMaxSmallSize) [[likely]] {
+            void* p = malloc(total);
+            if (p) __builtin_memset(p, 0, total);
+            return p;
+        }
+        return callocFull(n, sz);
+    }
+
+    // Small-to-small realloc: the page tag gives the old block's class, so
+    // stay in place when it still fits and is at least half used, else move
+    // through the lean malloc/free. Anything else takes the full path.
+    static void* realloc(void* p, size_t sz) {
+        using namespace smash;
+        const uintptr_t off = reinterpret_cast<uintptr_t>(p) - g_fast_span_table.base;
+        if (g_fast_tc && off < g_fast_span_table.size && sz - 1 < kMaxSmallSize) [[likely]] {
+            const uint16_t tag =
+                g_fast_span_table.tags[off >> kPageShift].load(std::memory_order_acquire);
+            if (tag & VmRegion::kPageTagSmall) [[likely]] {
+                const size_t cap = classSize(static_cast<uint8_t>(tag & 63));
+                if (sz <= cap && sz >= cap / 2) return p;
+                void* q = malloc(sz);
+                if (q) {
+                    __builtin_memcpy(q, p, cap < sz ? cap : sz);
+                    free(p);
+                }
+                return q;
+            }
+        }
+        return reallocFull(p, sz);
+    }
+
+    [[gnu::always_inline]] static void free(void* p) {
+        using namespace smash;
+        ThreadCache* tc = g_fast_tc;
+        const uintptr_t off = reinterpret_cast<uintptr_t>(p) - g_fast_span_table.base;
+        if (tc && off < g_fast_span_table.size) [[likely]] {
+            // One 2-byte load names the lane; the Span is not touched.
+            const uint16_t tag =
+                g_fast_span_table.tags[off >> kPageShift].load(std::memory_order_acquire);
+            if (tag & VmRegion::kPageTagSmall) [[likely]] {
+                const uint8_t sc = tag & 63;
+                const uint8_t arena = static_cast<uint8_t>(tag >> 6);
+                if (tc->deallocate(sc, arena, p)) [[likely]] return;
+            }
+        }
+        freeFull(p);
+    }
+};
+
 // When SMASH_NO_THREAD_HOOKS_BUILD is defined (via -D), use ALLOC8_REDIRECT
 // which doesn't register xxthread_init/xxthread_cleanup. This avoids alloc8's
 // pthread_create interposition which can cause crashes during process shutdown.
 #ifdef SMASH_NO_THREAD_HOOKS_BUILD
-ALLOC8_REDIRECT(SmashRedirect);
+ALLOC8_REDIRECT(SmashFastRedirect);
 #else
-ALLOC8_REDIRECT_WITH_THREADS(SmashRedirect);
+ALLOC8_REDIRECT(SmashFastRedirect)
+ALLOC8_THREAD_REDIRECT(alloc8::ThreadRedirect<smash::SmashHeap>);
 #endif
 
 extern "C" bool xxowns_active() { return true; }

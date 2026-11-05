@@ -20,6 +20,7 @@
 #include "../vm/platform_mem.h"
 #include "../core/bootstrap_alloc.h"
 #include "../core/page_map.h"
+#include "../util/waker.h"
 #include "../util/spinlock.h"
 #include "../util/safe_printf.h"  // signal-handler-safe snprintf for SIGUSR2 stats
 
@@ -967,6 +968,7 @@ public:
         helpers_created_ = 0;
         active_workers_ = kCompressorWorkers;
         work_gen_.store(0, std::memory_order_release);
+        work_waker_.reinitAfterFork();
         current_phase_ = 0;
         // /proc/self/{clear_refs,pagemap} fds inherited from the parent
         // refer to the parent's pid-namespace entries — the kernel
@@ -1032,6 +1034,7 @@ private:
     // Work dispatch: coordinator increments work_gen_ to signal helpers.
     // Helpers compare against their last-seen gen to detect new work.
     std::atomic<uint64_t> work_gen_{0};
+    Waker work_waker_;       // helpers park here between dispatches
     int current_phase_ = 0;  // 1=access, 2=compress, 3=monitor
     std::atomic<uint64_t> helper_done_gen_[kMaxHelpers]{};
 
@@ -2812,6 +2815,7 @@ private:
         if (helpers_active) {
             current_phase_ = phase;
             work_gen_.fetch_add(1, std::memory_order_release);
+            work_waker_.notifyAll();
 
             // Coordinator does worker 0's range
             executePhase(phase, 0);
@@ -4351,7 +4355,12 @@ private:
         while (self->running_.load(std::memory_order_relaxed)) {
             uint64_t gen = self->work_gen_.load(std::memory_order_acquire);
             if (gen == last_gen) {
-                usleep(100);  // brief sleep while waiting for work
+                // Park until dispatch() bumps work_gen_ or stop() clears
+                // running_ (was: usleep(100) polling; see util/waker.h).
+                self->work_waker_.waitUntil([&] {
+                    return self->work_gen_.load(std::memory_order_acquire) != last_gen ||
+                           !self->running_.load(std::memory_order_relaxed);
+                }, 100);
                 continue;
             }
             last_gen = gen;
@@ -4859,6 +4868,7 @@ public:
         // crashing at shutdown.
         if (pthread_create(&coord_thread_, &helper_attr, coordEntry, this) != 0) {
             running_.store(false, std::memory_order_release);
+            work_waker_.notifyAll();
             char buf[128];
             int n = smash::safe_snprintf(buf, sizeof(buf),
                 "[smash WARN] pthread_create(coordinator) failed; "
@@ -5101,6 +5111,7 @@ public:
         }
         trace_msg("setting running=false");
         running_.store(false, std::memory_order_release);
+        work_waker_.notifyAll();
         trace_msg("joining coord_thread...");
         pthread_join(coord_thread_, nullptr);
         trace_msg("coord_thread joined");

@@ -113,7 +113,26 @@ static void testSpanAllocFreeCycle() {
     vm::unmapPages(mem, span_bytes);
 }
 
+// Span::slotOf() replaces offset / object_size with a reciprocal multiply;
+// it must agree with the division for every byte offset of every class's
+// span (and well beyond, up to 64 MiB, far past any span size).
+static void testSlotOfMatchesDivision() {
+    for (int sc = 0; sc < kNumClasses; ++sc) {
+        Span span{};
+        span.object_size = kSizeClasses[sc].size;
+        span.div_magic = ((uint64_t{1} << Span::kDivShift) + span.object_size - 1)
+                         / span.object_size;
+        const size_t limit = size_t{64} << 20;
+        size_t bad = 0;
+        for (size_t off = 0; off < limit && bad == 0; ++off)
+            if (span.slotOf(off) != off / span.object_size) bad = off + 1;
+        CHECK(bad == 0, "slotOf mismatch for class %d (size %u) at offset %zu",
+              sc, span.object_size, bad - 1);
+    }
+}
+
 int main() {
+    testSlotOfMatchesDivision();
     testSpanAllocFree();
     testSpanNoDuplicates();
     testSpanAllocFreeCycle();

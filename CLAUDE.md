@@ -76,6 +76,20 @@ bench/                  Benchmarks (throughput, compression ratio, RSS, latency)
 - **Per-origin sliding-window stats**: `SizeClassStats` keyed by `(arena, size_class, worker)` — `sc_stats[kNumArenas * kNumClasses]` per worker, indexed via `statsIndex(arena, sc)`. Each bucket holds a 64-entry ratio window (0–255) plus per-tier compression-time EMAs. Aggregating across arenas would wash out the homogeneity arena routing produces.
 - **Signal handler path**: No malloc allowed. Decompression uses pre-allocated per-slot contexts only.
 
+## Allocation Fast Path
+
+Small `malloc`/`free`/`calloc`/`realloc` are served by lean entry points (`SmashFastRedirect` in `smash_heap.cpp`) that alloc8's `xx*` functions call directly; everything else tail-calls the full `SmashHeap` path, which handles every mode.
+
+- **One gate:** the per-thread `g_fast_tc` is non-null only when the lean path is valid (full mode, no free diagnostics, heap constructed). No per-call heap-state, mode or diagnostics checks.
+- **free() without touching the Span:** the VmRegion keeps a 2-byte page tag (small flag, arena, size class) beside the flat page→Span table, so free picks the thread-cache lane with one load.
+- **Thread cache:** 16 lanes × depth 16 (`SMASH_CACHE_LANES` to change); counts in a compact array separate from the pointers.
+- **Linking:** `LINKER:-Bsymbolic` binds the wrappers' calls to `xxmalloc`/`xxfree` locally (direct jump, no PLT). The old `"-Bsymbolic"` form went to the compiler driver as `-B symbolic` and never reached ld.
+- **Large blocks (16 KiB–8 MiB)** are cached on free with their Span descriptors (`LargeAlloc`'s `LargeBlockCache`) instead of being munmap'd or decommitted. Sizes round to 8 steps per power of two; idle buckets are purged after 2 compressor ticks.
+- **Empty slab spans** stay resident for 2 compressor ticks before `madvise` (they leave compressor tracking immediately), under a process-wide cap.
+- **Background threads** (compressor helpers, VmRegion decommit drainer) block on a `Waker` (condition variable) instead of polling with `usleep(100)`; `Spinlock` yields after a bounded spin.
+
+Measured on x86-64 (Xeon 8175M) and Graviton3, glibc 2.35: faster than glibc on every microbenchmark (e.g. malloc+free pairs 0.78×/0.86×, 16 KiB–1 MiB churn 0.22×/0.09×), g++ -O2 compile at parity, Python churn 0.67×/0.64×; `bench_rss`/`bench_sqlite` RSS reductions unchanged.
+
 ## Syscall & Buffered I/O Compatibility
 
 See [agents/syscall-compat.md](agents/syscall-compat.md) for details on EFAULT-driven decompress-and-retry, DYLD interposition limitations, buffered-I/O carve-outs, and the full list of interposed functions per platform.
@@ -206,6 +220,8 @@ Runtime environment variables:
 - `SMASH_TRACK_EXTERNAL=1`: Register application-direct `mmap` / `mach_vm_allocate` results so the compressor sees them. Opt-in (see "External-Mapping Tracking" above)
 - `SMASH_DEFER_PHASES_MS=N`: Skip Phase 2 (compress) + Phase 3 (monitor) for the first N ms after start. Useful for workloads that establish IPC channels at startup with buffers in smash-managed pages (Firefox sweet spot is 30000)
 - `SMASH_NO_MONITOR=1`: Disable Phase 3 (PROT_READ access tracking) entirely. Trades cold-detection accuracy for compatibility with code paths that synchronously check page protection
+- `SMASH_EMPTY_RESIDENT_MB=N`: Cap on empty slab spans kept resident (decommit deferred up to 2 compressor ticks). Default 1/32 of physical memory, clamped to [64 MiB, 1 GiB]; `0` decommits at once
+- `SMASH_LARGE_CACHE_MB=N`: Byte cap of the freed large-block cache (16 KiB–8 MiB blocks). Default 32; `0` disables it
 - `SMASH_COLD_TIMEOUT_SEC=N`: Override cold timeout at runtime
 - `SMASH_COOLING_CLOSE_TICKS=N`: Cooling-page closing threshold (default `getColdTicks()/2`; `0` disables). Slab allocation prefers warm/EMPTY pages over pages whose cold streak ≥ N, and redirects to a decommitted empty span (never a new one) when the front span has only cooling/compressed free slots. Allocator-induced re-heats are counted in the `reheat=` field of the SIGUSR2 stats line (`SMASH_STATS_SIGNAL=1`); the telemetry threshold stays at the default even when closing is disabled, so A/B runs can measure prevented re-heats. Note: objects recycled through the thread cache bypass slab placement entirely — the app's writes into recycled objects re-heat their pages regardless of this policy
 - `SMASH_VERY_COLD_TICKS=N`: Override deep-tier cold-tick threshold (ROI model). `9999` disables the deep tier entirely (fast tier only).

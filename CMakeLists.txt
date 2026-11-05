@@ -291,7 +291,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   target_link_libraries(smash PRIVATE alloc8::headers pthread dl)
   target_link_options(smash PRIVATE
     "LINKER:--version-script=${SMASH_VERSION_SCRIPT}"
-    "-Bsymbolic"
+    "LINKER:-Bsymbolic"
   )
 else()
   target_link_libraries(smash PRIVATE alloc8::interpose)
@@ -365,7 +365,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   target_link_libraries(smash_noopt PRIVATE alloc8::headers pthread dl)
   target_link_options(smash_noopt PRIVATE
     "LINKER:--version-script=${SMASH_VERSION_SCRIPT}"
-    "-Bsymbolic"
+    "LINKER:-Bsymbolic"
   )
 else()
   target_link_libraries(smash_noopt PRIVATE alloc8::interpose)

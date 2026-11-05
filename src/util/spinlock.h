@@ -2,6 +2,7 @@
 #pragma once
 
 #include <atomic>
+#include <sched.h>
 #include <cstdint>
 #include "thread_safety.h"
 
@@ -31,6 +32,10 @@ static inline void spinRelax() {
 // the herd of exchanges the instant the lock is released.
 class SMASH_CAPABILITY("mutex") Spinlock {
     std::atomic<uint8_t> state_{0};   // 0 = free, 1 = held
+    // ~1K pause/yield instructions: tens of microseconds, far longer than
+    // any smash critical section, so an uncontended-but-busy holder never
+    // triggers it; only a descheduled holder does.
+    static constexpr unsigned kSpinsBeforeYield = 1024;
 
 public:
     void lock() SMASH_ACQUIRE() {
@@ -39,9 +44,14 @@ public:
         unsigned backoff = 1;
         for (;;) {
             // Read-spin: no atomic RMW, line stays Shared, zero coherence
-            // traffic while another core holds the lock.
-            while (state_.load(std::memory_order_relaxed) != 0)
+            // traffic while another core holds the lock. If the holder is
+            // not running (preempted on an oversubscribed machine), spinning
+            // only burns the time slice it needs: yield after a bounded spin.
+            unsigned spins = 0;
+            while (state_.load(std::memory_order_relaxed) != 0) {
                 spinRelax();
+                if (++spins == kSpinsBeforeYield) { sched_yield(); spins = 0; }
+            }
             // Lock looks free — attempt the one atomic exchange.
             if (tryLockRelaxed()) return;
             // Lost the race; back off to spread out the retry storm.

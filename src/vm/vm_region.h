@@ -18,6 +18,7 @@
 #include "platform_mem.h"
 #include "page_state.h"
 #include "../core/bootstrap_alloc.h"
+#include "../util/waker.h"
 #include "../util/spinlock.h"
 
 #include <atomic>
@@ -135,6 +136,7 @@ class VmRegion {
     Spinlock decommit_pool_lock_;
     pthread_t decommit_thread_{};
     std::atomic<bool> decommit_running_{false};
+    Waker decommit_waker_;   // drainer parks here while the queue is empty
 
     DecommitEntry* newDecommitEntry() {
         LockGuard guard(decommit_pool_lock_);
@@ -165,6 +167,9 @@ class VmRegion {
             e->next = head;
         } while (!decommit_head_.compare_exchange_weak(head, e,
             std::memory_order_release, std::memory_order_relaxed));
+        // Wake the drainer only on the empty -> non-empty edge; while it is
+        // still draining a burst, later pushes need no wake-up.
+        if (head == nullptr) decommit_waker_.notifyAll();
     }
 
     void processDecommitEntry(DecommitEntry* e) {
@@ -235,7 +240,12 @@ class VmRegion {
                     batch = next;
                 }
             } else {
-                usleep(100);  // 100µs - short sleep for responsiveness
+                // Park until queueForDecommit() pushes or stop clears
+                // decommit_running_ (was: usleep(100) polling; util/waker.h).
+                self->decommit_waker_.waitUntil([&] {
+                    return self->decommit_head_.load(std::memory_order_acquire) != nullptr ||
+                           !self->decommit_running_.load(std::memory_order_relaxed);
+                }, 100);
             }
         }
         return nullptr;
@@ -277,6 +287,7 @@ class VmRegion {
     void stopDecommitThread() {
         if (!decommit_running_.load(std::memory_order_relaxed)) return;
         decommit_running_.store(false, std::memory_order_release);
+        decommit_waker_.notifyAll();
         pthread_join(decommit_thread_, nullptr);
         // Drain any remaining entries
         DecommitEntry* batch = decommit_head_.exchange(nullptr, std::memory_order_acquire);
@@ -330,6 +341,12 @@ class VmRegion {
     // BootstrapAlloc and we want the flat table to escape that.
     std::atomic<Span*>* page_to_span_ = nullptr;
     size_t page_to_span_bytes_ = 0;  // total mapped bytes (for cleanup / sizing)
+    // Parallel per-page tag, kept in step with page_to_span_: for a page of a
+    // small-object span, kPageTagSmall | arena << 6 | size class; 0 for no
+    // span or a large span. Lets free() route a pointer to its thread-cache
+    // lane with one 2-byte load instead of a table load plus a dependent load
+    // of the Span (the second cache miss in a random-access free).
+    std::atomic<uint16_t>* page_tag_ = nullptr;
 
     size_t lookupIdx(uintptr_t addr) const {
         if (!track_hash_) return 0;
@@ -413,6 +430,11 @@ public:
             // Non-fatal: callers fall back to the radix tree via PageMap.
         } else {
             page_to_span_ = static_cast<std::atomic<Span*>*>(m);
+            void* t = ::mmap(nullptr, total_pages_ * sizeof(std::atomic<uint16_t>),
+                             PROT_READ | PROT_WRITE,
+                             MAP_ANON | MAP_PRIVATE | MAP_NORESERVE, -1, 0);
+            page_tag_ = (t == MAP_FAILED) ? nullptr
+                                          : static_cast<std::atomic<uint16_t>*>(t);
         }
 
         // Decommit thread is started lazily on first releasePages() call
@@ -433,6 +455,7 @@ public:
     void resetDecommitThreadForFork() {
         // Thread doesn't exist in child - don't try to join it
         decommit_running_.store(false, std::memory_order_relaxed);
+        decommit_waker_.reinitAfterFork();
         // Drain pending entries synchronously
         DecommitEntry* batch = decommit_head_.exchange(nullptr, std::memory_order_acquire);
         while (batch) {
@@ -547,6 +570,18 @@ public:
         size_t commit_bytes = (target - already) * kPageSize;
         vm::commitPages(addr, commit_bytes);
         committed_pages_.store(target, std::memory_order_release);
+    }
+
+    // SMASH_LANDMINES / SMASH_ZERO_FREE (debug): releasePages must see every
+    // freed range, so callers that would otherwise keep a freed range
+    // (LargeAlloc's block cache) check this first.
+    static bool releaseDebugModes() {
+        static const bool on = [] {
+            const char* l = std::getenv("SMASH_LANDMINES");
+            const char* z = std::getenv("SMASH_ZERO_FREE");
+            return (l && l[0] == '1') || (z && z[0] == '1');
+        }();
+        return on;
     }
 
     void releasePages(void* addr, size_t num_pages) {
@@ -826,11 +861,22 @@ public:
         return page_to_span_[page_idx].load(std::memory_order_acquire);
     }
 
+    static constexpr uint16_t kPageTagSmall = 0x8000;
+
+    // `tag` is the page tag for `span` (see page_tag_); PageMap computes it.
     [[gnu::always_inline]]
-    void setSpan(size_t page_idx, Span* span) {
+    void setSpan(size_t page_idx, Span* span, uint16_t tag) {
         if (!page_to_span_) [[unlikely]] return;
         if (page_idx >= total_pages_) [[unlikely]] return;
-        page_to_span_[page_idx].store(span, std::memory_order_release);
+        // Tag first on set, last on clear: a nonzero tag always names a span
+        // whose table entry is already published.
+        if (span) {
+            page_to_span_[page_idx].store(span, std::memory_order_release);
+            if (page_tag_) page_tag_[page_idx].store(tag, std::memory_order_release);
+        } else {
+            if (page_tag_) page_tag_[page_idx].store(0, std::memory_order_release);
+            page_to_span_[page_idx].store(nullptr, std::memory_order_release);
+        }
     }
 
     // Set a contiguous run of flat-table slots to the same span. Bounds are
@@ -839,17 +885,30 @@ public:
     // calling setSpan() num_pages times would repeat. Used by the span-creation
     // path (PageMap::setRange) where every page of a fresh span maps to the
     // same Span*.
-    void setSpanRange(size_t first_page_idx, size_t num_pages, Span* span) {
+    void setSpanRange(size_t first_page_idx, size_t num_pages, Span* span, uint16_t tag) {
         if (!page_to_span_) [[unlikely]] return;
         if (first_page_idx + num_pages > total_pages_) [[unlikely]] return;
-        for (size_t i = 0; i < num_pages; ++i)
-            page_to_span_[first_page_idx + i].store(span, std::memory_order_release);
+        if (span) {
+            for (size_t i = 0; i < num_pages; ++i)
+                page_to_span_[first_page_idx + i].store(span, std::memory_order_release);
+            if (page_tag_)
+                for (size_t i = 0; i < num_pages; ++i)
+                    page_tag_[first_page_idx + i].store(tag, std::memory_order_release);
+        } else {
+            if (page_tag_)
+                for (size_t i = 0; i < num_pages; ++i)
+                    page_tag_[first_page_idx + i].store(0, std::memory_order_release);
+            for (size_t i = 0; i < num_pages; ++i)
+                page_to_span_[first_page_idx + i].store(nullptr, std::memory_order_release);
+        }
     }
+    std::atomic<uint16_t>* pageTagTable() const { return page_tag_; }
 
     // True iff the flat table is mapped (mmap succeeded in init()). Used by
     // PageMap to decide whether to write the flat slot in addition to the
     // radix tree.
     bool hasSpanTable() const { return page_to_span_ != nullptr; }
+    std::atomic<Span*>* spanTable() const { return page_to_span_; }
 
     // Cheap pointer-in-contiguous-arena check. Used by the free() / getSize()
     // hot path to decide whether the flat span table lookup is sufficient

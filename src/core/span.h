@@ -30,6 +30,11 @@ struct Span {
     uint64_t* bitmap;           // 1 = free, 0 = allocated; from BootstrapAlloc
     uint32_t page_count;
     uint32_t object_size;
+    // ceil(2^kDivShift / object_size): offset / object_size as a multiply
+    // and shift (exact for offset < 2^kDivShift / object_size, i.e. any
+    // offset inside a span; see slotOf()).
+    uint64_t div_magic;
+    static constexpr int kDivShift = 40;
     // Slots that *could* exist in the span's pages (pages*kPageSize/object_size).
     // Bitmap is always sized for this.  Under a per-page cap, most of these bits
     // are held at 0 and never handed out.  allocate() must scan the full bitmap
@@ -46,6 +51,10 @@ struct Span {
     // Slab::widenCapIfNeeded() compares this to the current adaptive cap and
     // unlocks additional slots when the cap has relaxed since span init.
     uint16_t current_cap_per_page;
+    // Empty span whose pages are still resident (decommit deferred; see
+    // Slab::retireEmptySpan), and the slab tick at which it became empty.
+    bool resident_empty;
+    uint32_t empty_tick;
 
     // Intrusive list pointers (used by Slab's partial/full/empty lists)
     Span* list_prev;
@@ -89,10 +98,13 @@ struct Span {
         is_large = false;
         arena_id = arena;
         object_size = kSizeClasses[sc].size;
+        div_magic = ((uint64_t{1} << kDivShift) + object_size - 1) / object_size;
         full_capacity = (pages * kPageSize) / object_size;
 
         allocated_count = 0;
         free_hint_word = 0;
+        resident_empty = false;
+        empty_tick = 0;
         list_prev = nullptr;
         list_next = nullptr;
         large_size = 0;
@@ -217,6 +229,8 @@ struct Span {
         object_count = 0;
         allocated_count = 1;
         free_hint_word = 0;
+        resident_empty = false;
+        empty_tick = 0;
         bitmap = nullptr;
         list_prev = nullptr;
         list_next = nullptr;
@@ -405,7 +419,7 @@ struct Span {
     // Free one object back to this span.
     void deallocate(void* ptr) {
         size_t offset = static_cast<size_t>(static_cast<char*>(ptr) - static_cast<char*>(base));
-        size_t slot = offset / object_size;
+        size_t slot = slotOf(offset);
         size_t word = slot / 64;
         size_t bit = slot % 64;
         bitmap[word] |= (1ULL << bit);   // mark free
@@ -413,6 +427,15 @@ struct Span {
         if (word < free_hint_word) {
             free_hint_word = static_cast<uint16_t>(word);
         }
+    }
+
+    // offset / object_size without a divide. With m = ceil(2^40 / d) and
+    // m*d = 2^40 + e (0 <= e < d), floor(n*m / 2^40) == floor(n / d) whenever
+    // n*e < 2^40 - which holds for every offset in a span (n < 2^26 for any
+    // span, e < d <= 2^14), and n*m < 2^62 fits in 64 bits. Checked
+    // exhaustively for every class in tests/test_span.cpp.
+    size_t slotOf(size_t offset) const {
+        return static_cast<size_t>((static_cast<uint64_t>(offset) * div_magic) >> kDivShift);
     }
 
     bool full() const { return allocated_count == object_count; }
