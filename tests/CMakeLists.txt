@@ -154,7 +154,6 @@ add_test(
   NAME test_interpose
   COMMAND ${CMAKE_COMMAND} -E env
     "DYLD_INSERT_LIBRARIES=$<TARGET_FILE:smash>"
-    "DYLD_FORCE_FLAT_NAMESPACE=1"
     $<TARGET_FILE:interpose_test>
 )
 
@@ -171,7 +170,6 @@ if(APPLE)
     NAME test_external_mapping
     COMMAND ${CMAKE_COMMAND} -E env
       "DYLD_INSERT_LIBRARIES=$<TARGET_FILE:smash>"
-      "DYLD_FORCE_FLAT_NAMESPACE=1"
       "MallocNanoZone=0"
       "SMASH_LARGE_ONLY=0"
       "SMASH_DEFER_PHASES_MS=0"
@@ -216,7 +214,6 @@ function(add_mode_compression_test test_name large_only)
       NAME ${test_name}
       COMMAND ${CMAKE_COMMAND} -E env
         "DYLD_INSERT_LIBRARIES=$<TARGET_FILE:smash>"
-        "DYLD_FORCE_FLAT_NAMESPACE=1"
         "MallocNanoZone=0"
         "SMASH_LARGE_ONLY=${large_only}"
         "SMASH_DEFER_PHASES_MS=0"
@@ -255,7 +252,6 @@ if(APPLE)
     NAME test_arena_routing
     COMMAND ${CMAKE_COMMAND} -E env
       "DYLD_INSERT_LIBRARIES=$<TARGET_FILE:smash>"
-      "DYLD_FORCE_FLAT_NAMESPACE=1"
       "MallocNanoZone=0"
       "SMASH_LARGE_ONLY=0"
       "SMASH_CPU_ARENA=0"
@@ -292,7 +288,6 @@ foreach(lo 0 1)
       NAME ${_name}
       COMMAND ${CMAKE_COMMAND} -E env
         "DYLD_INSERT_LIBRARIES=$<TARGET_FILE:smash>"
-        "DYLD_FORCE_FLAT_NAMESPACE=1"
         "MallocNanoZone=0"
         "SMASH_LARGE_ONLY=${lo}"
         $<TARGET_FILE:large_realloc_test>
@@ -324,7 +319,6 @@ if(APPLE)
     NAME test_syscall_efault
     COMMAND ${CMAKE_COMMAND} -E env
       "DYLD_INSERT_LIBRARIES=$<TARGET_FILE:smash>"
-      "DYLD_FORCE_FLAT_NAMESPACE=1"
       "MallocNanoZone=0"
       "SMASH_LARGE_ONLY=0"
       "SMASH_DEFER_PHASES_MS=0"
