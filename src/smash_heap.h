@@ -24,6 +24,7 @@
 #include "util/safe_printf.h"  // allocation-free snprintf for malloc-path diagnostics
 #include <alloc8/alloc8.h>     // alloc8_caller_ra: app allocation site captured at wrapper entry
 #include <cstddef>
+#include <bit>
 #include <numeric>
 #include <cstdint>
 #include <atomic>
@@ -1930,6 +1931,23 @@ public:
     }
 
     void* memalign(size_t alignment, size_t size) {
+        // glibc's memalign contract, which alloc8's memalign, __libc_memalign,
+        // valloc and pvalloc pass on unchecked (only posix_memalign and
+        // aligned_alloc validate): an alignment above SIZE_MAX / 2 + 1 is
+        // EINVAL, one that is not a power of two is rounded up to the next, and
+        // anything below the minimum is the minimum. Everything below assumes
+        // a power of two, and the over-map arithmetic wrapped:
+        // memalign(SIZE_MAX, 1) mapped 4095 bytes, unmapped 122 TiB from
+        // 0x1000 and crashed. Normalised here, first, because the passthrough
+        // and compress-only paths forward to posix_memalign, which rejects
+        // alignments glibc's memalign accepts (returned NULL, errno 0).
+        if (alignment > SIZE_MAX / 2 + 1) [[unlikely]] {
+            errno = EINVAL;
+            return nullptr;
+        }
+        if (alignment < kMinAlignment) alignment = kMinAlignment;
+        else if (alignment & (alignment - 1)) [[unlikely]] alignment = std::bit_ceil(alignment);
+
         // SMASH_PASSTHROUGH=1: pass aligned allocations to system allocator.
         if (isPassthroughMode()) {
             if (!g_system_alloc.posix_memalign) g_system_alloc.resolve();

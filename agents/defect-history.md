@@ -1374,3 +1374,36 @@ was there before; why the later code hits it more often was not established.
 held could not have noticed. The limit is 32768, against 16953 at 128 arenas; 0 of 60
 runs after the fix, and `fork_test` fails if the set ever fills.
 
+
+## memalign used its alignment unchecked (fixed 2026-11-05)
+
+alloc8 validates the alignment of `posix_memalign` (a power of two, a multiple
+of `sizeof(void*)`) and `aligned_alloc` (a power of two). Its `memalign`,
+`__libc_memalign`, `valloc` and `pvalloc` call `xxmemalign` with whatever they
+were given, and `SmashHeap::memalign` used it as it came. glibc's `memalign`
+accepts any alignment: above `SIZE_MAX / 2 + 1` is `EINVAL`, one that is not a
+power of two is rounded up to the next, one below 16 is `malloc`'s. Measured on
+the library before, full and large-only alike:
+
+| call | glibc | smash before |
+|---|---|---|
+| `memalign(SIZE_MAX, 1)` | NULL, `EINVAL` | `mmap` of 4095 bytes, `munmap(0x1000, 122 TiB)`, SIGSEGV |
+| `memalign(2^63 + 1, 1)`, `(2^63 + 4096, 1)` | NULL, `EINVAL` | not `EINVAL` |
+| `memalign(12288, 100)`, `(20480, n)`, `(3 MiB, 100)` | 16 KiB / 32 KiB / 4 MiB aligned | 4 KiB / 8 KiB / 1 MiB aligned |
+| `memalign(24 / 48 / 96 / 3 MiB, n)` under `SMASH_PASSTHROUGH=1` | a block | NULL, `errno` 0 |
+
+The crash: `LargeAlloc::allocate`'s over-map size `alloc_size + alignment`
+wrapped to 4095, and the trim after it unmapped a "prefix" of most of the
+address space. The misalignment: `roundUp` assumes a power of two. Passthrough
+and compress-only forward to the system's `posix_memalign`, which rejects what
+glibc's `memalign` accepts.
+
+Fixed in `SmashHeap::memalign`, first, before any mode's path: glibc's rules
+(`EINVAL` above `SIZE_MAX / 2 + 1`, `std::bit_ceil` for a non-power of two,
+`kMinAlignment` as the floor). `LargeAlloc::allocate`'s over-map now has the
+same wrap check as its node path, which cannot fire with the alignment kept at
+most `2^63` (a block is at most 2^44 bytes) but keeps the trim from unmapping
+what follows a wrapped mapping. Guarded by `test_alloc_contract_*`'s
+`testMemalignAlignments`: the library before failed 26 checks in full mode and
+22 in large-only (the `SIZE_MAX` calls crash in their own child), and the
+passthrough registration (`SMASH_PASSTHROUGH=1`, the same binary) fails 58.

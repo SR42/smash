@@ -196,8 +196,13 @@ public:
             if (alignment <= kPageSize) {
                 mem = vm::mapPages(alloc_size);
             } else {
-                // Over-allocate by alignment to guarantee aligned region
+                // Over-allocate by alignment to guarantee aligned region.
+                // SmashHeap::memalign keeps alignment a power of two no larger
+                // than SIZE_MAX / 2 + 1, so this cannot wrap; checked anyway,
+                // as the node path does: a wrapped map_size is a small
+                // mapping, and the trim below then unmapped what follows it.
                 size_t map_size = alloc_size + alignment;
+                if (map_size < alloc_size) { errno = ENOMEM; return nullptr; }
                 mem = vm::mapPages(map_size);
                 if (!mem) return nullptr;
 

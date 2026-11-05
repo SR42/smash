@@ -825,6 +825,69 @@ void testHugeSizes() {
            sizeof(kHuge) / sizeof(kHuge[0]), sizeof(kWrap) / sizeof(kWrap[0]));
 }
 
+#if defined(__linux__)
+// ── memalign's alignment ────────────────────────────────────────────────────
+// glibc's memalign (and __libc_memalign) accept any alignment: one above
+// SIZE_MAX / 2 + 1 is EINVAL, one that is not a power of two is rounded up to
+// the next, one below 16 is malloc's. alloc8 validates only posix_memalign and
+// aligned_alloc, and smash used the alignment as given: memalign(SIZE_MAX, 1)
+// wrapped the over-map size, mapped 4095 bytes, unmapped 122 TiB from 0x1000
+// and crashed, and a non-power-of-two alignment went through roundUp, which
+// assumes a power of two. The out-of-range calls run in a child each, so a
+// crash fails the check that made it instead of the whole test.
+void testMemalignAlignments() {
+    void* (*volatile p_memalign)(size_t, size_t) = memalign;
+    auto p_libc_memalign = reinterpret_cast<void* (*)(size_t, size_t)>(dlsym(RTLD_DEFAULT, "__libc_memalign"));
+    static volatile size_t kInvalid[] = {SIZE_MAX, SIZE_MAX / 2 + 2, (SIZE_MAX / 2 + 1) | 4096};
+    int invalid = 0;
+    for (size_t a : kInvalid) {
+        for (int which = 0; which < 2; ++which) {
+            if (which == 1 && !p_libc_memalign) continue;
+            const char* what = which ? "__libc_memalign" : "memalign";
+            const pid_t pid = fork();
+            if (pid == 0) {
+                errno = 0;
+                void* p = which ? p_libc_memalign(a, 1) : p_memalign(a, 1);
+                _exit(!p && errno == EINVAL ? 0 : 1);
+            }
+            int st = 0;
+            waitpid(pid, &st, 0);
+            CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0, "%s(%#zx, 1): %s, want nullptr with EINVAL", what, a,
+                  WIFSIGNALED(st) ? "crashed" : "returned something else");
+            ++invalid;
+        }
+    }
+    // Rounded up to a power of two, and the block usable. Several blocks per
+    // alignment: a wrong alignment can land right by chance.
+    static volatile size_t kOdd[] = {24, 48, 96, 3 * 4096, 5 * 4096, 3 << 20};
+    for (size_t a : kOdd) {
+        size_t want = 1;
+        while (want < a) want <<= 1;
+        for (int i = 0; i < 8; ++i) {
+            const size_t n = (i % 2) ? 100 : (size_t{1} << 20) + 100;
+            void* p = p_memalign(a, n);
+            CHECK(p && reinterpret_cast<uintptr_t>(p) % want == 0,
+                  "memalign(%zu, %zu) = %p, want a %zu-aligned block", a, n, p, want);
+            if (p) {
+                checkUsable(p, n, "memalign (odd alignment)");
+                std::free(p);
+            }
+        }
+    }
+    // Below the minimum: malloc's alignment.
+    for (size_t a : {size_t{0}, size_t{1}, size_t{2}, size_t{4}, size_t{8}}) {
+        void* p = p_memalign(a, 100);
+        CHECK(p && reinterpret_cast<uintptr_t>(p) % 16 == 0, "memalign(%zu, 100) = %p, want a 16-aligned block", a, p);
+        if (p) {
+            checkUsable(p, 100, "memalign (small alignment)");
+            std::free(p);
+        }
+    }
+    printf("memalign alignments: %d out-of-range calls EINVAL, %zu odd alignments rounded up, "
+           "5 below the minimum\n", invalid, sizeof(kOdd) / sizeof(kOdd[0]));
+}
+#endif
+
 int main() {
     // Unbuffered stdout: full mode used to zero the tail of glibc's buffered
     // stdout page at exit (fixed; guarded by test_stdout_buffer_integrity_full),
@@ -845,6 +908,9 @@ int main() {
     testChurn();
     testNewHandler();
     testHugeSizes();
+#if defined(__linux__)
+    testMemalignAlignments();
+#endif
 
     if (failures) {
         printf("alloc_contract_test (%s): %d FAILURES\n", modeName(), failures);

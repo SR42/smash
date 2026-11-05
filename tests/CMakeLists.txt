@@ -612,6 +612,10 @@ set_target_properties(alloc_contract_test PROPERTIES CXX_STANDARD 20)
 target_link_libraries(alloc_contract_test PRIVATE ${CMAKE_DL_LIBS})
 add_smash_mode_test(test_alloc_contract_full       alloc_contract_test 0 300)
 add_smash_mode_test(test_alloc_contract_large_only alloc_contract_test 1 300)
+# The same body under SMASH_PASSTHROUGH=1, where every call is forwarded to
+# the system allocator: memalign forwarded odd alignments to posix_memalign,
+# which refuses them (NULL, errno 0; testMemalignAlignments).
+add_smash_mode_test(test_alloc_contract_passthrough alloc_contract_test 0 300 "SMASH_PASSTHROUGH=1")
 
 # calloc returns zeroed memory and writes the zeros only where the pages are
 # not zero already (tests/calloc_test.cpp). Fresh and decommitted blocks must
