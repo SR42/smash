@@ -2003,8 +2003,27 @@ SMASH_VISIBLE char* getcwd(char* buf, size_t size) {
             }
             ret = do_getcwd_tmp();
         }
-        if (!ret) return nullptr;
-        return strdup(ret);
+        if (!ret) {
+            // Longer than PATH_MAX: glibc's own getcwd(NULL, size) still
+            // builds it (it walks the tree when the syscall cannot), and
+            // allocates for it, so this one case is glibc's.
+            if (errno == ERANGE && real_getcwd) return real_getcwd(nullptr, size);
+            return nullptr;
+        }
+        // glibc's contract for buf == NULL: size 0 is a buffer as large as
+        // needed; any other size is a buffer of `size` bytes, and a path that
+        // does not fit is ERANGE. strdup for every size gave
+        // getcwd(NULL, PATH_MAX) a buffer of strlen + 1 bytes, which the
+        // caller may write PATH_MAX of.
+        if (size == 0) return strdup(ret);
+        const size_t len = strlen(ret) + 1;
+        if (len > size) {
+            errno = ERANGE;
+            return nullptr;
+        }
+        auto* out = static_cast<char*>(malloc(size));
+        if (out) memcpy(out, ret, len);
+        return out;
     }
 
     // Standard retry pattern when caller supplied a buffer.

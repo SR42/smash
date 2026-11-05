@@ -1107,6 +1107,15 @@ if(NOT APPLE)
   set_tests_properties(test_syscall_side_effect PROPERTIES TIMEOUT 600)
 endif()
 
+# getcwd(NULL, size) must return a buffer of `size` bytes (ERANGE when the
+# path does not fit), and getcwd(NULL, 0) must work in a working directory
+# longer than PATH_MAX (getcwd_test.cpp). Passes under glibc alone.
+if(NOT APPLE)
+  add_executable(getcwd_test getcwd_test.cpp)
+  add_smash_mode_test(test_getcwd_full       getcwd_test 0 60)
+  add_smash_mode_test(test_getcwd_large_only getcwd_test 1 60)
+endif()
+
 # Sleeping application threads must not pin the compressor to one worker
 # (worker_cap_test.cpp).
 if(NOT APPLE)

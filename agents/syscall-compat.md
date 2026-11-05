@@ -367,6 +367,24 @@ Closing these needs the compressor to leave alone a page a thread is blocked
 in a syscall on — a pin — not anything a wrapper can do on its own.
 
 
+## getcwd(NULL, size) ignored size (fixed 2026-11-05)
+
+For `buf == NULL` the `getcwd` wrapper has the kernel write into a stack
+buffer (glibc's own buffer would be a fresh `malloc`, possibly a watched smash
+page) and copies the path out. It returned `strdup(path)` whatever `size` was,
+in every process, smash memory involved or not. glibc's contract: `size` 0 is
+a buffer as large as needed, any other `size` a buffer of `size` bytes, and a
+path that does not fit is `ERANGE`. So `getcwd(NULL, PATH_MAX)` followed by
+`strcat` overflowed the heap under smash only, and `getcwd(NULL, 1)` returned
+a buffer instead of failing. The stack buffer is `PATH_MAX` bytes, so a working
+directory longer than that failed with `ERANGE`, where glibc's
+`getcwd(NULL, 0)` walks the tree and returns it (4445 bytes in
+`getcwd_test`). Fixed: `size` 0 is `strdup`, a larger `size` a `malloc(size)`
+or `ERANGE`, and a path longer than `PATH_MAX` is left to glibc's own
+`getcwd(NULL, size)`, whose buffer can again be a watched page (the one case
+still exposed to an `EFAULT`). `test_getcwd_{full,large_only}`; the library
+before failed 6 checks in each, and glibc alone passes them all.
+
 ## Kernel-side access the handler cannot see (2026-10-29, documented, not fixed)
 
 Everything above assumes the access to a compressed page comes either from an
