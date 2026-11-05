@@ -1,4 +1,5 @@
 // smash/src/smash_heap.cpp - SmashHeap alloc8 integration + thread cache methods
+#include <new>
 #include "smash_heap.h"
 #include "vm/syscall_compat.h"
 #include <alloc8/alloc8.h>
@@ -235,6 +236,7 @@ smash::PageLockTable* smash::g_smash_page_locks_for_external = nullptr;
 // LD_PRELOAD'd, so its TLS block is part of the program's startup TLS
 // reservation, and accesses use a direct tpidr_el0 + offset load instead
 // of a __tls_get_addr indirection.
+#if !defined(SMASH_USE_TSD)
 __attribute__((tls_model("initial-exec")))
 thread_local smash::ThreadCache* smash::g_thread_cache = nullptr;
 
@@ -264,6 +266,7 @@ thread_local uint32_t smash::g_free_cache_skip = 0;
 
 __attribute__((tls_model("initial-exec")))
 thread_local uintptr_t smash::g_arena_stack_base = 0;
+#endif  // !SMASH_USE_TSD
 
 __attribute__((tls_model("initial-exec")))
 thread_local smash::ArenaMemo smash::g_arena_memo[smash::kArenaMemoSlots] = {};
@@ -1389,12 +1392,139 @@ static void smash_start_main_thread() {
 // macOS doesn't allow fork() in a multi-threaded program (it deadlocks Mach
 // ports), so this handler only matters on Linux. Registering it on both
 // platforms is harmless: the macOS atfork registration just never fires.
+// ── Per-thread state in a TSD slot (macOS; see util/tsd_slot.h) ─────────────
+#if defined(SMASH_USE_TSD)
+namespace {
+// Fallback storage, used only if BootstrapAlloc cannot supply a ThreadState.
+// The slot then stays null, so every access takes the slow call (+ a
+// _tlv_get_addr): correct but slow -- a safety net, not a configuration. There
+// is deliberately no runtime switch to fallback: the fast path reads the slot
+// unconditionally, so it cannot be made to ignore a slot that is in use
+// without paying a check on every access. Disable at build time instead
+// (-DSMASH_TSD_SLOT=OFF) or pick another slot (-DSMASH_TSD_SLOT_INDEX=N).
+thread_local smash::ThreadState g_tsd_fallback_state;
+std::atomic<size_t> g_ts_fallbacks{0};
+
+// Reclaimed ThreadStates. Threads come and go rarely relative to allocations,
+// so a spinlocked list is plenty; it also avoids a lock-free stack's ABA.
+smash::Spinlock g_ts_free_lock;
+smash::ThreadState* g_ts_free = nullptr;
+std::atomic<size_t> g_ts_allocated{0};   // ever carved from BootstrapAlloc
+std::atomic<size_t> g_ts_live{0};        // currently owned by a thread
+
+// Destructor key: its value is the thread's ThreadState, so pthread calls
+// threadStateRelease at thread exit for EVERY thread -- including GCD
+// workqueue threads, which never pass through alloc8's pthread_create
+// trampoline (and so never get xxthread_cleanup).
+std::atomic<bool> g_ts_key_ready{false};
+pthread_key_t g_ts_key;
+
+void threadStateRelease(void* p) {
+    auto* ts = static_cast<smash::ThreadState*>(p);
+    if (!ts || ts->magic != smash::kThreadStateMagic) return;
+    // Drain a thread cache the alloc8 trampoline did not (GCD threads, or a
+    // destructor that allocated after xxthread_cleanup). The slot still points
+    // at ts here, so threadCleanup() sees this thread's cache.
+    if (ts->thread_cache) {
+        if (auto* heap = SmashRedirect::getHeap()) heap->threadCleanup();
+    }
+    // Clear the slot BEFORE publishing ts for reuse: a later destructor that
+    // allocates then builds a fresh state (and re-arms this key; pthread
+    // repeats destructors up to PTHREAD_DESTRUCTOR_ITERATIONS) instead of
+    // touching one another thread may already own.
+    smash::tsdSet(nullptr);
+    {
+        smash::LockGuard g(g_ts_free_lock);
+        ts->next_free = g_ts_free;
+        g_ts_free = ts;
+    }
+    g_ts_live.fetch_sub(1, std::memory_order_relaxed);
+}
+}  // namespace
+
+smash::ThreadState* smash::threadStateSlow() {
+    ThreadState* ts = nullptr;
+    {
+        LockGuard g(g_ts_free_lock);
+        if ((ts = g_ts_free)) g_ts_free = ts->next_free;
+    }
+    if (!ts) {
+        void* mem = BootstrapAlloc::instance().allocate(sizeof(ThreadState), 64);
+        if (!mem) {                                // out of metadata: degrade, don't crash
+            g_ts_fallbacks.fetch_add(1, std::memory_order_relaxed);
+            return &g_tsd_fallback_state;
+        }
+        ts = static_cast<ThreadState*>(mem);
+        g_ts_allocated.fetch_add(1, std::memory_order_relaxed);
+    }
+    new (ts) ThreadState();
+    tsdSet(ts);
+    g_ts_live.fetch_add(1, std::memory_order_relaxed);
+    // Arm the exit-time destructor. (A thread that set up its state before
+    // the key existed -- only the main thread, during dyld init -- has none;
+    // the main thread never runs TSD destructors anyway.)
+    if (g_ts_key_ready.load(std::memory_order_acquire))
+        pthread_setspecific(g_ts_key, ts);
+    return ts;
+}
+
+void smash::threadStateAtforkPrepare() { g_ts_free_lock.lock(); }
+void smash::threadStateAtforkParent() { g_ts_free_lock.unlock(); }
+void smash::threadStateAtforkChild() {
+    // Only the forking thread survives; it held the lock across fork.
+    g_ts_free_lock.unlock();
+}
+
+extern "C" void smash_tsd_store_caller_ra(void* ra) {
+    smash::threadState()->caller_ra = ra;
+}
+
+// Runs early (before most other constructors), on the main thread.
+__attribute__((constructor(101)))
+static void smash_tsd_init() {
+    // The slot is unofficial (reserved by libpthread, unused by the OS), so
+    // another component could pick the same one -- e.g. a second malloc
+    // replacement. If the main thread's slot already holds something that is
+    // not our ThreadState, sharing it would corrupt both; refuse loudly.
+    void* cur = smash::tsdGet();
+    if (cur && static_cast<smash::ThreadState*>(cur)->magic != smash::kThreadStateMagic) {
+        static const char msg[] =
+            "[smash] FATAL: pthread TSD slot " SMASH_TSD_SLOT_STR " is already in use by another "
+            "library (another malloc replacement loaded?). Rebuild smash with "
+            "-DSMASH_TSD_SLOT_INDEX=<free slot> or -DSMASH_TSD_SLOT=OFF.\n";
+        (void)!::write(STDERR_FILENO, msg, sizeof(msg) - 1);
+        abort();
+    }
+    if (pthread_key_create(&g_ts_key, threadStateRelease) == 0)
+        g_ts_key_ready.store(true, std::memory_order_release);
+    // Arm the destructor for a state the main thread set up during dyld init
+    // (harmless: the main thread does not run TSD destructors on exit()).
+    if (cur && g_ts_key_ready.load(std::memory_order_relaxed))
+        pthread_setspecific(g_ts_key, cur);
+}
+
+// Exported diagnostic / test hook: ThreadStates ever allocated, currently
+// owned by a thread, and how often the thread_local fallback was used.
+extern "C" __attribute__((visibility("default")))
+void smash_tsd_stats(size_t* allocated, size_t* live, size_t* fallbacks) {
+    if (allocated) *allocated = g_ts_allocated.load(std::memory_order_relaxed);
+    if (live) *live = g_ts_live.load(std::memory_order_relaxed);
+    if (fallbacks) *fallbacks = g_ts_fallbacks.load(std::memory_order_relaxed);
+}
+#endif  // SMASH_USE_TSD
+
 extern "C" {
 static void smash_atfork_prepare() {
     auto* heap = SmashRedirect::getHeap();
     if (heap) heap->preparePauseForFork();
+#if defined(SMASH_USE_TSD)
+    smash::threadStateAtforkPrepare();
+#endif
 }
 static void smash_atfork_parent() {
+#if defined(SMASH_USE_TSD)
+    smash::threadStateAtforkParent();
+#endif
     auto* heap = SmashRedirect::getHeap();
     if (heap) heap->resumeAfterFork();
 }
@@ -1402,6 +1532,9 @@ static void smash_atfork_child() {
     // The HeapRedirect singleton is already constructed by the time anyone is
     // forking — we accessed it on the very first malloc in the parent. Calling
     // getHeap() here doesn't allocate.
+#if defined(SMASH_USE_TSD)
+    smash::threadStateAtforkChild();
+#endif
     auto* heap = SmashRedirect::getHeap();
     if (heap) heap->resetForFork();
 }

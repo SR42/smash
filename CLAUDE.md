@@ -22,7 +22,7 @@ cmake .. -DSMASH_BUILD_BENCH=ON && make -j$(nproc)
 cd build && ctest --output-on-failure
 ```
 
-All 18 tests must pass. CI (`.github/workflows/ci.yml`) runs the full suite on `ubuntu-latest` and `macos-latest` on every push and PR. Five of the tests are end-to-end under `DYLD_INSERT_LIBRARIES` / `LD_PRELOAD`:
+All tests must pass (`ctest` lists them; some are macOS-only). CI (`.github/workflows/ci.yml`) runs the full suite on `ubuntu-latest` and `macos-latest` on every push and PR. Five of the tests are end-to-end under `DYLD_INSERT_LIBRARIES` / `LD_PRELOAD`:
 
 - `test_arena_routing` guards call-site arena routing — the invariant behind the paper's compression-homogeneity claim. Runs a program with 32 distinct noinline allocation sites under interposition and asserts, via the exported `smash_arena_for(ptr)` query, that they do **not** all collapse into one arena. This is the regression guard for the LTO/wrapper return-address bug: under dynamic interposition the return address seen inside the allocator can point into the wrapper library instead of the app, collapsing every call site into one arena (homogeneity 0%). Fast and deterministic (no compressor): full mode routes 256 B allocations through the slab, and `SMASH_CPU_ARENA=0` + default thread-hash-off make the arena a pure function of the return address, so a buggy capture yields exactly 1 distinct arena. Verified as a real discriminator (injecting a constant RA makes it fail with `distinct_arenas=1`). Must run under interposition — a direct-linked call would never exercise the wrapper path where the bug lives.
 
@@ -124,6 +124,19 @@ The compressor flow calls `decommitPages()` (MADV_FREE_REUSABLE) **before** `mpr
 ## macOS arm64 / arm64e
 
 libsmash is built **fat** (arm64 + arm64e) so it can interpose into both ordinary and PAC (arm64e) processes; the benchmark binaries are built **arm64-only** because they are the app under test and must load arm64-only preloads. See [agents/macos-arm64e.md](agents/macos-arm64e.md) for the full mechanism, the exec-vs-load trap (macOS ≤ 15 SIGKILLs third-party arm64e; macOS 26 runs it), and the debugging pitfalls.
+
+## macOS Per-Thread State (TSD slot, `SMASH_TSD_SLOT`)
+
+On Mach-O every `thread_local` access from a dylib calls `_tlv_get_addr` — `tls_model("initial-exec")` has no effect (there is no static TLS model) — and each distinct variable a function touches is its own call. Smash's malloc/free fast path touched eight of them plus alloc8's caller-RA hint, which made `_tlv_get_addr` the hottest non-waiting frame in allocation-heavy programs.
+
+On Apple silicon (arm64/arm64e) the hot per-thread fields therefore live in one `ThreadState` (`smash_heap.h`) whose pointer sits in pthread TSD slot `SMASH_TSD_SLOT_INDEX` (default **89**, `__PTK_FRAMEWORK_OLDGC_KEY9`, the slot mimalloc uses: reserved by libpthread for the long-gone Objective-C GC, never handed out by `pthread_key_create`). A read is `mrs tpidrro_el0` + load; see `src/util/tsd_slot.h`. x86-64 macOS keeps the `thread_local`s: the `%gs` equivalent could not be validated (smash is unstable on x86-64 under Rosetta with or without it, and no Intel Mac was available).
+
+- The old names (`g_thread_cache`, `g_free_cache_*`, `g_arena_stack_base`, `g_full_mode_cached`) are macros for `threadState()->field`, so call sites are unchanged. Linux and x86-64 macOS keep the `thread_local`s.
+- **Lifecycle:** a null slot means "not set up": `threadStateSlow()` pops a recycled `ThreadState` or carves one from `BootstrapAlloc` (never malloc), installs it, and arms a pthread-key destructor. At thread exit the destructor drains a still-live thread cache (GCD workers never pass through alloc8's `pthread_create` trampoline, so they get no `xxthread_cleanup`), clears the slot, and pushes the state on a free list. A later destructor that allocates simply gets a fresh state (pthread re-runs destructors). The free-list lock is handled in the atfork handlers.
+- **Caller hint:** `tsd_slot.h` is force-included into every libsmash TU, including alloc8's wrappers, and defines `ALLOC8_CALLER_RA_HOOK`, so the wrappers store the return address in `ThreadState::caller_ra` (first field) instead of alloc8's `thread_local`. Requires an alloc8 with `ALLOC8_HAS_CALLER_RA_HOOK` — the build `#error`s otherwise, because the hint would silently never be written and call-site arenas would collapse.
+- **Conflicts:** the slot is unofficial. If the main thread's slot already holds something that is not a `ThreadState` (magic check) when smash's constructor runs — e.g. a second malloc replacement using the same slot — smash aborts with a message rather than corrupt both. There is deliberately no runtime fallback switch: the fast path reads the slot unconditionally. Pick another slot with `-DSMASH_TSD_SLOT_INDEX=N` or disable with `-DSMASH_TSD_SLOT=OFF`. A `thread_local` fallback state exists only for `BootstrapAlloc` exhaustion.
+- **Test:** `test_tsd_thread` (1024 short-lived pthreads, GCD workers, an app destructor that allocates during exit, fork with live threads) checks reuse via the exported `smash_tsd_stats()`.
+- Measured (M1 Max): malloc+free microbench 41.4 → 24.7 ns/op; jaq 24.3 → 18.0 s; minijinja, stylua, rhai 10–13% faster.
 
 ## Key Conventions
 

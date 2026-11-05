@@ -237,6 +237,24 @@ add_library(smash SHARED
 )
 target_include_directories(smash PRIVATE ${printf_SOURCE_DIR})
 
+# macOS arm64: keep hot per-thread state in a reserved pthread TSD slot (one
+# `mrs` + load) instead of thread_locals (a _tlv_get_addr call each on Mach-O).
+# See src/util/tsd_slot.h. The header is force-included so alloc8's wrappers
+# store the caller hint there too (ALLOC8_CALLER_RA_HOOK); requires an alloc8
+# with that hook (#error otherwise). Slot 89 is the one mimalloc uses; pick
+# another reserved-but-unused slot if something else claims it.
+if(APPLE)
+  option(SMASH_TSD_SLOT "Per-thread state in a reserved pthread TSD slot (macOS)" ON)
+  set(SMASH_TSD_SLOT_INDEX 89 CACHE STRING "pthread TSD slot used when SMASH_TSD_SLOT=ON")
+  if(SMASH_TSD_SLOT)
+    target_compile_definitions(smash PRIVATE
+      SMASH_TSD_SLOT=${SMASH_TSD_SLOT_INDEX}
+      SMASH_TSD_SLOT_STR="${SMASH_TSD_SLOT_INDEX}")
+    target_compile_options(smash PRIVATE
+      -include ${CMAKE_CURRENT_SOURCE_DIR}/src/util/tsd_slot.h)
+  endif()
+endif()
+
 # Linux syscall wrappers need default visibility for LD_PRELOAD interposition.
 # The global -fvisibility=hidden flag hides them otherwise.
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")

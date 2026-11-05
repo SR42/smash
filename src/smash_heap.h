@@ -92,6 +92,54 @@ extern PageLockTable* g_smash_page_locks_for_external;
 // Without this, the compiler emits __tls_get_addr indirections for
 // every static-local thread_local in an inline function, costing one
 // dependent indirect call per TLS access on the hot path.
+#include "util/tsd_slot.h"
+#if defined(SMASH_USE_TSD)
+#if !defined(ALLOC8_HAS_CALLER_RA_HOOK)
+#error "SMASH_TSD_SLOT needs an alloc8 with ALLOC8_CALLER_RA_HOOK (alloc8 main >= feat/caller-ra-hook); \
+otherwise the caller hint is never written and call-site arenas collapse. Update alloc8 or configure -DSMASH_TSD_SLOT=OFF."
+#endif
+// macOS: the hot per-thread fields live in one ThreadState reached through a
+// reserved TSD slot (see util/tsd_slot.h) instead of thread_locals, each of
+// which costs a _tlv_get_addr call per access on Mach-O. The names below
+// expand to fields of the current thread's ThreadState, so the code that
+// uses them is unchanged.
+inline constexpr uint64_t kThreadStateMagic = 0x4453545f48534d53ULL;  // "SMSH_TSD"
+struct ThreadState {
+    void* caller_ra = nullptr;          // MUST stay first: ALLOC8_CALLER_RA_HOOK writes slot[0]
+    ThreadCache* thread_cache = nullptr;
+    Span* free_cache_span = nullptr;
+    uintptr_t free_cache_base = 0;
+    uintptr_t free_cache_end = 0;
+    uint64_t free_cache_gen = ~0ULL;
+    uintptr_t arena_stack_base = 0;
+    int full_mode_cached = -1;
+    uint32_t free_cache_skip = 0;
+    uint64_t magic = kThreadStateMagic; // identifies our object in the slot
+    ThreadState* next_free = nullptr;   // free-list link after thread exit
+};
+static_assert(offsetof(ThreadState, caller_ra) == 0, "caller_ra must be first");
+
+// Cold path (smash_heap.cpp): set up (or reuse) this thread's state; returns a
+// thread_local fallback only if BootstrapAlloc is exhausted.
+ThreadState* threadStateSlow();
+void threadStateAtforkPrepare();
+void threadStateAtforkParent();
+void threadStateAtforkChild();
+
+[[gnu::always_inline]] inline ThreadState* threadState() {
+    auto* ts = static_cast<ThreadState*>(tsdGet());
+    if (__builtin_expect(ts == nullptr, 0)) ts = threadStateSlow();
+    return ts;
+}
+#define g_thread_cache     (::smash::threadState()->thread_cache)
+#define g_full_mode_cached (::smash::threadState()->full_mode_cached)
+#define g_free_cache_span  (::smash::threadState()->free_cache_span)
+#define g_free_cache_base  (::smash::threadState()->free_cache_base)
+#define g_free_cache_end   (::smash::threadState()->free_cache_end)
+#define g_free_cache_gen   (::smash::threadState()->free_cache_gen)
+#define g_free_cache_skip  (::smash::threadState()->free_cache_skip)
+#define g_arena_stack_base (::smash::threadState()->arena_stack_base)
+#else
 extern __attribute__((tls_model("initial-exec")))
     thread_local ThreadCache* g_thread_cache;
 
@@ -146,6 +194,7 @@ extern __attribute__((tls_model("initial-exec")))
 // drift while preserving the depth signal.
 extern __attribute__((tls_model("initial-exec")))
     thread_local uintptr_t g_arena_stack_base;
+#endif  // SMASH_USE_TSD
 
 // Per-thread memo of callsiteArena()'s result, keyed on (ra, size class); see
 // callsiteArena(). Namespace scope (not a function-local static) so the
@@ -440,7 +489,11 @@ extern SystemAllocFns g_system_alloc;
 // SmashHeap calls from tests and internal code — where no app site exists.
 [[gnu::always_inline]]
 inline uintptr_t appCallerRA() {
+#if defined(SMASH_USE_TSD)
+    if (void* ra = threadState()->caller_ra) [[likely]]
+#else
     if (void* ra = alloc8_caller_ra) [[likely]]
+#endif
         return reinterpret_cast<uintptr_t>(ra);
     return reinterpret_cast<uintptr_t>(__builtin_return_address(0));
 }

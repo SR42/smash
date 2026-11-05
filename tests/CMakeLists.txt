@@ -269,6 +269,23 @@ else()
 endif()
 set_tests_properties(test_arena_routing PROPERTIES TIMEOUT 30)
 
+# Per-thread state in a TSD slot (macOS SMASH_TSD_SLOT): ThreadStates are
+# reclaimed and reused across thousands of short-lived threads, GCD workers and
+# allocating app destructors work, fork() keeps the free list usable. Skips
+# itself when smash_tsd_stats is not exported (TSD slot not compiled in).
+if(APPLE)
+  add_executable(tsd_thread_test tsd_thread_test.cpp)
+  set_target_properties(tsd_thread_test PROPERTIES CXX_STANDARD 20)
+  add_test(
+    NAME test_tsd_thread
+    COMMAND ${CMAKE_COMMAND} -E env
+      "DYLD_INSERT_LIBRARIES=$<TARGET_FILE:smash>"
+      "MallocNanoZone=0"
+      $<TARGET_FILE:tsd_thread_test>
+  )
+  set_tests_properties(test_tsd_thread PROPERTIES TIMEOUT 120)
+endif()
+
 # Large-block ownership regression: blocks smash mmaps directly (16 KiB < size
 # < kLargeAllocVmThreshold, and every large block in large-only mode) sit
 # outside the contiguous arena; xxowns() must still claim them or alloc8
