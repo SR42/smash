@@ -363,20 +363,17 @@ SMASH_VISIBLE ssize_t __recvfrom_chk(int s, void* buf, size_t len, size_t buflen
     if (!g_real_recvfrom_chk) return recvfrom(s, buf, len, flags, addr, addr_len);
     if (g_syscall_wrap_disabled)
         return g_real_recvfrom_chk(s, buf, len, buflen, flags, addr, addr_len);
-    if (smash::vm::wantsPeekedRecv(s, flags, smash::vm::inSmashRegion(buf, len)))
-        return smash::vm::peekedRecv(
-            [&] { return g_real_recvfrom_chk(s, buf, len, buflen, flags | MSG_PEEK, nullptr, nullptr); },
-            [&] { smash::vm::walkPagesForFault(buf, len, smash::g_smash_vm_region); },
-            [&] {
-                if (addr_len) {
-                    smash::vm::touchRangeWritable(addr_len, sizeof(*addr_len));
-                    if (addr) smash::vm::touchRangeWritable(addr, *addr_len);
-                }
-            },
-            [&] { return g_real_recvfrom_chk(s, buf, len, buflen, flags, addr, addr_len); });
-    return smash::vm::retryWith1Buf(
-        [&] { return g_real_recvfrom_chk(s, buf, len, buflen, flags, addr, addr_len); },
-        buf, len);
+    // The source address is written after the data is consumed (withAddrOut).
+    return smash::vm::withAddrOut(addr, addr_len, [&](struct sockaddr* a, socklen_t* al) -> ssize_t {
+        if (smash::vm::wantsPeekedRecv(s, flags, smash::vm::inSmashRegion(buf, len)))
+            return smash::vm::peekedRecv(
+                [&] { return g_real_recvfrom_chk(s, buf, len, buflen, flags | MSG_PEEK, nullptr, nullptr); },
+                [&] { smash::vm::walkPagesForFault(buf, len, smash::g_smash_vm_region); }, [] {},
+                [&] { return g_real_recvfrom_chk(s, buf, len, buflen, flags, a, al); });
+        return smash::vm::retryWith1Buf(
+            [&] { return g_real_recvfrom_chk(s, buf, len, buflen, flags, a, al); },
+            buf, len);
+    });
 }
 SMASH_VISIBLE ssize_t __recvfrom_chk_24(int s, void* buf, size_t len, size_t buflen,
                                         int flags, struct sockaddr* addr,
@@ -530,20 +527,17 @@ SMASH_VISIBLE ssize_t recvfrom(int s, void* buf, size_t len, int flags,
     SMASH_LAZY_RESOLVE(fn_t, recvfrom);
     if (!real_recvfrom) return syscall(SYS_recvfrom, s, buf, len, flags, from, fromlen);
     auto* vm = smash::g_smash_vm_region;
-    if (smash::vm::wantsPeekedRecv(s, flags, smash::vm::inSmashRegion(buf, len)))
-        return smash::vm::peekedRecv(
-            [&] { return real_recvfrom(s, buf, len, flags | MSG_PEEK, nullptr, nullptr); },
-            [&] { smash::vm::walkPagesForFault(buf, len, vm); },
-            [&] {
-                if (fromlen) {
-                    smash::vm::touchRangeWritable(fromlen, sizeof(*fromlen));
-                    if (from) smash::vm::touchRangeWritable(from, *fromlen);
-                }
-            },
-            [&] { return real_recvfrom(s, buf, len, flags, from, fromlen); });
-    return smash::vm::retryWith1Buf(
-        [&] { return real_recvfrom(s, buf, len, flags, from, fromlen); },
-        buf, len);
+    // The source address is written after the data is consumed (withAddrOut).
+    return smash::vm::withAddrOut(from, fromlen, [&](struct sockaddr* f, socklen_t* fl) -> ssize_t {
+        if (smash::vm::wantsPeekedRecv(s, flags, smash::vm::inSmashRegion(buf, len)))
+            return smash::vm::peekedRecv(
+                [&] { return real_recvfrom(s, buf, len, flags | MSG_PEEK, nullptr, nullptr); },
+                [&] { smash::vm::walkPagesForFault(buf, len, vm); }, [] {},
+                [&] { return real_recvfrom(s, buf, len, flags, f, fl); });
+        return smash::vm::retryWith1Buf(
+            [&] { return real_recvfrom(s, buf, len, flags, f, fl); },
+            buf, len);
+    });
 }
 
 SMASH_VISIBLE ssize_t sendto(int s, const void* buf, size_t len, int flags,
@@ -561,27 +555,30 @@ SMASH_VISIBLE ssize_t recvmsg(int s, struct msghdr* msg, int flags) {
     SMASH_LAZY_RESOLVE(fn_t, recvmsg);
     if (!real_recvmsg) return syscall(SYS_recvmsg, s, msg, flags);
     auto* vm = smash::g_smash_vm_region;
-    bool in_heap = msg && iovecInHeap(msg->msg_iov, static_cast<int>(msg->msg_iovlen), vm);
-    if (msg && smash::vm::wantsPeekedRecv(
-                   s, flags, smash::vm::iovecInSmashRegion(msg->msg_iov, msg->msg_iovlen)))
-        return smash::vm::peekedRecv(
-            [&] {
-                struct msghdr peek{};
-                peek.msg_iov = msg->msg_iov;
-                peek.msg_iovlen = msg->msg_iovlen;
-                return real_recvmsg(s, &peek, flags | MSG_PEEK);
-            },
-            [&] { smash::vm::walkIovecForFault(msg->msg_iov, static_cast<int>(msg->msg_iovlen), vm); },
-            [&] {
-                smash::vm::touchRangeWritable(msg, sizeof(*msg));
-                smash::vm::touchRangeWritable(msg->msg_name, msg->msg_namelen);
-                smash::vm::touchRangeWritable(msg->msg_control, msg->msg_controllen);
-            },
-            [&] { return real_recvmsg(s, msg, flags); });
-    ssize_t ret = smash::vm::retryWithDecompress(
-        [&] { return real_recvmsg(s, msg, flags); },
-        [&] { if (in_heap) smash::vm::walkIovecForFault(msg->msg_iov, static_cast<int>(msg->msg_iovlen), vm); });
-    return ret;
+    // The address, msg_flags, msg_controllen and the control data are written
+    // after the data is consumed (recvmsgOut).
+    return smash::vm::recvmsgOut(msg, [&](struct msghdr* m) -> ssize_t {
+        bool in_heap = m && iovecInHeap(m->msg_iov, static_cast<int>(m->msg_iovlen), vm);
+        if (m && smash::vm::wantsPeekedRecv(
+                     s, flags, smash::vm::iovecInSmashRegion(m->msg_iov, m->msg_iovlen)))
+            return smash::vm::peekedRecv(
+                [&] {
+                    struct msghdr peek{};
+                    peek.msg_iov = m->msg_iov;
+                    peek.msg_iovlen = m->msg_iovlen;
+                    return real_recvmsg(s, &peek, flags | MSG_PEEK);
+                },
+                [&] { smash::vm::walkIovecForFault(m->msg_iov, static_cast<int>(m->msg_iovlen), vm); },
+                [&] {
+                    smash::vm::touchRangeWritable(m, sizeof(*m));
+                    smash::vm::touchRangeWritable(m->msg_name, m->msg_namelen);
+                    smash::vm::touchRangeWritable(m->msg_control, m->msg_controllen);
+                },
+                [&] { return real_recvmsg(s, m, flags); });
+        return smash::vm::retryWithDecompress(
+            [&] { return real_recvmsg(s, m, flags); },
+            [&] { if (in_heap) smash::vm::walkIovecForFault(m->msg_iov, static_cast<int>(m->msg_iovlen), vm); });
+    });
 }
 
 SMASH_VISIBLE ssize_t sendmsg(int s, const struct msghdr* msg, int flags) {
@@ -699,31 +696,27 @@ SMASH_VISIBLE int pselect(int nfds, fd_set* readfds, fd_set* writefds,
 }
 
 // ── accept/accept4 ──────────────────────────────────────────────────────────
-// The kernel writes the peer address into a heap-allocated sockaddr buffer.
+// The kernel writes the peer address (often into a heap listener or
+// connection object) only after it has dequeued the connection; when that
+// write faults it closes the new socket and returns EFAULT, and a retry took
+// the next connection or blocked. The address is the only memory involved,
+// so it is bounced (withAddrOut) and never retried.
 SMASH_VISIBLE int accept(int sockfd, struct sockaddr* addr, socklen_t* addrlen) {
     using fn_t = int(*)(int, struct sockaddr*, socklen_t*);
     SMASH_LAZY_RESOLVE(fn_t, accept);
     if (!real_accept) return syscall(SYS_accept, sockfd, addr, addrlen);
-    auto* vm = smash::g_smash_vm_region;
-    size_t addr_size = (addr && addrlen) ? static_cast<size_t>(*addrlen) : 0;
-    bool in_heap = addr_size && bufferInHeap(addr, addr_size, vm);
-    int ret = smash::vm::retryWithDecompress(
-        [&] { return real_accept(sockfd, addr, addrlen); },
-        [&] { if (in_heap) smash::vm::walkPagesForFault(addr, addr_size, vm); });
-    return ret;
+    return smash::vm::withAddrOut(addr, addrlen, [&](struct sockaddr* a, socklen_t* al) {
+        return real_accept(sockfd, a, al);
+    });
 }
 
 SMASH_VISIBLE int accept4(int sockfd, struct sockaddr* addr, socklen_t* addrlen, int flags) {
     using fn_t = int(*)(int, struct sockaddr*, socklen_t*, int);
     SMASH_LAZY_RESOLVE(fn_t, accept4);
     if (!real_accept4) return syscall(SYS_accept4, sockfd, addr, addrlen, flags);
-    auto* vm = smash::g_smash_vm_region;
-    size_t addr_size = (addr && addrlen) ? static_cast<size_t>(*addrlen) : 0;
-    bool in_heap = addr_size && bufferInHeap(addr, addr_size, vm);
-    int ret = smash::vm::retryWithDecompress(
-        [&] { return real_accept4(sockfd, addr, addrlen, flags); },
-        [&] { if (in_heap) smash::vm::walkPagesForFault(addr, addr_size, vm); });
-    return ret;
+    return smash::vm::withAddrOut(addr, addrlen, [&](struct sockaddr* a, socklen_t* al) {
+        return real_accept4(sockfd, a, al, flags);
+    });
 }
 
 // ── recvmmsg/sendmmsg ───────────────────────────────────────────────────────
@@ -770,16 +763,46 @@ SMASH_VISIBLE int sendmmsg(int sockfd, struct mmsghdr* msgvec, unsigned int vlen
     SMASH_LAZY_RESOLVE(fn_t, sendmmsg);
     if (!real_sendmmsg) return syscall(SYS_sendmmsg, sockfd, msgvec, vlen, flags);
     auto* vm = smash::g_smash_vm_region;
-    int ret = smash::vm::retryWithDecompress(
-        [&] { return real_sendmmsg(sockfd, msgvec, vlen, flags); },
-        [&] {
-            for (unsigned i = 0; i < vlen; ++i) {
-                struct msghdr* msg = &msgvec[i].msg_hdr;
-                if (msg->msg_iov && msg->msg_iovlen > 0)
-                    smash::vm::walkIovecForFault(msg->msg_iov, static_cast<int>(msg->msg_iovlen), vm);
-            }
-        });
-    return ret;
+    // The data is read before anything is sent, so an EFAULT on it is safe
+    // to retry.
+    auto send = [&](struct mmsghdr* v, unsigned n) {
+        return smash::vm::retryWithDecompress(
+            [&] { return real_sendmmsg(sockfd, v, n, flags); },
+            [&] {
+                for (unsigned i = 0; i < n; ++i) {
+                    struct msghdr* msg = &v[i].msg_hdr;
+                    if (msg->msg_iov && msg->msg_iovlen > 0)
+                        smash::vm::walkIovecForFault(msg->msg_iov, static_cast<int>(msg->msg_iovlen), vm);
+                }
+            });
+    };
+    // Each entry's msg_len is written after its datagram has been sent: an
+    // entry the kernel cannot write makes the call fail with EFAULT, the
+    // datagram already gone, and the retry sent it again. A vector on a smash
+    // page is sent from stack copies, kChunk entries at a time, and the
+    // lengths copied back. The kernel caps vlen at UIO_MAXIOV (1024) and stops
+    // at the first datagram that fails, returning the count so far.
+    if (!msgvec || !vlen || !smash::vm::inSmashRegion(msgvec, vlen * sizeof(*msgvec)))
+        return send(msgvec, vlen);
+    constexpr unsigned kUioMaxIov = 1024, kChunk = 32;
+    if (vlen > kUioMaxIov) vlen = kUioMaxIov;
+    const int saved_errno = errno;
+    unsigned done = 0;
+    while (done < vlen) {
+        const unsigned n = vlen - done < kChunk ? vlen - done : kChunk;
+        struct mmsghdr k[kChunk];
+        std::memcpy(k, msgvec + done, n * sizeof(*k));
+        const int r = send(k, n);
+        if (r < 0) {
+            if (done == 0) return r;
+            break;
+        }
+        for (int i = 0; i < r; ++i) msgvec[done + i].msg_len = k[i].msg_len;
+        done += static_cast<unsigned>(r);
+        if (static_cast<unsigned>(r) < n) break;
+    }
+    errno = saved_errno;
+    return static_cast<int>(done);
 }
 
 // Callers bind recvmmsg@GLIBC_2.12 and sendmmsg@GLIBC_2.14 on x86-64 (see
@@ -1128,33 +1151,62 @@ SMASH_VISIBLE ssize_t pwritev2(int fd, const struct iovec* iov, int iovcnt,
         });
 }
 
-// ── waitid / wait4 (process management) ─────────────────────────────────────
-// waitid writes a 128-byte siginfo_t into *infop; wait4 writes int wstatus
-// AND struct rusage. wstatus is usually stack (4 bytes); rusage may be heap
-// for long-lived accumulating perf counters.
+// ── waitid / wait4 / waitpid / wait / wait3 (process management) ────────────
+// The kernel reaps the child first and writes its status (waitid's siginfo_t,
+// wait4's int and struct rusage) last: when that write faults it returns
+// EFAULT with the child already gone, and the retry reaped another child or
+// got ECHILD, losing the first one's exit. The status is the only memory
+// involved, so it is bounced (withOut) and never retried. waitid writes its
+// six siginfo_t fields on every return, wait4 its status and rusage only for
+// a reaped child; the bounce copies back under the same conditions.
+// glibc's waitpid, wait and wait3 reach the kernel through an internal wait4
+// call that never comes back here, so they are wrapped too.
 
 SMASH_VISIBLE int waitid(idtype_t idtype, id_t id, siginfo_t* info, int options) {
     using fn_t = int(*)(idtype_t, id_t, siginfo_t*, int);
     SMASH_LAZY_RESOLVE(fn_t, waitid);
     if (!real_waitid) return syscall(SYS_waitid, idtype, id, info, options, nullptr);
-    return smash::vm::retryWith1Buf(
-        [&] { return real_waitid(idtype, id, info, options); },
-        info, sizeof(siginfo_t));
+    return smash::vm::withOut(info, [&](siginfo_t* i) { return real_waitid(idtype, id, i, options); },
+                              [](int) { return true; });
 }
+
+static inline bool reaped(pid_t r) { return r > 0; }
 
 SMASH_VISIBLE pid_t wait4(pid_t pid, int* wstatus, int options, struct rusage* rusage) {
     using fn_t = pid_t(*)(pid_t, int*, int, struct rusage*);
     SMASH_LAZY_RESOLVE(fn_t, wait4);
     if (!real_wait4) return syscall(SYS_wait4, pid, wstatus, options, rusage);
-    auto* vm = smash::g_smash_vm_region;
-    return smash::vm::retryWithDecompress(
-        [&] { return real_wait4(pid, wstatus, options, rusage); },
-        [&] {
-            if (vm) {
-                if (wstatus) smash::vm::walkPagesForFault(wstatus, sizeof(int), vm);
-                if (rusage) smash::vm::walkPagesForFault(rusage, sizeof(struct rusage), vm);
-            }
-        });
+    return smash::vm::withOut(wstatus, [&](int* st) {
+        return smash::vm::withOut(rusage, [&](struct rusage* ru) {
+            return real_wait4(pid, st, options, ru);
+        }, reaped);
+    }, reaped);
+}
+
+SMASH_VISIBLE pid_t waitpid(pid_t pid, int* wstatus, int options) {
+    using fn_t = pid_t(*)(pid_t, int*, int);
+    SMASH_LAZY_RESOLVE(fn_t, waitpid);
+    if (!real_waitpid) return syscall(SYS_wait4, pid, wstatus, options, nullptr);
+    return smash::vm::withOut(wstatus, [&](int* st) { return real_waitpid(pid, st, options); },
+                              reaped);
+}
+
+SMASH_VISIBLE pid_t wait(int* wstatus) {
+    using fn_t = pid_t(*)(int*);
+    SMASH_LAZY_RESOLVE(fn_t, wait);
+    if (!real_wait) return syscall(SYS_wait4, -1, wstatus, 0, nullptr);
+    return smash::vm::withOut(wstatus, [&](int* st) { return real_wait(st); }, reaped);
+}
+
+SMASH_VISIBLE pid_t wait3(int* wstatus, int options, struct rusage* rusage) {
+    using fn_t = pid_t(*)(int*, int, struct rusage*);
+    SMASH_LAZY_RESOLVE(fn_t, wait3);
+    if (!real_wait3) return syscall(SYS_wait4, -1, wstatus, options, rusage);
+    return smash::vm::withOut(wstatus, [&](int* st) {
+        return smash::vm::withOut(rusage, [&](struct rusage* ru) {
+            return real_wait3(st, options, ru);
+        }, reaped);
+    }, reaped);
 }
 
 // ── statvfs / fstatvfs ──────────────────────────────────────────────────────
@@ -1266,17 +1318,14 @@ SMASH_VISIBLE int prlimit64(pid_t pid, enum __rlimit_resource resource,
                          const struct rlimit64*, struct rlimit64*);
     SMASH_LAZY_RESOLVE(fn_t, prlimit64);
     if (!real_prlimit64) return syscall(SYS_prlimit64, pid, resource, new_limit, old_limit);
-    auto* vm = smash::g_smash_vm_region;
-    return smash::vm::retryWithDecompress(
-        [&] { return real_prlimit64(pid, resource, new_limit, old_limit); },
-        [&] {
-            if (vm) {
-                if (new_limit)
-                    smash::vm::walkPagesForFault(new_limit, sizeof(struct rlimit64), vm);
-                if (old_limit)
-                    smash::vm::walkPagesForFault(old_limit, sizeof(struct rlimit64), vm);
-            }
-        });
+    // The new limit is read before anything changes (safe to retry); the old
+    // one is written after the new one is applied, so a retry reported the
+    // new limit as the old: bounced (withOut), written on success only.
+    return smash::vm::withOut(old_limit, [&](struct rlimit64* o) {
+        return smash::vm::retryWith1Buf(
+            [&] { return real_prlimit64(pid, resource, new_limit, o); },
+            new_limit, new_limit ? sizeof(struct rlimit64) : 0);
+    }, [](int r) { return r == 0; });
 }
 
 // ── getrandom ───────────────────────────────────────────────────────────────
@@ -1462,6 +1511,17 @@ SMASH_VISIBLE int ioctl(int fd, unsigned long request, ...) __THROW {
     SMASH_PASSTHROUGH_IF_DISABLED(ioctl, fd, request, arg);
     const size_t encoded = (_IOC_DIR(request) != _IOC_NONE) ? _IOC_SIZE(request) : 0;
     auto* vm = smash::g_smash_vm_region;
+    // Made writable before the call, not only after an EFAULT: a driver that
+    // acts and then copies its result out (DRM's create ioctls,
+    // USBDEVFS_REAPURB, ...) has done the work when the copy faults, and the
+    // retry did it again. An ioctl's argument cannot be bounced like the other
+    // out-parameters (its real size and layout are the driver's), so this
+    // narrows the window to a call that blocks past the cold timeout without
+    // closing it; the retry stays for drivers that read first.
+    if (vm && arg) {
+        if (encoded) smash::vm::touchRangeWritable(arg, encoded);
+        else smash::vm::walkUnsizedForFault(arg, 1, vm);
+    }
     return smash::vm::retryWithDecompress(
         [&] { return real_ioctl(fd, request, arg); },
         [&] {
@@ -1495,16 +1555,19 @@ SMASH_VISIBLE int setsockopt(int fd, int level, int optname,
 }
 
 // ── sendfile / sendfile64 ───────────────────────────────────────────────────
-// The offset is in/out: a file server keeping its cursor in the connection
-// object loses the transfer entirely when that page is compressed.
+// The offset is in/out (a file server keeps its cursor in the connection
+// object): the kernel reads it, transfers the data, and writes it back last.
+// When that write faulted it returned EFAULT with the data already sent, and
+// the retry sent it again from the old offset. The offset is the only memory
+// involved, so it is bounced (withOut) and never retried; the kernel writes
+// it back whatever the result, and so does the bounce.
 SMASH_VISIBLE ssize_t sendfile(int out_fd, int in_fd, off_t* offset, size_t count) {
     using fn_t = ssize_t(*)(int, int, off_t*, size_t);
     SMASH_LAZY_RESOLVE(fn_t, sendfile);
     if (!real_sendfile) return syscall(SYS_sendfile, out_fd, in_fd, offset, count);
     SMASH_PASSTHROUGH_IF_DISABLED(sendfile, out_fd, in_fd, offset, count);
-    return smash::vm::retryWith1Buf(
-        [&] { return real_sendfile(out_fd, in_fd, offset, count); },
-        offset, offset ? sizeof(off_t) : 0);
+    return smash::vm::withOut(offset, [&](off_t* o) { return real_sendfile(out_fd, in_fd, o, count); },
+                              [](ssize_t) { return true; });
 }
 
 SMASH_VISIBLE ssize_t sendfile64(int out_fd, int in_fd, off64_t* offset, size_t count) {
@@ -1512,9 +1575,8 @@ SMASH_VISIBLE ssize_t sendfile64(int out_fd, int in_fd, off64_t* offset, size_t 
     SMASH_LAZY_RESOLVE(fn_t, sendfile64);
     if (!real_sendfile64) return syscall(SYS_sendfile, out_fd, in_fd, offset, count);
     SMASH_PASSTHROUGH_IF_DISABLED(sendfile64, out_fd, in_fd, offset, count);
-    return smash::vm::retryWith1Buf(
-        [&] { return real_sendfile64(out_fd, in_fd, offset, count); },
-        offset, offset ? sizeof(off64_t) : 0);
+    return smash::vm::withOut(offset, [&](off64_t* o) { return real_sendfile64(out_fd, in_fd, o, count); },
+                              [](ssize_t) { return true; });
 }
 SMASH_VISIBLE ssize_t sendfile64_23(int out_fd, int in_fd, off64_t* offset, size_t count) {
     return sendfile64(out_fd, in_fd, offset, count);
@@ -1750,10 +1812,15 @@ SMASH_VISIBLE int sigprocmask(int how, const sigset_t* set, sigset_t* oldset) __
     SMASH_LAZY_RESOLVE(fn_t, sigprocmask);
     if (!real_sigprocmask) return syscall(SYS_rt_sigprocmask, how, set, oldset, _NSIG / 8);
     SMASH_PASSTHROUGH_IF_DISABLED(sigprocmask, how, set, oldset);
-    return smash::vm::retryWith2Bufs(
-        [&] { return real_sigprocmask(how, set, oldset); },
-        set, set ? sizeof(sigset_t) : 0,
-        oldset, oldset ? sizeof(sigset_t) : 0);
+    // The new set is read before the mask changes (safe to retry); the old
+    // one is written after it has changed, so a retry reported the new mask
+    // as the old: bounced (withOut), written on success only. The bounce is
+    // seeded from the caller's sigset_t, of which the kernel writes 8 bytes.
+    return smash::vm::withOut(oldset, [&](sigset_t* o) {
+        return smash::vm::retryWith1Buf(
+            [&] { return real_sigprocmask(how, set, o); },
+            set, set ? sizeof(sigset_t) : 0);
+    }, [](int r) { return r == 0; });
 }
 
 // pthread_sigmask reports through its return value, not errno, so the retry
@@ -1765,11 +1832,10 @@ SMASH_VISIBLE int pthread_sigmask(int how, const sigset_t* set, sigset_t* oldset
     if (!real_pthread_sigmask) return syscall(SYS_rt_sigprocmask, how, set, oldset, _NSIG / 8);
     SMASH_PASSTHROUGH_IF_DISABLED(pthread_sigmask, how, set, oldset);
     auto* vm = smash::g_smash_vm_region;
-    if (vm) {
-        if (set) smash::vm::warmPages(set, sizeof(sigset_t), vm);
-        if (oldset) smash::vm::warmPages(oldset, sizeof(sigset_t), vm);
-    }
-    return real_pthread_sigmask(how, set, oldset);
+    if (vm && set) smash::vm::warmPages(set, sizeof(sigset_t), vm);
+    // The old mask is written after the new one is applied (sigprocmask).
+    return smash::vm::withOut(oldset, [&](sigset_t* o) { return real_pthread_sigmask(how, set, o); },
+                              [](int r) { return r == 0; });
 }
 SMASH_VISIBLE int pthread_sigmask_232(int how, const sigset_t* set, sigset_t* oldset) {
     return pthread_sigmask(how, set, oldset);
@@ -1784,10 +1850,16 @@ SMASH_VISIBLE int nanosleep(const struct timespec* req, struct timespec* rem) {
     SMASH_LAZY_RESOLVE(fn_t, nanosleep);
     if (!real_nanosleep) return syscall(SYS_nanosleep, req, rem);
     SMASH_PASSTHROUGH_IF_DISABLED(nanosleep, req, rem);
-    return smash::vm::retryWith2Bufs(
-        [&] { return real_nanosleep(req, rem); },
-        req, req ? sizeof(struct timespec) : 0,
-        rem, rem ? sizeof(struct timespec) : 0);
+    // req is read before sleeping (safe to retry). rem is written after a
+    // signal has interrupted the sleep: when that write faulted the call
+    // returned EFAULT instead of EINTR and the retry slept the whole request
+    // again. Bounced (withOut), seeded from the caller's and copied back on
+    // every return, as nanosleep(&ts, &ts) loops expect.
+    return smash::vm::withOut(rem, [&](struct timespec* r) {
+        return smash::vm::retryWith1Buf(
+            [&] { return real_nanosleep(req, r); },
+            req, req ? sizeof(struct timespec) : 0);
+    }, [](int) { return true; });
 }
 
 SMASH_VISIBLE int clock_nanosleep(clockid_t clock_id, int flags,
@@ -1797,17 +1869,17 @@ SMASH_VISIBLE int clock_nanosleep(clockid_t clock_id, int flags,
     if (!real_clock_nanosleep) return syscall(SYS_clock_nanosleep, clock_id, flags, req, rem);
     SMASH_PASSTHROUGH_IF_DISABLED(clock_nanosleep, clock_id, flags, req, rem);
     // clock_nanosleep returns the error code directly and leaves errno alone,
-    // so the EFAULT retry has to key on the return value.
+    // so the EFAULT retry has to key on the return value. It covers req only:
+    // rem is written after the interrupted sleep (nanosleep), so it is bounced.
     auto* vm = smash::g_smash_vm_region;
-    int ret = real_clock_nanosleep(clock_id, flags, req, rem);
-    for (int attempt = 0; ret == EFAULT && attempt < 8; ++attempt) {
-        if (vm) {
-            if (req) smash::vm::walkPagesForFault(req, sizeof(struct timespec), vm);
-            if (rem) smash::vm::walkPagesForFault(rem, sizeof(struct timespec), vm);
+    return smash::vm::withOut(rem, [&](struct timespec* r) {
+        int ret = real_clock_nanosleep(clock_id, flags, req, r);
+        for (int attempt = 0; ret == EFAULT && attempt < 8; ++attempt) {
+            if (vm && req) smash::vm::walkPagesForFault(req, sizeof(struct timespec), vm);
+            ret = real_clock_nanosleep(clock_id, flags, req, r);
         }
-        ret = real_clock_nanosleep(clock_id, flags, req, rem);
-    }
-    return ret;
+        return ret;
+    }, [](int) { return true; });
 }
 SMASH_VISIBLE int clock_nanosleep_217(clockid_t clock_id, int flags,
                                       const struct timespec* req, struct timespec* rem) {

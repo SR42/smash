@@ -1094,6 +1094,19 @@ if(NOT APPLE)
   set_tests_properties(test_dgram_recv PROPERTIES TIMEOUT 400)
 endif()
 
+# An out-parameter the kernel writes after it has done the work (wait4's
+# status, accept's address, sendfile's offset, ...) must not make the EFAULT
+# retry do the work twice (syscall_side_effect_test.cpp).
+if(NOT APPLE)
+  add_executable(syscall_side_effect_test syscall_side_effect_test.cpp)
+  target_link_libraries(syscall_side_effect_test PRIVATE ${CMAKE_DL_LIBS} Threads::Threads)
+  add_test(NAME test_syscall_side_effect COMMAND ${CMAKE_COMMAND} -E env
+    "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=1" "SMASH_SOFTDIRTY=0"
+    "SMASH_DEFER_PHASES_MS=0" "SMASH_COLD_TIMEOUT_SEC=1"
+    $<TARGET_FILE:syscall_side_effect_test>)
+  set_tests_properties(test_syscall_side_effect PROPERTIES TIMEOUT 600)
+endif()
+
 # Sleeping application threads must not pin the compressor to one worker
 # (worker_cap_test.cpp).
 if(NOT APPLE)

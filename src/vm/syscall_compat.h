@@ -327,8 +327,11 @@ inline bool fdIsMessageSocket(int fd) {
                   type == SOCK_RDM);
 }
 
-// True when any byte of [p, p + len) is in smash's region.
-inline bool inSmashRegion(const void* p, size_t len) {
+// True when any byte of [p, p + len) is in smash's region. Always inlined:
+// it is on every wrapped read, and once the out-parameter bounces gave it
+// enough callers for GCC to emit it out of line, passing __read_chk's
+// write_only buffer to it read as an access (-Wmaybe-uninitialized).
+[[gnu::always_inline]] inline bool inSmashRegion(const void* p, size_t len) {
     auto* vm = ::smash::g_smash_vm_region;
     if (!vm || !p || !len) return false;
     const auto a = reinterpret_cast<uintptr_t>(p);
@@ -370,6 +373,114 @@ inline auto peekedRecv(Peek peek, Walk walk, Prep prep, Real real) -> decltype(r
     if (p < 0) return p;
     prep();
     return real();
+}
+
+// ── Out-parameters the kernel writes after the work is done ───────────────
+// Some syscalls act first and write their results last: wait4/waitid reap
+// the child, accept dequeues the connection, a receive consumes the data,
+// sendfile transfers it, sendmmsg sends the datagram, rt_sigprocmask and
+// prlimit64 apply the new mask or limit, an interrupted nanosleep has slept.
+// When that last write faults, the kernel returns EFAULT with the work done,
+// and the EFAULT retry did it again: the child's status lost (the retry reaps
+// another, or gets ECHILD), the next connection, the next chunk of a stream,
+// the file sent twice, the new mask or limit reported as the old one, the
+// whole sleep again. Measured on Linux 6.8 with each out-parameter on a page
+// the kernel can read but not write (what a watched smash page is to it):
+// all eleven of those calls. A control buffer the kernel cannot write is not
+// even an EFAULT: the message arrives with MSG_CTRUNC and a passed
+// descriptor is closed. Touching the out-parameter first is not enough: a
+// blocking call can outlast the cold timeout.
+//
+// So when an out-parameter is on a smash page, the kernel gets a stack copy,
+// which it can always write, and the result is copied out in user space
+// afterwards, where a compressed or watched page faults through the handler
+// like any other store. Only what the kernel would have written is written,
+// and only when it would have: the copy is seeded from the caller's object,
+// so bytes the kernel leaves alone keep their value. An out-parameter that is
+// not on a smash page goes to the kernel untouched, so an EFAULT there is the
+// caller's own and is not retried.
+
+// call(p) with *p replaced by a stack copy when *p is on a smash page;
+// copied back when written(result).
+template <typename T, typename Call, typename Written>
+inline auto withOut(T* p, Call call, Written written) -> decltype(call(p)) {
+    if (!p || !inSmashRegion(p, sizeof(T))) return call(p);
+    T k;
+    __builtin_memcpy(&k, p, sizeof(T));
+    const auto r = call(&k);
+    if (written(r)) __builtin_memcpy(p, &k, sizeof(T));
+    return r;
+}
+
+// call(addr, addrlen) for an accept or a receive, with the address bounced
+// when it or its length is on a smash page. The kernel's move_addr_to_user,
+// in user space: after a non-negative result, at most the caller's length of
+// the address is copied and the address's full length is reported. A
+// negative length goes to the kernel as it is, for its EINVAL.
+template <typename Call>
+inline auto withAddrOut(struct sockaddr* addr, socklen_t* addrlen, Call call)
+    -> decltype(call(addr, addrlen)) {
+    if (!addr || !addrlen) return call(addr, addrlen);
+    if (!inSmashRegion(addrlen, sizeof(*addrlen)) && !inSmashRegion(addr, 1))
+        return call(addr, addrlen);
+    const socklen_t want = *addrlen;
+    if (static_cast<int>(want) < 0) return call(addr, addrlen);
+    struct sockaddr_storage ss;
+    socklen_t len = sizeof(ss);
+    const auto r = call(reinterpret_cast<struct sockaddr*>(&ss), &len);
+    if (r >= 0) {
+        __builtin_memcpy(addr, &ss, want < len ? want : len);
+        *addrlen = len;
+    }
+    return r;
+}
+
+// recvmsg(msg) with every field the kernel writes after consuming the data
+// bounced when the msghdr, its address or its control buffer is on a smash
+// page: msg_name and msg_namelen (only when msg_name is set, as the kernel
+// does), msg_flags, msg_controllen, and the control data itself up to
+// kCtlBounce bytes. A larger control buffer is made writable instead, which
+// leaves a call that blocks past the cold timeout exposed. A negative
+// msg_namelen goes to the kernel as it is: it fails before consuming.
+inline constexpr size_t kCtlBounce = 1024;
+
+template <typename Recv>
+inline ssize_t recvmsgOut(struct msghdr* msg, Recv recv) {
+    if (!msg) return recv(msg);
+    if (!inSmashRegion(msg, sizeof(*msg)) &&
+        !inSmashRegion(msg->msg_name, msg->msg_namelen) &&
+        !inSmashRegion(msg->msg_control, msg->msg_controllen))
+        return recv(msg);
+    struct msghdr k = *msg;
+    if (static_cast<int>(k.msg_namelen) < 0) return recv(msg);
+    void* const name = k.msg_name;
+    const socklen_t namelen = k.msg_namelen;
+    void* const control = k.msg_control;
+    struct sockaddr_storage ss;
+    if (name) {
+        k.msg_name = &ss;
+        if (k.msg_namelen > sizeof(ss)) k.msg_namelen = sizeof(ss);
+    }
+    // Seeded from the caller's buffer: the kernel does not write a cmsg's
+    // alignment padding, which msg_controllen counts.
+    alignas(struct cmsghdr) unsigned char ctl[kCtlBounce];
+    const bool ctl_bounced = control && k.msg_controllen && k.msg_controllen <= sizeof(ctl);
+    if (ctl_bounced) {
+        __builtin_memcpy(ctl, control, k.msg_controllen);
+        k.msg_control = ctl;
+    } else if (control) {
+        touchRangeWritable(control, k.msg_controllen);
+    }
+    const ssize_t r = recv(&k);
+    if (r < 0) return r;
+    if (name) {
+        __builtin_memcpy(name, &ss, namelen < k.msg_namelen ? namelen : k.msg_namelen);
+        msg->msg_namelen = k.msg_namelen;
+    }
+    if (ctl_bounced) __builtin_memcpy(control, ctl, k.msg_controllen);
+    msg->msg_controllen = k.msg_controllen;
+    msg->msg_flags = k.msg_flags;
+    return r;
 }
 
 } // namespace smash::vm

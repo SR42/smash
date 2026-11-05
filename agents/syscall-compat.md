@@ -6,6 +6,8 @@ Smash's mprotect-based monitoring (PROT_READ) and compression (PROT_NONE) can co
 
 Every buffer-taking syscall wrapper follows the same shape: call the real syscall, on `errno == EFAULT` walk the buffer pages (one byte per page; the SIGSEGV handler decompresses), then retry. Bounded to 8 attempts with us-scale exponential backoff (1, 2, 4, ..., 128 us); the compressor tick fires at ~10 ms intervals so 8 attempts at 128 us is well inside one tick. Bounded so unmapped-pointer bugs surface as EFAULT instead of livelocking. `retryMachOnInvalidData` is the same shape but keyed on `MACH_RCV_INVALID_DATA` / `MACH_SEND_INVALID_DATA` for the mach_msg trio.
 
+**A retry is only safe when the EFAULT means the kernel did nothing.** For a call that acts first and writes its result last (`wait4`, `accept`, a receive, `sendfile`, ...) it does not: those bounce the out-parameter through the stack instead, see "Out-parameters written after the work" below.
+
 The PageState CAS + per-page lock are sufficient for correctness — there is no separate pin counter. The fault handler takes the same per-page lock as the compressor's `transition(ACTIVE -> COMPRESSING)`, so syscall-retry -> walk -> fault -> handler -> decompress -> retry is correct without a pin counter.
 
 ## DYLD interposition limitations (macOS) — the buffered-I/O carve-out
@@ -295,6 +297,74 @@ x86-64 only; aarch64's base `GLIBC_2.17` is what callers bind);
 cannot peek (a peek covers one datagram): its buffers are touched first, so a
 wait that outlasts a tick can still lose one. Also not covered: `SO_PEEK_OFF`
 sockets (a peek advances their peek offset).
+
+## Out-parameters written after the work (fixed 2026-11-05)
+
+`retryWithDecompress` assumed an `EFAULT` means the kernel did nothing. Many
+calls act first and write their result last, and when that last write hits a
+watched or compressed page the kernel returns `EFAULT` with the work done; the
+retry did it again. Measured on Linux 6.8 with a raw probe, each out-parameter
+on a page the kernel can read but not write (what a watched page is to it):
+
+| Call | Done before the faulting write | What the retry did |
+| --- | --- | --- |
+| `wait4`, `waitid` | child reaped | status lost; reaped another child or `ECHILD` |
+| `accept`, `accept4` | connection dequeued; the kernel closes it on the fault | took the next connection, or blocked |
+| `recvfrom`, `recvmsg` (address, `msg_flags`, `msg_controllen`) | data consumed | consumed the next chunk / datagram, up to 9 times |
+| `sendfile` (offset) | data transferred | sent it again from the old offset |
+| `sendmmsg` (`msg_len`) | datagram sent | sent it again, 9 datagrams in all |
+| `rt_sigprocmask`, `prlimit64` (old value) | new mask / limit applied | reported the new one as the old |
+| `nanosleep`, `clock_nanosleep` (`rem`) | interrupted by a signal | `EFAULT` instead of `EINTR`, then slept the whole request again |
+| `read` on an `eventfd` | counter consumed | not fixed, see below |
+
+A control buffer the kernel cannot write is not even an `EFAULT`: the message
+arrives with `MSG_CTRUNC` and an `SCM_RIGHTS` descriptor is closed.
+`syscall_efault_test` had waitid/wait4 phases, removed as "an internally
+inconsistent kernel response" — waitid not seeing a child `kill(pid, 0)` had
+seen. It was this.
+
+Touching the out-parameter first does not fix it: a blocking call
+(`accept`, `wait4`, a receive) can outlast the cold timeout. When an
+out-parameter is on a smash page, the wrapper passes the kernel a **stack
+copy** and copies the result out in user space afterwards, where a watched or
+compressed page faults through the handler like any other store
+(`syscall_compat.h`): `withOut` for a fixed-size one (seeded from the
+caller's object, so bytes the kernel does not write keep their value — glibc
+asks for 8 of a `sigset_t`'s 128), `withAddrOut` for a socket address (the
+kernel's `move_addr_to_user`: at most the caller's length copied, the full
+length reported), `recvmsgOut` for a `msghdr` (name, `msg_namelen` only when
+`msg_name` is set, `msg_flags`, `msg_controllen`, and the control data up to
+`kCtlBounce` = 1 KiB, seeded because the kernel skips cmsg padding). Each copy
+is written back only when the kernel would have written it: `waitid`'s six
+`siginfo_t` fields on every return, `wait4`'s status only for a reaped child,
+`sendfile`'s offset whatever the result, `rem` always (an
+`nanosleep(&ts, &ts)` loop reads it back). `sendmmsg` sends a vector on a smash
+page from stack copies, 32 entries at a time, capped at `UIO_MAXIOV` like the
+kernel, and stops at the first short chunk. An out-parameter **not** on a
+smash page goes to the kernel as it is and is not retried: its `EFAULT` is the
+caller's own. glibc's `waitpid`, `wait` and `wait3` call an internal `wait4`
+that never reaches the wrapper, so they are wrapped too.
+
+`ioctl`'s argument cannot be bounced (its real size and layout are the
+driver's), so it is made writable **before** the call: a driver that acts and
+then copies out (DRM's create ioctls, `USBDEVFS_REAPURB`) is safe unless the
+call blocks past the cold timeout. Measured with `strace` on a watched page:
+`FIONREAD` took two `ioctl` syscalls before (`EFAULT`, retry) and takes one.
+
+`test_syscall_side_effect` is the guard (tests.md). Against the library before
+the fix, 19 of its 20 cases failed with exactly the symptoms in the table.
+
+**Still exposed:**
+- `read` on a descriptor that consumes what it returns — `eventfd`, `timerfd`,
+  `signalfd`, `inotify`, a tty (`tty_read` copies through a 64-byte kernel
+  buffer and drops it on a faulting copy). Here the out-parameter is the data
+  buffer, which cannot be bounced in general, and the retry then blocks
+  (or `EAGAIN`) with the value gone.
+- `recvmmsg` (buffers touched first).
+- A large `recvmsg` control buffer (> 1 KiB, touched first).
+
+Closing these needs the compressor to leave alone a page a thread is blocked
+in a syscall on — a pin — not anything a wrapper can do on its own.
 
 
 ## Kernel-side access the handler cannot see (2026-10-29, documented, not fixed)

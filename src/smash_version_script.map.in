@@ -237,9 +237,14 @@
     preadv2;
     pwritev2;
 
-    # Process management (Round 4 coverage)
+    # Process management (Round 4 coverage). glibc's waitpid, wait and wait3
+    # call an internal wait4 that never reaches the wrapper above, so they
+    # are wrapped themselves (all base-version symbols).
     waitid;
     wait4;
+    waitpid;
+    wait;
+    wait3;
 
     # statvfs / xattr / rusage / rlimit (Round 5 coverage)
     statvfs;

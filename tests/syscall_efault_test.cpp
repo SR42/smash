@@ -684,17 +684,14 @@ int main() {
     }
     fprintf(stderr, "syscall_efault_test: preadv() into compressed iovec PASSED\n");
 
-    // ── waitid / wait4 phases removed ────────────────────────────────────
-    // The wrappers exist in src/{linux_syscall_wrappers,smash_heap}.cpp
-    // and are exported via the version script, but the under-Smash test
-    // setup (multi-threaded process with the compressor thread + alloc8
-    // atfork hooks) breaks waitid in a way that sees the child via
-    // kill(pid,0) and waitpid(WNOHANG) but not via waitid(P_PID,...) —
-    // an internally inconsistent kernel response we couldn't track down
-    // in CI debug iterations. Diagnosing further isn't worth more cycles;
-    // the wrappers compile, link, and use the same retry template as
-    // fstat / statx / getdents64, all of which are independently
-    // confirmed to intercept correctly.
+    // ── waitid / wait4: see syscall_side_effect_test.cpp ──────────────────
+    // Phases for them were here and were removed as "an internally
+    // inconsistent kernel response": waitid did not see a child that
+    // kill(pid, 0) and waitpid(WNOHANG) had seen. That was the wrapper, not
+    // the kernel: the kernel reaps the child before it writes the status, so
+    // the EFAULT retry asked again for a child that was already gone. They
+    // are tested, with the fix (the status bounced through the stack), in
+    // test_syscall_side_effect.
 
     // ── Phase 16: statvfs / getrusage with heap output structs ────────────
     // Both are POSIX cross-platform.
