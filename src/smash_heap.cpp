@@ -1389,9 +1389,14 @@ static void smash_start_main_thread() {
 // committed=N / compressed=0 because of this. Re-init the bookkeeping in the
 // child so the next allocation re-runs startCompression() with fresh threads.
 //
-// macOS doesn't allow fork() in a multi-threaded program (it deadlocks Mach
-// ports), so this handler only matters on Linux. Registering it on both
-// platforms is harmless: the macOS atfork registration just never fires.
+// These run on macOS too: pthread_atfork handlers fire there, and a
+// multi-threaded program may fork (the child is restricted to async-signal-
+// safe calls until exec, but allocators still run in it -- e.g. Python's
+// subprocess, test harnesses). Any lock another thread may hold at fork time
+// must be taken in prepare and released in parent/child. Locks that
+// allocations need are NOT taken here but in SmashHeap::lock()/unlock()
+// (xxmalloc_lock), which alloc8 runs at the allocator's point in the fork
+// sequence -- see the comment there.
 // ── Per-thread state in a TSD slot (macOS; see util/tsd_slot.h) ─────────────
 #if defined(SMASH_USE_TSD)
 namespace {
@@ -1517,14 +1522,8 @@ extern "C" {
 static void smash_atfork_prepare() {
     auto* heap = SmashRedirect::getHeap();
     if (heap) heap->preparePauseForFork();
-#if defined(SMASH_USE_TSD)
-    smash::threadStateAtforkPrepare();
-#endif
 }
 static void smash_atfork_parent() {
-#if defined(SMASH_USE_TSD)
-    smash::threadStateAtforkParent();
-#endif
     auto* heap = SmashRedirect::getHeap();
     if (heap) heap->resumeAfterFork();
 }
@@ -1532,9 +1531,6 @@ static void smash_atfork_child() {
     // The HeapRedirect singleton is already constructed by the time anyone is
     // forking — we accessed it on the very first malloc in the parent. Calling
     // getHeap() here doesn't allocate.
-#if defined(SMASH_USE_TSD)
-    smash::threadStateAtforkChild();
-#endif
     auto* heap = SmashRedirect::getHeap();
     if (heap) heap->resetForFork();
 }

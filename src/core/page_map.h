@@ -77,6 +77,11 @@ class PageMap {
     }
 
 public:
+    // fork(): l2_lock_ nests inside slab locks and around BootstrapAlloc.
+    void lockForFork() SMASH_NO_TS_ANALYSIS { l2_lock_.lock(); }
+    void unlockForFork() SMASH_NO_TS_ANALYSIS { l2_lock_.unlock(); }
+
+public:
     void init() {
         level1_ = static_cast<std::atomic<L2Table>*>(
             BootstrapAlloc::instance().allocateZeroed(

@@ -2,8 +2,12 @@
 #include "core/bootstrap_alloc.h"
 #include "smash/config.h"
 
+#include <csignal>
 #include <cstdio>
 #include <cstring>
+#include <thread>
+#include <vector>
+#include <unistd.h>
 
 using namespace smash;
 
@@ -73,10 +77,56 @@ static void testManyAllocations() {
     }
 }
 
+// Growing past the initial region: expandAndAllocate() holds expand_lock_ and
+// commits the new region's first pages. ensureCommitted() used to take
+// expand_lock_ again there (Spinlock is not recursive), so the first
+// expansion self-deadlocked -- and every other thread needing a commit
+// spun behind it. Allocate well past kBootstrapInitialSize, single-threaded
+// and then from several threads at once, and touch every block.
+static void testExpansion() {
+    auto& ba = BootstrapAlloc::instance();
+    constexpr size_t kChunk = 1u << 20;
+    const size_t n = (kBootstrapInitialSize + 2 * kBootstrapExpandSize) / kChunk + 4;
+    for (size_t i = 0; i < n; ++i) {
+        auto* p = static_cast<unsigned char*>(ba.allocate(kChunk));
+        CHECK(p != nullptr, "expansion allocation %zu failed", i);
+        if (!p) return;
+        p[0] = 1;
+        p[kChunk - 1] = 2;
+        CHECK(ba.owns(p), "expansion allocation %zu not owned", i);
+    }
+}
+
+static void testConcurrentExpansion() {
+    auto& ba = BootstrapAlloc::instance();
+    std::vector<std::thread> ts;
+    for (int t = 0; t < 4; ++t) {
+        ts.emplace_back([&ba] {
+            for (int i = 0; i < 40; ++i) {
+                auto* p = static_cast<unsigned char*>(ba.allocate(1u << 20));
+                if (!p) { ++failures; return; }
+                p[0] = 1;
+                p[(1u << 20) - 1] = 2;
+            }
+        });
+    }
+    for (auto& t : ts) t.join();
+}
+
 int main() {
+    // A deadlock must fail the test, not hang CI until its timeout.
+    signal(SIGALRM, [](int) {
+        static const char m[] = "FAIL: bootstrap test timed out (deadlock?)\n";
+        (void)!write(2, m, sizeof(m) - 1);
+        _exit(2);
+    });
+    alarm(20);
+
     testBasicAlloc();
     testAlignment();
     testManyAllocations();
+    testExpansion();
+    testConcurrentExpansion();
 
     if (failures == 0) {
         fprintf(stderr, "bootstrap: all tests passed\n");

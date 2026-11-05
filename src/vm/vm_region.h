@@ -348,6 +348,21 @@ class VmRegion {
     }
 
 public:
+    // fork(): free-shard locks nest inside slab locks and around BootstrapAlloc
+    // (see the shard.lock / expand_lock_ ordering note below); commit_lock_ and
+    // decommit_pool_lock_ are leaves.
+    void lockForFork() SMASH_NO_TS_ANALYSIS {
+        for (size_t i = 0; i < kNumFreeShards; ++i) shards_[i].lock.lock();
+        commit_lock_.lock();
+        decommit_pool_lock_.lock();
+    }
+    void unlockForFork() SMASH_NO_TS_ANALYSIS {
+        decommit_pool_lock_.unlock();
+        commit_lock_.unlock();
+        for (size_t i = kNumFreeShards; i-- > 0;) shards_[i].lock.unlock();
+    }
+
+public:
     bool init(size_t region_size) {
         tracking_mode_ = isCompressOnlyMode();
 

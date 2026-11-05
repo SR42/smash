@@ -606,6 +606,10 @@ public:
 
     void lockSlab() SMASH_ACQUIRE(lock_) { lock_.lock(); }
     void unlockSlab() SMASH_RELEASE(lock_) { lock_.unlock(); }
+    // fork(): the slab's leaf locks (magazine transfer, pending-node pool).
+    // Taken after every slab lock_ (SmashHeap::lock), released before.
+    void lockLeafForFork() SMASH_NO_TS_ANALYSIS { mag_lock_.lock(); pending_pool_lock_.lock(); }
+    void unlockLeafForFork() SMASH_NO_TS_ANALYSIS { pending_pool_lock_.unlock(); mag_lock_.unlock(); }
 };
 
 } // namespace smash

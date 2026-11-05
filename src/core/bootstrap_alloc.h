@@ -53,29 +53,41 @@ class BootstrapAlloc {
         return (n + ps - 1) & ~(ps - 1);
     }
 
-    void ensureCommitted(Region& r, size_t end) {
-        if (end <= r.committed.load(std::memory_order_acquire)) return;
+    // Commit [committed, roundUp(end)) of r. Caller must hold expand_lock_.
+    void commitLocked(Region& r, size_t end) SMASH_NO_TS_ANALYSIS {
         size_t target = roundUpToPage(end);
         if (target > r.capacity) target = r.capacity;
-        // Serialize commits: mprotect must complete before any thread
-        // may write to the newly-committed range. The lock is only
-        // contended when multiple threads cross a page boundary
-        // simultaneously (rare — bump allocator is fast).
-        LockGuard guard(expand_lock_);
         size_t cur = r.committed.load(std::memory_order_relaxed);
         if (cur >= target) return;
         vm::commitPages(r.base + cur, target - cur);
         r.committed.store(target, std::memory_order_release);
     }
 
-    void* tryAllocFrom(Region& r, size_t size, size_t align) {
+    void ensureCommitted(Region& r, size_t end, bool lock_held) {
+        if (end <= r.committed.load(std::memory_order_acquire)) return;
+        // Serialize commits: mprotect must complete before any thread
+        // may write to the newly-committed range. The lock is only
+        // contended when multiple threads cross a page boundary
+        // simultaneously (rare — bump allocator is fast).
+        //
+        // expandAndAllocate() already holds expand_lock_ (Spinlock is not
+        // recursive). Taking it again there self-deadlocked the thread that
+        // grew the bootstrap allocator -- a brand-new region always needs a
+        // commit -- and then every other thread needing a commit (a new
+        // thread's thread cache, span descriptors, TLV setup ...).
+        if (lock_held) { commitLocked(r, end); return; }
+        LockGuard guard(expand_lock_);
+        commitLocked(r, end);
+    }
+
+    void* tryAllocFrom(Region& r, size_t size, size_t align, bool lock_held = false) {
         size_t off = r.offset.load(std::memory_order_relaxed);
         for (;;) {
             size_t aligned = (off + align - 1) & ~(align - 1);
             size_t end = aligned + size;
             if (end > r.capacity) return nullptr;
             if (r.offset.compare_exchange_weak(off, end, std::memory_order_relaxed)) {
-                ensureCommitted(r, end);
+                ensureCommitted(r, end, lock_held);
                 return r.base + aligned;
             }
         }
@@ -117,19 +129,30 @@ class BootstrapAlloc {
         // Double-check: another thread may have expanded while we waited
         size_t n = num_regions_.load(std::memory_order_acquire);
         if (n > 0) {
-            void* p = tryAllocFrom(regions_[n - 1], size, align);
+            void* p = tryAllocFrom(regions_[n - 1], size, align, /*lock_held=*/true);
             if (p) return p;
         }
         size_t region_size = kBootstrapExpandSize;
         if (size + align > region_size) region_size = size + align;
         if (!addRegion(region_size)) return nullptr;
         n = num_regions_.load(std::memory_order_acquire);
-        return tryAllocFrom(regions_[n - 1], size, align);
+        return tryAllocFrom(regions_[n - 1], size, align, /*lock_held=*/true);
     }
 
     BootstrapAlloc() {
         addRegion(kBootstrapInitialSize);
     }
+
+public:
+    // fork() safety: expand_lock_ serializes lazy page commits (and region
+    // growth). If another thread holds it when a thread calls fork(), the
+    // child inherits it locked with no owner, and the child's next commit --
+    // e.g. the compressor restarting on its first new thread -- spins forever.
+    // Called from smash's pthread_atfork handlers: prepare takes the lock LAST
+    // (after everything that might allocate from here), parent/child release it.
+    void atforkPrepare() SMASH_NO_TS_ANALYSIS { expand_lock_.lock(); }
+    void atforkParent() SMASH_NO_TS_ANALYSIS { expand_lock_.unlock(); }
+    void atforkChild() SMASH_NO_TS_ANALYSIS { expand_lock_.unlock(); }
 
 public:
     // Singleton instance, accessed on every free() via owns().  Profiling

@@ -158,6 +158,10 @@ public:
         return *inst;
     }
 
+    // fork(): see SmashHeap::lock().
+    void lockForFork() SMASH_NO_TS_ANALYSIS { lock_.lock(); }
+    void unlockForFork() SMASH_NO_TS_ANALYSIS { lock_.unlock(); }
+
     ThreadCache* acquire() {
         LockGuard guard(lock_);
         ThreadCache* tc = freelist_;

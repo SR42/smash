@@ -1880,16 +1880,53 @@ public:
     // are exempted. They are exact mirrors (lock all ascending; unlock large
     // then all descending) and both short-circuit identically in compress-only
     // mode, so the pairing is balanced by construction.
+    // fork() locking (xxmalloc_lock/xxmalloc_unlock). alloc8 calls these at
+    // the allocator's point in the fork sequence: on macOS from libSystem's
+    // own fork handling (interposed _malloc_fork_prepare/_parent/_child),
+    // which in the child runs BEFORE any pthread_atfork child handler and
+    // before other libSystem child handlers that allocate (libnotify calls
+    // calloc); on Linux from alloc8's pthread_atfork handlers. Every lock an
+    // allocation may need must be taken here and released in unlock() --
+    // a lock released only in smash's own pthread_atfork child handler is
+    // still held when the child's first allocations run, and they spin.
+    //
+    // Order = the nesting order the allocation paths use, outermost first,
+    // so prepare cannot deadlock against a thread still allocating:
+    //   slab locks -> large-alloc -> slab leaf locks (magazine, pending pool)
+    //   -> VmRegion free shards, commit, decommit pool -> PageMap L2
+    //   -> call-site image table -> TSD free list -> thread-cache pool
+    //   -> BootstrapAlloc (innermost: the others allocate from it).
+    // The compressor is already paused by smash's own pthread_atfork prepare
+    // handler, which runs before this.
     void lock() SMASH_NO_TS_ANALYSIS {
-        if (isCompressOnlyMode()) return;
         const int total = getTotalArenas() * kNumClasses;
-        for (int i = 0; i < total; ++i) slabs_[i].lockSlab();
-        large_alloc_.lockAlloc();
+        if (!isCompressOnlyMode()) {
+            for (int i = 0; i < total; ++i) slabs_[i].lockSlab();
+            large_alloc_.lockAlloc();
+            for (int i = 0; i < total; ++i) slabs_[i].lockLeafForFork();
+        }
+        vm_region_.lockForFork();
+        page_map_.lockForFork();
+        image_table_lock_.lock();
+#if defined(SMASH_USE_TSD)
+        threadStateAtforkPrepare();
+#endif
+        ThreadCachePool::instance().lockForFork();
+        BootstrapAlloc::instance().atforkPrepare();
     }
     void unlock() SMASH_NO_TS_ANALYSIS {
+        BootstrapAlloc::instance().atforkParent();   // same as child: release
+        ThreadCachePool::instance().unlockForFork();
+#if defined(SMASH_USE_TSD)
+        threadStateAtforkParent();
+#endif
+        image_table_lock_.unlock();
+        page_map_.unlockForFork();
+        vm_region_.unlockForFork();
         if (isCompressOnlyMode()) return;
-        large_alloc_.unlockAlloc();
         const int total = getTotalArenas() * kNumClasses;
+        for (int i = total - 1; i >= 0; --i) slabs_[i].unlockLeafForFork();
+        large_alloc_.unlockAlloc();
         for (int i = total - 1; i >= 0; --i) slabs_[i].unlockSlab();
     }
     // SMASH_NO_THREAD_HOOKS=1: disable all thread lifecycle hooks.
