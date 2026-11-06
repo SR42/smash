@@ -50,6 +50,7 @@ inline std::atomic<bool> g_smash_skip_external_tracking{false};
 #include <cstring>
 #include <unistd.h>
 #include <dirent.h>
+#include <sys/resource.h>   // getrusage (SMASH_PRESSURE_LOG)
 #include <sys/file.h>         // flock — cross-process profile-merge lock
 #if defined(__linux__)
 #include <sys/uio.h>          // process_vm_readv
@@ -2810,6 +2811,7 @@ private:
                 compressed_[adj] = {};
 
                 // Restore to active
+                pstats::onExit(adj, pstats::kPrefetch);
                 states_->set(adj, PageState::ACTIVE);
                 cold_count_[adj] = 0;
             }
@@ -2897,11 +2899,22 @@ private:
     }
 
     void executePhase(int phase, int worker_id) {
+        const bool timed = pstats::enabled();
+        uint64_t cpu0 = 0, wall0 = 0;
+        if (timed) [[unlikely]] { cpu0 = pstats::threadCpuNs(); wall0 = pstats::monoNs(); }
         auto& w = workers_[worker_id];
         if (phase == 1) phase1Range(w.range_start, w.range_end);
         else if (phase == 2) phase2Range(worker_id, w.range_start, w.range_end);
         else if (phase == 3) phase3Range(w.range_start, w.range_end);
         else if (phase == 4) reclaimShadowRange(w.range_start, w.range_end);
+        if (timed) [[unlikely]] {
+            uint64_t cpu = pstats::threadCpuNs() - cpu0;
+            pstats::g.phase_cpu_ns.fetch_add(cpu, std::memory_order_relaxed);
+            pstats::g.phase_wall_ns.fetch_add(pstats::monoNs() - wall0,
+                                              std::memory_order_relaxed);
+            if (worker_id != 0)
+                pstats::g.helper_cpu_ns.fetch_add(cpu, std::memory_order_relaxed);
+        }
     }
 
     // ── Phase B: reclaim shadow pages ────────────────────────────────────
@@ -3009,6 +3022,7 @@ private:
                     cold_count_[i] = 0;
                     compress_fail_count_[i] = 0;  // contents changed
                     vm::protectPages(page_addr, kPageSize, true, true);
+                    pstats::onExit(i, pstats::kShadowDiscard);
                     states_->set(i, PageState::ACTIVE);
                     locks_->unlock(i);
                     continue;
@@ -4729,7 +4743,14 @@ private:
                 self->in_tick_.store(false, std::memory_order_release);
                 continue;
             }
-            self->tick();
+            if (pstats::enabled()) [[unlikely]] {
+                uint64_t c0 = pstats::threadCpuNs();
+                self->tick();
+                self->pressure_.coord_cpu_ns += pstats::threadCpuNs() - c0;
+                self->pressureSample();
+            } else {
+                self->tick();
+            }
             self->in_tick_.store(false, std::memory_order_release);
         }
         return nullptr;
@@ -4791,6 +4812,7 @@ public:
         page_map_ = page_map;
         fault_handler_ = fault_handler;
         pre_tick_fn_ = nullptr;
+        pressureInit(states->numPages());
 
         size_t max_pages = vm->totalPages();
         compressed_ = bootstrapArray<CompressedPageInfo>(max_pages);
@@ -5491,7 +5513,239 @@ public:
         }
     }
 
+
+    // ── SMASH_PRESSURE_LOG: time/space accounting (util/pressure_stats.h) ──
+    // Measurement only. One "tick" line per compressor tick (deltas since the
+    // previous line) plus "hist" lines at exit. Read by
+    // scripts/pressure_report.py.
+    struct PressureState {
+        int fd = -1;
+        bool dumped = false;
+        uint64_t coord_cpu_ns = 0;  // coordinator CPU across tick()
+        uint64_t last_ns = 0, last_proc_cpu_ns = 0, last_entries = 0;
+        uint64_t last_exits[pstats::kNumExits] = {};
+        uint64_t last_fault_ns = 0, last_decomp_ns = 0;
+        uint64_t last_phase_cpu = 0, last_phase_wall = 0;
+        uint64_t last_helper_cpu = 0, last_coord_cpu = 0;
+        uint64_t last_psi_some = 0, last_psi_full = 0;
+    } pressure_;
+
+    void pressureInit(size_t num_pages) {
+        const char* path = std::getenv("SMASH_PRESSURE_LOG");
+        if (!path || !*path) return;
+        int fd = (std::strcmp(path, "stderr") == 0)
+            ? 2 : open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+        if (fd < 0) return;
+        void* m = mmap(nullptr, num_pages * sizeof(uint32_t),
+                       PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+        if (m == MAP_FAILED) { if (fd != 2) close(fd); return; }
+        pressure_.fd = fd;
+        pstats::g_base_ns = pstats::monoNs();
+        pressure_.last_ns = pstats::g_base_ns;
+        pressure_.last_proc_cpu_ns = processCpuNs();
+        readPsi(pressure_.last_psi_some, pressure_.last_psi_full);
+        pstats::g_stamp = static_cast<uint32_t*>(m);  // publish last
+        char buf[200];
+        int n = smash::safe_snprintf(buf, sizeof(buf),
+            "meta pid=%d nproc=%ld tick_ms=%d page=%zu hist_buckets=%d"
+            " write_bit=%d\n",
+            (int)getpid(), sysconf(_SC_NPROCESSORS_ONLN), kCompressIntervalMs,
+            kPageSize, pstats::kHistBuckets,
+#if defined(__x86_64__) && defined(__linux__)
+            1
+#else
+            0
+#endif
+            );
+        if (n > 0) (void)!write(fd, buf, (size_t)n);
+    }
+
+    static uint64_t processCpuNs() {
+        struct rusage ru;
+        if (getrusage(RUSAGE_SELF, &ru) != 0) return 0;
+        auto tv = [](const timeval& t) {
+            return static_cast<uint64_t>(t.tv_sec) * 1000000000ull +
+                   static_cast<uint64_t>(t.tv_usec) * 1000ull;
+        };
+        return tv(ru.ru_utime) + tv(ru.ru_stime);
+    }
+
+    // Linux PSI: cumulative microseconds in which some / all runnable tasks
+    // were stalled waiting for a CPU. Zeros where unavailable (macOS).
+    static void readPsi(uint64_t& some, uint64_t& full) {
+        some = full = 0;
+#if defined(__linux__)
+        int fd = open("/proc/pressure/cpu", O_RDONLY | O_CLOEXEC);
+        if (fd < 0) return;
+        char buf[512];
+        ssize_t n = read(fd, buf, sizeof(buf) - 1);
+        close(fd);
+        if (n <= 0) return;
+        buf[n] = 0;
+        for (char* line = buf; line && *line;) {
+            char* nl = std::strchr(line, '\n');
+            if (nl) *nl = 0;
+            char* t = std::strstr(line, "total=");
+            if (t) {
+                uint64_t v = std::strtoull(t + 6, nullptr, 10);
+                if (std::strncmp(line, "some", 4) == 0) some = v;
+                else if (std::strncmp(line, "full", 4) == 0) full = v;
+            }
+            line = nl ? nl + 1 : nullptr;
+        }
+#endif
+    }
+
+    static uint64_t residentKb() {
+#if defined(__linux__)
+        int fd = open("/proc/self/statm", O_RDONLY | O_CLOEXEC);
+        if (fd < 0) return 0;
+        char buf[128];
+        ssize_t n = read(fd, buf, sizeof(buf) - 1);
+        close(fd);
+        if (n <= 0) return 0;
+        buf[n] = 0;
+        char* sp = std::strchr(buf, ' ');
+        if (!sp) return 0;
+        return std::strtoull(sp + 1, nullptr, 10) *
+               static_cast<uint64_t>(sysconf(_SC_PAGESIZE)) / 1024;
+#elif defined(__APPLE__)
+        mach_task_basic_info_data_t info;
+        mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
+        if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO,
+                      reinterpret_cast<task_info_t>(&info), &count) != KERN_SUCCESS)
+            return 0;
+        return info.resident_size / 1024;
+#else
+        return 0;
+#endif
+    }
+
+    // Coordinator thread, after each tick (including paused/deferred ones).
+    void pressureSample() {
+        auto& ps = pressure_;
+        if (ps.fd < 0 || ps.dumped) return;
+        uint64_t now = pstats::monoNs();
+        size_t committed = vm_->committedPages();
+        size_t L = 0, shadow = 0;
+        uint64_t blob = 0;
+        for (size_t i = 0; i < committed; ++i) {
+            PageState st = states_->get(i);
+            if (st == PageState::COMPRESSED) {
+                ++L; blob += compressed_[i].alloc_size;
+            } else if (st == PageState::COMPRESSED_SHADOW) {
+                ++shadow; blob += compressed_[i].alloc_size;
+            }
+        }
+        uint64_t proc_cpu = processCpuNs();
+        uint64_t psi_some, psi_full;
+        readPsi(psi_some, psi_full);
+        double la[1] = {0};
+        int load_x100 = getloadavg(la, 1) >= 1 ? static_cast<int>(la[0] * 100) : -1;
+        auto& g = pstats::g;
+        auto ld = [](const std::atomic<uint64_t>& a) {
+            return a.load(std::memory_order_relaxed);
+        };
+        uint64_t entries = ld(g.entries);
+        uint64_t ex[pstats::kNumExits];
+        for (int k = 0; k < pstats::kNumExits; ++k) ex[k] = ld(g.exits[k]);
+        uint64_t fault = ld(g.fault_ns), dec = ld(g.decomp_ns);
+        uint64_t pcpu = ld(g.phase_cpu_ns), pwall = ld(g.phase_wall_ns);
+        uint64_t hcpu = ld(g.helper_cpu_ns), ccpu = ps.coord_cpu_ns;
+
+        char buf[640];
+        int n = smash::safe_snprintf(buf, sizeof(buf),
+            "tick pid=%d t_ms=%llu dt_ms=%llu L=%zu shadow=%zu blob_kb=%llu"
+            " rss_kb=%llu enter=%llu rr=%llu rw=%llu sd=%llu pf=%llu rs=%llu fr=%llu"
+            " proc_cpu_us=%llu comp_cpu_us=%llu phase_cpu_us=%llu"
+            " phase_wall_us=%llu fault_us=%llu decomp_us=%llu"
+            " psi_some_us=%llu psi_full_us=%llu load_x100=%d threads=%d"
+            " cap=%d workers=%d\n",
+            (int)getpid(),
+            (unsigned long long)((now - pstats::g_base_ns) / 1000000),
+            (unsigned long long)((now - ps.last_ns) / 1000000),
+            L, shadow, (unsigned long long)(blob / 1024),
+            (unsigned long long)residentKb(),
+            (unsigned long long)(entries - ps.last_entries),
+            (unsigned long long)(ex[0] - ps.last_exits[0]),
+            (unsigned long long)(ex[1] - ps.last_exits[1]),
+            (unsigned long long)(ex[2] - ps.last_exits[2]),
+            (unsigned long long)(ex[3] - ps.last_exits[3]),
+            (unsigned long long)(ex[4] - ps.last_exits[4]),
+            (unsigned long long)(ex[5] - ps.last_exits[5]),
+            (unsigned long long)((proc_cpu - ps.last_proc_cpu_ns) / 1000),
+            (unsigned long long)((ccpu - ps.last_coord_cpu + hcpu - ps.last_helper_cpu) / 1000),
+            (unsigned long long)((pcpu - ps.last_phase_cpu) / 1000),
+            (unsigned long long)((pwall - ps.last_phase_wall) / 1000),
+            (unsigned long long)((fault - ps.last_fault_ns) / 1000),
+            (unsigned long long)((dec - ps.last_decomp_ns) / 1000),
+            (unsigned long long)(psi_some - ps.last_psi_some),
+            (unsigned long long)(psi_full - ps.last_psi_full),
+            load_x100, countOwnThreads(), cpu_pressure_cached_cap_,
+            active_workers_);
+        if (n > 0) (void)!write(ps.fd, buf, (size_t)n);
+
+        ps.last_ns = now; ps.last_proc_cpu_ns = proc_cpu;
+        ps.last_entries = entries;
+        for (int k = 0; k < pstats::kNumExits; ++k) ps.last_exits[k] = ex[k];
+        ps.last_fault_ns = fault; ps.last_decomp_ns = dec;
+        ps.last_phase_cpu = pcpu; ps.last_phase_wall = pwall;
+        ps.last_helper_cpu = hcpu; ps.last_coord_cpu = ccpu;
+        ps.last_psi_some = psi_some; ps.last_psi_full = psi_full;
+    }
+
+    // Exit: residence-time histograms per exit kind, plus "censored" ages of
+    // pages still compressed (their residence is at least this long).
+    void pressureDump() {
+        auto& ps = pressure_;
+        if (ps.fd < 0 || ps.dumped) return;
+        pressureSample();
+        ps.dumped = true;
+        uint64_t censored[pstats::kHistBuckets] = {};
+        uint64_t censored_n = 0, censored_age = 0;
+        uint32_t now = pstats::stampNow();
+        size_t committed = vm_->committedPages();
+        for (size_t i = 0; i < committed; ++i) {
+            PageState st = states_->get(i);
+            if (st != PageState::COMPRESSED && st != PageState::COMPRESSED_SHADOW) continue;
+            uint32_t s = pstats::g_stamp[i];
+            if (!s) continue;
+            uint32_t age = now > s ? now - s : 0;
+            ++censored[pstats::ageBucket(age)];
+            ++censored_n; censored_age += age;
+        }
+        static const char* const kNames[pstats::kNumExits + 1] = {
+            "refault_read", "refault_write", "shadow_discard", "prefetch",
+            "restored", "freed", "censored"};
+        for (int k = 0; k <= pstats::kNumExits; ++k) {
+            const uint64_t* h;
+            uint64_t tmp[pstats::kHistBuckets];
+            uint64_t cnt, age;
+            if (k < pstats::kNumExits) {
+                for (int b = 0; b < pstats::kHistBuckets; ++b)
+                    tmp[b] = pstats::g.hist[k][b].load(std::memory_order_relaxed);
+                h = tmp;
+                cnt = pstats::g.exits[k].load(std::memory_order_relaxed);
+                age = pstats::g.exit_age_ms[k].load(std::memory_order_relaxed);
+            } else {
+                h = censored; cnt = censored_n; age = censored_age;
+            }
+            char buf[640];
+            int n = smash::safe_snprintf(buf, sizeof(buf),
+                "hist pid=%d kind=%s n=%llu age_ms_sum=%llu buckets=",
+                (int)getpid(), kNames[k], (unsigned long long)cnt,
+                (unsigned long long)age);
+            for (int b = 0; b < pstats::kHistBuckets && n > 0 && n < 600; ++b)
+                n += smash::safe_snprintf(buf + n, sizeof(buf) - n, "%s%llu",
+                                          b ? "," : "", (unsigned long long)h[b]);
+            if (n > 0 && n < (int)sizeof(buf) - 1) { buf[n++] = '\n'; }
+            if (n > 0) (void)!write(ps.fd, buf, (size_t)n);
+        }
+    }
+
     void stop() {
+        pressureDump();
         // Shutdown tracing for debugging (SMASH_SHUTDOWN_TRACE=1)
         static const bool trace = []{
             const char* v = std::getenv("SMASH_SHUTDOWN_TRACE");
@@ -5581,6 +5835,7 @@ public:
         // and bail so the SIGSEGV propagates with a real backtrace.
         if (locks_->heldByThisThread(page_idx)) return false;
 
+        const uint64_t pst_t0 = pstats::enabled() ? pstats::monoNs() : 0;
         locks_->lock(page_idx);
 
         PageState st = states_->get(page_idx);
@@ -5675,10 +5930,21 @@ public:
             compressed_[page_idx] = {};
             if (page_tier_) page_tier_[page_idx] = kTierNone;
 
+            if (pst_t0) [[unlikely]] {
+                pstats::onExit(page_idx, vm::faultWasWrite() == 0
+                                             ? pstats::kRefaultRead
+                                             : pstats::kRefaultWrite);
+                pstats::g.decomp_ns.fetch_add(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        dec_t1 - dec_t0).count(), std::memory_order_relaxed);
+            }
             states_->set(page_idx, PageState::ACTIVE);
             cold_count_[page_idx] = 0;
             compress_fail_count_[page_idx] = 0;  // access → verdict stale
             locks_->unlock(page_idx);
+            if (pst_t0) [[unlikely]]
+                pstats::g.fault_ns.fetch_add(pstats::monoNs() - pst_t0,
+                                             std::memory_order_relaxed);
 
             // Recompression-thrash signal. The act of faulting back from
             // COMPRESSED is direct evidence the page was hotter than we
@@ -5828,6 +6094,7 @@ public:
             compress_fail_count_[page_idx] = 0;  // write → contents changed
             if (recompress_count_[page_idx] < 255)
                 recompress_count_[page_idx]++;
+            pstats::onExit(page_idx, pstats::kShadowDiscard);
             states_->set(page_idx, PageState::ACTIVE);
             locks_->unlock(page_idx);
             return true;

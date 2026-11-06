@@ -9,6 +9,7 @@
 #include "../core/bootstrap_alloc.h"
 
 #include <atomic>
+#include "../util/pressure_stats.h"
 #include <cstddef>
 #include <cstdint>
 #include <pthread.h>
@@ -50,6 +51,7 @@ public:
     }
 
     void set(size_t page_idx, PageState state) {
+        if (pstats::g_stamp) [[unlikely]] pstatsHook(page_idx, state);
         states_[page_idx].store(static_cast<uint8_t>(state), std::memory_order_release);
         // Latch the global "some page is compressed" flag so the alloc-path
         // bitmap walk can skip its per-slot COMPRESSED check until this fires.
@@ -63,6 +65,9 @@ public:
     // iteration. Semantically identical to looping set().
     void setRange(size_t first_page_idx, size_t num_pages, PageState state) {
         const auto v = static_cast<uint8_t>(state);
+        if (pstats::g_stamp) [[unlikely]] {
+            for (size_t i = 0; i < num_pages; ++i) pstatsHook(first_page_idx + i, state);
+        }
         for (size_t i = 0; i < num_pages; ++i)
             states_[first_page_idx + i].store(v, std::memory_order_release);
         if (state == PageState::COMPRESSED) [[unlikely]]
@@ -78,6 +83,15 @@ public:
     }
 
     size_t numPages() const { return num_pages_; }
+
+private:
+    // SMASH_PRESSURE_LOG accounting (util/pressure_stats.h). Runs before the
+    // store so a page's stamp is set before any reader can see it compressed.
+    static void pstatsHook(size_t page_idx, PageState state) {
+        pstats::onTransition(page_idx,
+            state == PageState::COMPRESSED || state == PageState::COMPRESSED_SHADOW,
+            state == PageState::COMPRESSING, state == PageState::EMPTY);
+    }
 };
 
 // Per-page spinlock table for compression synchronization.
