@@ -21,8 +21,156 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 
 namespace smash {
+
+// ── Direct-mapped block cache ───────────────────────────────────────────────
+// From upstream #93. Large blocks below the compressible threshold
+// (SMASH_LARGE_ALLOC_VM_THRESHOLD, default 1 MiB) are placed with a direct
+// mmap and were munmap'd on free, so a program that churns 16 KiB..1 MiB
+// buffers paid an mmap + munmap (+ TLB shootdown + page faults) per
+// malloc/free pair: 25-50x slower than glibc, which serves these sizes from
+// its heap (measured here: 64 KiB churn 4412 -> 34 ns/op in full mode). Freed
+// blocks of those sizes now go to a small cache and are reused by later
+// allocations of the same rounded size.
+//
+// - Page counts are rounded up to 8 steps per power of two (<= 12.5% extra
+//   address space; tail pages a program never touches cost no RSS), so a
+//   freed block serves any request that rounds to the same bucket.
+// - Bounded: kDepth blocks per bucket and maxBytes() in total; a free that
+//   would exceed either unmaps as before.
+// - Idle blocks are returned to the OS by purgeIdle(), called from the
+//   compressor tick, once a bucket has gone kIdleTicks ticks without a free.
+// - Only blocks that are direct mappings by design (LargeAlloc's
+//   directByDesign) from LargeAlloc::allocate() (Span::block_cacheable),
+//   never a malloc_numa block. Upstream also caches arena blocks up to 8 MiB;
+//   here a freed arena block takes this branch's release path, where keeping
+//   it warm is opt-in (SMASH_RUN_CACHE_MIB, SMASH_SUBARENAS), and a direct
+//   mapping of a compressible size (made because the arena was full) is never
+//   cached, so it cannot be handed out ahead of reclaimed arena space.
+class LargeBlockCache {
+public:
+    // Blocks up to 8 MiB (the threshold can be raised that far).
+    static constexpr size_t kMaxPages = (size_t{8} << 20) / kPageSize;
+    static constexpr int kDepth = 32;
+    static constexpr size_t kMaxBytesDefault = 32ull << 20;
+    // SMASH_LARGE_CACHE_MB=N overrides the byte cap (0 disables the cache).
+    static size_t maxBytes() {
+        static std::atomic<size_t> cached{~size_t{0}};
+        size_t v = cached.load(std::memory_order_relaxed);
+        if (v == ~size_t{0}) [[unlikely]] {
+            const char* e = std::getenv("SMASH_LARGE_CACHE_MB");
+            v = e ? static_cast<size_t>(std::atol(e)) << 20 : kMaxBytesDefault;
+            cached.store(v, std::memory_order_relaxed);
+        }
+        return v;
+    }
+    static constexpr uint32_t kIdleTicks = 2;  // compressor ticks (kCompressIntervalMs = 1 s)
+
+    // Rounded page count for a request of n pages (n >= 1).
+    static size_t roundPages(size_t n) {
+        if (n <= 8) return n;
+        int b = 63 - __builtin_clzll(n - 1);      // n in (2^b, 2^(b+1)]
+        size_t step = size_t{1} << (b - 3);
+        return (n + step - 1) & ~(step - 1);
+    }
+    // The next rounded size above r (r on the rounding grid).
+    static size_t nextRounded(size_t r) {
+        if (r < 8) return r + 1;
+        int b = 63 - __builtin_clzll(r);  // r in [2^b, 2^(b+1)) on the grid
+        return r + (size_t{1} << (b - 3));
+    }
+    static int bucketOf(size_t rounded) {
+        if (rounded <= 8) return static_cast<int>(rounded) - 1;
+        int b = 63 - __builtin_clzll(rounded - 1);
+        size_t step = size_t{1} << (b - 3);
+        return 8 + (b - 3) * 8 + static_cast<int>(rounded / step - 9);
+    }
+
+    // Pop a cached block of exactly `rounded` pages, or nullptr. Blocks are
+    // cached together with their Span descriptor (span->base is the block),
+    // which saves a descriptor-stack pop and push per malloc/free pair.
+    Span* pop(size_t rounded) {
+        Bucket& bk = bucketFor(rounded);
+        if (bk.count.load(std::memory_order_relaxed) == 0) return nullptr;
+        LockGuard g(bk.lock);
+        uint32_t n = bk.count.load(std::memory_order_relaxed);
+        if (n == 0) return nullptr;
+        Span* p = bk.blocks[n - 1];
+        bk.count.store(n - 1, std::memory_order_relaxed);
+        bytes_.fetch_sub(rounded * kPageSize, std::memory_order_relaxed);
+        return p;
+    }
+
+    // Cache a freed block of `rounded` pages with its descriptor. False =>
+    // the caller unmaps the block and recycles the descriptor.
+    bool push(Span* span, size_t rounded, uint32_t now) {
+        size_t sz = rounded * kPageSize;
+        if (bytes_.load(std::memory_order_relaxed) + sz > maxBytes()) return false;
+        Bucket& bk = bucketFor(rounded);
+        LockGuard g(bk.lock);
+        uint32_t n = bk.count.load(std::memory_order_relaxed);
+        if (n >= kDepth) return false;
+        bk.blocks[n] = span;
+        bk.count.store(n + 1, std::memory_order_relaxed);
+        bk.last_use = now;
+        bytes_.fetch_add(sz, std::memory_order_relaxed);
+        return true;
+    }
+
+    // Room for a block of `rounded` pages under the byte cap?
+    bool canAccept(size_t rounded) const {
+        return bytes_.load(std::memory_order_relaxed) + rounded * kPageSize <= maxBytes();
+    }
+
+    // Return every cached block in buckets untouched for kIdleTicks;
+    // release(span, pages) disposes of each block and its descriptor.
+    template <class Release>
+    void purgeIdle(uint32_t now, Release release) {
+        if (bytes_.load(std::memory_order_relaxed) == 0) return;
+        for (size_t r = 1; r <= kMaxPages; r = nextRounded(r)) {
+            Bucket& bk = bucketFor(r);
+            if (bk.count.load(std::memory_order_relaxed) == 0) continue;
+            Span* victims[kDepth];
+            uint32_t nv = 0;
+            {
+                LockGuard g(bk.lock);
+                if (now - bk.last_use < kIdleTicks) continue;
+                nv = bk.count.load(std::memory_order_relaxed);
+                for (uint32_t i = 0; i < nv; ++i) victims[i] = bk.blocks[i];
+                bk.count.store(0, std::memory_order_relaxed);
+            }
+            bytes_.fetch_sub(nv * r * kPageSize, std::memory_order_relaxed);
+            for (uint32_t i = 0; i < nv; ++i) release(victims[i], r);
+        }
+    }
+
+    size_t cachedBytes() const { return bytes_.load(std::memory_order_relaxed); }
+
+    void forkLocks(ForkLockSet& s) {
+        for (auto& b : buckets_) s.add(b.lock);
+    }
+
+private:
+    struct alignas(64) Bucket {
+        Spinlock lock;
+        std::atomic<uint32_t> count{0};
+        uint32_t last_use = 0;
+        Span* blocks[kDepth];
+    };
+    static constexpr int kUsedBuckets = []{
+        int b = 0;
+        for (size_t r = 1; r <= kMaxPages; r = (r <= 8 ? r + 1 : r + (size_t{1} << (63 - __builtin_clzll(r) - 3))))
+            ++b;
+        return b;
+    }();
+    Bucket& bucketFor(size_t rounded) { return buckets_[bucketOf(rounded)]; }
+
+    Bucket buckets_[kUsedBuckets + 1];
+    std::atomic<size_t> bytes_{0};
+};
+
 
 class LargeAlloc {
     Spinlock lock_;
@@ -31,8 +179,35 @@ class LargeAlloc {
     PageStateTable* page_states_ = nullptr;
     bool (*release_hook_)(size_t, size_t, void*) = nullptr;
     void* release_ctx_ = nullptr;
+    LargeBlockCache cache_;
+    std::atomic<uint32_t> tick_{0};
+
+    // A cached block leaving the cache for good (always a direct mapping).
+    void releaseCached(Span* sp, size_t pages) {
+        vm::unmapPages(sp->base, pages * kPageSize);
+        recycleSpanDescriptor(sp);
+    }
+
+    // A size that never goes to the arena: below the compressible threshold,
+    // or no arena at all. Only those blocks are cached. A direct mapping of a
+    // compressible size exists only because the arena was full, and caching
+    // it handed it back ahead of arena space reclaimed since
+    // (test_arena_reclaim_concurrent: 16 of 200 blocks outside the arena, the
+    // cache's 32 MiB). Freed arena blocks take this branch's release path,
+    // whose warm reuse is opt-in (run cache, sub-arenas).
+    bool directByDesign(size_t bytes) const {
+        return !vm_region_ || bytes < largeAllocVmThreshold();
+    }
 
 public:
+    // Compressor tick: advance the cache clock and unmap idle blocks.
+    void onTick() {
+        const uint32_t now = tick_.fetch_add(1, std::memory_order_relaxed) + 1;
+        cache_.purgeIdle(now, [this](Span* sp, size_t pages) { releaseCached(sp, pages); });
+    }
+
+    size_t cachedBytes() const { return cache_.cachedBytes(); }
+
     void init(PageMap* pm,
               VmRegion* vr = nullptr, PageStateTable* ps = nullptr,
               bool (*hook)(size_t, size_t, void*) = nullptr,
@@ -168,9 +343,36 @@ public:
 
         void* mem = nullptr;
         bool fresh = false;
+        Span* span = nullptr;   // a cached block's descriptor, reused
+
+        // Block cache (LargeBlockCache): a size it holds is rounded to its
+        // grid, so the block can be cached when freed, and is served from it
+        // first: a block of the same rounded size, else one of the next two
+        // larger buckets (<= ~25% extra address space). Only sizes that are
+        // direct mappings by design; arena sizes are not rounded.
+        const bool cacheable = alignment <= kPageSize &&
+                               num_pages <= LargeBlockCache::kMaxPages &&
+                               LargeBlockCache::maxBytes() != 0 &&
+                               directByDesign(alloc_size);
+        if (cacheable) {
+            size_t rounded = LargeBlockCache::roundPages(num_pages);
+            num_pages = static_cast<uint32_t>(rounded);
+            span = cache_.pop(rounded);
+            for (int up = 0; !span && up < 2; ++up) {
+                const size_t bigger = LargeBlockCache::nextRounded(rounded);
+                if (bigger > LargeBlockCache::kMaxPages) break;
+                rounded = bigger;
+                span = cache_.pop(rounded);
+            }
+            if (span) {
+                mem = span->base;
+                num_pages = static_cast<uint32_t>(rounded);
+            }
+        }
+        const size_t map_bytes = size_t{num_pages} * kPageSize;
 
         // Route large-enough allocations through VmRegion for compression
-        if (vm_region_ && alignment <= kPageSize && alloc_size >= largeAllocVmThreshold()) {
+        if (!mem && vm_region_ && alignment <= kPageSize && alloc_size >= largeAllocVmThreshold()) {
             // A run this CPU freed warm, if SMASH_RUN_CACHE_MIB is on: its
             // pages hold what the last block wrote.
             mem = vm_region_->takeCachedRun(num_pages, /*node=*/-1, kPageSize);
@@ -194,7 +396,7 @@ public:
         if (!mem) {
             fresh = true;
             if (alignment <= kPageSize) {
-                mem = vm::mapPages(alloc_size);
+                mem = vm::mapPages(map_bytes);
             } else {
                 // Over-allocate by alignment to guarantee aligned region.
                 // SmashHeap::memalign keeps alignment a power of two no larger
@@ -220,14 +422,15 @@ public:
 
         if (!mem) return nullptr;
 
-        Span* span = newSpanDescriptor();
+        if (!span) span = newSpanDescriptor();
         if (!span) {   // metadata arena exhausted (it reports that itself)
             if (vm_region_ && vm_region_->inContigArena(reinterpret_cast<uintptr_t>(mem)))
                 vm_region_->releasePages(mem, num_pages);
-            else vm::unmapPages(mem, alloc_size);
+            else vm::unmapPages(mem, map_bytes);
             return nullptr;
         }
         span->initLarge(mem, size, num_pages, arena_id);
+        span->block_cacheable = cacheable;
 
         // O(1) registration: only register the first page. The Span contains
         // page_count so we can compute the full range from just the base.
@@ -334,7 +537,12 @@ public:
     bool resizeInPlace(Span* span, size_t new_size) {
         const size_t new_bytes = roundUp(new_size, kPageSize);
         if (new_bytes < new_size || new_bytes / kPageSize > UINT32_MAX) return false;
-        const uint32_t new_pages = static_cast<uint32_t>(new_bytes / kPageSize);
+        uint32_t new_pages = static_cast<uint32_t>(new_bytes / kPageSize);
+        // A cacheable block keeps its size on the cache's grid: within the
+        // grid step the block just changes size, and a resize that moves it
+        // takes the whole step, so the block can still be cached when freed.
+        if (span->block_cacheable && new_pages <= LargeBlockCache::kMaxPages)
+            new_pages = static_cast<uint32_t>(LargeBlockCache::roundPages(new_pages));
         const uint32_t old_pages = span->page_count;
         auto* base = static_cast<char*>(span->base);
         const bool arena = vm_region_ && vm_region_->inContigArena(reinterpret_cast<uintptr_t>(base));
@@ -379,10 +587,11 @@ public:
 
         // O(1) clear: only clear the first page (matches O(1) registration).
         // Must clear BEFORE releasing pages to prevent race with reallocation.
-        // No generation bump: large spans never enter free()'s TLS span
-        // cache, and the bump was one global cache line every large free
-        // wrote (see g_pagemap_generation).
-        page_map_->set(reinterpret_cast<uintptr_t>(base), nullptr, /*bump=*/false);
+        page_map_->set(reinterpret_cast<uintptr_t>(base), nullptr);
+
+        const bool cacheable = span->block_cacheable &&
+                               num_pages <= LargeBlockCache::kMaxPages &&
+                               LargeBlockCache::roundPages(num_pages) == num_pages;
 
         // Placement test, NOT contains(): under SMASH_TRACK_EXTERNAL,
         // contains() also matches externally-TRACKED pages (including this
@@ -393,6 +602,9 @@ public:
         // Only pages actually placed in the contiguous arena go back to it.
         if (vm_region_ && vm_region_->inContigArena(reinterpret_cast<uintptr_t>(base))) {
             releaseArenaRun(base, num_pages);
+        } else if (cacheable && directByDesign(num_pages * kPageSize) &&
+                   cache_.push(span, num_pages, tick_.load(std::memory_order_relaxed))) {
+            return;   // cached with its descriptor
         } else {
             vm::unmapPages(base, num_pages * kPageSize);
         }
@@ -422,7 +634,7 @@ public:
 
     void lockAlloc() SMASH_ACQUIRE(lock_) { lock_.lock(); }
     void unlockAlloc() SMASH_RELEASE(lock_) { lock_.unlock(); }
-    void forkLocks(ForkLockSet& s) { s.add(lock_); }
+    void forkLocks(ForkLockSet& s) { s.add(lock_); cache_.forkLocks(s); }
 };
 
 } // namespace smash

@@ -1,23 +1,24 @@
-// large_free_span_cache_test.cpp - a large free must never leave a stale
-// entry in free()'s per-thread span cache.
+// large_free_span_cache_test.cpp - a free inside a freed large block's old
+// range must reach its own span, never whatever a stale address-keyed entry
+// names.
 //
-// free() keeps the last span it resolved in a TLS cache (the Span* and its
-// [base, end) range), stamped with g_pagemap_generation; a page-map teardown
-// bumps the generation so a stale entry misses. Large blocks do not enter
-// that cache, so freeing one does not bump the generation: the bump was one
-// global cache line written by every large free, and on the 128-core aarch64
-// box it was 49% of smash_sim's time (PageMap::set) at 128 threads.
+// Written for free()'s per-thread last-span cache (the Span* and its
+// [base, end) range, stamped with a global page-map generation that large
+// frees did not bump: that bump was 49% of smash_sim's time at 128 threads on
+// the 128-core aarch64 box). Upstream #93 removed that cache; the lean free()
+// now routes by a per-page tag (VmRegion::page_tag_), which is keyed by
+// address the same way, so the scenario still applies.
 //
-// What breaks if a large span enters the cache while large frees skip the
-// bump: span descriptors are recycled, so the stale entry's Span* soon
-// describes some other block. Here: free a 1 MiB block A (cached), allocate a
-// 1 MiB block B at once (A's pages are still in flight to the free map, so B
-// lands elsewhere, and it takes A's recycled descriptor), let small objects
-// fill A's old range, and free one of them. The stale entry routes that free
-// to the descriptor — now B — and B is freed while live: its pages are
-// decommitted and handed out again. B must still hold its pattern.
+// Span descriptors are recycled, so a stale entry's Span* soon describes some
+// other block. Here: free a 1 MiB block A, allocate a 1 MiB block B at once
+// (A's pages are still in flight to the free map, so B lands elsewhere, and
+// it takes A's recycled descriptor), let small objects fill A's old range,
+// and free one of them. A stale entry routes that free to the descriptor --
+// now B -- and B is freed while live: its pages are decommitted and handed
+// out again. B must still hold its pattern. (1 MiB blocks are arena blocks,
+// which the large-block cache does not hold, so B cannot simply be A again.)
 //
-// Full mode (the TLS cache is on the full free() fast path), 1 GiB arena.
+// Full mode (the lean free and the TLS cache are full-mode paths), 1 GiB arena.
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>

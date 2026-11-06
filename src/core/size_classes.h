@@ -94,8 +94,8 @@ inline uint8_t sizeToClass(size_t size) {
         int bits = 63 - __builtin_clzll(size - 1);   // floor(log2(size-1))
         int group = bits - 10;                         // 0..3
         size_t groupBase = 1ULL << bits;               // 1024, 2048, 4096, 8192
-        size_t step = groupBase >> 2;                  // 256, 512, 1024, 2048
-        int sub = static_cast<int>((size - groupBase - 1) / step);
+        // step = groupBase / 4 (256, 512, 1024, 2048): a shift, not a div.
+        int sub = static_cast<int>((size - groupBase - 1) >> (bits - 2));
         return static_cast<uint8_t>(20 + group * 4 + sub);
     }
     return kNumClasses;

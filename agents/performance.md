@@ -4,6 +4,15 @@ Measured costs of the hot paths, compression throughput and its limits, codec an
 
 ## The base small-object path: the thread cache is 4 deep, and that is the cost
 
+**Superseded 2026-11-06 by the merge of upstream #93:** the default is now 16
+lanes x depth 16 (counts split from the pointers), with lean `xxmalloc`/`xxfree`
+entry points in front of it (CLAUDE.md, "Allocation Fast Path"). Upstream
+measured the depth change on a Xeon 8175M: batch 1.58x -> 1.40x glibc, random
+replace 1.21x -> 0.88x, 8-thread random 1.34x -> 1.04x. Above 16 arenas, arenas
+a, a+16, ... share a lane: a recycled object can then serve a sibling arena's
+call site (slab placement stays per arena). The analysis below is of the
+64-lane layout it replaced.
+
 An alloc+free pair of 64-byte objects costs **35 ns against glibc's 9 ns** with
 no drains involved, and the reason is `kPerLaneDepth`:
 
@@ -592,6 +601,11 @@ live 1 MiB block that way when large spans are cached without the bump).
 Large spans are no longer cached (the fast path dispatches them before the
 fill) and a large free clears its entry with `bump = false`; slab and mid
 teardowns still bump.
+
+Since the merge of upstream #93 (2026-11-06) neither exists: the last-span
+cache and `g_pagemap_generation` are gone, and the lean `free()` routes a small
+block by its VmRegion page tag, so no teardown writes a shared counter.
+`test_large_free_span_cache` still runs the scenario, now against the tag.
 
 On the 8-CPU host the bump was worth 1-4% (plain malloc with sub-arenas, 8
 threads: 7.21M -> 7.62M). The simulator had its own global counter on the

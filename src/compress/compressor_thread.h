@@ -1554,7 +1554,7 @@ class CompressorThread {
     // releaseCompressedPages accounting: pages given back through the
     // per-page walk and through the bulk path. Sharded by CPU — one cache
     // line written by every large free on every core was once 49 % of all
-    // time (performance.md, g_pagemap_generation).
+    // time (performance.md).
     static constexpr unsigned kReleaseShards = 256;
     struct alignas(64) ReleaseCounters {
         std::atomic<uint64_t> walked{0};

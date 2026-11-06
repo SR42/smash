@@ -239,7 +239,6 @@ add_test(
   NAME test_interpose
   COMMAND ${CMAKE_COMMAND} -E env
     "DYLD_INSERT_LIBRARIES=$<TARGET_FILE:smash>"
-    "DYLD_FORCE_FLAT_NAMESPACE=1"
     $<TARGET_FILE:interpose_test>
 )
 
@@ -256,7 +255,6 @@ if(APPLE)
     NAME test_external_mapping
     COMMAND ${CMAKE_COMMAND} -E env
       "DYLD_INSERT_LIBRARIES=$<TARGET_FILE:smash>"
-      "DYLD_FORCE_FLAT_NAMESPACE=1"
       "MallocNanoZone=0"
       "SMASH_LARGE_ONLY=0"
       "SMASH_DEFER_PHASES_MS=0"
@@ -465,7 +463,6 @@ function(add_mode_compression_test test_name large_only)
       NAME ${test_name}
       COMMAND ${CMAKE_COMMAND} -E env
         "DYLD_INSERT_LIBRARIES=$<TARGET_FILE:smash>"
-        "DYLD_FORCE_FLAT_NAMESPACE=1"
         "MallocNanoZone=0"
         "SMASH_LARGE_ONLY=${large_only}"
         "SMASH_DEFER_PHASES_MS=0"
@@ -504,7 +501,6 @@ if(APPLE)
     NAME test_arena_routing
     COMMAND ${CMAKE_COMMAND} -E env
       "DYLD_INSERT_LIBRARIES=$<TARGET_FILE:smash>"
-      "DYLD_FORCE_FLAT_NAMESPACE=1"
       "MallocNanoZone=0"
       "SMASH_LARGE_ONLY=0"
       "SMASH_CPU_ARENA=0"
@@ -522,6 +518,58 @@ else()
 endif()
 set_tests_properties(test_arena_routing PROPERTIES TIMEOUT 30)
 
+# Per-thread state in a TSD slot (macOS SMASH_TSD_SLOT): ThreadStates are
+# reclaimed and reused across thousands of short-lived threads, GCD workers and
+# allocating app destructors work, fork() keeps the free list usable. Skips
+# itself when smash_tsd_stats is not exported (TSD slot not compiled in).
+if(APPLE)
+  add_executable(tsd_thread_test tsd_thread_test.cpp)
+  set_target_properties(tsd_thread_test PROPERTIES CXX_STANDARD 20)
+  add_test(
+    NAME test_tsd_thread
+    COMMAND ${CMAKE_COMMAND} -E env
+      "DYLD_INSERT_LIBRARIES=$<TARGET_FILE:smash>"
+      "MallocNanoZone=0"
+      $<TARGET_FILE:tsd_thread_test>
+  )
+  set_tests_properties(test_tsd_thread PROPERTIES TIMEOUT 120)
+endif()
+
+# Large-block ownership regression: blocks smash mmaps directly (16 KiB < size
+# < kLargeAllocVmThreshold, and every large block in large-only mode) sit
+# outside the contiguous arena; xxowns() must still claim them or alloc8
+# forwards realloc/malloc_size/free to the system allocator (malloc_size 0,
+# realloc reads past the block -> SIGSEGV; crashed every Rust program).
+# Interposed, both modes, no compressor needed.
+add_executable(large_realloc_test large_realloc_test.cpp)
+set_target_properties(large_realloc_test PROPERTIES CXX_STANDARD 20)
+foreach(lo 0 1)
+  if(lo)
+    set(_name test_large_realloc_large_only)
+  else()
+    set(_name test_large_realloc)
+  endif()
+  if(APPLE)
+    add_test(
+      NAME ${_name}
+      COMMAND ${CMAKE_COMMAND} -E env
+        "DYLD_INSERT_LIBRARIES=$<TARGET_FILE:smash>"
+        "MallocNanoZone=0"
+        "SMASH_LARGE_ONLY=${lo}"
+        $<TARGET_FILE:large_realloc_test>
+    )
+  else()
+    add_test(
+      NAME ${_name}
+      COMMAND ${CMAKE_COMMAND} -E env
+        "LD_PRELOAD=$<TARGET_FILE:smash>"
+        "SMASH_LARGE_ONLY=${lo}"
+        $<TARGET_FILE:large_realloc_test>
+    )
+  endif()
+  set_tests_properties(${_name} PROPERTIES TIMEOUT 30)
+endforeach()
+
 # Syscall EFAULT-retry test: allocates a buffer, forces compression, then
 # issues real syscalls (read/writev/readv) directly on the compressed
 # buffer. Verifies that the EFAULT-driven retry path in syscall_compat.h
@@ -537,7 +585,6 @@ if(APPLE)
     NAME test_syscall_efault
     COMMAND ${CMAKE_COMMAND} -E env
       "DYLD_INSERT_LIBRARIES=$<TARGET_FILE:smash>"
-      "DYLD_FORCE_FLAT_NAMESPACE=1"
       "MallocNanoZone=0"
       "SMASH_LARGE_ONLY=0"
       "SMASH_DEFER_PHASES_MS=0"
@@ -1541,9 +1588,8 @@ if(NOT APPLE)
     test_write_track_fallback_host PROPERTIES TIMEOUT 60)
 endif()
 
-# A large free must not leave a stale entry in free()'s per-thread span
-# cache: large spans never enter it, so large frees need not bump the global
-# page-map generation (large_free_span_cache_test.cpp).
+# A free inside a freed large block's old range must reach its own span, not
+# a stale address-keyed entry (large_free_span_cache_test.cpp).
 if(NOT APPLE)
   add_executable(large_free_span_cache_test large_free_span_cache_test.cpp)
   target_link_libraries(large_free_span_cache_test PRIVATE ${CMAKE_DL_LIBS})

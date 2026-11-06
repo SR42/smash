@@ -274,7 +274,7 @@ The `bench_deps` target builds:
 ### macOS
 
 ```bash
-DYLD_INSERT_LIBRARIES=./build/libsmash.dylib DYLD_FORCE_FLAT_NAMESPACE=1 ./your_application
+DYLD_INSERT_LIBRARIES=./build/libsmash.dylib ./your_application
 ```
 
 If you downloaded `libsmash-macos-arm64.dylib` from a [release](https://github.com/emeryberger/smash/releases) (rather than building locally), clear the quarantine flag your browser adds first — otherwise dyld rejects the ad-hoc-signed dylib with *"library load disallowed by system policy"*:

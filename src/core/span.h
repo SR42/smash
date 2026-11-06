@@ -33,11 +33,28 @@ inline std::atomic<uint64_t> g_reheat_events{0};
 inline constexpr size_t kMaxSpanBitmapWords =
     (static_cast<size_t>(kMaxSpanPages) * kPageSize / kMinAlignment + 63) / 64;
 
+// ceil(2^40 / size) for every small size class: Span::slotOf()'s reciprocal,
+// offset / object_size as a multiply and shift (exact for any offset inside a
+// span; see slotOf()). A table rather than a Span field (upstream #93 had
+// one): it depends only on the class, and every byte of Span is metadata
+// paid per span (see the size pin after the struct).
+inline constexpr int kSpanDivShift = 40;
+struct SpanDivMagic { uint64_t m[kNumClasses]; };
+inline constexpr SpanDivMagic kSpanDivMagic = [] {
+    SpanDivMagic t{};
+    for (int sc = 0; sc < kNumClasses; ++sc) {
+        const uint64_t d = kSizeClasses[sc].size;
+        t.m[sc] = ((uint64_t{1} << kSpanDivShift) + d - 1) / d;
+    }
+    return t;
+}();
+
 struct Span {
     void* base;                 // start of data pages
     uint64_t* bitmap;           // 1 = free, 0 = allocated; from BootstrapAlloc
     uint32_t page_count;
     uint32_t object_size;
+    static constexpr int kDivShift = kSpanDivShift;
     // Slots that *could* exist in the span's pages (pages*kPageSize/object_size).
     // Bitmap is always sized for this.  Under a per-page cap, most of these bits
     // are held at 0 and never handed out.  allocate() must scan the full bitmap
@@ -74,6 +91,15 @@ struct Span {
     PageStateTable* page_states;
     uint32_t        first_page_vm_idx;
     uint8_t         free_shard;      // descriptor-cache shard it returns to (fills padding)
+    // The two flags and empty_tick below sit in what was padding, so Span
+    // stays at its pinned size.
+    // Empty span whose pages are still resident (decommit deferred; see
+    // Slab::retireEmptySpan); empty_tick is the slab tick it became empty at.
+    bool            resident_empty;
+    // Large span from LargeAlloc::allocate() whose size is on the block
+    // cache's grid: deallocate() may cache it (LargeBlockCache). Never set
+    // for a malloc_numa block, which must not be handed to another caller.
+    bool            block_cacheable;
     // Optional: per-page cold-tick counter array owned by CompressorThread.
     // allocate() resets the counter for the page that just received a chunk,
     // so phase2 doesn't compress pages that are still being filled.
@@ -88,6 +114,7 @@ struct Span {
     // can cover by 3x (329 GB -> 102 GB).
     uint64_t*       bitmap_store;
     uint32_t        bitmap_store_words;
+    uint32_t        empty_tick;
 
     // Initialize a slab span for the given size class.
     //
@@ -112,12 +139,15 @@ struct Span {
         size_class = sc;
         is_large = false;
         is_mid = explicit_object_size != 0;
+        block_cacheable = false;
         arena_id = arena;
         object_size = explicit_object_size ? explicit_object_size : kSizeClasses[sc].size;
         full_capacity = (pages * kPageSize) / object_size;
 
         allocated_count = 0;
         free_hint_word = 0;
+        resident_empty = false;
+        empty_tick = 0;
         list_prev = nullptr;
         list_next = nullptr;
         large_size = 0;
@@ -242,6 +272,7 @@ struct Span {
         size_class = kNumClasses;
         is_large = true;
         is_mid = false;
+        block_cacheable = false;
         arena_id = arena;
         object_size = 0;
         full_capacity = 0;
@@ -249,6 +280,8 @@ struct Span {
         object_count = 0;
         allocated_count = 1;
         free_hint_word = 0;
+        resident_empty = false;
+        empty_tick = 0;
         bitmap = nullptr;
         list_prev = nullptr;
         list_next = nullptr;
@@ -470,7 +503,7 @@ struct Span {
     // Free one object back to this span.
     void deallocate(void* ptr) {
         size_t offset = static_cast<size_t>(static_cast<char*>(ptr) - static_cast<char*>(base));
-        size_t slot = offset / object_size;
+        size_t slot = slotOf(offset);
         size_t word = slot / 64;
         size_t bit = slot % 64;
 
@@ -507,6 +540,21 @@ struct Span {
         if (word < free_hint_word) {
             free_hint_word = static_cast<uint16_t>(word);
         }
+    }
+
+    // offset / object_size without a divide. With m = ceil(2^40 / d) and
+    // m*d = 2^40 + e (0 <= e < d), floor(n*m / 2^40) == floor(n / d) whenever
+    // n*e < 2^40 - which holds for every offset in a span (n < 2^26 for any
+    // span, e < d <= 2^14), and n*m < 2^62 fits in 64 bits. Checked
+    // exhaustively for every class in tests/test_span.cpp.
+    //
+    // A mid-size span (MidAlloc, SMASH_MID_BINS) is outside that bound: its
+    // objects go up to 1 MiB, so e can reach 2^20 and n*e passes 2^40 inside
+    // one chunk. It divides.
+    size_t slotOf(size_t offset) const {
+        if (is_mid) [[unlikely]] return offset / object_size;
+        return static_cast<size_t>(
+            (static_cast<uint64_t>(offset) * kSpanDivMagic.m[size_class]) >> kDivShift);
     }
 
     bool full() const { return allocated_count == object_count; }

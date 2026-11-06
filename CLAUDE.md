@@ -42,7 +42,7 @@ codegen bug: [agents/sanitizers.md](agents/sanitizers.md).
 cd build && ctest --output-on-failure
 ```
 
-All 239 tests must pass; none are registered `DISABLED`. Run the suite **as root** too when touching the compressor: idle-page read tracking only exists with root (and `SMASH_WRITE_TRACK=yt` only with the youngtrace module loaded), and CI (`.github/workflows/ci.yml`, `ubuntu-latest` + `macos-latest`, every push and PR) runs unprivileged. After ctest, CI runs `bench/run_quick_ci.py` (`bench_rss` ≥30 %, `bench_sqlite --quick` ≥5 % RSS reduction).
+All 241 tests must pass; none are registered `DISABLED`. Run the suite **as root** too when touching the compressor: idle-page read tracking only exists with root (and `SMASH_WRITE_TRACK=yt` only with the youngtrace module loaded), and CI (`.github/workflows/ci.yml`, `ubuntu-latest` + `macos-latest`, every push and PR) runs unprivileged. After ctest, CI runs `bench/run_quick_ci.py` (`bench_rss` ≥30 %, `bench_sqlite --quick` ≥5 % RSS reduction).
 
 **Before changing a test or its threshold, read its entry in [agents/tests.md](agents/tests.md).** Thresholds encode measurements, several tests are probabilistic (one run is not a verdict), and some harness shapes (sharing a process between phases, `fork()` with smash threads running) reproduce the very symptom under test.
 
@@ -111,6 +111,22 @@ bench/                  Benchmarks (throughput, compression ratio, RSS, latency)
   - **Lifetime:** groups are created once in `start()` and never freed. Never create them mid-tick: `pthread_create` is unsafe once pages may be compressed.
   - **Still shared:** the coordinator, the deferred-madvise sweep and fault-time decompression. Decompression runs on the faulting thread; the arena binding puts the restored page back on the node.
 
+## Allocation Fast Path
+
+From upstream (#90, #93). Small `malloc`/`free`/`calloc`/`realloc` are served by lean entry points (`SmashFastRedirect` in `smash_heap.cpp`) that alloc8's `xx*` functions call directly; everything else tail-calls the full `SmashHeap` path, which handles every mode.
+
+- **One gate:** the per-thread `g_fast_tc` is published only when the lean path is valid (`leanEntriesAllowed()`: full mode, no free diagnostics, no `SMASH_COLD_ARENA_FEEDBACK`, heap constructed) and cleared before a thread's cache goes back to the pool, by `threadCleanup()` and by the TLS destructor (`reclaimThreadCache`) alike.
+- **malloc:** the `callsiteArena()` memo hit only. A memo naming `kStdioArena` takes the full path (stdio buffers go to the system allocator), and once anything has been compressed the block is marked on held pages like the full path does (`noteHeld`, a tail call; without it a reused slot counted as thrash, `test_alloc_reopen`).
+- **free() without touching the Span:** the VmRegion keeps a 2-byte page tag (small flag, arena, size class) beside the flat page→Span table, so free picks the thread-cache lane with one load. Large and **mid-size** spans are tagged 0: a `SMASH_MID_BINS` block must go back to `MidAlloc`, never to a thread cache.
+- **Thread cache:** 16 lanes × depth 16 (`SMASH_CACHE_LANES` to change); counts in a compact array separate from the pointers. Above 16 arenas, arenas share lanes.
+- **Span::slotOf** divides by multiply and shift with a per-class table (`kSpanDivMagic`), not a Span field: `Span` stays at its pinned 112 bytes. Mid-size spans divide (their objects are past the bound the reciprocal is exact for).
+- **Linking:** `LINKER:-Bsymbolic` binds the wrappers' calls to `xxmalloc`/`xxfree` locally. The old `"-Bsymbolic"` went to the compiler driver as `-B symbolic` and never reached ld.
+- **Direct-mapped large blocks** (below `SMASH_LARGE_ALLOC_VM_THRESHOLD`, so 16 KiB–1 MiB in full mode) are cached on free with their Span descriptors (`LargeBlockCache` in `large_alloc.h`) instead of being unmapped: 64 KiB churn 4412 → 34 ns/op. Sizes round to 8 steps per power of two (`resizeInPlace` keeps a cacheable block on that grid); idle buckets are unmapped after 2 compressor ticks. Never a `malloc_numa` block (`Span::block_cacheable`). **Upstream also caches arena blocks up to 8 MiB by default; this branch does not**: a freed arena block takes the release path, where keeping it warm stays opt-in (`SMASH_RUN_CACHE_MIB`, `SMASH_SUBARENAS`), and a direct mapping of a compressible size (one made because the arena was full) is never cached, which would hand it out ahead of reclaimed arena space (`test_arena_reclaim_concurrent`). Caching arena blocks measured only 5–8% on 2 MiB churn here: ~30 µs of each 2 MiB free is `releaseCompressedPages`' per-page walk.
+- **Empty slab spans** stay resident for 2 compressor ticks before `madvise` (they leave compressor tracking at once), under a process-wide cap; spans outside the arena decommit as their own mapping.
+- **Background threads** park on futexes (`util/park.h`: compressor helpers on `helper_go_`, decommit queues on their `wake` word, page locks), `__ulock_wait` on macOS. Upstream's `Waker` (a condition variable) for the same polling loops is superseded: a condition variable cannot serve the page locks, which park from the fault handler. `Spinlock` yields after a bounded spin.
+
+Measured upstream on x86-64 (Xeon 8175M) and Graviton3, glibc 2.35, against upstream's own base: faster than glibc on every microbenchmark (malloc+free pairs 0.78×/0.86×, 16 KiB–1 MiB churn 0.22×/0.09×), g++ -O2 at parity, Python churn 0.67×/0.64×.
+
 ## Syscall & Buffered I/O Compatibility
 
 See [agents/syscall-compat.md](agents/syscall-compat.md) for details on EFAULT-driven decompress-and-retry, DYLD interposition limitations, buffered-I/O carve-outs, and the full list of interposed functions per platform. It also records two things worth knowing before adding a wrapper: a wrapper exported only at the base glibc version never runs when glibc versions that symbol (the caller binds the versioned one: `test_symbol_versions` compares every function libsmash defines with the default version the loaded system libraries give it, so a new wrapper at the wrong version fails it), and a measured audit of which syscalls still return `EFAULT` when their buffer is on a compressed page.
@@ -167,6 +183,16 @@ The compressor flow calls `decommitPages()` (MADV_FREE_REUSABLE) **before** `mpr
 ## macOS arm64 / arm64e
 
 libsmash is built **fat** (arm64 + arm64e) so it can interpose into both ordinary and PAC (arm64e) processes; the benchmark binaries are built **arm64-only** because they are the app under test and must load arm64-only preloads. See [agents/macos-arm64e.md](agents/macos-arm64e.md) for the full mechanism, the exec-vs-load trap (macOS ≤ 15 SIGKILLs third-party arm64e; macOS 26 runs it), and the debugging pitfalls.
+
+## macOS Per-Thread State (TSD slot, `SMASH_TSD_SLOT`)
+
+From upstream (#89, #91). On Mach-O every `thread_local` access from a dylib is a `_tlv_get_addr` call (`tls_model("initial-exec")` has no effect), one per distinct variable, and it was the hottest non-waiting frame on the malloc/free path. On Apple silicon the hot per-thread fields therefore live in one `ThreadState` (`smash_heap.h`) whose pointer sits in pthread TSD slot `SMASH_TSD_SLOT_INDEX` (default **89**, `__PTK_FRAMEWORK_OLDGC_KEY9`, mimalloc's: reserved by libpthread, never handed out by `pthread_key_create`); a read is `mrs tpidrro_el0` + load (`src/util/tsd_slot.h`). Linux and x86-64 macOS keep the `thread_local`s.
+
+- `g_thread_cache`, `g_fast_tc`, `g_full_mode_cached`, `g_arena_stack_base` and `g_arena_memo` are macros for `threadState()->field` there, so call sites are unchanged.
+- **Lifecycle:** a null slot means not set up; `threadStateSlow()` reuses a state from a free list or carves one from `BootstrapAlloc`, and arms a pthread-key destructor that drains a live thread cache at exit (GCD workers never get `xxthread_cleanup`) and recycles the state. The free list's lock is in the fork lock set (`collectForkLocks`).
+- **Caller hint:** `tsd_slot.h` is force-included into every libsmash TU and defines `ALLOC8_CALLER_RA_HOOK`, so alloc8's wrappers store the return address in `ThreadState::caller_ra`. It needs an alloc8 with `ALLOC8_HAS_CALLER_RA_HOOK` (the pin is 882ff34); the build `#error`s otherwise, since call-site arenas would silently collapse.
+- **Conflicts:** if the main thread's slot already holds something that is not a `ThreadState` when smash starts, smash aborts with a message. No runtime fallback: pick another slot with `-DSMASH_TSD_SLOT_INDEX=N` or disable with `-DSMASH_TSD_SLOT=OFF`.
+- **Test:** `test_tsd_thread` (macOS only). Measured upstream (M1 Max): malloc+free 41.4 → 24.7 ns/op, jaq 24.3 → 18.0 s.
 
 
 ## Key Conventions
@@ -256,6 +282,8 @@ Full list of constants and environment variables: [agents/config.md](agents/conf
 - `SMASH_COLD_TIMEOUT_SEC=N`: cold timeout override (tests use 1–2). Idle time is counted in nominal seconds, so it stays seconds when ticks run long. At most 254: larger values are clamped with a warning (a page's idle count is one byte; 255 or more used to compress nothing). Use `SMASH_NO_COMPRESSOR=1` to switch compression off.
 - `SMASH_WRITE_TRACK=auto|softdirty|uffd|none|idle|yt`, `SMASH_SOFTDIRTY=0`: write detection. `idle` (opt-in, needs `CAP_SYS_ADMIN` and the page_idle bitmap read-write) tracks reads and writes with the kernel's accessed bit and protects nothing: zero monitor faults on the arm64 6.6 path where `SMASH_SOFTDIRTY=0` is the only alternative. It keeps the host's THP setting (`SMASH_THP=1` hints the arena, `SMASH_THP=0` forbids it huge pages) and reads a large folio at its head. `yt` (opt-in, needs the youngtrace module and `CAP_SYS_ADMIN`) reads the same bit through the module's page-table walk: on the same workload 0.50 s of scanning against the bitmap's 2.2 s (K=4), 0.84 s against 9.2 s (K=1).
 - `SMASH_THP_UNIT=1` (opt-in, `idle` tracking only): a cold transparent huge page is compressed and restored as one 2 MiB unit, so it comes back a huge page; without it compression splits it and a fault brings back 4 KiB. The price is per fault: one byte read restores 2 MiB (512 decompressions on the faulting thread: 630 us against 26 us per page, measured on highly compressible data). A unit's compression ratio is judged as a whole. Hints the arena huge like `SMASH_THP=1`; where it cannot work it says why on stderr and stays off. See "Hugepages and THP" in [agents/allocation-paths.md](agents/allocation-paths.md).
+- `SMASH_LARGE_CACHE_MB=N` (default 32, `0` = off): byte cap of the cache of freed direct-mapped large blocks (`LargeBlockCache`; sizes below `SMASH_LARGE_ALLOC_VM_THRESHOLD`). Idle buckets are unmapped after 2 ticks.
+- `SMASH_EMPTY_RESIDENT_MB=N`: cap on empty slab spans kept resident for 2 ticks before their `madvise`. Default 1/32 of RAM, clamped to [64 MiB, 1 GiB]; `0` decommits at once.
 - `SMASH_RUN_CACHE_MIB=N` (default off): per-CPU cache of freed large runs — about 2x large-block churn throughput one thread per core, at up to (CPUs) x N MiB of extra RSS. See [agents/design-run-cache.md](agents/design-run-cache.md).
 - `SMASH_CODEC=lz4|zstd`: fast-tier codec (default zstd-1). `SMASH_USE_LZ4` was never an environment variable; the build option of that name is removed.
 - `SMASH_STATS_SIGNAL=1`: enable the SIGUSR2 stats line (`compressed=`, `zero_now=`, `bump=`, `arena_free=`, `track=`, `codec=`, `cold_arenas=`, `boot=`, `reheat=`, `rss=`, `blob=`; `bump=` rising while `arena_free=` is large means the arena is walking past its own free memory).

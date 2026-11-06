@@ -121,10 +121,13 @@ real fixes, both found *because* UBSan changed what the compiler could prove:
   sanitized suite now reports **0 findings**. It also removes a
   `cmpq`/`je`/`call` from the fast path of direct-linked binaries.
 
-  All eight extern `thread_local`s in `smash_heap.h` are `constinit` for this
+  All eight extern `thread_local`s in `smash_heap.h` were `constinit` for this
   reason — `g_full_mode_cached`, `g_thread_cache`, the five `g_free_cache_*` and
   `g_arena_stack_base` — which took the init-wrapper references in
-  `test_integration` from **204 to 0**, with no wrapper symbols left. Only these
+  `test_integration` from **204 to 0**, with no wrapper symbols left. The
+  upstream merge (2026-11-06) removed the `g_free_cache_*` and added `g_fast_tc`
+  and `g_arena_memo`; those are `constinit` too (upstream declared them without
+  it). Keep every new one that way. Only these
   file-scope `extern` declarations generate wrappers; `inline thread_local` and
   function-local `static thread_local` (e.g. `g_compressor_thread`,
   `tl_numa_worker_`) generate none, so they need nothing.

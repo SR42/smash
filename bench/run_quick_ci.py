@@ -61,7 +61,6 @@ def smash_env(libsmash: Path, base_env: dict[str, str]) -> dict[str, str]:
     e = dict(base_env)
     if sys.platform == "darwin":
         e["DYLD_INSERT_LIBRARIES"] = str(libsmash)
-        e["DYLD_FORCE_FLAT_NAMESPACE"] = "1"
         e["MallocNanoZone"] = "0"
     else:
         e["LD_PRELOAD"] = str(libsmash)

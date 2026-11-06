@@ -14,34 +14,13 @@
 #include "span.h"
 #include "../vm/vm_region.h"
 #include "../util/spinlock.h"
+#include "../util/fork_locks.h"
 
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
 
 namespace smash {
-
-// Global page→span mapping generation. Bumped every time a page's span
-// mapping is torn down (PageMap::set(addr, nullptr)), except for a large
-// block's: large spans never enter an address-keyed cache, so nothing can go
-// stale when one goes, and LargeAlloc::deallocate passes bump = false.
-// Address-keyed span caches (the free() TLS last-span cache) stamp this value
-// at populate time and discard the cache on mismatch.
-//
-// Large frees used to bump it too, and at 128 threads that one cache line was
-// the allocator's bottleneck: 49% of smash_sim's time in PageMap::set on the
-// 128-core aarch64 box, with 1.8% waiting on any lock.
-//
-// Correctness rests on the load-before-read ordering at the cache site: read
-// the generation BEFORE reading the span mapping. A teardown that races the
-// cache fill bumps the counter, so a cached entry whose stamped generation
-// still equals the current one provably reflects a mapping that has not been
-// torn down since. A stale-low stamp only forces an extra cache miss; it can
-// never yield a span for a range that has since been reassigned to a different
-// size class. Teardowns are rare, so this counter stays read-mostly and
-// cache-resident — that is the whole point versus re-reading the 128 MB flat
-// page→span table on every free.
-inline std::atomic<uint64_t> g_pagemap_generation{0};
 
 class PageMap {
     using L2Entry = std::atomic<Span*>;
@@ -68,6 +47,20 @@ class PageMap {
         return tbl;
     }
 
+    // VmRegion page tag for a span: small-object spans carry their arena and
+    // size class so free() can pick the thread-cache lane without loading
+    // the Span; large spans, mid-size spans (SMASH_MID_BINS: their blocks go
+    // back to MidAlloc, never to a thread cache) and "no span" are 0 (full
+    // free path).
+    static_assert(kNumClasses <= 64, "page tag holds the size class in 6 bits");
+    static_assert(kTotalArenas <= 256, "the lean free() reads the tag's arena as a uint8_t");
+    static uint16_t pageTag(const Span* span) {
+        if (!span || span->is_large || span->is_mid) return 0;
+        return static_cast<uint16_t>(VmRegion::kPageTagSmall |
+                                     (static_cast<uint16_t>(span->arena_id) << 6) |
+                                     span->size_class);
+    }
+
     // If the address falls inside the attached VmRegion, mirror the write
     // into its flat table. Always also update the radix tree so external
     // (non-VmRegion) callers continue to resolve via PageMap::get().
@@ -80,8 +73,14 @@ class PageMap {
         // mode index 0 is a legitimate contig-arena page, but contains()
         // gates entry — so a 0 here is fine because we only land here when
         // the address is inside the region.
-        vm_region_->setSpan(idx, span);
+        vm_region_->setSpan(idx, span, pageTag(span));
     }
+
+public:
+    // fork() (util/fork_locks.h): ensureL2() takes l2_lock_ on the
+    // allocation path, so a child that inherited it held spun on its first
+    // new L2 table.
+    void forkLocks(ForkLockSet& s) { s.add(l2_lock_); }
 
 public:
     void init() {
@@ -97,9 +96,7 @@ public:
     // is to be consistent with the radix tree.
     void attachVmRegion(VmRegion* vr) { vm_region_ = vr; }
 
-    // `bump` = false only for a span no address-keyed cache ever holds (large
-    // blocks, see g_pagemap_generation).
-    void set(uintptr_t addr, Span* span, bool bump = true) {
+    void set(uintptr_t addr, Span* span) {
         const auto page_idx = addr >> kPageShift;
         const auto l1 = page_idx >> kPageMapL2Bits;
         const auto l2 = page_idx & (kPageMapL2Size - 1);
@@ -107,13 +104,6 @@ public:
         if (!tbl) return;   // metadata arena exhausted (reported there)
         tbl[l2].store(span, std::memory_order_release);
         mirrorFlat(addr, span);
-        // Teardown of a page→span mapping invalidates any address-keyed span
-        // cache. Bump after the store so observers that reload the generation
-        // and re-resolve see the cleared mapping. release ordering pairs with
-        // the acquire load at the cache site.
-        if (span == nullptr && bump) {
-            g_pagemap_generation.fetch_add(1, std::memory_order_release);
-        }
     }
 
     // Same resolution free() uses on its fast path: one load from the flat
@@ -171,16 +161,7 @@ public:
 
         // Flat table mirror: one bounds-checked batched store run.
         if (vm_region_ && vm_region_->contains(addr)) {
-            vm_region_->setSpanRange(vm_region_->pageIndex(addr), num_pages, span);
-        }
-
-        // A teardown (span == nullptr) invalidates address-keyed span caches.
-        // Bump once for the whole run, after the stores. Matches the per-page
-        // set() semantics (which bumps once per cleared page) closely enough —
-        // the cache only needs to observe *a* change, and a single monotonic
-        // bump per teardown is sufficient and cheaper.
-        if (span == nullptr) {
-            g_pagemap_generation.fetch_add(1, std::memory_order_release);
+            vm_region_->setSpanRange(vm_region_->pageIndex(addr), num_pages, span, pageTag(span));
         }
     }
 

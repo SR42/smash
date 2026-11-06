@@ -5,6 +5,8 @@
 #pragma once
 
 #include "smash/config.h"
+#include <cstdlib>
+#include <unistd.h>
 #include "span.h"
 #include "page_map.h"
 #include "size_classes.h"
@@ -39,6 +41,7 @@ class Slab {
     IntrusiveList<Span> partial_;
     IntrusiveList<Span> full_;
     IntrusiveList<Span> empty_;
+    std::atomic<uint32_t> resident_empty_count_{0};  // resident spans in empty_
     PageMap* page_map_;   // set during init, shared across all slabs
     VmRegion* vm_region_ = nullptr;
     PageStateTable* page_states_ = nullptr;
@@ -212,7 +215,7 @@ class Slab {
             partial_.pushFront(span);
         } else if (span->empty()) {
             partial_.remove(span);
-            decommitEmptySpan(span);
+            retireEmptySpan(span);
             empty_.pushFront(span);
         }
     }
@@ -254,6 +257,99 @@ class Slab {
         return vm_region_ &&
                vm_region_->inContigArena(reinterpret_cast<uintptr_t>(span->base));
     }
+
+    // A span just became empty. Its pages leave compressor tracking now
+    // (release hook, EMPTY state), but the madvise that drops them is
+    // deferred: churn that empties and refills spans (free a batch, allocate
+    // a batch) otherwise paid a syscall + TLB shootdown per span plus a zero
+    // page fault per page on reuse. A resident empty span is reused as-is, or
+    // decommitted by purgeResidentEmpty() once it has sat empty for
+    // kResidentEmptyTicks compressor ticks. Process-wide resident empties are
+    // capped at residentEmptyMaxBytes(); past that, decommit immediately.
+    static constexpr uint32_t kResidentEmptyTicks = 2;
+    // Default cap: 1/32 of physical memory, clamped to [64 MiB, 1 GiB]. A
+    // batch workload that frees and re-allocates a working set larger than
+    // the cap pays decommit + refault on the excess every round (measured on
+    // a 260 MB set: 32 MiB cap 2.5 s, 512 MiB 0.75 s, glibc 2.3 s), while
+    // the retained spans are reused, so peak RSS is unchanged. The cost is a
+    // transient: freed spans of one class stay resident for up to
+    // kResidentEmptyTicks ticks while another class grows.
+    // SMASH_EMPTY_RESIDENT_MB=N overrides it (0 = decommit at once).
+    static size_t residentEmptyMaxBytesInit() {
+        if (const char* e = std::getenv("SMASH_EMPTY_RESIDENT_MB"))
+            return static_cast<size_t>(std::atol(e)) << 20;
+        long pages = sysconf(_SC_PHYS_PAGES);
+        long psz = sysconf(_SC_PAGESIZE);
+        size_t ram = (pages > 0 && psz > 0) ? static_cast<size_t>(pages) * static_cast<size_t>(psz)
+                                            : (size_t{2} << 30);
+        size_t cap = ram / 32;
+        if (cap < (size_t{64} << 20)) cap = size_t{64} << 20;
+        if (cap > (size_t{1} << 30)) cap = size_t{1} << 30;
+        return cap;
+    }
+    static size_t residentEmptyMaxBytes() {
+        static std::atomic<size_t> cached{~size_t{0}};
+        size_t v = cached.load(std::memory_order_relaxed);
+        if (v == ~size_t{0}) [[unlikely]] {
+            v = residentEmptyMaxBytesInit();
+            cached.store(v, std::memory_order_relaxed);
+        }
+        return v;
+    }
+    static inline std::atomic<size_t> resident_empty_bytes_{0};
+    static inline std::atomic<uint32_t> slab_tick_{0};
+
+    void retireEmptySpan(Span* span) {
+        const size_t bytes = span->page_count * kPageSize;
+        if (resident_empty_bytes_.load(std::memory_order_relaxed) + bytes > residentEmptyMaxBytes()) {
+            decommitEmptySpan(span);
+            return;
+        }
+        // Same compressor and page-state steps as decommitEmptySpan(), and
+        // like it only for arena pages: a span from a direct mapping (arena
+        // exhausted) has no page states.
+        const bool in_region = inRegion(span);
+        if (release_hook_ && in_region) {
+            size_t idx = vm_region_->pageIndex(reinterpret_cast<uintptr_t>(span->base));
+            release_hook_(idx, span->page_count, release_ctx_);
+        }
+        if (page_states_ && in_region) {
+            size_t idx = vm_region_->pageIndex(reinterpret_cast<uintptr_t>(span->base));
+            page_states_->setRange(idx, span->page_count, PageState::EMPTY);
+        }
+        span->resident_empty = true;
+        span->empty_tick = slab_tick_.load(std::memory_order_relaxed);
+        resident_empty_bytes_.fetch_add(bytes, std::memory_order_relaxed);
+        resident_empty_count_.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    void clearResident(Span* span) {
+        if (!span->resident_empty) return;
+        span->resident_empty = false;
+        resident_empty_bytes_.fetch_sub(span->page_count * kPageSize, std::memory_order_relaxed);
+        resident_empty_count_.fetch_sub(1, std::memory_order_relaxed);
+    }
+
+public:
+    static void advanceTick() { slab_tick_.fetch_add(1, std::memory_order_relaxed); }
+    static size_t residentEmptyBytes() { return resident_empty_bytes_.load(std::memory_order_relaxed); }
+
+    // Compressor tick: decommit empty spans that have stayed empty for
+    // kResidentEmptyTicks ticks. Cheap when nothing is resident.
+    void purgeResidentEmpty() {
+        if (resident_empty_count_.load(std::memory_order_relaxed) == 0) return;
+        const uint32_t now = slab_tick_.load(std::memory_order_relaxed);
+        LockGuard guard(lock_);
+        for (Span* sp = empty_.front(); sp; sp = sp->list_next) {
+            if (sp->resident_empty && now - sp->empty_tick >= kResidentEmptyTicks) {
+                clearResident(sp);
+                const size_t bytes = sp->page_count * kPageSize;
+                if (inRegion(sp)) vm::decommitPages(sp->base, bytes);
+                else vm::decommitOwnMapping(sp->base, bytes);
+            }
+        }
+    }
+private:
 
     Span* allocateNewSpan() {
         const auto& info = kSizeClasses[size_class_];
@@ -346,6 +442,7 @@ public:
         };
         while (Span* span = empty_.popFront()) {
             ++n;
+            clearResident(span);
             if (!inRegion(span)) {
                 releaseSpan(span, /*sync=*/true);
                 recycleSpanDescriptor(span);
@@ -377,6 +474,7 @@ private:
     }
 
     void releaseSpan(Span* span, bool sync = false) {
+        clearResident(span);
         page_map_->clearRange(reinterpret_cast<uintptr_t>(span->base), span->page_count);
         if (inRegion(span)) {
             if (release_hook_) {
@@ -423,6 +521,7 @@ private:
     // Physical pages are zero-filled by the kernel on first access
     // (MADV_DONTNEED on Linux, MADV_FREE on macOS).
     void recommitEmptySpan(Span* span) {
+        clearResident(span);
         if (page_states_ && inRegion(span)) {
             size_t idx = vm_region_->pageIndex(reinterpret_cast<uintptr_t>(span->base));
             page_states_->setRange(idx, span->page_count, PageState::ACTIVE);
