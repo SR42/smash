@@ -269,6 +269,26 @@ else()
 endif()
 set_tests_properties(test_arena_routing PROPERTIES TIMEOUT 30)
 
+# vm.max_map_count regression guard (#94): with the process held 12K VMAs
+# below the cap (the test uses them up itself; no root), a teardown-like
+# stride walk over 128 MiB of compressed large blocks must neither hang nor
+# return wrong data. Linux only (no VMA cap elsewhere). The test exits 77
+# (skipped) if the cap is too large to approach quickly.
+if(NOT APPLE)
+  add_executable(vma_cap_test vma_cap_test.cpp)
+  set_target_properties(vma_cap_test PROPERTIES CXX_STANDARD 20)
+  add_test(
+    NAME test_vma_cap
+    COMMAND ${CMAKE_COMMAND} -E env
+      "LD_PRELOAD=$<TARGET_FILE:smash>"
+      "SMASH_LARGE_ONLY=1"
+      "SMASH_DEFER_PHASES_MS=0"
+      "SMASH_COLD_TIMEOUT_SEC=1"
+      $<TARGET_FILE:vma_cap_test>
+  )
+  set_tests_properties(test_vma_cap PROPERTIES TIMEOUT 150 SKIP_RETURN_CODE 77)
+endif()
+
 # Per-thread state in a TSD slot (macOS SMASH_TSD_SLOT): ThreadStates are
 # reclaimed and reused across thousands of short-lived threads, GCD workers and
 # allocating app destructors work, fork() keeps the free list usable. Skips
