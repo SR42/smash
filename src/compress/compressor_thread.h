@@ -406,6 +406,27 @@ class CompressorThread {
     size_t environ_page_idx_ = kNoEnvironPage;
     long vma_count_cached_ = 0;   // VMA-cap guard: refreshed every N ticks
 
+    // Per-tick VMA budget for Phases 2 and 3 (see chargeVmaBudget). Set by the
+    // coordinator before dispatch(2); charged by every worker before a
+    // per-page protection change that can split a VMA. vma_budget_on_ is
+    // false where there is no cap to respect (non-Linux).
+    std::atomic<long> vma_budget_{0};
+    bool vma_budget_on_ = false;
+    std::atomic<uint64_t> vma_budget_skips_{0};     // pages/runs skipped for budget
+    std::atomic<uint64_t> vma_cap_run_restores_{0};  // run / whole-VMA restores
+    // Set when the VMA count is within the margin of the cap. Faults then
+    // restore the faulting page's run up to its nearer end instead of the
+    // page alone (see restoreNearCap), so fault traffic stops ratcheting the
+    // count up to the cap. The tick-start guard sets it from a real count; between ticks the
+    // fault path keeps vma_estimate_ (that count plus the splits faults have
+    // made since) and sets the flag as soon as the estimate crosses
+    // vma_near_at_. A burst of scattered faults (interpreter teardown) can
+    // otherwise add the whole margin within one tick.
+    std::atomic<bool> vma_near_cap_{false};
+    std::atomic<long> vma_estimate_{0};
+    std::atomic<long> vma_near_at_{0};  // max_map_count - margin (0: no cap)
+    std::atomic<long> vma_max_{0};             // max_map_count (0: no cap)
+
     // ── Time-budget machinery (SMASH_TIME_BUDGET_PCT) ────────────────────
     // start_steady_time_ is captured at start() and used to compute the
     // available compress budget as elapsed × pct/100. budget_recompute_period_
@@ -508,6 +529,24 @@ class CompressorThread {
 
     void releaseFaultSlot(int slot) {
         fault_slots_[slot].used.store(false, std::memory_order_release);
+    }
+
+    // Charge `n` potential new VMAs against this tick's Phase 2/3 budget.
+    // Returns false (and charges nothing useful) once the budget is spent;
+    // the caller must then skip the protection change. A single-page
+    // mprotect in the middle of a VMA splits it in three (+2), so callers
+    // charge 2 per page or per contiguous run.
+    //
+    // Why a mid-loop budget: the tick-start guard only stops Phases 2 and 3
+    // when the count is ALREADY near the cap; within one tick they had no
+    // bound (Phase B and the sweep already carry their own). On a hot/cold
+    // interleaved heap, a run of single-page protection changes adds two
+    // VMAs per page.
+    bool chargeVmaBudget(long n) {
+        if (!vma_budget_on_) return true;
+        if (vma_budget_.fetch_sub(n, std::memory_order_relaxed) >= n) return true;
+        vma_budget_skips_.fetch_add(1, std::memory_order_relaxed);
+        return false;
     }
 
     // ── Per-bucket sliding window stats ───────────────────────────────────
@@ -1565,10 +1604,17 @@ private:
                 // this just changes protection, not compression. It gives
                 // the compressor more accurate access info for thrashy
                 // pages (which we won't compress anyway until eff_floor).
-                escalateToDeepMonitoring(i);
+                escalateToDeepMonitoring(i);  // charges the VMA budget itself
             } else if (cold_count_[i] > profile_floor && cold_count_[i] >= eff_floor) {
                 // Page is eligible for compression — count it
                 worker_pages_eligible_[worker_id].fetch_add(1, std::memory_order_relaxed);
+                // compressPage changes this page's protection: PROT_READ for
+                // the snapshot in standard mode; PROT_RW in deferred mode,
+                // which splits a VMA only if the page is not already RW
+                // (monitored). A deferred-mode ACTIVE page costs nothing.
+                if ((st == PageState::ACTIVE_MONITORING || !isDeferredReclaimMode()) &&
+                    !chargeVmaBudget(2))
+                    return;  // VMA budget spent this tick
                 if (compressPage(i, workers_[worker_id])) {
                     worker_pages_compressed_[worker_id].fetch_add(1, std::memory_order_relaxed);
                     // Periodic mid-range flush so the pending list
@@ -1684,6 +1730,7 @@ private:
         // there is no shadow re-inflate to avoid).
         if (isDeferredReclaimMode()) return;
 #endif
+        if (!chargeVmaBudget(2)) return;  // VMA budget spent: stay PROT_READ
         locks_->lock(page_idx);
         if (states_->get(page_idx) == PageState::ACTIVE_MONITORING) {
             void* page_addr = vm_->pageAddress(page_idx);
@@ -1738,6 +1785,18 @@ private:
     // then blocks in handleFault on the same per-page lock.
     void flushPhase3Run(size_t run_start, size_t run_end) {
         if (run_end <= run_start) return;
+        // One contiguous run mprotect'd page by page still nets at most two
+        // new VMA boundaries (the pages merge with each other). Out of budget:
+        // undo the ACTIVE -> ACTIVE_MONITORING CAS so the pages stay plain RW.
+        if (!chargeVmaBudget(2)) {
+            for (size_t k = run_start; k < run_end; ++k) {
+                locks_->lock(k);
+                if (states_->get(k) == PageState::ACTIVE_MONITORING)
+                    states_->set(k, PageState::ACTIVE);
+                locks_->unlock(k);
+            }
+            return;
+        }
         bool any_ok = false;
         for (size_t k = run_start; k < run_end; ++k) {
             locks_->lock(k);
@@ -2739,8 +2798,12 @@ private:
                     algo, sc);
                 // Populate backing before the page becomes readable so a
                 // concurrent app load never sees a readable-but-empty page.
-                restorePageContents(adj_addr, fault_slots_[slot].buf);
+                const bool restored = restorePageContents(adj_addr, fault_slots_[slot].buf);
                 releaseFaultSlot(slot);
+                if (!restored) {  // VMA cap: prefetch is optional, keep it compressed
+                    locks_->unlock(adj);
+                    continue;
+                }
 
                 // Release compressed blob (sharded by page index)
                 releaseBlob(adj);
@@ -3169,9 +3232,11 @@ private:
     // memcpy. This restores the legacy behavior with its small race window —
     // acceptable because Linux is the production target and the fast path is
     // expected to succeed there.
-    void restorePageContents(void* page_addr, const void* src) {
+    // Returns false if the page could not be made accessible (VMA cap): the
+    // caller must then leave the page COMPRESSED with its blob intact.
+    bool restorePageContents(void* page_addr, const void* src) {
         if (!page_addr || !vm_->contains(reinterpret_cast<uintptr_t>(page_addr))) {
-            return;
+            return true;  // not ours: nothing to restore
         }
 #ifdef __linux__
         if (self_mem_fd_ < 0) {
@@ -3200,7 +3265,7 @@ private:
                 // (it would discard the bytes we just wrote), so fall through
                 // only on the rare mprotect failure.
                 if (vm::protectPages(page_addr, kPageSize, true, true)) {
-                    return;
+                    return true;
                 }
                 // mprotect(PROT_RW) failed (ENOMEM at vm.max_map_count). The
                 // only recovery is remapPages, which would discard the bytes
@@ -3225,17 +3290,320 @@ private:
             !vm::remapPages(page_addr, kPageSize, true, true)) {
             static std::atomic<uint64_t> warned{0};
             if (warned.fetch_add(1, std::memory_order_relaxed) == 0) {
-                char buf[160];
+                char buf[224];
                 int n = smash::safe_snprintf(buf, sizeof(buf),
                     "[smash WARN] restorePageContents: cannot make page %p "
-                    "writable (mprotect/mmap ENOMEM — likely vm.max_map_count "
-                    "exhausted); skipping restore to avoid wild-store crash\n",
+                    "writable (mprotect/mmap ENOMEM, likely vm.max_map_count "
+                    "exhausted); page stays compressed, trying whole-VMA restore\n",
                     page_addr);
+                // snprintf returns the untruncated length; never write past buf.
+                if (n > static_cast<int>(sizeof(buf)) - 1) n = static_cast<int>(sizeof(buf)) - 1;
                 if (n > 0) (void)!::write(2, buf, (size_t)n);
             }
-            return;  // page stays PROT_NONE+COMPRESSED → access re-faults; no crash
+            return false;  // caller keeps the page COMPRESSED; access re-faults
         }
         __builtin_memcpy(page_addr, src, kPageSize);
+        return true;
+    }
+
+    // ── Whole-VMA restore at the VMA cap ───────────────────────────────────
+    //
+    // At vm.max_map_count, making ONE page of a multi-page VMA accessible
+    // needs a split (+1 or +2 VMAs), so mprotect fails with ENOMEM and the
+    // faulting access can never complete: the process livelocks re-faulting
+    // (measured: Python heap on Graviton, pinned at 65531 maps). Changing the
+    // protection of an ENTIRE VMA needs no split and merges with RW
+    // neighbors, so it succeeds at the cap and lowers the count.
+    //
+    // restoreWholeVma finds the VMA holding `page_idx` and restores all of
+    // it: it populates every compressed page in it through /proc/self/mem
+    // while it is still inaccessible, then flips the range to PROT_RW with
+    // one mprotect. The range is clamped to kMaxVmaRunPages around the page
+    // (a clamped range may still need a split; the mprotect then fails and
+    // we abort).
+    //
+    // Near the cap, restoreNearCap avoids the split before the cap is
+    // reached. It restores the run of inaccessible pages from the faulting
+    // page to the run's nearer end instead of the page alone: the restored
+    // piece merges with the RW neighbor on that side, so the VMA count stays
+    // flat (or drops by 2 if the whole run goes) instead of rising by 2.
+    // Interpreter teardown walks large cold runs page by page from one end
+    // (measured: a 29K-page run, faults 1-4 pages apart); single-page
+    // restores there leave a trail of 1-3 page PROT_NONE fragments, two VMAs
+    // per fault. The run is found from page states, not /proc/self/maps, so
+    // it costs no syscall; a run end that is not a real VMA boundary only
+    // makes the restore less effective, never incorrect. The extra pages
+    // restored are bounded by nearCapVmaLimit(), which starts small (a large
+    // restore throws away compression savings) and grows as headroom shrinks.
+    //
+    // Both: the caller holds page_idx's lock. `data` is page_idx's
+    // decompressed contents, or nullptr if its backing is already correct.
+    // Every other page in the range is tryLock'ed; a busy lock, a page
+    // mid-compression or an EMPTY page aborts with nothing changed (the
+    // access re-faults and retries). Neighbors are finalized (blob released,
+    // state ACTIVE) only after the mprotect succeeds, so an abort at any
+    // point leaves every page consistent with its state. The caller
+    // finalizes page_idx.
+    //
+    // Linux only. Signal-safe: raw syscalls, no allocation, no libc calls.
+    static constexpr size_t kMaxVmaRunPages = size_t{1} << 16;  // 256 MiB of 4K pages
+    // Extra pages restoreNearCap may restore, by headroom below the cap.
+    static constexpr size_t kNearCapVmaPages = 64;      // headroom > margin/2
+    static constexpr size_t kNearCapVmaPagesMid = 512;  // headroom > margin/4
+    static constexpr size_t kNearCapVmaPagesMax = 4096; // closer than that
+
+    size_t nearCapVmaLimit() const {
+        const long headroom = vma_max_.load(std::memory_order_relaxed) -
+                              vma_estimate_.load(std::memory_order_relaxed);
+        if (headroom > cfg_vma_margin_ / 2) return kNearCapVmaPages;
+        if (headroom > cfg_vma_margin_ / 4) return kNearCapVmaPagesMid;
+        return kNearCapVmaPagesMax;
+    }
+
+    // Number of page_idx's neighbors that may share an inaccessible VMA with
+    // it. Restoring page_idx alone splits that VMA: +2 if both neighbors are
+    // in it, about +1 if one is, and 0 or fewer (a merge) if neither is.
+    int inaccessibleNeighbors(size_t page_idx) const {
+        auto maybeSameVma = [&](size_t j) {
+            PageState s = states_->get(j);
+            return s == PageState::COMPRESSED || s == PageState::ACTIVE_MONITORING;
+        };
+        int n = 0;
+        if (page_idx > 0 && maybeSameVma(page_idx - 1)) ++n;
+        if (page_idx + 1 < vm_->committedPages() && maybeSameVma(page_idx + 1)) ++n;
+        return n;
+    }
+
+    // Fault path: record `n` VMAs a single-page restore just created, and
+    // enter near-cap mode as soon as the running estimate crosses the margin.
+    void noteFaultSplits(long n) {
+        if (n <= 0) return;
+        const long at = vma_near_at_.load(std::memory_order_relaxed);
+        if (at <= 0) return;
+        if (vma_estimate_.fetch_add(n, std::memory_order_relaxed) + n >= at)
+            vma_near_cap_.store(true, std::memory_order_relaxed);
+    }
+
+#ifdef __linux__
+    // Bounds [*lo, *hi) of the VMA containing `addr`, from /proc/self/maps.
+    // Streams the file through a small buffer and parses only the
+    // "start-end " prefix of each line, so long path names don't matter.
+    static bool findVma(uintptr_t addr, uintptr_t* lo, uintptr_t* hi) {
+        int fd = static_cast<int>(syscall(SYS_openat, AT_FDCWD, "/proc/self/maps",
+                                          O_RDONLY | O_CLOEXEC));
+        if (fd < 0) return false;
+        auto hexval = [](char ch) -> int {
+            if (ch >= '0' && ch <= '9') return ch - '0';
+            if (ch >= 'a' && ch <= 'f') return ch - 'a' + 10;
+            if (ch >= 'A' && ch <= 'F') return ch - 'A' + 10;
+            return -1;
+        };
+        char buf[4096];
+        uintptr_t s = 0, e = 0;
+        int field = 0;  // 0: start, 1: end, 2: rest of line
+        bool found = false, done = false;
+        ssize_t r;
+        while (!done && (r = syscall(SYS_read, fd, buf, sizeof(buf))) > 0) {
+            for (ssize_t k = 0; k < r; ++k) {
+                const char ch = buf[k];
+                if (field == 0) {
+                    if (ch == '-') field = 1;
+                    else if (hexval(ch) >= 0) s = s * 16 + static_cast<uintptr_t>(hexval(ch));
+                } else if (field == 1) {
+                    if (ch == ' ') {
+                        if (addr >= s && addr < e) { found = true; done = true; break; }
+                        if (s > addr) { done = true; break; }  // lines are sorted
+                        field = 2;
+                    } else if (hexval(ch) >= 0) {
+                        e = e * 16 + static_cast<uintptr_t>(hexval(ch));
+                    }
+                } else if (ch == '\n') {
+                    field = 0;
+                    s = e = 0;
+                }
+            }
+        }
+        syscall(SYS_close, fd);
+        if (found) { *lo = s; *hi = e; }
+        return found;
+    }
+#endif
+
+    bool restoreWholeVma(size_t page_idx, const void* data) {
+#ifdef __linux__
+        if (self_mem_fd_ < 0) return false;
+        const size_t contig = vm_->contigPages();
+        if (page_idx >= contig) return false;  // external / tracking-mode page
+        const uintptr_t base = reinterpret_cast<uintptr_t>(vm_->base());
+        uintptr_t vlo = 0, vhi = 0;
+        if (!findVma(base + page_idx * kPageSize, &vlo, &vhi)) return false;
+        size_t lo = vlo <= base ? 0 : (vlo - base) / kPageSize;
+        size_t hi = (vhi - base + kPageSize - 1) / kPageSize;
+        if (hi > contig) hi = contig;
+        if (hi > states_->numPages()) hi = states_->numPages();
+        // Bound the work. A clamped range may still need a split; then the
+        // mprotect fails and we abort cleanly.
+        if (page_idx - lo > kMaxVmaRunPages / 2) lo = page_idx - kMaxVmaRunPages / 2;
+        if (hi - page_idx > kMaxVmaRunPages / 2) hi = page_idx + kMaxVmaRunPages / 2;
+        return restoreRange(page_idx, data, lo, hi, /*whole_vma=*/true);
+#else
+        (void)page_idx; (void)data;
+        return false;
+#endif
+    }
+
+    bool restoreNearCap(size_t page_idx, const void* data) {
+#ifdef __linux__
+        if (self_mem_fd_ < 0) return false;
+        const size_t contig = vm_->contigPages();
+        if (page_idx >= contig) return false;  // external / tracking-mode page
+        size_t end = vm_->committedPages();
+        if (end > contig) end = contig;
+        if (end > states_->numPages()) end = states_->numPages();
+        if (page_idx >= end) return false;
+        const PageState cls = states_->get(page_idx);
+        if (cls != PageState::COMPRESSED && cls != PageState::ACTIVE_MONITORING) return false;
+        const size_t limit = nearCapVmaLimit();
+        // Run of pages in the faulting page's state, scanned at most `limit`
+        // pages each way. An unlocked read: restoreRange rechecks under lock.
+        size_t l = page_idx, r = page_idx + 1;
+        while (l > 0 && page_idx - l < limit && states_->get(l - 1) == cls) --l;
+        while (r < end && r - page_idx - 1 < limit && states_->get(r) == cls) ++r;
+        const bool left_end = l == 0 || states_->get(l - 1) != cls;
+        const bool right_end = r == end || states_->get(r) != cls;
+        size_t lo, hi;
+        if (left_end && right_end && r - l - 1 <= limit) {
+            lo = l; hi = r;                                   // whole run: -2
+        } else if (left_end && (!right_end || page_idx - l <= r - 1 - page_idx)) {
+            lo = l; hi = page_idx + 1;                        // left piece: +0
+        } else if (right_end) {
+            lo = page_idx; hi = r;                            // right piece: +0
+        } else {
+            return false;  // both ends too far: no better than one page
+        }
+        if (hi - lo < 2) return false;  // nothing beyond the page itself
+        return restoreRange(page_idx, data, lo, hi, /*whole_vma=*/false);
+#else
+        (void)page_idx; (void)data;
+        return false;
+#endif
+    }
+
+#ifdef __linux__
+    // Shared body of restoreWholeVma / restoreNearCap: restore [lo, hi),
+    // which contains page_idx. See the comment above restoreWholeVma.
+    bool restoreRange(size_t page_idx, const void* data, size_t lo, size_t hi,
+                      bool whole_vma) {
+        const uintptr_t base = reinterpret_cast<uintptr_t>(vm_->base());
+        const uintptr_t addr = base + page_idx * kPageSize;
+        auto unlockOthers = [&](size_t end) {
+            for (size_t k = lo; k < end; ++k)
+                if (k != page_idx) locks_->unlock(k);
+        };
+        size_t j = lo;
+        for (; j < hi; ++j) {
+            if (j == page_idx) continue;
+            if (!locks_->tryLock(j)) break;
+            const PageState sj = states_->get(j);
+            if (sj == PageState::COMPRESSING || sj == PageState::EMPTY) {
+                locks_->unlock(j);
+                break;
+            }
+        }
+        if (j < hi) {
+            unlockOthers(j);
+            return false;
+        }
+
+        auto populate = [&](size_t k, const void* src) -> bool {
+            const char* p = static_cast<const char*>(src);
+            size_t remaining = kPageSize;
+            off_t off = static_cast<off_t>(base + k * kPageSize);
+            while (remaining > 0) {
+                ssize_t w = syscall(SYS_pwrite64, self_mem_fd_, p, remaining, off);
+                if (w <= 0) return false;
+                p += w; off += w; remaining -= static_cast<size_t>(w);
+            }
+            return true;
+        };
+        bool ok = !data || populate(page_idx, data);
+        int slot = -1;
+        for (size_t k = lo; ok && k < hi; ++k) {
+            if (k == page_idx || states_->get(k) != PageState::COMPRESSED) continue;
+            if (slot < 0 && (slot = acquireFaultSlot()) < 0) { ok = false; break; }
+            engine_->decompressWithDCtx(
+                fault_slots_[slot].dctx,
+                compressed_[k].data, fault_slots_[slot].buf,
+                compressed_[k].compressedSize(), kPageSize,
+                compressed_[k].algorithm(), lookupSizeClass(k));
+            ok = populate(k, fault_slots_[slot].buf);
+        }
+        if (slot >= 0) releaseFaultSlot(slot);
+        if (ok) {
+            ok = vm::protectPages(reinterpret_cast<void*>(base + lo * kPageSize),
+                                  (hi - lo) * kPageSize, true, true);
+        }
+        if (!ok) {
+            unlockOthers(hi);
+            return false;
+        }
+
+        // Every page in [lo, hi) is now PROT_RW with correct contents.
+        for (size_t k = lo; k < hi; ++k) {
+            if (k == page_idx) continue;
+            PageState st = states_->get(k);
+            if (st == PageState::COMPRESSED || st == PageState::COMPRESSED_SHADOW) {
+                // A shadow's blob is only valid while writes fault; the page
+                // is writable now, so the shadow is dropped too.
+                if (deferred_pending_)
+                    deferred_pending_[k].store(false, std::memory_order_release);
+                releaseBlob(k);
+                compressed_[k] = {};
+                if (page_tier_) page_tier_[k] = kTierNone;
+                states_->set(k, PageState::ACTIVE);
+                cold_count_[k] = 0;
+            } else if (st == PageState::ACTIVE_MONITORING) {
+                states_->set(k, PageState::ACTIVE);
+            }
+            locks_->unlock(k);
+        }
+        if (vma_cap_run_restores_.fetch_add(1, std::memory_order_relaxed) == 0) {
+            char buf[192];
+            int n = smash::safe_snprintf(buf, sizeof(buf),
+                "[smash WARN] near vm.max_map_count: restored %s of %zu "
+                "pages around %p instead of splitting a VMA\n",
+                whole_vma ? "whole VMA" : "run", hi - lo, reinterpret_cast<void*>(addr));
+            if (n > static_cast<int>(sizeof(buf)) - 1) n = static_cast<int>(sizeof(buf)) - 1;
+            if (n > 0) (void)!::write(2, buf, (size_t)n);
+        }
+        return true;
+    }
+#endif
+
+    // Fault path: make a page whose backing already holds its live data
+    // (ACTIVE / ACTIVE_MONITORING) writable. Caller holds the page lock.
+    // At the VMA cap (ENOMEM) the remapPages fallback is wrong twice over: it
+    // fails too (MAP_FIXED over part of a VMA also splits it), and if it ever
+    // succeeded it would replace the live page with zeros. Restore the whole
+    // VMA instead. Returns false if the page is still inaccessible.
+    // Near the cap it tries restoreNearCap first, as handleFault does for
+    // compressed pages.
+    bool makeResidentPageWritable(size_t page_idx, void* page_addr) {
+#ifdef __linux__
+        const int split = page_idx < vm_->contigPages() ? inaccessibleNeighbors(page_idx) : 0;
+        if (split > 0 && vma_near_cap_.load(std::memory_order_relaxed) &&
+            restoreNearCap(page_idx, nullptr))
+            return true;
+        if (vm::protectPages(page_addr, kPageSize, true, true)) {
+            noteFaultSplits(split);
+            return true;
+        }
+        if (errno == ENOMEM) return restoreWholeVma(page_idx, nullptr);
+#else
+        (void)page_idx;
+        if (vm::protectPages(page_addr, kPageSize, true, true)) return true;
+#endif
+        return vm::remapPages(page_addr, kPageSize, true, true);
     }
 
     // Read pagemap entries for the smash region [start, end) and OR the
@@ -3523,14 +3891,21 @@ private:
 
     // Current VMA count for this process (lines in /proc/self/maps). Linux
     // only; returns 0 elsewhere so callers treat the budget as unbounded.
+    //
+    // Raw syscalls, no stdio. The stdio version read 0 on Graviton whenever
+    // the count was high (pyheap teardown at 60K+ maps), which silently
+    // disabled every guard that uses it.
     static long readVmaCount() {
 #ifdef __linux__
-        FILE* f = fopen("/proc/self/maps", "r");
-        if (!f) return 0;
+        int fd = static_cast<int>(syscall(SYS_openat, AT_FDCWD, "/proc/self/maps",
+                                          O_RDONLY | O_CLOEXEC));
+        if (fd < 0) return 0;
         long n = 0;
         char buf[4096];
-        while (fgets(buf, sizeof(buf), f)) ++n;
-        fclose(f);
+        ssize_t r;
+        while ((r = syscall(SYS_read, fd, buf, sizeof(buf))) > 0)
+            for (ssize_t k = 0; k < r; ++k) n += buf[k] == '\n';
+        syscall(SYS_close, fd);
         return n;
 #else
         return 0;
@@ -3876,6 +4251,16 @@ private:
         const long max_map_count = vmaMaxMapCount();
         const long kVmaSafetyMargin = cfg_vma_margin_;
         vma_count_cached_ = readVmaCount();
+        // Re-anchor the fault path's estimate to the real count. Faults that
+        // race with this store lose their increments; the next tick fixes it.
+        const bool have_cap = max_map_count > 0 && vma_count_cached_ > 0;
+        vma_max_.store(have_cap ? max_map_count : 0, std::memory_order_relaxed);
+        vma_estimate_.store(vma_count_cached_, std::memory_order_relaxed);
+        vma_near_at_.store(have_cap ? max_map_count - kVmaSafetyMargin : 0,
+                           std::memory_order_relaxed);
+        vma_near_cap_.store(have_cap &&
+                                vma_count_cached_ + kVmaSafetyMargin >= max_map_count,
+                            std::memory_order_relaxed);
         if (vma_count_cached_ + kVmaSafetyMargin >= max_map_count) {
             // Can't safely fragment more VMAs — defer compression for
             // the remainder of this tick. Phase 1 (access tracking)
@@ -3985,6 +4370,18 @@ private:
 
         if (!defer_phases && isDeferredReclaimMode())
             dispatch(4);  // Phase B: reclaim confirmed-cold shadow pages
+
+        // Arm the Phase 2/3 VMA budget from a fresh count: Phase B above
+        // creates VMAs too (its own mid-loop budget reads the live count), so
+        // the tick-start count is stale whenever Phase B ran.
+        vma_budget_on_ = false;
+        if (!defer_phases && max_map_count > 0 && vma_count_cached_ > 0) {
+            const long vma_now = isDeferredReclaimMode() ? readVmaCount()
+                                                         : vma_count_cached_;
+            vma_budget_.store(max_map_count - kVmaSafetyMargin - vma_now,
+                              std::memory_order_relaxed);
+            vma_budget_on_ = true;
+        }
 
         if (!defer_phases) dispatch(2);  // Phase 2: compression
         // Phase 3 mprotects ACTIVE pages to PROT_READ for write-fault tracking.
@@ -5073,17 +5470,22 @@ public:
                     fault_slots_[slot].dctx,
                     compressed_[i].data, fault_slots_[slot].buf,
                     compressed_[i].compressedSize(), kPageSize, algo, sc);
-                restorePageContents(page_addr, fault_slots_[slot].buf);
+                bool restored = restorePageContents(page_addr, fault_slots_[slot].buf) ||
+                                restoreWholeVma(i, fault_slots_[slot].buf);
                 releaseFaultSlot(slot);
-                releaseBlob(i);
-                compressed_[i] = {};
-                if (page_tier_) page_tier_[i] = kTierNone;
-                states_->set(i, PageState::ACTIVE);
-            } else if (st == PageState::ACTIVE_MONITORING) {
-                if (!vm::protectPages(page_addr, kPageSize, true, true)) {
-                    vm::remapPages(page_addr, kPageSize, true, true);
+                // On failure (VMA cap) the page stays COMPRESSED with its
+                // blob, still served by the fault handler.
+                if (restored) {
+                    if (deferred_pending_)
+                        deferred_pending_[i].store(false, std::memory_order_release);
+                    releaseBlob(i);
+                    compressed_[i] = {};
+                    if (page_tier_) page_tier_[i] = kTierNone;
+                    states_->set(i, PageState::ACTIVE);
                 }
-                states_->set(i, PageState::ACTIVE);
+            } else if (st == PageState::ACTIVE_MONITORING) {
+                if (makeResidentPageWritable(i, page_addr))
+                    states_->set(i, PageState::ACTIVE);
             }
             locks_->unlock(i);
         }
@@ -5189,8 +5591,10 @@ public:
             // out of COMPRESSED. The per-page lock is held; the sweeper
             // tryLock+recheck will observe the cleared bit (or skip the
             // page entirely because state is no longer COMPRESSED).
+            bool was_pending = false;
             if (deferred_pending_) {
-                deferred_pending_[page_idx].store(false, std::memory_order_release);
+                was_pending = deferred_pending_[page_idx].exchange(
+                    false, std::memory_order_acq_rel);
             }
             void* page_addr = vm_->pageAddress(page_idx);
             CompressAlgo algo = compressed_[page_idx].algorithm();
@@ -5231,8 +5635,40 @@ public:
             // is still PROT_NONE (Linux /proc/self/mem fast path) and only then
             // flips it to PROT_RW. See restorePageContents() for the full
             // rationale and the fallback path.
-            restorePageContents(page_addr, fault_slots_[slot].buf);
+            //
+            // VMA cap: restoring one page in the middle of an inaccessible
+            // run splits its VMA (+2). Scattered faults (e.g. interpreter
+            // teardown freeing every object) ratchet the count to
+            // vm.max_map_count that way; past it the single-page mprotect
+            // fails. Near the cap, restore the page's run up to its nearer
+            // end (restoreNearCap: no net new VMA). At the cap, restore the
+            // whole VMA (needs no split, merges with RW neighbors).
+            const void* buf = fault_slots_[slot].buf;
+            // A page whose neighbors are both plain RW is alone in its VMA:
+            // the single-page restore merges, so skip the /proc/self/maps scan.
+            const int split = inaccessibleNeighbors(page_idx);
+            const bool near_cap = split > 0 && vma_near_cap_.load(std::memory_order_relaxed);
+            bool restored = near_cap && restoreNearCap(page_idx, buf);
+            if (!restored) {
+                restored = restorePageContents(page_addr, buf);
+                if (restored) noteFaultSplits(split);
+            }
+            if (!restored) restored = restoreWholeVma(page_idx, buf);
             releaseFaultSlot(slot);
+            if (!restored) {
+                // Could not make the page accessible (a neighbor in its VMA
+                // was busy). Leave it COMPRESSED with its blob intact so the
+                // access re-faults and retries. The old code released the
+                // blob and marked the still-inaccessible page ACTIVE, which
+                // no later fault could repair.
+                if (was_pending)
+                    deferred_pending_[page_idx].store(true, std::memory_order_release);
+                locks_->unlock(page_idx);
+#ifdef __linux__
+                syscall(SYS_sched_yield);
+#endif
+                return true;
+            }
 
             // Release compressed blob (sharded store)
             releaseBlob(page_idx);
@@ -5350,8 +5786,13 @@ public:
 
         case PageState::ACTIVE_MONITORING: {
             void* page_addr = vm_->pageAddress(page_idx);
-            if (!vm::protectPages(page_addr, kPageSize, true, true)) {
-                vm::remapPages(page_addr, kPageSize, true, true);
+            if (!makeResidentPageWritable(page_idx, page_addr)) {
+                // VMA cap, neighbor busy: stay monitored, re-fault, retry.
+                locks_->unlock(page_idx);
+#ifdef __linux__
+                syscall(SYS_sched_yield);
+#endif
+                return true;
             }
             accessed_[page_idx].store(true, std::memory_order_relaxed);
             states_->set(page_idx, PageState::ACTIVE);
@@ -5363,10 +5804,13 @@ public:
             // Race: Phase 3's batched mprotect(PROT_READ) can overwrite a
             // per-page PROT_RW restoration done by a concurrent fault handler.
             void* page_addr = vm_->pageAddress(page_idx);
-            if (!vm::protectPages(page_addr, kPageSize, true, true)) {
-                vm::remapPages(page_addr, kPageSize, true, true);
-            }
+            bool writable = makeResidentPageWritable(page_idx, page_addr);
             locks_->unlock(page_idx);
+#ifdef __linux__
+            if (!writable) syscall(SYS_sched_yield);  // VMA cap: retry
+#else
+            (void)writable;
+#endif
             return true;
         }
 
