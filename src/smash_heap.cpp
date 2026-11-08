@@ -1917,8 +1917,9 @@ int smash_tick_cost_info(uint64_t* sweep_pages, uint64_t* memread_calls, uint64_
 }
 
 // Diagnostic / test hook (not public API): compressed pages the blob store
-// refused (SMASH_BLOB_MAX_MIB, or a region it could not map) and page
-// restores that had to wait for a VMA. 0 on success, -1 without a compressor.
+// refused (SMASH_BLOB_MAX_MIB, or a region it could not map) and faults that
+// had to retry at the VMA cap (capStall: neither the page's run nor its whole
+// VMA could be restored at once). 0 on success, -1 without a compressor.
 extern "C" __attribute__((visibility("default")))
 int smash_resilience_info(uint64_t* store_fail, uint64_t* restore_retries) {
     uint64_t sf = 0, rr = 0;

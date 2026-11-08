@@ -947,6 +947,54 @@ unmapping half the fillers 300 ms later the touch completes with 21 ms of CPU
 for the waiting thread (385 ms of wall time); with nothing unmapped the child
 aborts with the message inside 8 s where the library before spun on.
 
+## At vm.max_map_count a fault could only wait for a VMA, then abort (fixed 2026-11-08, upstream #94 ported)
+
+The fix above waited for a VMA to come free and aborted after 2 s. Nothing in
+a process frees VMAs on a schedule, so at the cap that was an abort: upstream's
+`test_vma_cap` (an interpreter-teardown walk, every 3rd page of 128 MiB of
+compressed blocks, 12K VMAs below the cap) aborted on every run once the
+prefetch window was off (`SMASH_PREFETCH_WINDOW=0`) or near-cap handling was
+(a negative `SMASH_VMA_MARGIN`); with the default window it passed only because
+prefetch restored the walk contiguously. Upstream had the earlier, spinning
+variant and fixed it in #94; the port, adapted to this branch:
+
+- **Whole-VMA restore at the cap** (`restoreWholeVma`): changing the protection
+  of an entire VMA needs no split, so it succeeds at the cap and merges with
+  the RW neighbours. Every compressed page in the range is decompressed into
+  its backing through `/proc/self/mem` first, then one `mprotect`; any other
+  page's lock busy, or a page mid-compression, free, or in a unit compressed
+  whole, aborts it with nothing changed. Upstream finds the VMA in
+  `/proc/self/maps`; at this host's (and CI's) 1 048 576-map cap one read cost
+  295 ms of CPU for a single restore, so the run of inaccessible pages around
+  the fault, from page states, goes first (4-5 ms), and the maps file is read
+  only when that `mprotect` needed a split.
+- **Near the cap** (`restoreNearCap`, within `SMASH_VMA_MARGIN` by the shared
+  estimate, which now also counts the splits faults make): the faulting page's
+  run up to its nearer end comes back instead of the page alone, so a
+  teardown walk stops adding two VMAs per fault.
+- **A restore that cannot complete leaves the page as it was** — COMPRESSED
+  with its blob, its deferred-madvise bit back — and the access re-faults:
+  `capStall` yields, then sleeps 1 ms per retry, with no page lock held (the
+  old wait slept under it), and aborts with a FATAL line after 2 s without
+  progress. Upstream retries for ever.
+- **`remapPages` no longer backs up a failed `mprotect` of a live page**
+  (`makeResidentPageWritable`, ACTIVE and watched pages): at the cap it fails
+  too, and anywhere it succeeds it replaces the live page with zeros. On ENOMEM
+  the whole VMA is restored instead.
+- **`restoreUnit`**: a page of a whole unit that could not be made accessible
+  was released with the rest; it now keeps its blob and its state.
+- **A VMA budget for Phases 2 and 3 within a tick** (`chargeVmaBudget`), armed
+  from the shared estimate after Phase B: before, only the tick-start check
+  bounded them.
+- **`readVmaCount` uses raw syscalls**: upstream found the stdio version read 0
+  at high counts on Graviton (stdio buffers on watched pages), which turned
+  every VMA guard off. Not measured here, where stdio buffers come from the
+  system allocator, but `fopen`'s `FILE` still came from the managed heap.
+
+`test_vma_cap{,_no_prefetch,_at_cap}` and a rewritten `test_vma_exhaust`
+([tests.md](tests.md)) guard it; the library before the port fails the
+variants and the at-cap and stall cases.
+
 ## A stack overflow never reached an application's alternate-stack handler (fixed 2026-10-29)
 
 smash's handler was installed without `SA_ONSTACK` (deliberately: alternate

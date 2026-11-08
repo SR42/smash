@@ -518,6 +518,56 @@ else()
 endif()
 set_tests_properties(test_arena_routing PROPERTIES TIMEOUT 30)
 
+# vm.max_map_count regression guard (#94): with the process held 12K VMAs
+# below the cap (the test uses them up itself; no root), a teardown-like
+# stride walk over 128 MiB of compressed large blocks must neither hang nor
+# return wrong data. Linux only (no VMA cap elsewhere). The test exits 77
+# (skipped) if the cap is too large to approach quickly.
+if(NOT APPLE)
+  add_executable(vma_cap_test vma_cap_test.cpp)
+  set_target_properties(vma_cap_test PROPERTIES CXX_STANDARD 20)
+  add_test(
+    NAME test_vma_cap
+    COMMAND ${CMAKE_COMMAND} -E env
+      "LD_PRELOAD=$<TARGET_FILE:smash>"
+      "SMASH_LARGE_ONLY=1"
+      "SMASH_DEFER_PHASES_MS=0"
+      "SMASH_COLD_TIMEOUT_SEC=1"
+      $<TARGET_FILE:vma_cap_test>
+  )
+  # Here test_vma_cap alone does not reach the cap: the default prefetch
+  # window (2 pages each side) restores a stride-3 walk contiguously, and the
+  # VMA count never rises. The two variants below are what fail on this
+  # branch's pre-#94 code (an abort after its 2 s wait for a VMA, 3 of 3
+  # each): no_prefetch restores one page per fault, so near-cap run restores
+  # (restoreNearCap) carry the walk; at_cap also turns near-cap mode off
+  # (a negative margin), so single-page restores reach the cap and the
+  # whole-VMA restore (restoreWholeVma) carries it.
+  add_test(
+    NAME test_vma_cap_no_prefetch
+    COMMAND ${CMAKE_COMMAND} -E env
+      "LD_PRELOAD=$<TARGET_FILE:smash>"
+      "SMASH_LARGE_ONLY=1"
+      "SMASH_DEFER_PHASES_MS=0"
+      "SMASH_COLD_TIMEOUT_SEC=1"
+      "SMASH_PREFETCH_WINDOW=0"
+      $<TARGET_FILE:vma_cap_test>
+  )
+  add_test(
+    NAME test_vma_cap_at_cap
+    COMMAND ${CMAKE_COMMAND} -E env
+      "LD_PRELOAD=$<TARGET_FILE:smash>"
+      "SMASH_LARGE_ONLY=1"
+      "SMASH_DEFER_PHASES_MS=0"
+      "SMASH_COLD_TIMEOUT_SEC=1"
+      "SMASH_PREFETCH_WINDOW=0"
+      "SMASH_VMA_MARGIN=-100000"
+      $<TARGET_FILE:vma_cap_test>
+  )
+  set_tests_properties(test_vma_cap test_vma_cap_no_prefetch test_vma_cap_at_cap
+    PROPERTIES TIMEOUT 150 SKIP_RETURN_CODE 77)
+endif()
+
 # Per-thread state in a TSD slot (macOS SMASH_TSD_SLOT): ThreadStates are
 # reclaimed and reused across thousands of short-lived threads, GCD workers and
 # allocating app destructors work, fork() keeps the free list usable. Skips
@@ -810,7 +860,8 @@ if(NOT APPLE)
 endif()
 
 # Restoring a compressed page at vm.max_map_count (tests/vma_exhaust_test.cpp):
-# wait for a VMA, then abort with a message rather than spin.
+# the whole VMA comes back at once; a restore a held page lock blocks waits
+# without spinning, and aborts with a message after 2 s rather than spin.
 if(NOT APPLE)
   add_executable(vma_exhaust_test vma_exhaust_test.cpp)
   target_link_libraries(vma_exhaust_test PRIVATE ${CMAKE_DL_LIBS} Threads::Threads)
