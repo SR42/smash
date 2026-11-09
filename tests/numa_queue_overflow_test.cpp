@@ -67,10 +67,10 @@ int main(int, char** argv) {
         cpu_set_t node0, allowed0;
         if (!nodeCpus(0, &node0) || sched_getaffinity(0, sizeof allowed0, &allowed0) != 0) {
             std::printf("numa_queue_overflow: SKIP (no node 0 with CPUs)\n");
-            return 0;
+            return 77;
         }
         CPU_AND(&node0, &node0, &allowed0);
-        if (CPU_COUNT(&node0) == 0) { std::printf("numa_queue_overflow: SKIP (node 0's CPUs are not in the affinity mask)\n"); return 0; }
+        if (CPU_COUNT(&node0) == 0) { std::printf("numa_queue_overflow: SKIP (node 0's CPUs are not in the affinity mask)\n"); return 77; }
         if (sched_setaffinity(0, sizeof node0, &node0) != 0) { perror("sched_setaffinity"); return 1; }
         setenv("NUMA_QUEUE_OVERFLOW_PINNED", "1", 1);
         execv("/proc/self/exe", argv);
@@ -86,11 +86,11 @@ int main(int, char** argv) {
     if (!page_info || !blob_for || !route) { std::fprintf(stderr, "FAIL: diagnostic exports missing\n"); return 1; }
 
     cpu_set_t node1, allowed;
-    if (!nodeCpus(1, &node1)) { std::printf("numa_queue_overflow: SKIP (no node 1 with CPUs)\n"); return 0; }
+    if (!nodeCpus(1, &node1)) { std::printf("numa_queue_overflow: SKIP (no node 1 with CPUs)\n"); return 77; }
     if (sched_getaffinity(0, sizeof allowed, &allowed) != 0) return 1;   // node 0: where the workers run
     if (sched_setaffinity(0, sizeof node1, &node1) != 0) {
         std::printf("numa_queue_overflow: SKIP (cannot run on node 1's CPUs: %s)\n", std::strerror(errno));
-        return 0;
+        return 77;
     }
 
     const size_t ps = static_cast<size_t>(sysconf(_SC_PAGESIZE));
@@ -112,7 +112,7 @@ int main(int, char** argv) {
     for (size_t i = 0; i < pages; ++i) on1 += status[i] == 1;
     if (on1 < pages * 9 / 10) {
         std::printf("numa_queue_overflow: SKIP (only %zu of %zu pages landed on node 1)\n", on1, pages);
-        return 0;
+        return 77;
     }
 
     uint64_t q0 = 0, f0 = 0;

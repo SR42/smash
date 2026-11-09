@@ -2091,3 +2091,30 @@ set_target_properties(span_descriptor_race_test PROPERTIES CXX_STANDARD 20)
 target_link_libraries(span_descriptor_race_test PRIVATE Threads::Threads)
 add_smash_mode_test(test_span_descriptor_race_full span_descriptor_race_test 0 300)
 add_smash_mode_test(test_span_descriptor_race_large_only span_descriptor_race_test 1 300)
+
+# ── Skips and the preload fixture (issue #12) ────────────────────────────────
+# Must stay at the end of this file: it applies to every test registered above.
+#
+# Exit 77 is a skip, for every test: ctest reports it as skipped, not passed.
+# A test exits 77 only when the host cannot run it (no root, one NUMA node, no
+# youngtrace module, ...) or when its scenario did not arise; never on the
+# symptom it guards, and never because libsmash is missing. Until 2026-11-09
+# every skip returned 0: the unprivileged suite's "247 passed" held 24 skips,
+# one of them (test_large_free_span_cache) a test that had not run its
+# scenario since the upstream merge.
+#
+# test_libsmash_loads fails when the preloaded libsmash is missing or is not
+# this build's, and every other test requires it: with it failing, ctest runs
+# none of them and reports them as not run. The direct-linked unit tests do
+# not need the preload, but a tree whose libsmash does not load is broken
+# whatever the test. A preloaded test that finds no libsmash in its process
+# fails on its own as well ("FAIL: not running under libsmash").
+add_executable(libsmash_loads_test libsmash_loads_test.cpp)
+target_link_libraries(libsmash_loads_test PRIVATE ${CMAKE_DL_LIBS})
+add_smash_mode_test(test_libsmash_loads libsmash_loads_test 0 30
+  "SMASH_TEST_EXPECT_LIB=$<TARGET_FILE:smash>")
+get_property(_smash_all_tests DIRECTORY PROPERTY TESTS)
+set_tests_properties(${_smash_all_tests} PROPERTIES SKIP_RETURN_CODE 77)
+list(REMOVE_ITEM _smash_all_tests test_libsmash_loads)
+set_tests_properties(test_libsmash_loads PROPERTIES FIXTURES_SETUP libsmash)
+set_tests_properties(${_smash_all_tests} PROPERTIES FIXTURES_REQUIRED libsmash)

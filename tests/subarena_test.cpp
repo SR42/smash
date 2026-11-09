@@ -479,7 +479,7 @@ int main() {
     g_shared_info = reinterpret_cast<shared_info_fn>(dlsym(RTLD_DEFAULT, "smash_shared_arena_info"));
     const char* pl = std::getenv("SUBARENA_TEST_PLAIN");
     plain = pl && pl[0] == '1';
-    if (!g_numa || !g_arena_info) { std::printf("SKIP: not running under libsmash\n"); return 0; }
+    if (!g_numa || !g_arena_info) { std::fprintf(stderr, "FAIL: not running under libsmash\n"); return 1; }
     const char* v = std::getenv("SMASH_SUBARENAS");
     on = v && v[0] == '1';
     const char* cap = std::getenv("SMASH_DIRTY_MAX_MIB");
@@ -491,17 +491,17 @@ int main() {
     if (!g_info) fail("smash_subarena_info is not exported");
 
     const std::vector<int> nodes = numa_test::memoryNodes();
-    if (nodes.empty()) { std::printf("SKIP: no memory nodes\n"); return 0; }
+    if (nodes.empty()) { std::printf("SKIP: no memory nodes\n"); return 77; }
     node0 = nodes[0];
     errno = 0;
     void* probe = g_numa(static_cast<uint32_t>(node0), ps);
     if (!probe && (errno == EPERM || errno == ENOSYS)) {
         std::printf("SKIP: mbind refused\n");
-        return 0;
+        return 77;
     }
     free(probe);
     const std::vector<int> cpus = node0Cpus();
-    if (cpus.empty()) { std::printf("SKIP: no usable CPU on node %d\n", node0); return 0; }
+    if (cpus.empty()) { std::printf("SKIP: no usable CPU on node %d\n", node0); return 77; }
     const bool two = cpus.size() >= 2;
 
     std::printf("1. reuse at a different size\n");

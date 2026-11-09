@@ -208,7 +208,7 @@ static void runLinux(numa_fn numa, arena_fn arena_for) {
     void* probe = numa(static_cast<uint32_t>(nodes.front()), 1);
     if (!probe && (errno == ENOSYS || errno == EPERM)) {
         printf("SKIP: mbind unavailable (errno=%d %s)\n", errno, strerror(errno));
-        exit(0);
+        exit(77);
     }
     free(probe);
 
@@ -430,8 +430,8 @@ int main() {
     auto numa = reinterpret_cast<numa_fn>(dlsym(RTLD_DEFAULT, "malloc_numa"));
     auto arena_for = reinterpret_cast<arena_fn>(dlsym(RTLD_DEFAULT, "smash_arena_for"));
     if (!numa || !arena_for) {
-        printf("SKIP: malloc_numa not found (not running under libsmash)\n");
-        return 0;
+        fprintf(stderr, "FAIL: malloc_numa not found (not running under libsmash)\n");
+        return 1;
     }
     if (const char* e = getenv("MALLOC_NUMA_EXPECT_ENOTSUP"); e && e[0] == '1')
         return runNotSupported(numa);

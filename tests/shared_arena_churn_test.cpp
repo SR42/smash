@@ -254,8 +254,8 @@ int main() {
     setvbuf(stdout, nullptr, _IONBF, 0);
     g_in_arena = reinterpret_cast<in_arena_fn>(dlsym(RTLD_DEFAULT, "smash_in_arena"));
     if (!g_in_arena) {
-        std::printf("SKIP: smash_in_arena not found (not running under libsmash)\n");
-        return 0;
+        std::fprintf(stderr, "FAIL: smash_in_arena not found (not running under libsmash)\n");
+        return 1;
     }
     const char* lo = std::getenv("SMASH_LARGE_ONLY");
     const bool large_only = (lo && lo[0] == '1');
@@ -270,7 +270,7 @@ int main() {
             std::printf("SKIP: phase B needs full mode — a 256-byte allocation goes to "
                         "the system allocator in large-only, so the arena never fills "
                         "with slab spans\n");
-            return 0;
+            return 77;
         }
         phaseB();
     } else {

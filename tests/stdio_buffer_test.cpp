@@ -100,7 +100,7 @@ int child(const char* fn) {
 int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
     if (argc > 1) return child(argv[1]);
-    if (!dlsym(RTLD_DEFAULT, "smash_in_arena")) { std::printf("SKIP: not running under libsmash\n"); return 0; }
+    if (!dlsym(RTLD_DEFAULT, "smash_in_arena")) { std::fprintf(stderr, "FAIL: not running under libsmash\n"); return 1; }
     const char* fns[] = {"fgets", "getline", "getdelim", "fscanf", "getc_unlocked", "fgets_unlocked",
                          "fread_unlocked"};
     // Run the children in parallel: each spends ~5 s waiting.

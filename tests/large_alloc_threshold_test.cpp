@@ -86,7 +86,7 @@ void check(const char* label, size_t size, bool want_arena) {
 int main() {
     setvbuf(stdout, nullptr, _IONBF, 0);
     in_arena = reinterpret_cast<InArenaFn>(dlsym(RTLD_DEFAULT, "smash_in_arena"));
-    if (!in_arena) { std::printf("SKIP: not running under libsmash\n"); return 0; }
+    if (!in_arena) { std::fprintf(stderr, "FAIL: not running under libsmash\n"); return 1; }
 
     const size_t t = effectiveThreshold();
     std::printf("large_alloc_threshold_test: effective threshold %zu B\n", t);

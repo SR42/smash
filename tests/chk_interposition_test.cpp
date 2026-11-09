@@ -53,8 +53,8 @@ int main() {
     setvbuf(stdout, nullptr, _IONBF, 0);
     // Is smash even loaded? Without it, every symbol legitimately belongs to libc.
     if (!dlsym(RTLD_DEFAULT, "smash_in_arena")) {
-        std::printf("SKIP: not running under libsmash\n");
-        return 0;
+        std::fprintf(stderr, "FAIL: not running under libsmash\n");
+        return 1;
     }
 #if defined(__GLIBC__) && defined(__USE_FORTIFY_LEVEL) && __USE_FORTIFY_LEVEL > 0
     expectOwnedBySmash("__read_chk",       reinterpret_cast<void*>(&__read_chk));
@@ -73,7 +73,7 @@ int main() {
     expectOwnedBySmash("__fread_chk",      reinterpret_cast<void*>(&__fread_chk));
 #else
     std::printf("SKIP: _FORTIFY_SOURCE declarations unavailable; nothing to check\n");
-    return 0;
+    return 77;
 #endif
     if (failures) {
         std::printf("chk_interposition_test: %d FAILURES\n", failures);

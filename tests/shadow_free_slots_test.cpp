@@ -42,8 +42,8 @@ int main() {
     setvbuf(stdout, nullptr, _IONBF, 0);
     const PageInfoFn page_info = pageInfoFn();
     if (!page_info) {
-        std::printf("SKIP: not running under libsmash\n");
-        return 0;
+        std::fprintf(stderr, "FAIL: not running under libsmash\n");
+        return 1;
     }
     std::vector<unsigned char*> objs(kCount);
     for (size_t k = 0; k < kCount; ++k) {

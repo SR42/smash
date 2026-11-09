@@ -75,7 +75,7 @@ int main() {
     }
     if (!policyIsMadvise()) {
         std::printf("SKIP: host THP policy is not [madvise]; the off-case cannot be distinguished\n");
-        return 0;
+        return 77;
     }
     const char* env = std::getenv("SMASH_THP");
     const bool want_thp = env && env[0] == '1';

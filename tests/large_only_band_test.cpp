@@ -63,7 +63,7 @@ static double faultsPerCycle(size_t size, Alloc alloc) {
 
 int main() {
     in_arena = reinterpret_cast<InArena>(dlsym(RTLD_DEFAULT, "smash_in_arena"));
-    if (!in_arena) { std::printf("SKIP: not running under libsmash\n"); return 0; }
+    if (!in_arena) { std::fprintf(stderr, "FAIL: not running under libsmash\n"); return 1; }
     const char* e = std::getenv("BAND_EXPECT");
     const std::string expect = e ? e : "system";
 

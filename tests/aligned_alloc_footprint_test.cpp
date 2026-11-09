@@ -146,7 +146,7 @@ int main() {
 
     if (getCurrentRSSBytes() == 0) {
         printf("SKIP: RSS sampling unavailable on this platform\n");
-        return 0;
+        return 77;
     }
 
     std::vector<void*> live;

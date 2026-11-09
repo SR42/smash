@@ -156,10 +156,10 @@ void writeCase(const char* name, Call call) {
 }  // namespace
 
 int main() {
-    if (!dlsym(RTLD_DEFAULT, "smash_in_arena")) { std::printf("SKIP: not running under libsmash\n"); return 0; }
+    if (!dlsym(RTLD_DEFAULT, "smash_in_arena")) { std::fprintf(stderr, "FAIL: not running under libsmash\n"); return 1; }
     g_ps = static_cast<size_t>(sysconf(_SC_PAGESIZE));
     const int src = makeFile(true);
-    if (src < 0) { std::printf("SKIP: could not create the source file\n"); return 0; }
+    if (src < 0) { std::printf("SKIP: could not create the source file\n"); return 77; }
 
     readCase("read", src, [&](unsigned char* b) {
         lseek(src, 0, SEEK_SET);

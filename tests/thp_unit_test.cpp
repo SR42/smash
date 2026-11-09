@@ -181,7 +181,7 @@ bool waitOut(const char* p, size_t len, size_t max_pages, int seconds) {
 }
 
 // Root, the bitmap, the idle tracker running, and a block that really got huge
-// pages. 0 = go, 1 = fail, 2 = skip (printed).
+// pages. 0 = go, 1 = fail, 2 = skip (printed; the part exits 77).
 // `lead`: the 2 MiB before `a` is part of the block too, on 4 KiB pages
 // (MADV_NOHUGEPAGE), so it is compressed page by page next to unit 0.
 int prepare(char*& a, size_t units, uint64_t salt, void** block = nullptr, bool lead = false) {
@@ -191,7 +191,7 @@ int prepare(char*& a, size_t units, uint64_t salt, void** block = nullptr, bool 
     }
     using TrackFn = const char* (*)();
     auto track = reinterpret_cast<TrackFn>(dlsym(RTLD_DEFAULT, "smash_write_tracker"));
-    if (!track) { std::printf("SKIP: not running under libsmash\n"); return 2; }
+    if (!track) { std::fprintf(stderr, "FAIL: not running under libsmash\n"); return 1; }
     void* blk = std::malloc(units * kUnit + (lead ? 2 : 1) * kUnit);
     CHECK(blk, "malloc");
     a = alignUnit(blk) + (lead ? kUnit : 0);
@@ -221,7 +221,7 @@ int partUnit() {
     const bool split = expectSplit();
     char* a = nullptr;
     void* blk = nullptr;
-    if (int r = prepare(a, kUnits, 1, &blk, true)) return r == 2 ? 0 : 1;
+    if (int r = prepare(a, kUnits, 1, &blk, true)) return r == 2 ? 77 : 1;
 
     CHECK(waitOut(a, kLen, 64, 120), "the block never left RSS: %zu of %zu pages resident",
           resident(a, kLen), kLen / kPage);
@@ -353,7 +353,7 @@ int partMixed() {
     // page read every 200 ms. Units 7..10: plain.
     constexpr size_t kUnits = 11;
     char* a = nullptr;
-    if (int r = prepare(a, kUnits, 2)) return r == 2 ? 0 : 1;
+    if (int r = prepare(a, kUnits, 2)) return r == 2 ? 77 : 1;
     uint64_t x = 88172645463325252ull;
     auto rnd = [&] { x ^= x << 13; x ^= x >> 7; x ^= x << 17; return x; };
     std::vector<uint64_t> saved;
@@ -414,7 +414,7 @@ int partMixed() {
 int partSyscall() {
     constexpr size_t kUnits = 8, kLen = kUnits * kUnit;
     char* a = nullptr;
-    if (int r = prepare(a, kUnits, 3)) return r == 2 ? 0 : 1;
+    if (int r = prepare(a, kUnits, 3)) return r == 2 ? 77 : 1;
     CHECK(waitOut(a, kLen, 64, 120), "the block never left RSS");
     printCounts("cold");
     char path[] = "/tmp/thp_unit_XXXXXX";
@@ -461,7 +461,7 @@ int partSyscall() {
 int partFork() {
     constexpr size_t kUnits = 8, kLen = kUnits * kUnit;
     char* a = nullptr;
-    if (int r = prepare(a, kUnits, 4)) return r == 2 ? 0 : 1;
+    if (int r = prepare(a, kUnits, 4)) return r == 2 ? 77 : 1;
     CHECK(waitOut(a, kLen, 64, 120), "the block never left RSS");
     printCounts("cold");
     const long fb0 = thpFallbacks();
@@ -488,7 +488,7 @@ int partShrink() {
     constexpr size_t kUnits = 16, kLen = kUnits * kUnit;
     char* a = nullptr;
     void* blk = nullptr;
-    if (int r = prepare(a, kUnits, 5, &blk)) return r == 2 ? 0 : 1;
+    if (int r = prepare(a, kUnits, 5, &blk)) return r == 2 ? 77 : 1;
     CHECK(waitOut(a, kLen, 64, 120), "the block never left RSS");
     printCounts("cold");
     // Keep the block up to the middle of unit 4.

@@ -519,15 +519,15 @@ int main() {
     auto info = reinterpret_cast<info_fn>(dlsym(RTLD_DEFAULT, "smash_numa_compressor_info"));
     auto blob = reinterpret_cast<blob_fn>(dlsym(RTLD_DEFAULT, "smash_compressed_blob_for"));
     if (!numa || !info || !blob) {
-        printf("SKIP: NUMA exports not found (not running under libsmash)\n");
-        return 0;
+        fprintf(stderr, "FAIL: NUMA exports not found (not running under libsmash)\n");
+        return 1;
     }
 
 #if defined(__linux__)
-    if (runLinux(numa, info, blob)) return 0;
+    if (runLinux(numa, info, blob)) return 77;
 #else
     printf("SKIP: NUMA compressor groups are Linux only\n");
-    return 0;
+    return 77;
 #endif
 
     if (g_failures) {

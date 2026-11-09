@@ -143,15 +143,15 @@ int countFds() {
 
 int main() {
     setvbuf(stdout, nullptr, _IONBF, 0);   // keep partial output if a case hangs
-    if (!dlsym(RTLD_DEFAULT, "smash_in_arena")) { std::printf("SKIP: not running under libsmash\n"); return 0; }
+    if (!dlsym(RTLD_DEFAULT, "smash_in_arena")) { std::fprintf(stderr, "FAIL: not running under libsmash\n"); return 1; }
     g_ps = static_cast<size_t>(sysconf(_SC_PAGESIZE));
     char path[] = "/tmp/smash_dgram_XXXXXX";
     g_probe = mkstemp(path);
-    if (g_probe < 0) { std::printf("SKIP: mkstemp\n"); return 0; }
+    if (g_probe < 0) { std::printf("SKIP: mkstemp\n"); return 77; }
     unlink(path);
     {
         static unsigned char z[1 << 16];
-        if (::syscall(SYS_pwrite64, g_probe, z, sizeof(z), 0) != sizeof(z)) { std::printf("SKIP: probe file\n"); return 0; }
+        if (::syscall(SYS_pwrite64, g_probe, z, sizeof(z), 0) != sizeof(z)) { std::printf("SKIP: probe file\n"); return 77; }
     }
 
     // recvmmsg / sendmmsg at the versions callers bind.

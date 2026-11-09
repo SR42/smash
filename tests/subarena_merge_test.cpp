@@ -42,7 +42,7 @@ static bool waitNoDirty(int ms) {
 
 int main() {
     info = reinterpret_cast<Info>(dlsym(RTLD_DEFAULT, "smash_subarena_info"));
-    if (!info) { std::printf("SKIP: not running under libsmash\n"); return 0; }
+    if (!info) { std::fprintf(stderr, "FAIL: not running under libsmash\n"); return 1; }
     // One CPU, so one sub-arena serves every block below.
     cpu_set_t set;
     CPU_ZERO(&set);

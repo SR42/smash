@@ -59,7 +59,7 @@ double residentFraction(unsigned char* p, size_t bytes) {
 int main() {
     setvbuf(stdout, nullptr, _IONBF, 0);
     in_arena = reinterpret_cast<InArenaFn>(dlsym(RTLD_DEFAULT, "smash_in_arena"));
-    if (!in_arena) { std::printf("SKIP: not running under libsmash\n"); return 0; }
+    if (!in_arena) { std::fprintf(stderr, "FAIL: not running under libsmash\n"); return 1; }
     const char* env = std::getenv("SMASH_MID_BINS");
     bins_on = env && env[0] == '1';
     std::printf("mid_bins_test: SMASH_MID_BINS=%s\n", bins_on ? "1" : "(unset)");

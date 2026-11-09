@@ -237,17 +237,17 @@ unsigned long long ytSlicePages() {
 }  // namespace
 
 int main() {
-    if (!dlsym(RTLD_DEFAULT, "smash_in_arena")) { std::printf("SKIP: not running under libsmash\n"); return 0; }
+    if (!dlsym(RTLD_DEFAULT, "smash_in_arena")) { std::fprintf(stderr, "FAIL: not running under libsmash\n"); return 1; }
     const char* part_env = std::getenv("IDLE_PART");
     const std::string part = part_env ? part_env : "tracker";
     if (part == "tracker" && !trackerUsable()) {
         std::printf("SKIP: needs root and %s\n",
                     yt() ? "the youngtrace module (/dev/youngtrace/scanner)" : "/sys/kernel/mm/page_idle/bitmap");
-        return 0;
+        return 77;
     }
     char path[] = "/tmp/smash_idletrack_XXXXXX";
     g_log = mkstemp(path);
-    if (g_log < 0) { std::printf("SKIP: mkstemp failed\n"); return 0; }
+    if (g_log < 0) { std::printf("SKIP: mkstemp failed\n"); return 77; }
     unlink(path);
     const int saved = dup(2);
     dup2(g_log, 2);
@@ -274,7 +274,7 @@ int main() {
         if (huge < 16 * 1024) {
             dup2(saved, 2);
             std::printf("SKIP: the arena holds no huge pages (THP off on this host?)\n");
-            return 0;
+            return 77;
         }
     }
 

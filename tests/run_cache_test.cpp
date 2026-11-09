@@ -249,8 +249,8 @@ void phaseBound() {
 int main() {
     setvbuf(stdout, nullptr, _IONBF, 0);
     if (!dlsym(RTLD_DEFAULT, "smash_in_arena")) {
-        std::printf("SKIP: not running under libsmash\n");
-        return 0;
+        std::fprintf(stderr, "FAIL: not running under libsmash\n");
+        return 1;
     }
     g_numa = reinterpret_cast<numa_fn>(dlsym(RTLD_DEFAULT, "malloc_numa"));
     g_info = reinterpret_cast<info_fn>(dlsym(RTLD_DEFAULT, "smash_run_cache_info"));

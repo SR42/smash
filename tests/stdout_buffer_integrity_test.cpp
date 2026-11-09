@@ -215,7 +215,7 @@ int main(int argc, char** argv) {
     else if (argc > 0) { std::snprintf(exe, sizeof(exe), "%s", argv[0]); }
     else {
         printf("SKIP: cannot resolve own executable path to re-exec\n");
-        return 0;
+        return 77;
     }
 
     char path[] = "/tmp/smash-stdout-integrity-XXXXXX";

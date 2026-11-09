@@ -51,6 +51,7 @@
 #include <dlfcn.h>
 #include <new>
 #include <string>
+#include <sys/mman.h>
 #include <unistd.h>
 #include <vector>
 
@@ -222,9 +223,9 @@ int runNumaMode(bool aligned) {
         reinterpret_cast<MallocNumaAligned>(dlsym(RTLD_DEFAULT, "malloc_numa_aligned"));
     auto in_arena = reinterpret_cast<InArena>(dlsym(RTLD_DEFAULT, "smash_in_arena"));
     if (!malloc_numa || !malloc_numa_aligned || !in_arena) {
-        printf("SKIP: malloc_numa / malloc_numa_aligned / smash_in_arena not exported (libsmash not "
-               "interposed)\n");
-        return 0;
+        fprintf(stderr, "FAIL: malloc_numa / malloc_numa_aligned / smash_in_arena not exported (libsmash not "
+                "interposed)\n");
+        return 1;
     }
     const char* fn = aligned ? "malloc_numa_aligned" : "malloc_numa";
 
@@ -351,7 +352,17 @@ int runTooBigMode() {
         void* p = nullptr;
         const std::string err = captureStderr([&] { p = do_malloc(kBig); });
         if (!p) {
-            printf("SKIP (plain): the host refused malloc(2 GiB)\n");
+            // Only a host that refuses the mapping itself has nothing to
+            // check: nullptr where the host maps 2 GiB is the bad_alloc
+            // defect. The probe reserves its memory (no MAP_NORESERVE), so it
+            // is stricter than smash's fallback mapping.
+            void* raw = mmap(nullptr, kBig, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (raw == MAP_FAILED) {
+                printf("SKIP (plain): the host refused a 2 GiB mapping (errno %d)\n", errno);
+            } else {
+                munmap(raw, kBig);
+                CHECK(false, "malloc(2 GiB) returned nullptr, but the host maps 2 GiB");
+            }
         } else {
             const size_t warnings = countOf(err, "did not fit the compressible arena");
             CHECK(warnings == 1, "%zu 'did not fit' warnings for a 2 GiB malloc, want 1", warnings);
@@ -376,9 +387,9 @@ int runTooBigMode() {
     auto in_arena = reinterpret_cast<InArena>(dlsym(RTLD_DEFAULT, "smash_in_arena"));
     auto arena_info = reinterpret_cast<ArenaInfo>(dlsym(RTLD_DEFAULT, "smash_numa_arena_info"));
     if (!malloc_numa || !malloc_numa_aligned || !in_arena || !arena_info) {
-        printf("SKIP (numa): malloc_numa / malloc_numa_aligned / smash_in_arena / smash_numa_arena_info "
-               "not exported (libsmash not interposed)\n");
-        return failures ? 1 : 0;
+        fprintf(stderr, "FAIL (numa): malloc_numa / malloc_numa_aligned / smash_in_arena / smash_numa_arena_info "
+                "not exported (libsmash not interposed)\n");
+        return 1;
     }
     // Two whole chunks; free the one whose range holds no 2 GiB boundary (at
     // most one of two neighbours does), so its free run cannot place the block.
@@ -455,7 +466,7 @@ int main() {
     if (strictOvercommit()) {
         printf("SKIP: vm.overcommit_memory=2 (strict) — a 1.5 GiB reservation "
                "can fail for reasons unrelated to smash\n");
-        return 0;
+        return 77;
     }
     if (const char* e = std::getenv("VM_EXHAUST_TOO_BIG"); e && e[0] == '1') return runTooBigMode();
     if (const char* e = std::getenv("VM_EXHAUST_NUMA")) {
@@ -464,7 +475,7 @@ int main() {
         if (strcmp(e, "aligned") == 0) return runNumaMode(true);
 #else
         printf("SKIP: VM_EXHAUST_NUMA=%s needs Linux (without NUMA, malloc_numa is plain malloc)\n", e);
-        return 0;
+        return 77;
 #endif
     }
 

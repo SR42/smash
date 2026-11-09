@@ -90,8 +90,8 @@ int main() {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     arena_for = reinterpret_cast<arena_fn>(dlsym(RTLD_DEFAULT, "smash_arena_for"));
     if (!arena_for) {
-        std::printf("SKIP: smash_arena_for not found (not running under libsmash)\n");
-        return 0;
+        std::fprintf(stderr, "FAIL: smash_arena_for not found (not running under libsmash)\n");
+        return 1;
     }
     const char* na = std::getenv("SMASH_NUM_ARENAS");
     std::printf("SMASH_NUM_ARENAS=%s\n", na ? na : "(default)");

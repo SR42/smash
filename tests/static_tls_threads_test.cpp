@@ -18,6 +18,7 @@
 // the coordinator unable to start, nothing ever ticks and it never does. (A
 // thread count is not enough: on a multi-node host the NUMA group workers,
 // which have larger stacks, started even when the coordinator did not.)
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -45,7 +46,7 @@ int main() {
     g_big_tls[0] = 1;  // keep the TLS block referenced
     if (sysconf(_SC_PAGESIZE) != static_cast<long>(kPage)) {
         printf("SKIP: this check assumes 4 KiB pages\n");
-        return 0;
+        return 77;
     }
     char* p = static_cast<char*>(malloc(kBytes));
     if (!p) { fprintf(stderr, "FAIL: malloc(16 MiB) returned nullptr\n"); return 1; }
@@ -55,7 +56,7 @@ int main() {
     for (int t = 0; t < 40 && frac > 0.5; ++t) {   // up to 20 s
         usleep(500000);
         frac = residentFraction(p, kBytes);
-        if (frac < 0) { printf("SKIP: mincore failed\n"); return 0; }
+        if (frac < 0) { fprintf(stderr, "FAIL: mincore failed on the block (%s)\n", strerror(errno)); return 1; }
     }
     if (frac > 0.5) {
         fprintf(stderr,

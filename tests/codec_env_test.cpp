@@ -240,7 +240,7 @@ bool near(size_t a, size_t b) { return a * 10 <= b * 11 && b * 10 <= a * 11; }
 
 int main(int argc, char** argv) {
     if (argc > 1 && std::strcmp(argv[1], "child") == 0) return child();
-    if (!dlsym(RTLD_DEFAULT, "smash_in_arena")) { std::printf("SKIP: not running under libsmash\n"); return 0; }
+    if (!dlsym(RTLD_DEFAULT, "smash_in_arena")) { std::fprintf(stderr, "FAIL: not running under libsmash\n"); return 1; }
     char self[PATH_MAX];
     const ssize_t n = readlink("/proc/self/exe", self, sizeof(self) - 1);
     if (n <= 0) return 1;

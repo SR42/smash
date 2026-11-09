@@ -91,7 +91,7 @@ int main() {
            cap, start);
     if (start < 0) {
         printf("SKIP: /proc/self/maps unreadable\n");
-        return 0;
+        return 77;
     }
 
     long peak = start;
@@ -228,7 +228,7 @@ int main() {
 
 int main() {
     printf("SKIP: vm.max_map_count and /proc/self/maps are Linux-only\n");
-    return 0;
+    return 77;
 }
 
 #endif

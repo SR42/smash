@@ -76,10 +76,10 @@ void show(const char* when, const Dump& d) {
 }  // namespace
 
 int main() {
-    if (!dlsym(RTLD_DEFAULT, "smash_in_arena")) { std::printf("SKIP: not running under libsmash\n"); return 0; }
+    if (!dlsym(RTLD_DEFAULT, "smash_in_arena")) { std::fprintf(stderr, "FAIL: not running under libsmash\n"); return 1; }
     char path[] = "/tmp/smash_blobrss_XXXXXX";
     g_log = mkstemp(path);
-    if (g_log < 0) { std::printf("SKIP: mkstemp failed\n"); return 0; }
+    if (g_log < 0) { std::printf("SKIP: mkstemp failed\n"); return 77; }
     unlink(path);
     const int saved = dup(2);
     dup2(g_log, 2);

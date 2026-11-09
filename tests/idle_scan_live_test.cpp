@@ -54,7 +54,7 @@ int main() {
     if (on != 1) {
         std::printf("SKIP: the write tracker is %s, not idle (smash_idle_scan_info %d; needs root and "
                     "/sys/kernel/mm/page_idle/bitmap)\n", name, on);
-        return 0;
+        return 77;
     }
     auto waitTicks = [&](uint64_t n) {
         uint64_t r1 = 0, p1 = 0, t1 = 0, start = 0;

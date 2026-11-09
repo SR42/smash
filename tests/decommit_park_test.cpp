@@ -84,7 +84,7 @@ int main(int argc, char** argv) {
         churn(4);
         pthread_exit(nullptr);
     }
-    if (!dlsym(RTLD_DEFAULT, "smash_in_arena")) { std::printf("SKIP: not running under libsmash\n"); return 0; }
+    if (!dlsym(RTLD_DEFAULT, "smash_in_arena")) { std::fprintf(stderr, "FAIL: not running under libsmash\n"); return 1; }
     int failures = 0;
 
     // 1. A free must reach a parked thread. Warm the queue's thread first so

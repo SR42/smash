@@ -42,9 +42,9 @@ static void onSegv(int, siginfo_t* si, void*) {
 
 int main() {
     auto in_arena = reinterpret_cast<int (*)(const void*)>(dlsym(RTLD_DEFAULT, "smash_in_arena"));
-    if (!in_arena) { std::printf("SKIP: not running under libsmash\n"); return 0; }
+    if (!in_arena) { std::fprintf(stderr, "FAIL: not running under libsmash\n"); return 1; }
     auto* p = static_cast<char*>(malloc(8u << 20));
-    if (!p || !in_arena(p)) { std::printf("SKIP: the block is not in the arena\n"); return 0; }
+    if (!p || !in_arena(p)) { std::fprintf(stderr, "FAIL: the 8 MiB block is not in the arena (%p)\n", static_cast<void*>(p)); return 1; }
     std::memset(p, 1, 8u << 20);
     free(p);
     usleep(200 * 1000);
@@ -61,7 +61,7 @@ int main() {
         usleep(50 * 1000);
         reclaimed = kernelHandler(SIGSEGV) != reinterpret_cast<void*>(onSegv);
     }
-    if (!reclaimed) { std::printf("SKIP: smash did not re-claim SIGSEGV within 10 s\n"); return 0; }
+    if (!reclaimed) { std::fprintf(stderr, "FAIL: smash did not re-claim SIGSEGV within 10 s\n"); return 1; }
     std::fflush(stdout);
     *reinterpret_cast<volatile char*>(p) = 2;
     std::printf("FAIL: the write to a read-only page did not fault\n");

@@ -160,7 +160,7 @@ int main() {
                "(HugePages_Free=%ld). Reserve some with "
                "`sysctl -w vm.nr_hugepages=N` to exercise this test.\n",
                huge_free);
-        return 0;
+        return 77;
     }
 
     const size_t huge = static_cast<size_t>(huge_kb) * 1024;
@@ -170,7 +170,7 @@ int main() {
 
     if (static_cast<size_t>(huge_free) < want) {
         printf("SKIP: need %zu free hugepages, have %ld\n", want, huge_free);
-        return 0;
+        return 77;
     }
 
     // ── 1. The app's hugetlb mmap must still succeed under interposition ────
@@ -358,7 +358,7 @@ int main() {
 
 int main() {
     printf("SKIP: MAP_HUGETLB is Linux-only\n");
-    return 0;
+    return 77;
 }
 
 #endif

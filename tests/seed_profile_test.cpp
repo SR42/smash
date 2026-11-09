@@ -87,7 +87,7 @@ static int child(const char* part, const char* profile, bool save, const char* h
 }
 
 static int runPart(const char* part) {
-    if (!dlsym(RTLD_DEFAULT, "smash_in_arena")) { std::printf("SKIP: not running under libsmash\n"); return 0; }
+    if (!dlsym(RTLD_DEFAULT, "smash_in_arena")) { std::fprintf(stderr, "FAIL: not running under libsmash\n"); return 1; }
     if (!std::strcmp(part, "save")) {
         // Something compressed, so the save has run through a tick.
         constexpr size_t kLen = 4u << 20;
@@ -147,10 +147,10 @@ static int runPart(const char* part) {
 
 int main() {
     if (const char* part = std::getenv("SEED_PART")) return runPart(part);
-    if (!dlsym(RTLD_DEFAULT, "smash_in_arena")) { std::printf("SKIP: not running under libsmash\n"); return 0; }
+    if (!dlsym(RTLD_DEFAULT, "smash_in_arena")) { std::fprintf(stderr, "FAIL: not running under libsmash\n"); return 1; }
     if (std::getenv("SEED_GROUPS") && nodesWithCpus() < 2) {
         std::printf("SKIP: fewer than two memory nodes with CPUs, no node groups\n");
-        return 0;
+        return 77;
     }
 
     char path[] = "/tmp/smash_seed_profile_XXXXXX";

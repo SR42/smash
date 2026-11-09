@@ -205,10 +205,10 @@ static bool testNodeArenas() {
 
 int main() {
 #if defined(__linux__)
-    if (!testNodeArenas()) return 0;  // skipped
+    if (!testNodeArenas()) return 77;  // skipped
 #else
     fprintf(stderr, "numa_arena: SKIP (Linux only)\n");
-    return 0;
+    return 77;
 #endif
     if (failures == 0) {
         fprintf(stderr, "numa_arena: all tests passed\n");

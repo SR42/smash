@@ -91,8 +91,8 @@ int main() {
     const PageInfoFn page_info = pageInfoFn();
     const ArenaForFn arena_for = arenaForFn();
     if (!page_info || !arena_for) {
-        std::printf("SKIP: not running under libsmash\n");
-        return 0;
+        std::fprintf(stderr, "FAIL: not running under libsmash\n");
+        return 1;
     }
     auto state = [&](uintptr_t pg, int* rc = nullptr) {
         int st = -1;

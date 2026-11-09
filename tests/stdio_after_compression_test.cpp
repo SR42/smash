@@ -84,9 +84,11 @@ int main() {
         block[i] = static_cast<unsigned char>(i >> 12);
 
     if (!waitCompressed(block, kBlockMiB << 20)) {
-        std::fprintf(stderr, "SKIP: nothing compressed within 30s; cannot exercise the path\n");
+        // Cold timeout 1 s: a block that never leaves RSS is a compressor
+        // defect, not a reason to skip.
+        std::fprintf(stderr, "FAIL: nothing compressed within 30 s; the path was not exercised\n");
         unlink(path);
-        return 0;
+        return 1;
     }
 
     // Each of these opens a FRESH stream, so glibc allocates its buffer inside

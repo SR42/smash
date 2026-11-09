@@ -92,7 +92,7 @@ int main() {
     stats_fn = reinterpret_cast<StatsFn>(dlsym(RTLD_DEFAULT, "smash_tsd_stats"));
     if (!stats_fn) {
         std::printf("tsd_thread_test: SKIP (smash_tsd_stats not exported; TSD slot not compiled in)\n");
-        return 0;
+        return 77;
     }
     churn(1);  // main thread
     const int kWidth = 16;

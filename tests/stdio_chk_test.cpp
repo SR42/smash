@@ -57,10 +57,10 @@ void fail(const char* what, int round, int err) {
 
 int main() {
     setvbuf(stdout, nullptr, _IONBF, 0);
-    if (!dlsym(RTLD_DEFAULT, "smash_in_arena")) { std::printf("SKIP: not running under libsmash\n"); return 0; }
+    if (!dlsym(RTLD_DEFAULT, "smash_in_arena")) { std::fprintf(stderr, "FAIL: not running under libsmash\n"); return 1; }
 #if !(defined(__GLIBC__) && defined(__USE_FORTIFY_LEVEL) && __USE_FORTIFY_LEVEL > 0)
     std::printf("SKIP: _FORTIFY_SOURCE declarations unavailable\n");
-    return 0;
+    return 77;
 #else
     static void* junk4[2048];
     static void* junk12[1024];

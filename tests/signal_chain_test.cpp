@@ -78,11 +78,11 @@ void* kernelHandler(int sig) {
 
 int main() {
     auto in_arena = reinterpret_cast<int (*)(const void*)>(dlsym(RTLD_DEFAULT, "smash_in_arena"));
-    if (!in_arena) { std::printf("SKIP: not running under libsmash\n"); return 0; }
+    if (!in_arena) { std::fprintf(stderr, "FAIL: not running under libsmash\n"); return 1; }
     const long ps = sysconf(_SC_PAGESIZE);
 
     auto* block = static_cast<char*>(malloc(8u << 20));
-    if (!block || !in_arena(block)) { std::printf("SKIP: the block is not in the arena\n"); return 0; }
+    if (!block || !in_arena(block)) { std::fprintf(stderr, "FAIL: the 8 MiB block is not in the arena (%p)\n", block); return 1; }
     std::memset(block, 1, 8u << 20);
     void* const smash_handler = kernelHandler(SIGSEGV);
 

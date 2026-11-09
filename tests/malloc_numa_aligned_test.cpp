@@ -376,7 +376,7 @@ static void runLinux(aligned_fn numa_aligned, arena_fn arena_for, in_arena_fn in
     void* probe = numa_aligned(0, ps, ps);
     if (!probe && (errno == ENOSYS || errno == EPERM)) {
         printf("SKIP: mbind refused (errno=%d %s)\n", errno, strerror(errno));
-        return;
+        exit(77);
     }
     free(probe);
 
@@ -526,8 +526,8 @@ int main() {
     auto arena_info =
         reinterpret_cast<arena_info_fn>(dlsym(RTLD_DEFAULT, "smash_numa_arena_info"));
     if (!numa_aligned || !arena_for || !in_arena || !arena_info) {
-        printf("SKIP: malloc_numa_aligned not found (not running under libsmash)\n");
-        return 0;
+        fprintf(stderr, "FAIL: malloc_numa_aligned not found (not running under libsmash)\n");
+        return 1;
     }
 
 #if defined(__linux__)

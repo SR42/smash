@@ -67,8 +67,8 @@ int main() {
     if (!arena_for) {
         // Not running under libsmash — nothing to check. A no-op pass keeps
         // the binary runnable standalone; the ctest always sets the preload.
-        printf("SKIP: smash_arena_for not found (not running under libsmash)\n");
-        return 0;
+        fprintf(stderr, "FAIL: smash_arena_for not found (not running under libsmash)\n");
+        return 1;
     }
 
     void* ptrs[kNumSites];

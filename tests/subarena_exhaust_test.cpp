@@ -79,7 +79,7 @@ void pinTo(int cpu) {
 
 int phaseA() {
     const std::vector<int> nodes = numa_test::memoryNodes();
-    if (nodes.empty()) { std::printf("SKIP: no memory nodes\n"); return 0; }
+    if (nodes.empty()) { std::printf("SKIP: no memory nodes\n"); return 77; }
     const int node = nodes[0];
     char path[96];
     std::snprintf(path, sizeof(path), "/sys/devices/system/node/node%d/cpulist", node);
@@ -88,13 +88,13 @@ int phaseA() {
     std::vector<int> cpus;
     for (int c : numa_test::readList(path))
         if (CPU_ISSET(c, &allowed)) cpus.push_back(c);
-    if (cpus.size() < 2) { std::printf("SKIP: fewer than two CPUs on node %d\n", node); return 0; }
+    if (cpus.size() < 2) { std::printf("SKIP: fewer than two CPUs on node %d\n", node); return 77; }
 
     constexpr size_t kChunk = 64u << 20;
     pinTo(cpus[0]);
     errno = 0;
     auto* a = static_cast<unsigned char*>(g_numa(static_cast<uint32_t>(node), 1u << 20));
-    if (!a && (errno == EPERM || errno == ENOSYS)) { std::printf("SKIP: mbind refused\n"); return 0; }
+    if (!a && (errno == EPERM || errno == ENOSYS)) { std::printf("SKIP: mbind refused\n"); return 77; }
     if (!a || !g_in_arena(a)) { std::printf("FAIL: the first node block is not in the arena\n"); return 1; }
     a[0] = 1;
     const auto a_chunk = reinterpret_cast<uintptr_t>(a) / kChunk * kChunk;
@@ -126,7 +126,7 @@ int phaseA() {
 
 int phaseB() {
     const char* lo = std::getenv("SMASH_LARGE_ONLY");
-    if (lo && lo[0] == '1') { std::printf("SKIP: phase B needs full mode\n"); return 0; }
+    if (lo && lo[0] == '1') { std::printf("SKIP: phase B needs full mode\n"); return 77; }
     // Eight threads on two CPUs of one node: they share two sub-arenas and
     // are preempted inside them, which is what stranded whole free chunks in
     // a sub-arena's clean runs (768-896 MiB instead of 960, about half the
@@ -319,7 +319,7 @@ int main() {
     setvbuf(stdout, nullptr, _IONBF, 0);
     g_numa = reinterpret_cast<numa_fn>(dlsym(RTLD_DEFAULT, "malloc_numa"));
     g_in_arena = reinterpret_cast<in_arena_fn>(dlsym(RTLD_DEFAULT, "smash_in_arena"));
-    if (!g_numa || !g_in_arena) { std::printf("SKIP: not running under libsmash\n"); return 0; }
+    if (!g_numa || !g_in_arena) { std::fprintf(stderr, "FAIL: not running under libsmash\n"); return 1; }
     g_subarena_info = reinterpret_cast<subarena_info_fn>(dlsym(RTLD_DEFAULT, "smash_subarena_info"));
     const char* ph = std::getenv("SUBARENA_EXHAUST_PHASE");
     if (ph && ph[0] == 'D' && (!g_subarena_info || g_subarena_info(nullptr, nullptr) != 0)) {
@@ -330,6 +330,6 @@ int main() {
                    : ph && ph[0] == 'C' ? phaseC()
                    : ph && ph[0] == 'D' ? phaseD()
                                         : phaseA();
-    std::printf("subarena_exhaust_test: %s\n", rc ? "FAILED" : "done");
+    std::printf("subarena_exhaust_test: %s\n", rc == 77 ? "skipped" : rc ? "FAILED" : "done");
     return rc;
 }

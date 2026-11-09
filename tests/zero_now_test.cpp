@@ -64,7 +64,7 @@ uint8_t dataByte(size_t page, size_t i) { return static_cast<uint8_t>((page * 13
 }  // namespace
 
 int main() {
-    if (!dlsym(RTLD_DEFAULT, "smash_in_arena")) { std::printf("SKIP: not running under libsmash\n"); return 0; }
+    if (!dlsym(RTLD_DEFAULT, "smash_in_arena")) { std::fprintf(stderr, "FAIL: not running under libsmash\n"); return 1; }
     char path[] = "/tmp/smash_zeronow_XXXXXX";
     g_log = mkstemp(path);
     if (g_log < 0) { std::perror("mkstemp"); return 1; }

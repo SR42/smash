@@ -74,7 +74,7 @@ static void runLinux() {
     void* probe = g_numa(0, ps);
     if (!probe && (errno == ENOSYS || errno == EPERM)) {
         printf("SKIP: mbind refused (errno=%d %s)\n", errno, strerror(errno));
-        return;
+        exit(77);
     }
     free(probe);
 
@@ -201,13 +201,14 @@ int main() {
     g_numa = reinterpret_cast<numa_fn>(dlsym(RTLD_DEFAULT, "malloc_numa"));
     g_in_arena = reinterpret_cast<in_arena_fn>(dlsym(RTLD_DEFAULT, "smash_in_arena"));
     if (!g_numa || !g_in_arena) {
-        printf("SKIP: malloc_numa not found (not running under libsmash)\n");
-        return 0;
+        fprintf(stderr, "FAIL: malloc_numa not found (not running under libsmash)\n");
+        return 1;
     }
 #if defined(__linux__)
     runLinux();
 #else
     printf("SKIP: node arenas are Linux-only\n");
+    return 77;
 #endif
     if (g_failures) {
         fprintf(stderr, "FAIL: %d check(s) failed\n", g_failures);

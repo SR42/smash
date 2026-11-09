@@ -27,6 +27,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <dlfcn.h>
 #include <fcntl.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -93,6 +94,10 @@ bool has(const char* hay, const char* needle) { return std::strstr(hay, needle) 
 int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
     if (argc > 1 && std::strcmp(argv[1], "child") == 0) return runChild();
+    if (!dlsym(RTLD_DEFAULT, "smash_in_arena")) {
+        std::fprintf(stderr, "FAIL: not running under libsmash\n");
+        return 1;
+    }
 
     char out[8192];
     int status = 0;
@@ -102,9 +107,11 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "FAIL: could not fork child\n"); return 1;
     }
     if (!has(out, "SURVIVED")) {
-        // Under glibc (no preload) the process aborts instead; nothing to guard.
-        std::printf("SKIP: child did not survive the double free (not under libsmash?)\n");
-        return 0;
+        // Under libsmash with warn the second free is dropped and the child
+        // carries on; glibc would abort, and so does a broken detector.
+        std::fprintf(stderr, "FAIL: the child did not survive the double free (status %#x):\n%s\n",
+                     status, out);
+        return 1;
     }
     if (!has(out, "[smash double-free]")) {
         std::fprintf(stderr,

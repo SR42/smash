@@ -329,7 +329,7 @@ int testMixed() {
 int main() {
     setvbuf(stdout, nullptr, _IONBF, 0);
     g_in_arena = reinterpret_cast<in_arena_fn>(dlsym(RTLD_DEFAULT, "smash_in_arena"));
-    if (!g_in_arena) { std::printf("SKIP: not running under libsmash\n"); return 0; }
+    if (!g_in_arena) { std::fprintf(stderr, "FAIL: not running under libsmash\n"); return 1; }
     g_shared_info = reinterpret_cast<shared_info_fn>(dlsym(RTLD_DEFAULT, "smash_shared_arena_info"));
     g_subarena_info = reinterpret_cast<subarena_info_fn>(dlsym(RTLD_DEFAULT, "smash_subarena_info"));
     pinToOneCpu();

@@ -561,8 +561,8 @@ int main() {
     setvbuf(stdout, nullptr, _IONBF, 0);
     g_page_info = reinterpret_cast<PageInfoFn>(dlsym(RTLD_DEFAULT, "smash_page_info"));
     if (!g_page_info) {
-        std::printf("SKIP: not running under libsmash\n");
-        return 0;
+        std::fprintf(stderr, "FAIL: not running under libsmash\n");
+        return 1;
     }
     const char* lo = std::getenv("SMASH_LARGE_ONLY");
     g_large_only = lo && lo[0] == '1';

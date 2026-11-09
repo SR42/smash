@@ -53,10 +53,10 @@ static void phase(const char* name, size_t size, size_t count, double min_frac) 
 int main() {
     setvbuf(stdout, nullptr, _IONBF, 0);
     in_arena = reinterpret_cast<InArenaFn>(dlsym(RTLD_DEFAULT, "smash_in_arena"));
-    if (!in_arena) { std::printf("SKIP: not running under libsmash (no smash_in_arena)\n"); return 0; }
+    if (!in_arena) { std::fprintf(stderr, "FAIL: not running under libsmash (no smash_in_arena)\n"); return 1; }
     if (const char* lo = std::getenv("SMASH_LARGE_ONLY"); lo && lo[0] == '1') {
         std::printf("SKIP: small objects bypass the arena in large-only mode\n");
-        return 0;
+        return 77;
     }
     const size_t budget = 700u << 20;   // ~70% of the 1 GiB arena per phase
     const double need = 0.95;

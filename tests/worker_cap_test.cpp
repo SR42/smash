@@ -35,10 +35,10 @@ static std::string slurp(int fd) {
 }
 
 int main() {
-    if (!dlsym(RTLD_DEFAULT, "smash_in_arena")) { std::printf("SKIP: not running under libsmash\n"); return 0; }
+    if (!dlsym(RTLD_DEFAULT, "smash_in_arena")) { std::fprintf(stderr, "FAIL: not running under libsmash\n"); return 1; }
     char path[] = "/tmp/smash_workers_XXXXXX";
     const int fd = mkstemp(path);
-    if (fd < 0) { std::printf("SKIP: mkstemp failed\n"); return 0; }
+    if (fd < 0) { std::printf("SKIP: mkstemp failed\n"); return 77; }
     unlink(path);
     const int saved = dup(2);
     dup2(fd, 2);
@@ -50,7 +50,7 @@ int main() {
         // 2 CPUs, under the suite's load: cap 1).
         dup2(saved, 2);
         std::printf("SKIP: %ld CPUs; the cap's floor is 1 below 4\n", nproc);
-        return 0;
+        return 77;
     }
     std::atomic<bool> stop{false};
     std::vector<std::thread> idle;

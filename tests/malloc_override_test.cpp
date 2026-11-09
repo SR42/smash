@@ -57,8 +57,8 @@ int main() {
     g_arena_for = reinterpret_cast<arena_fn>(dlsym(RTLD_DEFAULT, "smash_arena_for"));
     if (!g_arena_for) {
         // Runnable standalone; the ctest registrations always set the preload.
-        std::printf("SKIP: smash_arena_for not found (not running under libsmash)\n");
-        return 0;
+        std::fprintf(stderr, "FAIL: smash_arena_for not found (not running under libsmash)\n");
+        return 1;
     }
 
     const char* lo = std::getenv("SMASH_LARGE_ONLY");

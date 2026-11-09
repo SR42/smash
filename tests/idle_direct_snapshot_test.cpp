@@ -79,7 +79,7 @@ int main() {
     for (int w = 0; w < 10000 && std::strcmp(name, "unprobed") == 0; w += 100) { usleep(100000); name = track(); }
     if (std::strcmp(name, "idle") != 0 && std::strcmp(name, "yt") != 0) {
         std::printf("idle_direct_snapshot: SKIP (tracker is %s: needs CAP_SYS_ADMIN for idle)\n", name);
-        return 0;
+        return 77;
     }
 
     // Phase 1: cold, with writes during the shadow window.

@@ -69,9 +69,9 @@ int main() {
     setvbuf(stdout, nullptr, _IONBF, 0);
     auto in_arena = reinterpret_cast<InArenaFn>(dlsym(RTLD_DEFAULT, "smash_in_arena"));
     auto blob = reinterpret_cast<BlobFn>(dlsym(RTLD_DEFAULT, "smash_compressed_blob_for"));
-    if (!in_arena || !blob) { std::printf("SKIP: not running under libsmash\n"); return 0; }
+    if (!in_arena || !blob) { std::fprintf(stderr, "FAIL: not running under libsmash\n"); return 1; }
     const char* bins = std::getenv("SMASH_MID_BINS");
-    if (!bins || bins[0] != '1') { std::printf("SKIP: needs SMASH_MID_BINS=1\n"); return 0; }
+    if (!bins || bins[0] != '1') { std::printf("SKIP: needs SMASH_MID_BINS=1\n"); return 77; }
     const size_t ps = static_cast<size_t>(sysconf(_SC_PAGESIZE));
     const size_t block_pages = kBlock / ps;
 

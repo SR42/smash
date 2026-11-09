@@ -73,7 +73,7 @@ int main() {
     const long base = rssKiB();
     if (base < 0) {
         std::printf("SKIP: cannot read /proc/self/statm\n");
-        return 0;
+        return 77;
     }
 
     if (!churn(kMeasuredThreads)) return 1;

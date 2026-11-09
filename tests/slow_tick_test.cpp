@@ -37,7 +37,7 @@ static size_t residentPages(const char* p, size_t len, size_t ps) {
 
 int main() {
     setvbuf(stdout, nullptr, _IONBF, 0);
-    if (!dlsym(RTLD_DEFAULT, "smash_in_arena")) { std::printf("SKIP: not running under libsmash\n"); return 0; }
+    if (!dlsym(RTLD_DEFAULT, "smash_in_arena")) { std::fprintf(stderr, "FAIL: not running under libsmash\n"); return 1; }
     const size_t ps = static_cast<size_t>(sysconf(_SC_PAGESIZE));
     constexpr size_t kIdle = 64u << 20, kHot = 4u << 20;
     auto* idle = static_cast<char*>(malloc(kIdle));

@@ -219,8 +219,8 @@ int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
     if (argc > 1 && std::strcmp(argv[1], "child") == 0) return child();
     if (!dlsym(RTLD_DEFAULT, "smash_in_arena")) {
-        std::printf("SKIP: not running under libsmash\n");
-        return 0;
+        std::fprintf(stderr, "FAIL: not running under libsmash\n");
+        return 1;
     }
     char self[PATH_MAX];
     if (!selfPath(self)) return 1;

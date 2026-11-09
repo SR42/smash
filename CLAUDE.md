@@ -42,7 +42,7 @@ codegen bug: [agents/sanitizers.md](agents/sanitizers.md).
 cd build && ctest --output-on-failure
 ```
 
-All 244 tests must pass; none are registered `DISABLED`. Run the suite **as root** too when touching the compressor: idle-page read tracking only exists with root (and `SMASH_WRITE_TRACK=yt` only with the youngtrace module loaded), and CI (`.github/workflows/ci.yml`, `ubuntu-latest` + `macos-latest`, every push and PR) runs unprivileged. After ctest, CI runs `bench/run_quick_ci.py` (`bench_rss` ≥30 %, `bench_sqlite --quick` ≥5 % RSS reduction).
+All 248 tests must pass or skip; none are registered `DISABLED`. A skip exits 77 and ctest lists it as skipped: unprivileged on x86-64, 23 skip (idle tracker, THP unit, youngtrace). `test_libsmash_loads` is the fixture every test requires: when libsmash is missing or not this build's, nothing else runs. Run the suite **as root** too when touching the compressor: idle-page read tracking only exists with root (and `SMASH_WRITE_TRACK=yt` only with the youngtrace module loaded), and CI (`.github/workflows/ci.yml`, `ubuntu-latest` + `macos-latest`, every push and PR) runs unprivileged. After ctest, CI runs `bench/run_quick_ci.py` (`bench_rss` ≥30 %, `bench_sqlite --quick` ≥5 % RSS reduction).
 
 **Before changing a test or its threshold, read its entry in [agents/tests.md](agents/tests.md).** Thresholds encode measurements, several tests are probabilistic (one run is not a verdict), and some harness shapes (sharing a process between phases, `fork()` with smash threads running) reproduce the very symptom under test.
 
@@ -53,6 +53,7 @@ Rules that the investigations behind this suite keep relearning:
 - **On the free path, `perf` attribution and interleaved A/B timing disagree, and only the timing counts.**
 - **`bench_sqlite` tells you whether a compressor change did anything; `bench_rss` saturates at ~72 %.**
 - **A churn-only stress proves nothing about the compressor** (blocks are freed before they go cold); hold a live set idle.
+- **Exit 77 only when the host cannot run the test or its scenario did not arise; never skip on the symptom the test guards.** A preloaded test that finds no libsmash fails. Until 2026-11-09 skips returned 0 and passed: a block outside the arena, a dead double-free child and an inert test all read as green ([agents/tests.md](agents/tests.md), "Skips and the preload fixture").
 
 ## Further documentation
 

@@ -230,11 +230,11 @@ void compareRead(const char* name, fread_fn ref_r, fgets_fn ref_g, fread_fn smas
 int main() {
     setvbuf(stdout, nullptr, _IONBF, 0);
     if (!dlsym(RTLD_DEFAULT, "smash_in_arena")) {
-        std::printf("SKIP: not running under libsmash\n");
-        return 0;
+        std::fprintf(stderr, "FAIL: not running under libsmash\n");
+        return 1;
     }
     void* libc = dlopen("libc.so.6", RTLD_NOW | RTLD_NOLOAD);
-    if (!libc) { std::printf("SKIP: cannot open libc.so.6\n"); return 0; }
+    if (!libc) { std::printf("SKIP: cannot open libc.so.6\n"); return 77; }
     auto ref_w = reinterpret_cast<fwrite_fn>(dlsym(libc, "fwrite"));
     auto ref_r = reinterpret_cast<fread_fn>(dlsym(libc, "fread"));
     auto ref_g = reinterpret_cast<fgets_fn>(dlsym(libc, "fgets"));

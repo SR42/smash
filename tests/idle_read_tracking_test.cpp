@@ -175,7 +175,7 @@ int main() {
     setvbuf(stdout, nullptr, _IONBF, 0);
     if (!idleTrackingAvailable()) {
         printf("SKIP: idle-page read tracking needs root and CONFIG_IDLE_PAGE_TRACKING\n");
-        return 0;
+        return 77;
     }
     scenario("A: written, untouched", Kind::kWritten);
     scenario("B: written, read after arm", Kind::kReadAfterArm);

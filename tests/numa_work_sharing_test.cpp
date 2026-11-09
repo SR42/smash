@@ -90,10 +90,10 @@ int main(int, char** argv) {
         cpu_set_t node0, allowed0;
         if (!nodeCpus(0, &node0) || sched_getaffinity(0, sizeof allowed0, &allowed0) != 0) {
             std::printf("numa_work_sharing: SKIP (no node 0 with CPUs)\n");
-            return 0;
+            return 77;
         }
         CPU_AND(&node0, &node0, &allowed0);
-        if (CPU_COUNT(&node0) == 0) { std::printf("numa_work_sharing: SKIP (node 0's CPUs are not in the affinity mask)\n"); return 0; }
+        if (CPU_COUNT(&node0) == 0) { std::printf("numa_work_sharing: SKIP (node 0's CPUs are not in the affinity mask)\n"); return 77; }
         if (sched_setaffinity(0, sizeof node0, &node0) != 0) { perror("sched_setaffinity"); return 1; }
         setenv("NUMA_WORK_SHARING_PINNED", "1", 1);
         execv("/proc/self/exe", argv);
@@ -113,11 +113,11 @@ int main(int, char** argv) {
     if (!page_info || !blob_for || !route || !info || !share) { std::fprintf(stderr, "FAIL: diagnostic exports missing\n"); return 1; }
 
     cpu_set_t node1, allowed;
-    if (!nodeCpus(1, &node1)) { std::printf("numa_work_sharing: SKIP (no node 1 with CPUs)\n"); return 0; }
+    if (!nodeCpus(1, &node1)) { std::printf("numa_work_sharing: SKIP (no node 1 with CPUs)\n"); return 77; }
     if (sched_getaffinity(0, sizeof allowed, &allowed) != 0) return 1;   // node 0: where the workers run
     if (sched_setaffinity(0, sizeof node1, &node1) != 0) {
         std::printf("numa_work_sharing: SKIP (cannot run on node 1's CPUs: %s)\n", std::strerror(errno));
-        return 0;
+        return 77;
     }
     {
         SmashNumaCompressorInfo in{};
@@ -126,7 +126,7 @@ int main(int, char** argv) {
         if (rc != 0) {
             if (rc == -2) { fail("smash_numa_compressor_info: layout mismatch (the test's struct is stale)"); return 1; }
             std::printf("numa_work_sharing: SKIP (node 1 has no compressor group, rc=%d)\n", rc);
-            return 0;
+            return 77;
         }
     }
 
@@ -157,7 +157,7 @@ int main(int, char** argv) {
     for (size_t i = 0; i < pages; ++i) on1 += status[i] == 1;
     if (on1 < pages * 9 / 10) {
         std::printf("numa_work_sharing: SKIP (only %zu of %zu pages landed on node 1)\n", on1, pages);
-        return 0;
+        return 77;
     }
 
     uint64_t q0 = 0, f0 = 0;

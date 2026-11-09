@@ -50,7 +50,7 @@ bool check(const char* p, size_t i) {
 }  // namespace
 
 int main() {
-    if (!dlsym(RTLD_DEFAULT, "smash_in_arena")) { std::printf("SKIP: not running under libsmash\n"); return 0; }
+    if (!dlsym(RTLD_DEFAULT, "smash_in_arena")) { std::fprintf(stderr, "FAIL: not running under libsmash\n"); return 1; }
     const char* d = std::getenv("IDLE_COMPRESS_DEADLINE_S");
     const int deadline_s = d ? std::atoi(d) : 120;
     const size_t ps = static_cast<size_t>(sysconf(_SC_PAGESIZE));
@@ -78,11 +78,11 @@ int main() {
         }
         if (limit < static_cast<long>(n) + 100000) {
             std::printf("SKIP: vm.max_map_count=%ld is too low for %zu extra mappings\n", limit, n);
-            return 0;
+            return 77;
         }
         auto* res = static_cast<char*>(mmap(nullptr, n * ps, PROT_NONE,
                                             MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0));
-        if (res == MAP_FAILED) { std::printf("SKIP: reservation for extra mappings failed\n"); return 0; }
+        if (res == MAP_FAILED) { std::printf("SKIP: reservation for extra mappings failed\n"); return 77; }
         size_t made = 0;
         for (size_t k = 0; k < n; k += 2)
             made += mprotect(res + k * ps, ps, PROT_READ) == 0;

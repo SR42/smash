@@ -70,7 +70,7 @@ int main() {
     setenv("SMASH_WRITE_TRACK", "uffd", 1);
     if (!kernelHasAsyncUffdWp()) {
         printf("SKIP: kernel lacks async userfaultfd write-protect (needs Linux 6.7+)\n");
-        return 0;
+        return 77;
     }
 
     VmRegion vm;

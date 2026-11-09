@@ -80,7 +80,7 @@ int main(int argc, char** argv) {
         usleep(static_cast<useconds_t>(rand() % 2500) * 1000);
         return 0;
     }
-    if (!dlsym(RTLD_DEFAULT, "smash_in_arena")) { std::printf("SKIP: not running under libsmash\n"); return 0; }
+    if (!dlsym(RTLD_DEFAULT, "smash_in_arena")) { std::fprintf(stderr, "FAIL: not running under libsmash\n"); return 1; }
     int failures = 0;
 
     auto* b = static_cast<unsigned char*>(malloc(kBlock));
