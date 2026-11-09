@@ -22,67 +22,104 @@ namespace smash {
 class Slab;
 class PageMap;
 
-class ThreadCache {
-    // Per-(lane, size-class) cache. The cache has kCacheLanes independent lanes;
-    // each arena maps to a lane via (arena % kCacheLanes). With kCacheLanes=4
-    // and typical runtime arenas=4-8, most arenas get a dedicated lane (or share
-    // with at most one other). This enforces page-level segregation by call site
-    // while keeping total footprint bounded.
+class alignas(64) ThreadCache {
+    // Per-(lane, size-class) pointer stacks. One lane per arena: the lane
+    // count is the process's arena count (getTotalArenas(): hot and cold
+    // arenas both, with SMASH_COLD_ARENA_FEEDBACK), fixed at startup, and the
+    // per-class budget kThreadCacheMaxPerClass (256) is split between them:
     //
-    // Depth per lane = kThreadCacheMaxPerClass / kCacheLanes (= 4 with defaults).
-    // Total = kCacheLanes * kNumClasses * depth * 8 = 16 * 36 * 16 * 8 = 72 KB
-    // of pointers (+ 2 bytes of count per lane), whatever the lane split.
-    // Shallow depth (4) trades refill frequency for segregation quality.
-    // Overridable: fewer lanes → deeper per-lane cache → far fewer slab-lock
-    // acquisitions per allocation (glibc's tcache is ~64 deep and refills rarely;
-    // smash's default depth-4 hits the slab lock every 4 allocs — 16× more lock
-    // traffic, the structural reason smash scales ~2.7× where glibc scales ~12×).
+    //   arenas   4   8  16  32  64  128
+    //   depth   64  32  16   8   4    4
     //
-    // Default 16 lanes x depth 16: one lane per arena up to 16 arenas (the
-    // default arena count up to 16 CPUs), and a depth that refills/drains
-    // every 16 operations instead of every 4. Measured on x86-64 (Xeon
-    // 8175M): batch 1.58x -> 1.40x glibc, random replace 1.21x -> 0.88x,
-    // 8-thread random 1.34x -> 1.04x; 64 lanes (depth 4) kept arenas apart on
-    // machines with up to 256 CPUs at that cost. Beyond 16 arenas, arenas
-    // a, a+16, ... share a lane: a recycled object can then go to a sibling
-    // arena's call site; slab placement is still per arena.
+    // so a thread holds 256 pointers per class (72 KB) whatever the arena
+    // count, except at 128 arenas, where the depth floor of 4 doubles it.
+    //
+    // A lane must never be shared by two arenas. refill() fills a lane from
+    // the asking arena's slab and allocate() hands out whatever the lane
+    // holds, so with shared lanes every refill put objects into the other
+    // arenas' call sites, not only recycled ones. Measured with 16 fixed
+    // lanes (upstream #93) at 32 arenas: 61% of 32 interleaved call sites'
+    // objects in their own arena, 81% of pages holding several arenas'
+    // objects; at 64 arenas, with half the arenas hot, 40% of the cold
+    // objects' pages left RAM instead of 100%.
+    //
+    // Depth is what buys speed: on random replace (x86-64, 8 CPUs) a
+    // malloc+free costs 20 ns at depth 4, 14 ns at 8, 11 ns at 16 and
+    // 10 ns at 32 (glibc 17). A small machine therefore gets a deep cache
+    // and a large one, with many arenas, a shallow one.
+    //
+    // Layout of one allocation (layout(), the same for every cache of the
+    // process): this 64-byte header, then lanes * kNumClasses 2-byte
+    // counts (compact, touched on every malloc and free, so they stay in L1;
+    // interleaving them with the pointers cost a miss on the count and on
+    // the slot), then lanes * kNumClasses stacks of depth pointers.
+    //
+    // SMASH_CACHE_LANES=N (build option, power of two) caps the lanes, which
+    // makes arenas share them again: only for measuring that.
 #ifdef SMASH_CACHE_LANES
-    static constexpr int kCacheLanes = SMASH_CACHE_LANES;
+    static constexpr uint32_t kMaxCacheLanes = SMASH_CACHE_LANES;
 #else
-    static constexpr int kCacheLanes = 16;
+    static constexpr uint32_t kMaxCacheLanes = kTotalArenas;
 #endif
-    static constexpr int kPerLaneDepth = kThreadCacheMaxPerClass / kCacheLanes;
-    static_assert(kPerLaneDepth >= 4, "per-lane cache too shallow");
-    static_assert((kCacheLanes & (kCacheLanes - 1)) == 0, "kCacheLanes must be power of 2");
+    static constexpr uint32_t kMinLaneDepthShift = 2;   // depth >= 4
+    static_assert((kMaxCacheLanes & (kMaxCacheLanes - 1)) == 0, "SMASH_CACHE_LANES must be a power of 2");
+    static_assert(kThreadCacheMaxPerClass >= (1 << kMinLaneDepthShift),
+                  "drain buffers are sized kThreadCacheMaxPerClass and must hold a lane");
+    static_assert(kThreadCacheMaxPerClass <= 0x8000, "a lane count must fit uint16_t");
 
-    // Pointers and counts live in separate arrays, indexed by
-    // idx(arena, sc) = lane * kNumClasses + sc. The counts are touched on
-    // every malloc and free and are compact (2 bytes per lane: ~1 KB, stays
-    // in L1); the pointer arrays (~74 KB) are not. Interleaving them put
-    // each count on its own cache line next to 128 bytes of pointers, so a
-    // random-access workload paid a miss on the count AND on the slot.
-    void* ptrs_[kCacheLanes * kNumClasses][kPerLaneDepth];
-    uint16_t counts_[kCacheLanes * kNumClasses];
-    static_assert(kPerLaneDepth <= 0xFFFF, "lane count must fit uint16_t");
+public:
+    struct Layout {
+        uint32_t lanes;         // power of 2
+        uint32_t depth_shift;   // depth = 1 << depth_shift
+        size_t ptrs_offset;     // from the start of the ThreadCache
+        size_t bytes;           // the whole allocation
+    };
+
+    static Layout layout() {
+        uint32_t lanes = static_cast<uint32_t>(getTotalArenas());
+        if (lanes < 1) lanes = 1;
+        if (lanes > kMaxCacheLanes) lanes = kMaxCacheLanes;
+        // The deepest power of 2 with lanes * depth <= the per-class budget.
+        uint32_t shift = kMinLaneDepthShift;
+        while ((size_t{2} << shift) * lanes <= static_cast<size_t>(kThreadCacheMaxPerClass)) ++shift;
+        const size_t slots = static_cast<size_t>(lanes) * kNumClasses;
+        const size_t ptrs_offset = sizeof(ThreadCache) + ((slots * sizeof(uint16_t) + 63) & ~size_t{63});
+        return Layout{lanes, shift, ptrs_offset, ptrs_offset + (slots << shift) * sizeof(void*)};
+    }
+
+    ThreadCache* pool_next;
+
+private:
+    void** ptrs_;           // stack i is ptrs_[i << depth_shift_ ...]
+    uint32_t lane_mask_;    // lanes - 1
+    uint32_t depth_;
+    uint32_t depth_shift_;
+    uint32_t num_stacks_;   // lanes * kNumClasses
+
+    // The counts follow the header (see Layout).
+    uint16_t* counts() { return reinterpret_cast<uint16_t*>(this + 1); }
+    const uint16_t* counts() const { return reinterpret_cast<const uint16_t*>(this + 1); }
 
     struct Lane {
         void** ptrs;
         uint16_t& count;
     };
-    Lane lane(int i) { return Lane{ptrs_[i], counts_[i]}; }
-    uint16_t laneCount(int i) const { return counts_[i]; }
+    Lane lane(uint32_t i) { return Lane{ptrs_ + (static_cast<size_t>(i) << depth_shift_), counts()[i]}; }
+    uint16_t laneCount(uint32_t i) const { return counts()[i]; }
 
-    static int idx(uint8_t arena, uint8_t sc) {
-        int lane = arena & (kCacheLanes - 1);
-        return lane * kNumClasses + sc;
+    uint32_t idx(uint8_t arena, uint8_t sc) const {
+        return (arena & lane_mask_) * kNumClasses + sc;
     }
 
 public:
-    ThreadCache* pool_next;
-
-    ThreadCache() {
-        __builtin_memset(counts_, 0, sizeof(counts_));
+    explicit ThreadCache(const Layout& l) {
         pool_next = nullptr;
+        ptrs_ = reinterpret_cast<void**>(reinterpret_cast<char*>(this) + l.ptrs_offset);
+        lane_mask_ = l.lanes - 1;
+        depth_shift_ = l.depth_shift;
+        depth_ = 1u << l.depth_shift;
+        num_stacks_ = l.lanes * kNumClasses;
+        __builtin_memset(counts(), 0, num_stacks_ * sizeof(uint16_t));
     }
 
     // Allocate from the arena-specific bucket for this size class.
@@ -94,11 +131,11 @@ public:
         return nullptr;
     }
 
-    // Legacy: allocate without arena (scans all arenas, returns first hit).
+    // Legacy: allocate without arena (scans all lanes, returns first hit).
     // Used only by paths that don't have arena context.
     void* allocate(uint8_t sc) {
-        for (int a = 0; a < kMaxArenas; ++a) {
-            auto c = lane(idx(a, sc));
+        for (uint32_t ln = 0; ln <= lane_mask_; ++ln) {
+            auto c = lane(ln * kNumClasses + sc);
             if (c.count > 0) return c.ptrs[--c.count];
         }
         return nullptr;
@@ -110,7 +147,7 @@ public:
         // Opt-in double-free detection (SMASH_DOUBLE_FREE, default off). This
         // is the only place the common `free(p); free(p);` can be caught: both
         // pointers land here and never reach the slab bitmap, so the lane must
-        // be scanned. Bounded by kPerLaneDepth, but it is the free fast path —
+        // be scanned. Bounded by the lane depth, but it is the free fast path —
         // hence the cached flag test first, which is all a default build pays.
         if (smash::doubleFreeChecksEnabled()) [[unlikely]] {
             for (uint32_t i = 0; i < c.count; ++i) {
@@ -122,7 +159,7 @@ public:
                 }
             }
         }
-        if (c.count < kPerLaneDepth) [[likely]] {
+        if (c.count < depth_) [[likely]] {
             c.ptrs[c.count++] = ptr;
             return true;
         }
@@ -135,7 +172,7 @@ public:
     }
 
     bool isFull(uint8_t sc, uint8_t arena) const {
-        return laneCount(idx(arena, sc)) >= kPerLaneDepth;
+        return laneCount(idx(arena, sc)) >= depth_;
     }
 
     bool isFull(uint8_t sc) const {
@@ -147,8 +184,8 @@ public:
     }
 
     bool isEmpty(uint8_t sc) const {
-        for (int a = 0; a < kMaxArenas; ++a)
-            if (laneCount(idx(a, sc)) > 0) return false;
+        for (uint32_t ln = 0; ln <= lane_mask_; ++ln)
+            if (laneCount(ln * kNumClasses + sc) > 0) return false;
         return true;
     }
 
@@ -173,13 +210,14 @@ public:
 
     // Reset for reuse from pool
     void reset() {
-        __builtin_memset(counts_, 0, sizeof(counts_));
+        __builtin_memset(counts(), 0, num_stacks_ * sizeof(uint16_t));
         pool_next = nullptr;
     }
 
-    // Expose per-arena depth for batch sizing
-    static constexpr int perLaneDepth() { return kPerLaneDepth; }
+    uint32_t lanes() const { return lane_mask_ + 1; }
+    uint32_t laneDepth() const { return depth_; }
 };
+static_assert(sizeof(ThreadCache) == 64, "the counts start one cache line in");
 
 // Pool of thread caches for reuse across threads
 class ThreadCachePool {
@@ -220,9 +258,12 @@ inline ThreadCache* newThreadCache() {
     // Allocate from bootstrap. Returns nullptr when the arena is exhausted;
     // callers must handle that rather than placement-new onto null (which
     // segfaulted at ~12k threads once caches started leaking).
-    void* mem = BootstrapAlloc::instance().allocate(sizeof(ThreadCache), alignof(ThreadCache));
+    // Every cache of the process has the same layout (the arena count is
+    // fixed at startup), so a pooled one always fits.
+    const ThreadCache::Layout l = ThreadCache::layout();
+    void* mem = BootstrapAlloc::instance().allocate(l.bytes, alignof(ThreadCache));
     if (!mem) return nullptr;
-    return new (mem) ThreadCache();
+    return new (mem) ThreadCache(l);
 }
 
 // Return ThreadCache to pool for reuse

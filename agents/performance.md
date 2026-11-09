@@ -4,14 +4,79 @@ Measured costs of the hot paths, compression throughput and its limits, codec an
 
 ## The base small-object path: the thread cache is 4 deep, and that is the cost
 
-**Superseded 2026-11-06 by the merge of upstream #93:** the default is now 16
-lanes x depth 16 (counts split from the pointers), with lean `xxmalloc`/`xxfree`
-entry points in front of it (CLAUDE.md, "Allocation Fast Path"). Upstream
-measured the depth change on a Xeon 8175M: batch 1.58x -> 1.40x glibc, random
-replace 1.21x -> 0.88x, 8-thread random 1.34x -> 1.04x. Above 16 arenas, arenas
-a, a+16, ... share a lane: a recycled object can then serve a sibling arena's
-call site (slab placement stays per arena). The analysis below is of the
-64-lane layout it replaced.
+**Superseded twice.** 2026-11-06, the merge of upstream #93: 16 lanes x depth
+16 (counts split from the pointers), with lean `xxmalloc`/`xxfree` entry points
+in front of it (CLAUDE.md, "Allocation Fast Path"). Upstream measured the depth
+change on a Xeon 8175M: batch 1.58x -> 1.40x glibc, random replace 1.21x ->
+0.88x, 8-thread random 1.34x -> 1.04x. 2026-11-09: **the lanes follow the
+runtime arena count** (`ThreadCache::layout()`), the fix proposed at the end of
+this section, because 16 fixed lanes broke placement above 16 arenas.
+
+**A shared lane mixes placement on every refill, not only for recycled
+objects.** `refill(sc, arena)` fills the lane from the asking arena's slab and
+`allocate()` hands out whatever the lane holds, so with arenas a and a + 16 in
+one lane, a's refill feeds a + 16's next allocations. The fixed-16 layout's own
+comment said only recycled objects crossed; measured, it is most of them. On
+this 8-CPU host, 72 KB per thread in every layout, `SMASH_NUM_ARENAS` varied
+(32 noinline call sites of 256 B, 2048 objects each allocated round robin;
+`$S/lanes/purity.cpp` and `hotcold.cpp` in the 2026-11-09 session):
+
+| arenas | lanes x depth | objects in their site's arena | pages holding several arenas' objects |
+|---|---|---|---|
+| 16 | 16 x 16 | 100% | 0% |
+| 32 | 16 x 16 | 61% | 81% |
+| 64 | 16 x 16 | 57% | 81% |
+| 64 | 32 x 8 | 93% | 16% |
+| 32, 64 | 8 x 32 | 37–40% | 97% |
+| any | lanes = arenas | 100% | 0% |
+
+and what it costs compression (half the arenas' objects written every 250 ms,
+the other half idle; `SMASH_COLD_TIMEOUT_SEC=2`, 16 s): at 64 arenas 100% of
+the cold objects' pages left RAM with 64 lanes, 60% with 32 and 40% with 16
+(RSS drop 7.5 / 4.5 / 3.0 MB); at 32 arenas, 100% with 32 or 64 lanes, 87.5%
+with 16. `bench_sqlite --quick` cannot see any of it: 66.5–66.6% RSS reduction
+in every layout and arena count, its heap being a couple of call sites.
+
+**Depth is what buys speed** (same host, median of 7 interleaved runs, ns per
+malloc+free; 64-byte objects except random replace, 16–1024 B):
+
+| benchmark | 64 x 4 | 32 x 8 | 16 x 16 | 8 x 32 | glibc |
+|---|---|---|---|---|---|
+| random replace, 1 thread | 20.0 | 14.4 | 11.3 | 9.8 | 16.6 |
+| random replace, 8 threads | 37.9 | 24.6 | 16.6 | 13.4 | 20.5 |
+| batch of 64 | 28.0 | 21.8 | 16.8 | 13.8 | 8.7 |
+| batch of 256 | 29.8 | 24.2 | 19.7 | 18.3 | 8.8 |
+| malloc+free pair | 11.2 | 11.0 | 11.0 | 11.1 | 7.0 |
+
+So the runtime layout keeps the 16 x 16 split where there are 16 arenas (5–16
+CPUs), is faster on 4 CPUs or fewer (4 arenas, depth 64), and is slower where
+the 16-lane speed came from broken placement: 32 x 8 on 17–64 CPUs, 64 x 4 on
+65–256. At 128 arenas (more than 256 CPUs, or 64 with cold-arena feedback) the
+budget would give depth 2; the floor keeps 4, at 144 KB per thread.
+
+**The runtime layout itself costs 1–5%.** Against the compile-time 16 x 16, at
+16 arenas, where the split is the same (`L16` and `RT` in `$S/lanes/speed3.tsv`
+and `speed4.tsv`, two campaigns of 11 interleaved runs each on a quiet machine,
+paired medians):
+
+| benchmark | compile-time | runtime | ratio |
+|---|---|---|---|
+| malloc+free pair | 10.93–10.96 ns | 11.36–11.44 | 1.036–1.037 |
+| batch of 64 | 16.77–16.85 | 17.50–17.56 | 1.041–1.044 |
+| batch of 256 | 19.39–19.60 | 20.36–20.39 | 1.042–1.050 |
+| random replace, 1 thread | 11.35–11.50 | 11.64–11.68 | 1.012–1.026 |
+| cross-thread free, 1 thread | 11.40–11.46 | 11.61–11.70 | 1.019–1.023 |
+
+The fast path now reads the lane mask, the depth shift and the stack base from
+the cache's header and shifts by a variable; that is all that changed in
+`xxmalloc` and `ThreadCache::deallocate`. Putting the stacks at a fixed offset
+(the counts sized for 128 lanes), which removes the stack-base load, did not
+help: 1.014–1.048 on the same runs. Measured on a Ryzen 9 5950X (Zen 3, where
+`shl %cl` is one µop; on Intel before Ice Lake it is three: not measured).
+On 4 arenas the deeper cache more than pays for it (batch of 64: 16.8 -> 9.0
+ns; random replace: 11.4 -> 9.2).
+
+The analysis below is of the 64-lane layout #93 replaced.
 
 An alloc+free pair of 64-byte objects costs **35 ns against glibc's 9 ns** with
 no drains involved, and the reason is `kPerLaneDepth`:
@@ -76,10 +141,15 @@ cores**: `getNumArenas()` gives 64 there, so 128 arenas with cold-bias against
 collides with exactly its own twin, never with an unrelated call-site group.
 It also means the lane-sizing fix below buys such a machine nothing — its lanes
 are already saturated, and matching lanes to 128 arenas within a fixed budget
-would *halve* the depth to 2.
+would *halve* the depth to 2. (Since 2026-11-09 128 arenas get 128 lanes of the
+floor depth 4. What the twin sharing did, unmeasured: the flip is per (base
+arena, size class), so the twins are never asked at once, but after a flip the
+objects freed into the hot arena went to the shared lane and from there to the
+call site's cold-routed allocations.)
 
-**The principled fix is to size the lanes to the runtime arena count**, which
-is known at thread-cache creation: `getTotalArenas()` is 32 here and 8 on a
+**The principled fix is to size the lanes to the runtime arena count** (done
+2026-11-09, see the top of this section), which is known at thread-cache
+creation: `getTotalArenas()` is 32 here and 8 on a
 4-CPU host, against a fixed 64 lanes. That wastes half the cache on this host
 and 87% of it on a small one, and pays for it in depth. Matching them is worth
 **17% here at identical memory with routing untouched** (35.5 → 29.7 ns,

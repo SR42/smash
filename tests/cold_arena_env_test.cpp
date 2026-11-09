@@ -17,12 +17,13 @@
 // last new object, and the stats line's cold_arenas=. Never the first block's:
 // the thread cache serves what it holds first, and a lane can hold another
 // arena's blocks. The new objects' first ones are slots the hot slab handed
-// out before the flip. The old arena's first block, with more than 16 arenas
-// (16 cache lanes since upstream #93; arenas a, a + 16, ... share one), can be
-// a block some other call site freed: built with UBSan, the first 256-byte
-// object came from arena 23 (a libc call site's, freed into the shared lane)
+// out before the flip. The old arena's first block, while the cache had 16
+// fixed lanes (upstream #93 until 2026-11-09; arenas a, a + 16, ... shared
+// one), could be a block of another call site: built with UBSan, the first
+// 256-byte object came from arena 23 (a libc call site's, in the shared lane)
 // while the call site routes to 55, and the 128-arena case failed with
-// "arena 23 then 119, want +64" (119 = 55 + 64, correct).
+// "arena 23 then 119, want +64" (119 = 55 + 64, correct). The lanes follow
+// the arena count now; a build with SMASH_CACHE_LANES below it still shares.
 // Checks:
 //   - feedback on: the new objects come from arena old + 8, cold_arenas >= 1;
 //   - feedback off (unset): same arena, cold_arenas=0;
@@ -84,7 +85,7 @@ ArenaFor arena_for = nullptr;
 
 // The arena most of `blocks` came from (-1 if none has one): where their call
 // site routes. Any single block can be one the thread cache held for another
-// arena sharing its lane (see the header).
+// arena, when arenas share lanes (see the header).
 template <typename T>
 int mostCommonArena(const std::vector<T*>& blocks) {
     size_t n[256] = {};

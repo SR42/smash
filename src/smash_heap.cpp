@@ -90,7 +90,7 @@ void* ThreadCache::refill(uint8_t sc, uint8_t arena, Slab* slab) {
     // Batch-allocate from slab into the arena-specific lane
     auto c = lane(idx(arena, sc));
     size_t batch = kThreadCacheBatchSize;
-    if (batch > static_cast<size_t>(kPerLaneDepth)) batch = kPerLaneDepth;
+    if (batch > depth_) batch = depth_;
 
     // Magazine fast path: try to satisfy the refill from the lock-free depot
     // (a batch a peer thread freed). No slab lock_, no bitmap scan.
@@ -141,8 +141,8 @@ void dispatchToSlab(Slab& slab, void** ptrs, Span** spans, size_t n) {
 
 // Return the `n` pointers at `ptrs[start..start+n)` to their arenas' slabs for
 // size class `sc`. Resolves each span exactly once. The common case -- every
-// pointer from one arena (a lane holds one arena unless arenas outnumber
-// lanes) -- goes straight to that slab; otherwise group by arena with a
+// pointer from one arena (a lane holds one arena, unless SMASH_CACHE_LANES
+// caps the lanes) -- goes straight to that slab; otherwise group by arena with a
 // counting sort into small fixed-size stack buffers and dispatch one batch
 // per non-empty arena. n is bounded by kThreadCacheMaxPerClass (cache
 // capacity), so all buffers are statically sized.
@@ -209,18 +209,16 @@ void ThreadCache::drain(uint8_t sc, uint8_t arena, Slab* all_slabs, PageMap* pag
 }
 
 void ThreadCache::drainAll(Slab* all_slabs, PageMap* page_map) {
-    // Sweep every (lane, size class) — pointers live in lane(ln*kNumClasses+sc)
-    // for lane = arena & (kCacheLanes-1). The old loop covered only lane 0's
-    // classes (i < kNumClasses), leaking every non-zero-lane pointer on thread
-    // teardown. drainRangeToSlabs re-resolves each span's true arena, so passing
-    // sc alone is sufficient for correct routing back to the slabs.
-    for (int ln = 0; ln < kCacheLanes; ++ln) {
-        for (int sc = 0; sc < kNumClasses; ++sc) {
-            auto c = this->lane(ln * kNumClasses + sc);
-            if (c.count > 0) {
-                drainRangeToSlabs(c.ptrs, 0, c.count, static_cast<uint8_t>(sc), all_slabs, page_map);
-                c.count = 0;
-            }
+    // Sweep every (lane, size class) stack, i = lane * kNumClasses + sc. The
+    // old loop covered only lane 0's classes (i < kNumClasses), leaking every
+    // non-zero-lane pointer on thread teardown. drainRangeToSlabs re-resolves
+    // each span's true arena, so passing sc alone is sufficient for correct
+    // routing back to the slabs.
+    for (uint32_t i = 0; i < num_stacks_; ++i) {
+        auto c = this->lane(i);
+        if (c.count > 0) {
+            drainRangeToSlabs(c.ptrs, 0, c.count, static_cast<uint8_t>(i % kNumClasses), all_slabs, page_map);
+            c.count = 0;
         }
     }
 }

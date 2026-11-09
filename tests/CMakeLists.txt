@@ -1871,6 +1871,20 @@ add_smash_mode_test(test_thread_cache_reclaim_tls_only   thread_cache_reclaim_te
                     "SMASH_NO_THREAD_HOOKS=1")
 add_smash_mode_test(test_thread_cache_reclaim_large_only thread_cache_reclaim_test 1 180)
 
+# Thread-cache lanes: 32 call sites allocate round robin, then churn; every
+# call site's objects must stay in one arena. A lane shared by two arenas (16
+# fixed lanes against 32+ arenas, upstream #93) hands one arena's objects to
+# the other's call site. Arena counts: 64 (depth 4), 128 (the depth floor:
+# 128 lanes of 4) and 4 (depth 64). Fast and deterministic (no compressor).
+add_executable(thread_cache_lanes_test thread_cache_lanes_test.cpp)
+set_target_properties(thread_cache_lanes_test PROPERTIES CXX_STANDARD 20)
+target_link_libraries(thread_cache_lanes_test PRIVATE ${CMAKE_DL_LIBS})
+foreach(_arenas 64 128 4)
+  add_smash_mode_test(test_thread_cache_lanes_${_arenas} thread_cache_lanes_test 0 60
+                      "SMASH_NUM_ARENAS=${_arenas}" "SMASH_CPU_ARENA=0"
+                      "SMASH_COLD_ARENA_FEEDBACK=0" "SMASH_NO_COMPRESSOR=1")
+endforeach()
+
 # Over-aligned footprint: SmashHeap::memalign() sends every alignment > 16 B to
 # LargeAlloc, which rounds up to a whole page — so an `alignas(64)` 64-byte
 # object costs a full kernel page (64x on 4 KiB pages, 256x on macOS arm64's

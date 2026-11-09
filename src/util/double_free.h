@@ -18,7 +18,7 @@
 //   - ThreadCache::deallocate — scans the lane. This catches the common
 //     `free(p); free(p);` case, which never reaches the slab because both
 //     pointers sit in the per-thread cache. The scan is bounded by
-//     kPerLaneDepth but runs on the free fast path, so it is gated on the
+//     the lane depth but runs on the free fast path, so it is gated on the
 //     policy being enabled and costs one predictable branch when off.
 //   - Span::deallocate — tests the bitmap bit (1 = free) before setting it.
 //     Essentially free: the function already loads and stores that word, so
