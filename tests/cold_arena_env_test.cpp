@@ -13,9 +13,16 @@
 // SMASH_NUM_ARENAS=8 unless the case sets it. The child allocates 8 MiB of
 // 256-byte objects from one call site, leaves them idle until most of their
 // pages are out of RAM, then allocates 512 more from the same call site and
-// prints the arenas (smash_arena_for) of the first block and of the last new
-// object, and the stats line's cold_arenas=. The last, not the first: the
-// thread cache serves slots the hot slab handed out before the flip first.
+// prints the arena (smash_arena_for) most of the 8 MiB came from, that of the
+// last new object, and the stats line's cold_arenas=. Never the first block's:
+// the thread cache serves what it holds first, and a lane can hold another
+// arena's blocks. The new objects' first ones are slots the hot slab handed
+// out before the flip. The old arena's first block, with more than 16 arenas
+// (16 cache lanes since upstream #93; arenas a, a + 16, ... share one), can be
+// a block some other call site freed: built with UBSan, the first 256-byte
+// object came from arena 23 (a libc call site's, freed into the shared lane)
+// while the call site routes to 55, and the 128-arena case failed with
+// "arena 23 then 119, want +64" (119 = 55 + 64, correct).
 // Checks:
 //   - feedback on: the new objects come from arena old + 8, cold_arenas >= 1;
 //   - feedback off (unset): same arena, cold_arenas=0;
@@ -72,9 +79,38 @@ constexpr size_t kHotCount = 2048;
 
 unsigned char want(size_t obj, size_t i) { return i < 64 ? static_cast<unsigned char>(obj + i) : 0; }
 
+using ArenaFor = int (*)(const void*);
+ArenaFor arena_for = nullptr;
+
+// The arena most of `blocks` came from (-1 if none has one): where their call
+// site routes. Any single block can be one the thread cache held for another
+// arena sharing its lane (see the header).
+template <typename T>
+int mostCommonArena(const std::vector<T*>& blocks) {
+    size_t n[256] = {};
+    for (T* b : blocks) {
+        const int a = arena_for(b);
+        if (a >= 0 && a < 256) ++n[a];
+    }
+    int best = -1;
+    for (int a = 0; a < 256; ++a)
+        if (n[a] && (best < 0 || n[a] > n[best])) best = a;
+    return best;
+}
+
+// Where call site `f` routes: 512 blocks, freed again. Twice a thread's whole
+// cache for a size class (256, kThreadCacheMaxPerClass), so most come from
+// the slab however the cache is split into lanes (SMASH_CACHE_LANES).
+int siteArena(SiteFn f) {
+    std::vector<void*> blocks(512);
+    for (void*& b : blocks) b = f();
+    const int a = mostCommonArena(blocks);
+    for (void* b : blocks) free(b);
+    return a;
+}
+
 int child() {
-    using ArenaFor = int (*)(const void*);
-    auto arena_for = reinterpret_cast<ArenaFor>(dlsym(RTLD_DEFAULT, "smash_arena_for"));
+    arena_for = reinterpret_cast<ArenaFor>(dlsym(RTLD_DEFAULT, "smash_arena_for"));
     if (!arena_for) return 2;
     char path[] = "/tmp/smash_coldarena_XXXXXX";
     const int log = mkstemp(path);
@@ -94,15 +130,12 @@ int child() {
         objs[k] = static_cast<unsigned char*>(site());
         for (size_t i = 0; i < kObj; ++i) objs[k][i] = want(k, i);
     }
-    const int old_arena = arena_for(objs[0]);
+    const int old_arena = mostCommonArena(objs);
 
     // The hot site: kept hot by a write to each object every 250 ms below.
     SiteFn hot_site = kHotSites[0];
     for (SiteFn h : kHotSites) {
-        void* p = h();
-        const int a = arena_for(p);
-        free(p);
-        if (a != old_arena) {
+        if (siteArena(h) != old_arena) {
             hot_site = h;
             break;
         }
@@ -112,7 +145,7 @@ int child() {
         hot[k] = static_cast<unsigned char*>(hot_site());
         for (size_t i = 0; i < kObj; ++i) hot[k][i] = want(k + 7, i);
     }
-    const int hot_old = arena_for(hot[0]);
+    const int hot_old = mostCommonArena(hot);
     unsigned round = 0;
     auto heatUp = [&] {
         ++round;
