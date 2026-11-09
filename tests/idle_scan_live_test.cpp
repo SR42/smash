@@ -15,7 +15,7 @@
 // block's 2048: the skip must not reach live pages).
 //
 // Root only: without CAP_SYS_ADMIN and the page_idle bitmap the tracker is
-// not `idle`, and the test prints SKIP and passes.
+// not `idle`, and the test prints SKIP and exits 77 (skipped).
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>

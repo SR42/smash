@@ -172,8 +172,10 @@ static bool testTrainSaveLoadRoundtrip(const char* path) {
     bool trained = engineA.trainDictionary(
         kSizeClass, sample_buf, sample_sizes, kSamples);
     if (!trained) {
-        // ZDICT can refuse on degenerate samples; skip rather than fail.
-        fprintf(stderr, "  (training did not produce a dict — skipping)\n");
+        // The samples are fixed and zstd is pinned, so training either always
+        // works or is broken. This used to print a note, skip the round trip
+        // and the corrupt-file checks, and pass.
+        CHECK(false, "training produced no dict from the fixed samples");
         return false;
     }
     CHECK(engineA.hasDictionary(kSizeClass), "engineA should have dict");

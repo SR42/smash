@@ -114,6 +114,14 @@ int main(int argc, char** argv) {
         }
     }
     std::printf("fork: %d of %zu cold pages compressed before the forks\n", compressed, kCold / 4096);
+    if (!compressor_off && compressed == 0) {
+        // The page-lock rounds below need a compressed page for the child to
+        // read through the fault handler. Without one they ran on a plain
+        // page and passed.
+        std::fprintf(stderr, "FAIL: no cold page compressed in 20 s: the child's read of a compressed "
+                             "page was not exercised\n");
+        return 1;
+    }
 
     // Deterministic: fork while another thread holds every lock.
     using hold_fn = int (*)(unsigned);

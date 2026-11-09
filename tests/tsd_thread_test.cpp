@@ -8,8 +8,9 @@
 //   3. a thread whose own pthread-key destructor allocates after smash's
 //      destructor ran neither crashes nor leaks a state per thread;
 //   4. fork() with live threads keeps the free list usable in the child;
-// and that every allocation's contents survive. Skips (exit 0) when the
-// library has no smash_tsd_stats (TSD slot not compiled in, e.g. Linux).
+// and that every allocation's contents survive. Skips (exit 77) when the
+// library has no smash_tsd_stats (TSD slot not compiled in: x86-64, or
+// SMASH_TSD_SLOT=OFF); fails when libsmash is not in the process at all.
 
 #include <dispatch/dispatch.h>
 #include <dlfcn.h>
@@ -89,6 +90,10 @@ static void run_threads(int rounds, int width, void* (*body)(void*)) {
 
 int main() {
     std::setvbuf(stdout, nullptr, _IONBF, 0);  // keep progress lines if a phase crashes
+    if (!dlsym(RTLD_DEFAULT, "smash_in_arena")) {
+        std::fprintf(stderr, "FAIL: not running under libsmash\n");
+        return 1;
+    }
     stats_fn = reinterpret_cast<StatsFn>(dlsym(RTLD_DEFAULT, "smash_tsd_stats"));
     if (!stats_fn) {
         std::printf("tsd_thread_test: SKIP (smash_tsd_stats not exported; TSD slot not compiled in)\n");

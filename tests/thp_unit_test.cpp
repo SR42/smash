@@ -185,13 +185,14 @@ bool waitOut(const char* p, size_t len, size_t max_pages, int seconds) {
 // `lead`: the 2 MiB before `a` is part of the block too, on 4 KiB pages
 // (MADV_NOHUGEPAGE), so it is compressed page by page next to unit 0.
 int prepare(char*& a, size_t units, uint64_t salt, void** block = nullptr, bool lead = false) {
+    // Before the root check: a missing libsmash is a failure on any host.
+    using TrackFn = const char* (*)();
+    auto track = reinterpret_cast<TrackFn>(dlsym(RTLD_DEFAULT, "smash_write_tracker"));
+    if (!track) { std::fprintf(stderr, "FAIL: not running under libsmash\n"); return 1; }
     if (geteuid() != 0 || access("/sys/kernel/mm/page_idle/bitmap", R_OK | W_OK) != 0) {
         std::printf("SKIP: needs root and /sys/kernel/mm/page_idle/bitmap\n");
         return 2;
     }
-    using TrackFn = const char* (*)();
-    auto track = reinterpret_cast<TrackFn>(dlsym(RTLD_DEFAULT, "smash_write_tracker"));
-    if (!track) { std::fprintf(stderr, "FAIL: not running under libsmash\n"); return 1; }
     void* blk = std::malloc(units * kUnit + (lead ? 2 : 1) * kUnit);
     CHECK(blk, "malloc");
     a = alignUnit(blk) + (lead ? kUnit : 0);

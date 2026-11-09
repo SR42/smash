@@ -53,7 +53,7 @@ Rules that the investigations behind this suite keep relearning:
 - **On the free path, `perf` attribution and interleaved A/B timing disagree, and only the timing counts.**
 - **`bench_sqlite` tells you whether a compressor change did anything; `bench_rss` saturates at ~72 %.**
 - **A churn-only stress proves nothing about the compressor** (blocks are freed before they go cold); hold a live set idle.
-- **Exit 77 only when the host cannot run the test or its scenario did not arise; never skip on the symptom the test guards.** A preloaded test that finds no libsmash fails. Until 2026-11-09 skips returned 0 and passed: a block outside the arena, a dead double-free child and an inert test all read as green ([agents/tests.md](agents/tests.md), "Skips and the preload fixture").
+- **Exit 77 only when the host cannot run the test or its scenario did not arise; never skip on the symptom the test guards.** A preloaded test that finds no libsmash fails, and so does a wait for compression that times out: a note and a pass on an uncompressed page is a skip too. Until 2026-11-09 skips returned 0 and passed: a block outside the arena, a dead double-free child and an inert test all read as green ([agents/tests.md](agents/tests.md), "Skips and the preload fixture").
 
 ## Further documentation
 

@@ -205,7 +205,7 @@ static bool testNodeArenas() {
 
 int main() {
 #if defined(__linux__)
-    if (!testNodeArenas()) return 77;  // skipped
+    if (!testNodeArenas()) return failures ? 1 : 77;  // skipped, unless a check before the probe failed
 #else
     fprintf(stderr, "numa_arena: SKIP (Linux only)\n");
     return 77;

@@ -154,7 +154,14 @@ void testCompressedPageStillRestored() {
         usleep(100000);
         if (page_info(p + 4096, &state, &cold, &re) == 0 && state == 2) break;
     }
-    if (state != 2) { std::printf("  (no page compressed in 15 s; restore check skipped)\n"); std::free(p); return; }
+    if (state != 2) {
+        // Cold timeout 1 s: a page that is still not compressed means the
+        // restore below would run on nothing. This used to print a note and
+        // pass.
+        fail("no page compressed in 15 s: the restore on the alternate stack was not exercised");
+        std::free(p);
+        return;
+    }
     // Faults into smash's handler, now on the alternate stack.
     size_t bad = 0;
     for (size_t i = 0; i < bytes; i += 64) bad += p[i] != static_cast<unsigned char>(i >> 12);

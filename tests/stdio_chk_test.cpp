@@ -99,11 +99,17 @@ int main() {
         for (size_t i = 0; i < kBig; ++i) buf[i] = static_cast<char>('a' + i % 7);
         bool out = false;
         for (int w = 0; w < 160 && !out; ++w) {
+            // 12288 bytes are three 4 KiB pages, one 16 or 64 KiB page.
+            const size_t ps = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+            const size_t np = (12288 + ps - 1) / ps;
             unsigned char v[3] = {1, 1, 1};
-            out = mincore(buf, 12288, v) == 0 && !(v[0] & 1) && !(v[1] & 1) && !(v[2] & 1);
+            out = mincore(buf, 12288, v) == 0;
+            for (size_t i = 0; i < np; ++i) out = out && !(v[i] & 1);
             if (!out) usleep(250 * 1000);
         }
-        if (!out) std::printf("note: __fread_chk round %d's buffer did not leave RAM\n", round);
+        // Not a note: a buffer still in RAM makes the read below plain
+        // glibc's, and the test passed with the compressor switched off.
+        if (!out) { fail("the __fread_chk buffer did not leave RAM in 40 s: the path was not exercised", round, 0); free(buf); continue; }
         // A regular file: glibc reads a request larger than the stream's
         // buffer straight into the caller's (on a pipe it only ever filled
         // its own buffer, so the caller's pages were written by a memcpy,
