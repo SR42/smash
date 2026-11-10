@@ -11,6 +11,8 @@ change on a Xeon 8175M: batch 1.58x -> 1.40x glibc, random replace 1.21x ->
 0.88x, 8-thread random 1.34x -> 1.04x. 2026-11-09: **the lanes follow the
 runtime arena count** (`ThreadCache::layout()`), the fix proposed at the end of
 this section, because 16 fixed lanes broke placement above 16 arenas.
+2026-11-10: **the depth is capped at 16**, so fewer than 16 arenas no longer
+buy a deeper cache ("The depth cap" below).
 
 **A shared lane mixes placement on every refill, not only for recycled
 objects.** `refill(sc, arena)` fills the lane from the asking arena's slab and
@@ -49,10 +51,11 @@ malloc+free; 64-byte objects except random replace, 16–1024 B):
 | malloc+free pair | 11.2 | 11.0 | 11.0 | 11.1 | 7.0 |
 
 So the runtime layout keeps the 16 x 16 split where there are 16 arenas (5–16
-CPUs), is faster on 4 CPUs or fewer (4 arenas, depth 64), and is slower where
-the 16-lane speed came from broken placement: 32 x 8 on 17–64 CPUs, 64 x 4 on
-65–256. At 128 arenas (more than 256 CPUs, or 64 with cold-arena feedback) the
-budget would give depth 2; the floor keeps 4, at 144 KB per thread.
+CPUs) and is slower where the 16-lane speed came from broken placement: 32 x 8
+on 17–64 CPUs, 64 x 4 on 65–256. At 128 arenas (more than 256 CPUs, or 64 with
+cold-arena feedback) the budget would give depth 2; the floor keeps 4, at
+144 KB per thread. On 4 CPUs or fewer (4 arenas) the budget would give depth
+64; the cap keeps 16.
 
 **The runtime layout itself costs 1–5%.** Against the compile-time 16 x 16, at
 16 arenas, where the split is the same (`L16` and `RT` in `$S/lanes/speed3.tsv`
@@ -73,8 +76,35 @@ the cache's header and shifts by a variable; that is all that changed in
 (the counts sized for 128 lanes), which removes the stack-base load, did not
 help: 1.014–1.048 on the same runs. Measured on a Ryzen 9 5950X (Zen 3, where
 `shl %cl` is one µop; on Intel before Ice Lake it is three: not measured).
-On 4 arenas the deeper cache more than pays for it (batch of 64: 16.8 -> 9.0
-ns; random replace: 11.4 -> 9.2).
+On 4 arenas the deeper cache more than paid for it (batch of 64: 16.8 -> 9.0
+ns; random replace: 11.4 -> 9.2), until the cap below took the depth back to
+16.
+
+**The depth cap (2026-11-10).** `layout()` stops at depth 16
+(`kMaxLaneDepthShift`), so 4 and 8 arenas get 16 where the budget alone gave
+64 and 32. The reason is compression, not speed. Cooling-page closing works in
+the slab's slot scan, and a lane hands the slots it holds out again whatever
+page they are on. `test_cooling_close` counts the churn allocations that land
+on pages going cold: 128 of 38272 at depth 16, 256 at 32 and 392 at 64, which
+is over its 1% limit. It failed on a host with 4 CPUs or fewer (4 arenas) and
+passed here, at 16 arenas; `test_cooling_close_4_arenas` now shows it on any
+host. What the cap costs, the capped library against the one before it (same
+flags, `SMASH_NUM_ARENAS` set, this 8-CPU host, medians of 9 interleaved runs,
+ns per malloc+free; `$S/lanes/speed5.tsv` in the 2026-11-10 session):
+
+| benchmark | 4 arenas, depth 64 | capped (16) | 8 arenas, depth 32 | capped (16) |
+|---|---|---|---|---|
+| malloc+free pair | 11.5 | 11.4 | 11.4 | 11.4 |
+| batch of 64 | 9.0 | 17.5 | 14.5 | 17.4 |
+| batch of 256 | 17.6 | 20.4 | 19.0 | 20.3 |
+| random replace, 1 thread | 9.3 | 11.7 | 10.1 | 11.8 |
+| random replace, 8 threads | 11.4 | 16.8 | 13.2 | 17.4 |
+| cross-thread free, 1 thread | 11.6 | 11.6 | 11.7 | 11.7 |
+
+At 16 arenas nothing moved (ratios 0.97–1.00). A small host is back at the
+speed of the fixed 16 x 16 layout: ahead of glibc on random replace and behind
+it on batches, like the 16-arena column of the table above. Keeping the depth
+and taking cooling slots out of the lanes instead was not tried.
 
 The analysis below is of the 64-lane layout #93 replaced.
 

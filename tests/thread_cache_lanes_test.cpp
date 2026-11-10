@@ -14,9 +14,10 @@
 // The lanes now follow the arena count (ThreadCache::layout()).
 //
 // The test runs under LD_PRELOAD in full mode with SMASH_NUM_ARENAS set by
-// the ctest (64: depth 4; 128: the depth floor; 4: depth 64). 32 noinline
-// call sites of 256-byte objects allocate 2048 objects each, round robin;
-// then 200k times a random object is freed and replaced from a random site.
+// the ctest (64: depth 4; 128: the depth floor; 4: depth 16, the cap). 32
+// noinline call sites of 256-byte objects allocate 2048 objects each, round
+// robin; then 200k times a random object is freed and replaced from a random
+// site.
 // After each phase every call site's live objects must all be in one arena.
 // Same size and stack depth at every site, so the arena is a function of the
 // return address alone (SMASH_CPU_ARENA=0, feedback off).

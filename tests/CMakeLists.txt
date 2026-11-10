@@ -1389,6 +1389,17 @@ if(NOT APPLE)
     "SMASH_DEFER_PHASES_MS=0" "SMASH_COLD_TIMEOUT_SEC=4"
     $<TARGET_FILE:cooling_close_test>)
   set_tests_properties(test_cooling_close PROPERTIES TIMEOUT 300)
+  # The same at 4 arenas, what a host with 4 CPUs or fewer has. The thread
+  # cache splits its per-class budget between the arenas' lanes, and the
+  # slots a lane holds are handed out again whatever page they are on: at
+  # depth 64 (4 lanes, no cap) the churn put 392 of 38272 allocations on the
+  # pages going cold, over the 1% limit. ThreadCache::layout() caps the depth
+  # at 16. Hosts with more CPUs never saw it (16 arenas: depth 16 anyway).
+  add_test(NAME test_cooling_close_4_arenas COMMAND ${CMAKE_COMMAND} -E env
+    "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=0" "SMASH_STATS_SIGNAL=1"
+    "SMASH_DEFER_PHASES_MS=0" "SMASH_COLD_TIMEOUT_SEC=4" "SMASH_NUM_ARENAS=4"
+    $<TARGET_FILE:cooling_close_test>)
+  set_tests_properties(test_cooling_close_4_arenas PROPERTIES TIMEOUT 300)
   # A page with dirty freed slots must be reclaimed from COMPRESSED_SHADOW, and a
   # write to a page awaiting reclaim must survive (shadow_free_slots_test.cpp).
   add_executable(shadow_free_slots_test shadow_free_slots_test.cpp)
@@ -1875,7 +1886,8 @@ add_smash_mode_test(test_thread_cache_reclaim_large_only thread_cache_reclaim_te
 # call site's objects must stay in one arena. A lane shared by two arenas (16
 # fixed lanes against 32+ arenas, upstream #93) hands one arena's objects to
 # the other's call site. Arena counts: 64 (depth 4), 128 (the depth floor:
-# 128 lanes of 4) and 4 (depth 64). Fast and deterministic (no compressor).
+# 128 lanes of 4) and 4 (depth 16, the cap). Fast and deterministic (no
+# compressor).
 add_executable(thread_cache_lanes_test thread_cache_lanes_test.cpp)
 set_target_properties(thread_cache_lanes_test PROPERTIES CXX_STANDARD 20)
 target_link_libraries(thread_cache_lanes_test PRIVATE ${CMAKE_DL_LIBS})

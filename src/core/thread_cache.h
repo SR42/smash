@@ -26,13 +26,15 @@ class alignas(64) ThreadCache {
     // Per-(lane, size-class) pointer stacks. One lane per arena: the lane
     // count is the process's arena count (getTotalArenas(): hot and cold
     // arenas both, with SMASH_COLD_ARENA_FEEDBACK), fixed at startup, and the
-    // per-class budget kThreadCacheMaxPerClass (256) is split between them:
+    // per-class budget kThreadCacheMaxPerClass (256) is split between them,
+    // up to a depth of 16:
     //
     //   arenas   4   8  16  32  64  128
-    //   depth   64  32  16   8   4    4
+    //   depth   16  16  16   8   4    4
     //
-    // so a thread holds 256 pointers per class (72 KB) whatever the arena
-    // count, except at 128 arenas, where the depth floor of 4 doubles it.
+    // so a thread holds 256 pointers per class (72 KB) from 16 arenas up,
+    // less below (18 KB at 4 arenas, 36 KB at 8), and twice that at 128
+    // arenas, where the depth floor of 4 doubles it.
     //
     // A lane must never be shared by two arenas. refill() fills a lane from
     // the asking arena's slab and allocate() hands out whatever the lane
@@ -45,8 +47,19 @@ class alignas(64) ThreadCache {
     //
     // Depth is what buys speed: on random replace (x86-64, 8 CPUs) a
     // malloc+free costs 20 ns at depth 4, 14 ns at 8, 11 ns at 16 and
-    // 10 ns at 32 (glibc 17). A small machine therefore gets a deep cache
-    // and a large one, with many arenas, a shallow one.
+    // 10 ns at 32 (glibc 17). A large machine, with many arenas, therefore
+    // gets a shallow cache.
+    //
+    // Depth is capped at 16 (kMaxLaneDepthShift) all the same. A lane keeps
+    // handing out the slots it holds, and those sit on pages that are going
+    // cold: cooling-page closing only keeps the slab from refilling them.
+    // test_cooling_close counts the churn allocations that land on such
+    // pages: 128 of 38272 at depth 16, 256 at 32, 392 at 64 (its limit is
+    // 1%, 382). Without the cap a host with 4 arenas (4 CPUs or fewer) got
+    // depth 64 and failed it; 16 is what such a host had with the fixed
+    // 16 x 16 layout. The price is the speed of the deeper cache there: at
+    // 4 arenas a batch of 64 costs 17.5 ns per malloc+free against 9.0, and
+    // random replace 11.7 against 9.3 (agents/performance.md).
     //
     // Layout of one allocation (layout(), the same for every cache of the
     // process): this 64-byte header, then lanes * kNumClasses 2-byte
@@ -62,6 +75,7 @@ class alignas(64) ThreadCache {
     static constexpr uint32_t kMaxCacheLanes = kTotalArenas;
 #endif
     static constexpr uint32_t kMinLaneDepthShift = 2;   // depth >= 4
+    static constexpr uint32_t kMaxLaneDepthShift = 4;   // depth <= 16
     static_assert((kMaxCacheLanes & (kMaxCacheLanes - 1)) == 0, "SMASH_CACHE_LANES must be a power of 2");
     static_assert(kThreadCacheMaxPerClass >= (1 << kMinLaneDepthShift),
                   "drain buffers are sized kThreadCacheMaxPerClass and must hold a lane");
@@ -79,9 +93,11 @@ public:
         uint32_t lanes = static_cast<uint32_t>(getTotalArenas());
         if (lanes < 1) lanes = 1;
         if (lanes > kMaxCacheLanes) lanes = kMaxCacheLanes;
-        // The deepest power of 2 with lanes * depth <= the per-class budget.
+        // The deepest power of 2 with lanes * depth <= the per-class budget,
+        // no deeper than the cap.
         uint32_t shift = kMinLaneDepthShift;
-        while ((size_t{2} << shift) * lanes <= static_cast<size_t>(kThreadCacheMaxPerClass)) ++shift;
+        while (shift < kMaxLaneDepthShift &&
+               (size_t{2} << shift) * lanes <= static_cast<size_t>(kThreadCacheMaxPerClass)) ++shift;
         const size_t slots = static_cast<size_t>(lanes) * kNumClasses;
         const size_t ptrs_offset = sizeof(ThreadCache) + ((slots * sizeof(uint16_t) + 63) & ~size_t{63});
         return Layout{lanes, shift, ptrs_offset, ptrs_offset + (slots << shift) * sizeof(void*)};
