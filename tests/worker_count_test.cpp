@@ -16,11 +16,20 @@
 //     pages handed to a node's group were eligible and not compressed by the
 //     default workers.)
 //
-//   burst: 512 MiB of compressible bytes go cold at once, with ticks of
-//     200 ms: several ticks' worth of CPU time in one tick. The old count
-//     stayed at 1, every eligible page being compressed, while one thread
-//     worked through the lot. The count must reach 2 or more while the block
-//     is being compressed, and be back at 1 within 30 ticks of the end.
+//   burst: 512 MiB of compressible bytes are cold when compression starts
+//     (SMASH_DEFER_PHASES_MS=8000 holds it back until the block is filled),
+//     with ticks of 200 ms. The first compressing tick has all of it to do:
+//     many ticks' worth of CPU time, on the one worker an idle process runs
+//     with. The count for the ticks after it must be 2 or more, and it must
+//     be back at 1 within 20 s. The old count stayed at 1: every eligible
+//     page was compressed.
+//
+//     The work is fixed and the tick before it short, so the load is far
+//     above half a worker whatever share of a CPU the host gives the
+//     compressor. The first version let compression start while the block
+//     was being filled and stopped looking once it was compressed: under the
+//     UBSan suite as root on a loaded 2-CPU host the whole block was done in
+//     one tick, the test stopped looking during it, and saw one worker.
 //
 // SMASH_CPU_PRESSURE_CAP=0 in both: the cap would hide the count on a loaded
 // 2-CPU host. SMASH_NUMA_COMPRESSOR=0 in burst: with node groups the default
@@ -128,49 +137,64 @@ int light() {
     return 0;
 }
 
-int burst() {
+int burst(double process_start) {
     constexpr size_t kBlock = size_t{512} << 20;
+    constexpr double kDeferS = 8.0;   // SMASH_DEFER_PHASES_MS in the registration
     auto* p = static_cast<unsigned char*>(std::malloc(kBlock));
     if (!p) { std::fprintf(stderr, "FAIL: malloc\n"); return 1; }
     fillCompressible(p, kBlock);
+    const double filled_at = now() - process_start;
+    // Compression must not have started while the block was being filled,
+    // or its pages go cold a few at a time and there is no burst.
+    if (filled_at > kDeferS - 1.5) {
+        std::printf("SKIP: filling 512 MiB took until %.1f s after start; compression is held back for "
+                    "%.0f s only, so the block would not be cold all at once\n", filled_at, kDeferS);
+        return 77;
+    }
     const size_t pages = kBlock / 4096;
     uint32_t max_workers = 0;
     const double t0 = now();
-    double done_at = -1;
+    double done_at = -1, last_look = 0;
     size_t c = 0;
+    // Until the block is compressed, and then until the count has risen or
+    // 3 s (15 ticks) have passed: the count a tick leads to is applied to
+    // the next one, so it shows after the tick that did the work.
     while (now() - t0 < 120.0) {
         max_workers = std::max(max_workers, workers());
+        if (done_at >= 0 && (max_workers >= 2 || now() - t0 - done_at > 3.0)) break;
         usleep(10000);
         // The states cost a call per page: look twice a second.
-        static double last_look = 0;
-        if (now() - last_look >= 0.5) {
+        if (done_at < 0 && now() - last_look >= 0.5) {
             last_look = now();
             c = compressedPages(p, kBlock);
-            if (c >= pages * 9 / 10) { done_at = now() - t0; break; }
+            if (c >= pages * 9 / 10) done_at = now() - t0;
         }
     }
     if (done_at < 0) {
         std::fprintf(stderr, "FAIL: %zu of %zu pages compressed in 120 s\n", c, pages);
         return 1;
     }
-    // 30 ticks of 200 ms for the count to come down.
+    // The count comes down a quarter of the way per tick from wherever the
+    // burst put the load: 13 ticks from 20 workers' worth, 19 from 100. 20 s
+    // is 100 ticks of 200 ms, and more when a loaded host stretches them.
     uint32_t last = 0;
     const double t1 = now();
     double back_at = -1;
-    while (now() - t1 < 6.0) {
+    while (now() - t1 < 20.0) {
         last = workers();
+        max_workers = std::max(max_workers, last);
         if (last <= 1) { back_at = now() - t1; break; }
         usleep(20000);
     }
-    std::printf("burst: %zu of %zu pages compressed after %.1f s; most workers meanwhile: %u; back at one "
-                "worker %.1f s later\n", c, pages, done_at, max_workers, back_at);
+    std::printf("burst: block filled %.1f s after start; %zu of %zu pages compressed %.1f s later; most "
+                "workers: %u; back at one worker after %.1f s\n", filled_at, c, pages, done_at, max_workers, back_at);
     if (max_workers < 2) {
-        std::fprintf(stderr, "FAIL: 512 MiB went cold at once and the compressor never ran with more than "
+        std::fprintf(stderr, "FAIL: one tick had 512 MiB to compress and the ticks after it still ran with "
                      "%u worker(s)\n", max_workers);
         return 1;
     }
     if (back_at < 0) {
-        std::fprintf(stderr, "FAIL: %u workers 6 s (30 ticks) after the work ended\n", last);
+        std::fprintf(stderr, "FAIL: %u workers 20 s (100 ticks) after the count rose\n", last);
         return 1;
     }
     return 0;
@@ -178,6 +202,7 @@ int burst() {
 }  // namespace
 
 int main(int argc, char** argv) {
+    const double process_start = now();
     setvbuf(stdout, nullptr, _IOLBF, 0);
     page_info = reinterpret_cast<info_fn>(dlsym(RTLD_DEFAULT, "smash_page_info"));
     balance = reinterpret_cast<bal_fn>(dlsym(RTLD_DEFAULT, "smash_worker_balance_info"));
@@ -188,7 +213,7 @@ int main(int argc, char** argv) {
     const char* mode = argc > 1 ? argv[1] : "";
     int rc;
     if (!std::strcmp(mode, "light")) rc = light();
-    else if (!std::strcmp(mode, "burst")) rc = burst();
+    else if (!std::strcmp(mode, "burst")) rc = burst(process_start);
     else { std::fprintf(stderr, "usage: %s light|burst\n", argv[0]); return 2; }
     if (rc == 0) std::printf("OK\n");
     return rc;

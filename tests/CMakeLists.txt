@@ -977,7 +977,9 @@ if(NOT APPLE)
 
   # The worker count in the running library (worker_count_test.cpp, issue #8):
   # a light load with half its pages not compressed must not climb to the cap,
-  # and 512 MiB going cold at once must bring more than one worker.
+  # and a tick with 512 MiB to compress must bring more than one worker for
+  # the ticks after it. In burst, compression is held back for 8 s so that the
+  # whole block is cold when it starts.
   add_executable(worker_count_test worker_count_test.cpp)
   target_link_libraries(worker_count_test PRIVATE ${CMAKE_DL_LIBS})
   add_test(NAME test_worker_count_light COMMAND ${CMAKE_COMMAND} -E env
@@ -986,7 +988,7 @@ if(NOT APPLE)
     $<TARGET_FILE:worker_count_test> light)
   add_test(NAME test_worker_count_burst COMMAND ${CMAKE_COMMAND} -E env
     "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=1" "SMASH_COLD_TIMEOUT_SEC=1"
-    "SMASH_DEFER_PHASES_MS=0" "SMASH_CPU_PRESSURE_CAP=0" "SMASH_NUMA_COMPRESSOR=0"
+    "SMASH_DEFER_PHASES_MS=8000" "SMASH_CPU_PRESSURE_CAP=0" "SMASH_NUMA_COMPRESSOR=0"
     "SMASH_TEST_TICK_MS=200"
     $<TARGET_FILE:worker_count_test> burst)
   set_tests_properties(test_worker_count_light test_worker_count_burst PROPERTIES TIMEOUT 240)
