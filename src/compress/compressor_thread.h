@@ -93,12 +93,6 @@ inline std::atomic<bool> g_smash_skip_external_tracking{false};
 
 namespace smash {
 
-// Compressor thread bypass flag. inline thread_local (C++17) gives a single
-// definition across all TUs — both libsmash.so and test executables that
-// include this header directly without linking smash_heap.cpp.
-inline __attribute__((tls_model("initial-exec")))
-    thread_local bool g_compressor_thread = false;
-
 // ── Optional remote-core store-drain barrier ───────────────────────────────
 // SMASH_PROT_READ_BARRIER=1 enables a syscall after mprotect(PROT_READ)
 // (and before the snapshot memcpy) that forces all other application threads
@@ -5040,7 +5034,7 @@ private:
                 pthread_attr_init(&attr);
                 pthread_attr_setstack(&attr, nw.stack, nodeStackBytes());
                 if (g->pinned) pthread_attr_setaffinity_np(&attr, sizeof(g->cpus), &g->cpus);
-                const int rc = pthread_create(&nw.thread, &attr, nodeWorkerEntry, &nw);
+                const int rc = startSmashThread(&nw.thread, &attr, nodeWorkerEntry, &nw);
                 pthread_attr_destroy(&attr);
                 if (rc != 0) break;
                 ++g->threads_running;
@@ -5281,7 +5275,7 @@ private:
     }
 
     __attribute__((cold)) static void* nodeWorkerEntry(void* arg) {
-        g_compressor_thread = true;
+        enterSmashThread();   // before anything here can allocate
         tl_numa_worker_ = true;
         blockAsyncSignalsOnSelf();
         exit_guard::ThreadRegistration exit_reg;  // not an application thread
@@ -8593,7 +8587,7 @@ private:
             // EAGAIN under thread exhaustion: stop scaling up rather than
             // counting a helper that does not exist (dispatch would wait
             // forever for its generation ack; stop() would join garbage).
-            if (pthread_create(&helper_threads_[helper_id], nullptr, helperEntry, ha) != 0)
+            if (startSmashThread(&helper_threads_[helper_id], nullptr, helperEntry, ha) != 0)
                 break;
             helpers_created_++;
         }
@@ -8670,7 +8664,7 @@ private:
     }
 
     __attribute__((cold)) static void* coordEntry(void* arg) {
-        g_compressor_thread = true;
+        enterSmashThread();   // before anything here can allocate
         blockAsyncSignalsOnSelf();
         exit_guard::ThreadRegistration exit_reg;  // not an application thread
         auto* self = static_cast<CompressorThread*>(arg);
@@ -8757,7 +8751,7 @@ private:
     }
 
     __attribute__((cold)) static void* helperEntry(void* arg) {
-        g_compressor_thread = true;
+        enterSmashThread();   // before anything here can allocate
         blockAsyncSignalsOnSelf();
         exit_guard::ThreadRegistration exit_reg;  // not an application thread
         auto* ha = static_cast<HelperArg*>(arg);

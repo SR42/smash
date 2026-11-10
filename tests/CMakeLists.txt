@@ -934,6 +934,22 @@ if(NOT APPLE)
     $<TARGET_FILE:slab_purge_test> fork)
   set_tests_properties(test_slab_purge_unlocked test_slab_purge_fork PROPERTIES TIMEOUT 300)
 
+  # smash's own threads allocate from the system allocator, never from the
+  # arena (smash_thread_alloc_test.cpp, issue #7). The test defines usleep(),
+  # madvise() and sched_getcpu(), which libsmash calls on those threads, and
+  # allocates from inside them. Full mode, and large-only, where only an
+  # aligned block of a compressible size went to the arena.
+  add_executable(smash_thread_alloc_test smash_thread_alloc_test.cpp)
+  target_link_libraries(smash_thread_alloc_test PRIVATE ${CMAKE_DL_LIBS} Threads::Threads)
+  set_target_properties(smash_thread_alloc_test PROPERTIES ENABLE_EXPORTS ON)
+  add_test(NAME test_smash_thread_alloc_full COMMAND ${CMAKE_COMMAND} -E env
+    "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=0" "SMASH_COLD_TIMEOUT_SEC=1"
+    "SMASH_DEFER_PHASES_MS=0" $<TARGET_FILE:smash_thread_alloc_test>)
+  add_test(NAME test_smash_thread_alloc_large_only COMMAND ${CMAKE_COMMAND} -E env
+    "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=1" "SMASH_COLD_TIMEOUT_SEC=1"
+    "SMASH_DEFER_PHASES_MS=0" $<TARGET_FILE:smash_thread_alloc_test>)
+  set_tests_properties(test_smash_thread_alloc_full test_smash_thread_alloc_large_only PROPERTIES TIMEOUT 120)
+
   # Root only (CAP_SYS_ADMIN for the idle bitmap): skips otherwise.
   add_executable(idle_direct_snapshot_test idle_direct_snapshot_test.cpp)
   target_link_libraries(idle_direct_snapshot_test PRIVATE ${CMAKE_DL_LIBS})

@@ -1147,6 +1147,7 @@ public:
     }
 
     static inline SmashHeap* tick_self_ = nullptr;
+    static inline SmashHeap* smash_thread_self_ = nullptr;   // for the hooks of util/thread_stack.h
 
     static void compressedEventHook(size_t /*page_idx*/, uint8_t arena_id,
                                     uint8_t sc, void* ctx) {
@@ -1525,6 +1526,18 @@ public:
                              &compress_store_, &compress_engine_,
                              compress_only ? nullptr : &page_map_, &fault_handler_);
             log_time("compressor_init");
+            // smash's own threads (the compressor's, VmRegion's decommit
+            // thread) are marked before anything runs on them and do not pass
+            // through the application's thread hook (util/thread_stack.h).
+            // threadInit() gives them what they still need from it, the exit
+            // watch and the alternate signal stack, and no thread cache.
+            smash_thread_self_ = this;
+            g_smash_thread_init.store(+[] {
+                if (SmashHeap* h = smash_thread_self_) h->threadInit();
+            }, std::memory_order_release);
+            g_smash_thread_drop_cache.store(+[] {
+                if (SmashHeap* h = smash_thread_self_) h->threadCleanup();
+            }, std::memory_order_release);
             // A3: register the cold-arena feedback hook (no-op when
             // SMASH_COLD_ARENA_FEEDBACK is off — onPageCompressed early-returns).
             if (!compress_only && (cold_feedback_ || kAdaptiveCap)) {
@@ -1741,6 +1754,10 @@ public:
     ThreadCache* getOrCreateThreadCache() {
         ThreadCache*& tc = currentThreadCache();
         if (!tc) {
+            // One of smash's own threads never has one: a cache is what
+            // malloc's fast path serves from, and it serves from the arena
+            // (util/thread_stack.h). Every caller handles nullptr.
+            if (g_smash_thread) [[unlikely]] return nullptr;
             armExitWatch();
             tc = newThreadCache();
             if (tc) {
@@ -1787,11 +1804,13 @@ public:
             return nullptr;
         }
 
-        // Compressor threads route all allocations to the system allocator.
+        // smash's own threads route all allocations to the system allocator.
         // This prevents the compressor from allocating slab pages that it
         // will later compress — which causes SIGSEGV recursion when libc
         // functions on the compressor thread access their own heap data.
-        if (g_compressor_thread) {
+        // They reach this path for every size, because they have no thread
+        // cache (getOrCreateThreadCache) for the fast paths to serve from.
+        if (g_smash_thread) {
             if (!g_system_alloc.malloc) g_system_alloc.resolve();
             if (g_system_alloc.malloc) return g_system_alloc.malloc(size);
             return nullptr;
@@ -2117,6 +2136,17 @@ public:
             return nullptr;
         }
 
+        // A smash thread's memory comes from the system allocator, as in
+        // mallocSlow. It did not here: an aligned block of any size came
+        // from the slab or from LargeAlloc, in large-only mode too.
+        if (g_smash_thread) [[unlikely]] {
+            if (!g_system_alloc.posix_memalign) g_system_alloc.resolve();
+            void* ptr = nullptr;
+            if (g_system_alloc.posix_memalign && g_system_alloc.posix_memalign(&ptr, alignment, size) == 0)
+                return ptr;
+            return nullptr;
+        }
+
         if (isCompressOnlyMode()) {
             if (!g_system_alloc.posix_memalign) return nullptr;
             void* ptr = nullptr;
@@ -2254,9 +2284,9 @@ public:
             if (g_system_alloc.calloc) return g_system_alloc.calloc(count, size);
             return nullptr;
         }
-        // A compressor thread's memory comes from the system allocator,
+        // A smash thread's memory comes from the system allocator,
         // untracked, as in mallocSlow.
-        if (g_compressor_thread) [[unlikely]] {
+        if (g_smash_thread) [[unlikely]] {
             if (!g_system_alloc.calloc) g_system_alloc.resolve();
             return g_system_alloc.calloc ? g_system_alloc.calloc(count, size) : nullptr;
         }

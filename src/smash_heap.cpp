@@ -260,8 +260,8 @@ constinit thread_local int smash::g_full_mode_cached = -1;
 __attribute__((tls_model("initial-exec")))
 constinit thread_local smash::ThreadCache* smash::g_fast_tc = nullptr;
 
-// g_compressor_thread is now defined as inline thread_local in
-// compressor_thread.h (C++17 inline variable, single definition).
+// g_smash_thread (the mark of smash's own threads) is an inline thread_local
+// in util/thread_stack.h (C++17 inline variable, single definition).
 
 __attribute__((tls_model("initial-exec")))
 constinit thread_local uintptr_t smash::g_arena_stack_base = 0;

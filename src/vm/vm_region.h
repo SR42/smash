@@ -28,6 +28,7 @@
 #include "../util/cpu_shard.h"
 #include "../util/exit_guard.h"
 #include "../util/park.h"
+#include "../util/thread_stack.h"
 
 #include <algorithm>
 #include <atomic>
@@ -318,6 +319,7 @@ class VmRegion {
     }
 
     static void* decommitThreadEntry(void* arg) {
+        enterSmashThread();   // before anything here can allocate
         // Block asynchronous signals so a process-directed signal (e.g. an
         // app's shutdown SIGUSR2/SIGTERM) is never absorbed by this smash
         // background thread instead of reaching a host application thread.
@@ -412,7 +414,7 @@ class VmRegion {
             return;
         }
         q.region = this;
-        if (pthread_create(&q.thread, nullptr, decommitThreadEntry, &q) != 0) {
+        if (startSmashThread(&q.thread, nullptr, decommitThreadEntry, &q) != 0) {
             // EAGAIN under thread exhaustion. Without the rollback,
             // decommit_running_ claims a drainer exists while nothing ever
             // pops the MPSC queue: freed runs never reach the free list

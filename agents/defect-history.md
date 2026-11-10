@@ -1552,3 +1552,64 @@ cache lines".
 
 Guarded by `test_slab_purge_unlocked`, `test_slab_purge_fork` and
 `test_spinlock_park` ([tests.md](tests.md)).
+
+## smash's own threads allocated from the arena (fixed 2026-11-10, issue #7)
+
+A thread smash creates must not keep its data on pages smash compresses. The
+compressor is what takes those pages away: its own data would be compressed
+like any other, and it would fault on it when the fault cannot be served.
+While it holds that page's lock the handler refuses (the lock is not
+recursive) and the SIGSEGV is fatal; while it holds another page's lock, two
+workers doing that to each other deadlock; inside the fault handler the fault
+re-enters it. So a compressor thread's allocations are meant to go to the
+system allocator, and `mallocSlow` and `calloc` sent them there.
+
+Only those two did, and only when reached:
+
+- Every thread started through the thread hook got a thread cache in
+  `threadInit`, smash's own included, before its entry function set the mark.
+  `malloc`'s fast path, and since the upstream merge the lean `malloc` and
+  `calloc` entries, look at nothing but the cache.
+- `memalign` (and so `posix_memalign`, `aligned_alloc`, `valloc`) never looked
+  at the mark.
+- VmRegion's decommit thread was not marked at all.
+
+Measured with a test program that defines `usleep()`, `madvise()` and
+`sched_getcpu()`, which libsmash calls on its own threads, and allocates from
+inside them: in full mode 17 of smash's threads were reached and on every one
+`malloc(100)`, `calloc`, `realloc(NULL, 300)`, `posix_memalign(64, 256)`,
+`new char[100]`, a `realloc` to 5000 bytes and `strdup` returned arena
+memory; in large-only mode, the production mode, `aligned_alloc(4096, 2 MiB)`
+on the coordinator did. In gdb all 16 threads with the mark had a thread
+cache. No crash was reproduced: these threads allocate little (a `FILE` for
+`/proc`, the profile file), so it stayed latent.
+
+Fixed:
+
+- `startSmashThread()` (`util/thread_stack.h`) starts every thread smash
+  creates. It calls libc's `pthread_create` (inside libsmash the plain name is
+  alloc8's interposer, whose trampoline runs the application's thread hook
+  first) with a trampoline of its own that sets the mark, `g_smash_thread`,
+  before anything else runs on the thread, then calls `threadInit` for what
+  such a thread still needs from it (the exit watch, the alternate signal
+  stack), then the thread's function. The function and its argument travel in
+  a fixed table: the new thread must not allocate, and a block from the
+  creating thread would be the arena's.
+- `getOrCreateThreadCache()` returns nullptr on a marked thread, so every
+  allocation on it takes the slow path, where `malloc` and `calloc` already
+  checked. `memalign` checks now. `realloc` needs nothing: it allocates
+  through `malloc`.
+- Each entry function calls `enterSmashThread()` first. On a thread the
+  trampoline started it does nothing. On one that came through the
+  application's hook after all (libc's `pthread_create` not found; macOS,
+  where the trampoline is not used) it sets the mark and hands the thread
+  cache back.
+
+All 16 marked threads now have no thread cache (gdb), which is also about
+1 MiB less metadata (the stats line's `boot=` 21 to 20 MiB at 16 arenas).
+
+Not done: the Mach exception thread on macOS is started as before and not
+marked; nothing here was built or run on macOS.
+
+Guarded by `test_smash_thread_alloc_full` and
+`test_smash_thread_alloc_large_only` ([tests.md](tests.md)).

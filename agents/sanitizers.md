@@ -129,7 +129,7 @@ real fixes, both found *because* UBSan changed what the compiler could prove:
   and `g_arena_memo`; those are `constinit` too (upstream declared them without
   it). Keep every new one that way. Only these
   file-scope `extern` declarations generate wrappers; `inline thread_local` and
-  function-local `static thread_local` (e.g. `g_compressor_thread`,
+  function-local `static thread_local` (e.g. `g_smash_thread`,
   `tl_numa_worker_`) generate none, so they need nothing.
 
   `libsmash.so` itself never had the guard — inside the library GCC sees the
