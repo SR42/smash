@@ -263,7 +263,8 @@ ratio-gate failure (cold streak restarted, effective floor doubled): one
 attempt per page, 32752 of 32768 declined before any codec ran
 (`roi_skip=`). Note `SMASH_COLD_TIMEOUT_SEC` sets `cold_ticks_overridden`,
 which makes `shouldCompress()` return true at once: tests that set it never
-reach the decline path.
+reach the decline path. (It no longer does: see "The cold timeout switched
+the ROI gate off" below.)
 
 
 ## The blob store kept regions of holes (fixed 2026-10-13)
@@ -1613,3 +1614,84 @@ marked; nothing here was built or run on macOS.
 
 Guarded by `test_smash_thread_alloc_full` and
 `test_smash_thread_alloc_large_only` ([tests.md](tests.md)).
+
+
+## The cold timeout switched the ROI gate off, and a declined bucket stayed declined (fixed 2026-11-10, issues #10 and #22)
+
+Two defects in `CompressionROI::shouldCompress`, the gate that decides before
+any codec runs whether a page is worth compressing. The first hid the second
+from every test.
+
+**The timeout was also a policy switch (#10).** The gate returned true for
+every page past the floor whenever `SMASH_COLD_TIMEOUT_SEC` or
+`SMASH_COLD_TICKS` had been given a valid value ("ablation: if cold_ticks was
+explicitly overridden, use fixed threshold only"). The timeout is the
+documented time-space dial and what every test and benchmark sets, so all of
+them ran a policy the default configuration never runs. One worker, a 32 MiB
+block of random bytes and then two of compressible bytes from the same call
+site, 36 s:
+
+| Setting | tried | stored | gate_fail | roi_skip |
+|---|---|---|---|---|
+| none (the default, 10 s) | 49152 | 0 | 8 | 49144 |
+| `SMASH_COLD_TIMEOUT_SEC=10` | 32768 | 16384 | 16384 | 0 |
+| `SMASH_COLD_TICKS=10` | 32768 | 16384 | 16384 | 0 |
+
+The same timeout, and a different outcome for every page: with it set, the
+codec ran on all 8192 random pages, twice; without it, nothing was compressed
+at all. `test_large_bucket_decline` had to be registered without the timeout
+for this reason, and a comment in its test said so.
+
+**A declined bucket could not recover (#22).** The first row is the second
+defect. The gate decides from the bucket's window of compression ratios
+(`SizeClassStats`, 64 samples per worker, arena and size class), and a sample
+is recorded only after a codec run. Once the window holds nothing but pages
+that saved nothing, its mean is 0, the benefit is 0 at any cold time, every
+page is declined, and nothing can change the window again. With fewer than 8
+samples the gate passes everything, so 8 incompressible pages are enough on a
+fresh bucket; on a used one, 64 in a row. In large-only mode every block of
+128 pages or more from one call site's arena is one bucket, so one buffer of
+random, encrypted or already compressed bytes switched compression off for
+every later large block of that call site, on that worker.
+
+Fixing the first alone would have put the second into every run that sets
+the timeout: such runs had been compressing everything past the floor, and
+would have started losing whole buckets. So they are fixed together.
+
+- The timeout sets the floor and nothing else. `ROIConfig::cold_ticks_overridden`
+  is gone. `SMASH_ROI_THRESHOLD=0` switches the gate off (every ROI is at
+  least 0), for a run that must compress every page past the floor.
+- Every 64th page a bucket's statistics decline goes to the codec anyway
+  (`kRoiProbeEvery`, `SizeClassStats::declined_run`; the hard floor is never
+  probed). A probe that fails the ratio gate is recorded like any failure. A
+  probe that is stored restarts the window (`restartRatios`), so the pages
+  after it are judged by what the bucket holds now: with fewer than 8 samples
+  the gate passes them, and their ratios fill the window. Without the restart
+  the old samples outvote the probes; at a 2 s timeout 1582 compressible
+  pages were declined before the bucket recovered.
+- A declined page backs off as before (cold streak restarted, effective floor
+  doubled), so a bucket of incompressible pages costs one codec run per 64
+  declines: 128 MiB of random bytes over 25 s, 32768 attempts, about 32200
+  declined, about 570 codec runs (16 before the probe).
+
+The same program after the fix, in all three settings of the table:
+`tried=32775 stored=16377 gate_fail=321 roi_skip=16077 roi_probe=255`. With
+`SMASH_ROI_THRESHOLD=0`: `tried=32768 stored=16384 gate_fail=16384
+roi_skip=0`, what the timeout used to give.
+
+Not done:
+
+- All-zero pages in a declined bucket are still declined: the gate runs
+  before the snapshot that would recognise them (the last sentence of #22).
+- `kMaxEffectiveFloorTicks` (200) is below `kMaxColdTicks` (254), so the
+  back-offs cannot lengthen a timeout above 200 s and at most double one
+  above 100 s (the "Related" note in #10). A page's idle count is one byte,
+  so no cap can give a 254 s timeout a longer back-off; raising 200 to 254
+  would change how long thrashing pages wait at the default timeout, which
+  nothing here measured.
+- The benchmarks that set the timeout now run the default policy. Their
+  published numbers were taken with the gate off and have not been taken
+  again.
+
+Guarded by `test_roi_gate_recovers`, `test_roi_gate_recovers_timeout_set`
+and `test_large_bucket_decline_timeout_set` ([tests.md](tests.md)).

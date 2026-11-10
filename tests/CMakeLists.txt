@@ -223,8 +223,6 @@ add_test(NAME test_fault_cycle COMMAND test_fault_cycle)
 # runners where the cold-tick floor multiplier would otherwise keep pages
 # from being compressed within the test's tick budget. Disable both for this
 # test so it can verify the underlying fault-cycle correctness.
-# SMASH_COLD_TIMEOUT_SEC=1 sets cold_ticks_overridden, which bypasses the
-# CPU-pressure floor multiplier (see compressor_thread.h::phase2Range).
 set_tests_properties(test_fault_cycle PROPERTIES
   ENVIRONMENT "SMASH_RECOMPRESS_BACKOFF=0;SMASH_COLD_TIMEOUT_SEC=1;SMASH_FIXAV=0")
 # Same body with eager (non-deferred) reclaim, where a COMPRESSED page stays
@@ -1326,14 +1324,41 @@ if(NOT APPLE)
     "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=1" "SMASH_STATS_SIGNAL=1"
     "SMASH_BUCKET_STATS=1" "SMASH_DEFER_PHASES_MS=0" "SMASH_COLD_TIMEOUT_SEC=1"
     $<TARGET_FILE:large_bucket_stats_test>)
-  # The ROI decline path needs the default cold timeout (an override makes
-  # shouldCompress() return true at once). LZ4, as the application runs; zstd
-  # declines the same pages.
+  # The ROI decline path, at the default cold timeout. LZ4, as the application
+  # runs; zstd declines the same pages.
   add_test(NAME test_large_bucket_decline COMMAND ${CMAKE_COMMAND} -E env
     "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=1" "SMASH_STATS_SIGNAL=1"
     "SMASH_DEFER_PHASES_MS=0" "SMASH_CODEC=lz4" "LBS_PART=decline"
     $<TARGET_FILE:large_bucket_stats_test>)
-  set_tests_properties(test_large_bucket_stats test_large_bucket_decline PROPERTIES TIMEOUT 180)
+  # The same with the cold timeout set, to the default's own 10 s: setting it
+  # must change the floor and nothing else. It used to switch the ROI gate
+  # off, so nothing was declined and every random page went to the codec
+  # (issue #10).
+  add_test(NAME test_large_bucket_decline_timeout_set COMMAND ${CMAKE_COMMAND} -E env
+    "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=1" "SMASH_STATS_SIGNAL=1"
+    "SMASH_DEFER_PHASES_MS=0" "SMASH_CODEC=lz4" "LBS_PART=decline"
+    "SMASH_COLD_TIMEOUT_SEC=10"
+    $<TARGET_FILE:large_bucket_stats_test>)
+  set_tests_properties(test_large_bucket_stats test_large_bucket_decline
+                       test_large_bucket_decline_timeout_set PROPERTIES TIMEOUT 180)
+
+  # A bucket the ROI gate declined is compressed again once it holds
+  # something worth compressing (roi_gate_test.cpp, issue #22): 16 MiB of
+  # random bytes, then 16 MiB of compressible bytes from the same call site.
+  # One worker, so one window. The second registration sets the cold timeout:
+  # the gate must decline the random block all the same (issue #10).
+  add_executable(roi_gate_test roi_gate_test.cpp)
+  target_link_libraries(roi_gate_test PRIVATE ${CMAKE_DL_LIBS})
+  add_test(NAME test_roi_gate_recovers COMMAND ${CMAKE_COMMAND} -E env
+    "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=1" "SMASH_STATS_SIGNAL=1"
+    "SMASH_DEFER_PHASES_MS=0" "SMASH_TEST_WORKERS=1" "SMASH_NUMA_COMPRESSOR=0"
+    $<TARGET_FILE:roi_gate_test>)
+  add_test(NAME test_roi_gate_recovers_timeout_set COMMAND ${CMAKE_COMMAND} -E env
+    "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=1" "SMASH_STATS_SIGNAL=1"
+    "SMASH_DEFER_PHASES_MS=0" "SMASH_TEST_WORKERS=1" "SMASH_NUMA_COMPRESSOR=0"
+    "SMASH_COLD_TIMEOUT_SEC=2"
+    $<TARGET_FILE:roi_gate_test>)
+  set_tests_properties(test_roi_gate_recovers test_roi_gate_recovers_timeout_set PROPERTIES TIMEOUT 240)
 endif()
 
 # The [smash faults] line reports fault-handler time per kind for exactly the

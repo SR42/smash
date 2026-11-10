@@ -52,9 +52,11 @@ int main() {
     dup2(fd, 2);
 
     // LBS_PART=decline (test_large_bucket_decline): random bytes, attempts
-    // counted from allocation over 25 s. Registered WITHOUT
-    // SMASH_COLD_TIMEOUT_SEC, which makes shouldCompress() return true at
-    // once (cold_ticks_overridden) and so hides the decline path.
+    // counted from allocation over 25 s. Registered twice, without a cold
+    // timeout and with SMASH_COLD_TIMEOUT_SEC=10, the default's own value
+    // (test_large_bucket_decline_timeout_set): a timeout that was set used
+    // to make shouldCompress() return true at once, so nothing was declined
+    // (issue #10).
     if (const char* part = std::getenv("LBS_PART"); part && !std::strcmp(part, "decline")) {
         constexpr size_t kRand = 128u << 20;
         auto* r = static_cast<uint64_t*>(malloc(kRand));
@@ -77,8 +79,8 @@ int main() {
                 "(gate_fail=%llu roi_skip=%llu)\n", t, rpages, gate_fail, roi_skip);
         free(r);
         if (roi_skip == 0) {
-            dprintf(saved, "FAIL: the ROI model declined nothing (roi_skip=0): the check cannot "
-                    "see the decline path (SMASH_COLD_TIMEOUT_SEC set?)\n");
+            dprintf(saved, "FAIL: the ROI model declined nothing (roi_skip=0): every random page "
+                    "went to the codec\n");
             return 1;
         }
         if (t > rpages * 5) {

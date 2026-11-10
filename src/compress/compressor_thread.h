@@ -689,8 +689,9 @@ class CompressorThread {
         std::atomic<uint64_t> p2_at_floor{0}, p2_escalated{0}, p2_eligible{0},
                               p2_hint_skip{0}, p2_routed{0};
         std::atomic<uint64_t> cp_attempts{0}, cp_stored{0}, cp_gate_fail{0};
-        // Compressions declined by the ROI model before any codec ran.
-        std::atomic<uint64_t> cp_roi_skip{0};
+        // Compressions declined by the ROI model before any codec ran, and
+        // pages it would have declined that went to the codec as a probe.
+        std::atomic<uint64_t> cp_roi_skip{0}, cp_roi_probe{0};
         // Blobs the store refused (SMASH_BLOB_MAX_MIB, or a region it could
         // not map), and restores that had to wait for the kernel to find a
         // VMA (restorePageContents: mprotect/mmap ENOMEM at vm.max_map_count).
@@ -1130,6 +1131,14 @@ class CompressorThread {
         // load-bearing signal and we want it stable). count gates trust.
         uint16_t redirty_ema_x256 = 0;
         uint8_t  redirty_count = 0;
+
+        // Pages of this bucket the ROI gate has declined since the last one
+        // it let through as a probe (kRoiProbeEvery, compressPage).
+        uint8_t  declined_run = 0;
+        static_assert(kRoiProbeEvery >= 1 && kRoiProbeEvery <= 255, "declined_run is one byte");
+        // The ratio window starts again: what a stored probe does to a
+        // window that said nothing in this bucket is worth compressing.
+        void restartRatios() { head = 0; count = 0; sum = 0; }
 
         void recordRedirty(bool rewritten) {
             uint16_t sample = rewritten ? 256 : 0;
@@ -3522,9 +3531,26 @@ private:
                 worker.sc_stats[stats_idx].redirtyDiscountX256(streak_relief);
         }
 
-        if (!CompressionROI::shouldCompress(cold_count_[page_idx],
-                                             stats_count, stats_sum,
-                                             redirty_discount_x256)) {
+        // A bucket the gate declines gets no new samples: the window only
+        // changes after a codec run, and the gate is before the codec. So a
+        // window of pages that saved nothing declined every later page of
+        // the bucket for good, whatever it held: one 256 KiB block of random
+        // bytes switched compression off for every later large block from
+        // its call site's arena, on that worker (issue #22). Every
+        // kRoiProbeEvery-th declined page goes to the codec anyway. If it is
+        // stored, the window starts again from it (below), and the pages
+        // after it are judged by what the bucket holds now.
+        bool roi_ok = CompressionROI::shouldCompress(cold_count_[page_idx], stats_count, stats_sum,
+                                                     redirty_discount_x256);
+        bool roi_probe = false;
+        if (!roi_ok && have_span && sc < kTotalBucketsPerArena &&
+            cold_count_[page_idx] >= ROIConfig::instance().cold_ticks_floor &&
+            ++worker.sc_stats[stats_idx].declined_run >= kRoiProbeEvery) {
+            worker.sc_stats[stats_idx].declined_run = 0;
+            roi_ok = roi_probe = true;
+            pc_.cp_roi_probe.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (!roi_ok) {
             // Declined by the bucket's statistics: back off exactly like a
             // ratio-gate failure below (restart the cold streak, double the
             // effective floor). Without it a declined page stays at the
@@ -4034,6 +4060,9 @@ private:
         // Zero pages are excluded: they say nothing about the codec's
         // behavior on this bucket's live data and would skew the ROI model.
         if (!zero_page && have_span && sc < kTotalBucketsPerArena) {
+            // A probe that is stored contradicts the window that declined
+            // it: forget the window.
+            if (roi_probe) worker.sc_stats[stats_idx].restartRatios();
             worker.sc_stats[stats_idx].record(comp_size, kPageSize);
             int tier = is_fast_tier ? 0 : 1;
             worker.sc_stats[stats_idx].recordCost(tier, comp_elapsed_us);
@@ -9572,7 +9601,7 @@ public:
                 "[smash pipeline] ticks=%llu tick_ms=%llu/%llu deferred=%llu"
                 " | p1 accessed=%llu idle=%llu | p2 at_floor=%llu escalated=%llu"
                 " eligible=%llu routed=%llu hint_skip=%llu | compress tried=%llu"
-                " stored=%llu gate_fail=%llu roi_skip=%llu | release checked=%llu released=%llu"
+                " stored=%llu gate_fail=%llu roi_skip=%llu roi_probe=%llu | release checked=%llu released=%llu"
                 " changed=%llu vma_stop=%llu | faults monitor=%llu shadow=%llu"
                 " compressed=%llu active=%llu alloc_reopen=%llu | phase_ms=%llu/%llu/%llu/%llu"
                 " max=%llu/%llu/%llu/%llu | p1 minflt=%llu range_ms_max=%llu workers=%llu cap=%llu"
@@ -9582,7 +9611,7 @@ public:
                 v(pc.ticks), v(pc.tick_ms_last), v(pc.tick_ms_max), v(pc.deferred_ticks),
                 v(pc.p1_accessed), v(pc.p1_idle), v(pc.p2_at_floor), v(pc.p2_escalated),
                 v(pc.p2_eligible), v(pc.p2_routed), v(pc.p2_hint_skip), v(pc.cp_attempts),
-                v(pc.cp_stored), v(pc.cp_gate_fail), v(pc.cp_roi_skip), v(pc.rc_checked),
+                v(pc.cp_stored), v(pc.cp_gate_fail), v(pc.cp_roi_skip), v(pc.cp_roi_probe), v(pc.rc_checked),
                 v(pc.rc_released),
                 v(pc.rc_changed), v(pc.rc_vma_stop), v(pc.f_monitor), v(pc.f_shadow),
                 v(pc.f_compressed), v(pc.f_active), v(pc.f_alloc_reopen), v(pc.phase_ms[1]), v(pc.phase_ms[2]),

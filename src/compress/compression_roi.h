@@ -184,7 +184,6 @@ struct ROIConfig {
     AlgoProfile profiles[4];
     int num_profiles = 0;
 
-    bool cold_ticks_overridden = false;
     bool very_cold_ticks_overridden = false;
     bool initialized = false;
 
@@ -244,8 +243,12 @@ struct ROIConfig {
         // It sets the idle time (in seconds) before a page is compressed.
         // SMASH_COLD_TICKS is the lower-level override (in tick counts).
         // Both are parsed, checked and clamped in one place (config.h).
+        // They set the floor and nothing else: the ROI gate below runs the
+        // same whether the floor is the default or was given. It used to
+        // return true for every page past a floor that had been set, so any
+        // run that set the timeout -- every test and benchmark -- compressed
+        // by a different policy from the default (issue #10).
         cold_ticks_floor = static_cast<uint32_t>(coldTicksSetting().ticks);
-        cold_ticks_overridden = coldTicksSetting().overridden;
 
         const char* vct_env = std::getenv("SMASH_VERY_COLD_TICKS");
         if (vct_env) {
@@ -700,6 +703,9 @@ private:
 namespace CompressionROI {
 
 // Should this page be compressed?
+// SMASH_ROI_THRESHOLD=0 switches the gate off (every ROI is at least 0), for
+// a run that must compress every page past the floor; the cold timeout does
+// not (issue #10).
 // cold_count: ticks without access
 // stats_count: SizeClassStats::count (sliding window sample count)
 // stats_sum: SizeClassStats::sum (sum of ratio_255 values)
@@ -711,9 +717,6 @@ inline bool shouldCompress(uint8_t cold_count,
 
     // Hard floor: never compress before minimum ticks
     if (cold_count < cfg.cold_ticks_floor) return false;
-
-    // Ablation: if cold_ticks was explicitly overridden, use fixed threshold only
-    if (cfg.cold_ticks_overridden) return true;
 
 #ifdef SMASH_ABLATION_NO_SKIP_STATS
     return true;

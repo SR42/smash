@@ -357,6 +357,10 @@ inline constexpr size_t kPageMapL1Size = 1ULL << kPageMapL1Bits;
 
 // ── ROI model defaults (overridable via SMASH_ROI_THRESHOLD env var) ─────────
 inline constexpr int kRoiThresholdDefault = 1024;
+// One page in this many that a bucket's statistics decline goes to the codec
+// anyway, so the statistics can change (compressPage). A declined page backs
+// off, so this is a few codec runs per hundred incompressible pages.
+inline constexpr int kRoiProbeEvery = 64;
 
 // ── Compression (Phase 3+) ───────────────────────────────────────────────────
 inline constexpr int kCompressIntervalMs = 1000;

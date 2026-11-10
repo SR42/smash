@@ -369,11 +369,11 @@ All runtime behavior is controlled via `SMASH_*` environment variables read once
 
 | Variable | Default | Effect |
 |----------|---------|--------|
-| `SMASH_COLD_TIMEOUT_SEC=N` | 2 | Minimum cold-time floor (seconds) before fast-tier compression considered. CPU-pressure adaptive cap raises this on busy systems. |
-| `SMASH_COLD_TICKS=N` | 2 | Override the fast-tier cold-tick threshold directly (alternative to `SMASH_COLD_TIMEOUT_SEC`). |
+| `SMASH_COLD_TIMEOUT_SEC=N` | 10 | Seconds a page must stay untouched before it is considered for compression (at most 254). Sets this floor and nothing else: the ROI model decides the same way whether the timeout is the default or was set. |
+| `SMASH_COLD_TICKS=N` | 10 | The same floor in compressor ticks (used when `SMASH_COLD_TIMEOUT_SEC` is unset). |
 | `SMASH_VERY_COLD_TICKS=N` | 60 | Cold-tick threshold for the deep-tier (zstd-9) profile. Only takes effect when the deep tier is compiled in (`-DSMASH_ENABLE_DEEP_TIER`); the default single-tier build ignores it. |
 | `SMASH_CODEC=lz4\|zstd` | `zstd` | Fast-tier codec: `zstd` (zstd-1, higher ratio at comparable throughput on the measured workloads) or `lz4` (trades ratio for speed). The stats line reports it as `codec=`. (`SMASH_USE_LZ4` was a build option, never an environment variable, and has been removed.) |
-| `SMASH_ROI_THRESHOLD=N` | 1024 | Bytes-saved-per-microsecond cutoff for the ROI model. |
+| `SMASH_ROI_THRESHOLD=N` | 1024 | Bytes-saved-per-microsecond cutoff for the ROI model. `0` switches the ROI gate off: every page past the cold timeout goes to the codec. |
 | `SMASH_MIN_COMPRESS_RATIO=F` | 0.75 | Reject compressed page unless `comp_size < F × original_size`. |
 | `SMASH_RECOMPRESS_BACKOFF=0` | 1 (active) | Disable per-bucket recompression-thrash back-off (ablation switch); phase 2 then ignores `recompress_count_` and bucket EMAs. |
 
