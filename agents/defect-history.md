@@ -1695,3 +1695,79 @@ Not done:
 
 Guarded by `test_roi_gate_recovers`, `test_roi_gate_recovers_timeout_set`
 and `test_large_bucket_decline_timeout_set` ([tests.md](tests.md)).
+
+
+## The worker count did not follow the load (fixed 2026-11-10, issue #8)
+
+`adaptWorkerCount` set the next tick's default workers to `N = ⌈λ/μ⌉`, λ the
+pages eligible this tick and μ the pages each worker compressed this tick,
+both smoothed. μ was throughput, not capacity. A tick has no time limit, so
+when the gates pass compressed is about eligible, and
+
+    N = eligible / (compressed / nw) = nw x eligible / compressed.
+
+The count the tick ran with is a fixed point, and N moves only with the share
+of eligible pages the default workers did not compress. Measured on 8 CPUs
+and 4 memory nodes, large-only, cold timeout 1 s (`SMASH_PRESSURE_LOG`):
+
+| Load | Workers | What happened |
+|---|---|---|
+| 512 MiB/s of compressible data for 14 s, node groups off | 1 throughout | one thread at 100 %, ticks 3.9-9.5 s apart, seven CPUs idle; 1.28 M of 1.84 M pages compressed 30 s in |
+| 2 MiB/s compressible and 2 MiB/s random, node groups off | 8 from the fifth tick | the cap, for about 20 ms of work a tick: half the eligible pages are not compressed |
+| 4 MiB/s compressible, node groups on (the default) | 8 from the third tick | pages handed to a node's group are eligible and not compressed by the default workers |
+| the same, node groups off | 1 | |
+| 512 MiB/s for 14 s, node groups on | 2, then 3-5 | all 1.84 M pages compressed 24.4 s in |
+
+So a NUMA host ran at the cap whatever it had to do (the pool of 8 that "a
+128-core host hit every tick" was this), and a single-node host stayed at one
+or two workers whatever it had to do.
+
+The arithmetic was 32-bit fixed point (x 256): `total_eligible << 8` cast to
+`int32_t` is negative past 2^23 eligible pages in a tick (32 GiB), and wraps
+past 2^24. Replayed on 20 M pages a tick, all compressed: 1, 1, 5, 2, 1, 8,
+4, 2 workers.
+
+Now `N = ⌈2 x load⌉` (`src/compress/worker_scaling.h`), where the load is the
+CPU time the default workers spent in the tick's phases, added up in
+`executePhase`, divided by the wall time from the previous tick's start to
+this one's. It is smoothed: up to a larger sample at once, down a quarter of
+the way to a smaller one per tick. No page count enters it.
+
+- **Twice the load.** With work arriving at a rate of r workers' worth, a
+  tick lasts r x interval / (N - r), which is at most the interval when
+  N >= 2r: the workers are busy at most half the time, and a tick takes no
+  longer than the sleep between two.
+- **Per unit of time, not per tick.** The first version divided by the
+  interval. The work of one tick grows with the time since the last one, so
+  that count rose after a long tick and fell after a short one: 4, 4, 4, 3,
+  4 at a steady 1.7 workers' worth, with the tick at 3 workers taking 1.13
+  intervals. The load does not depend on how many workers did the work.
+- **CPU time, not wall time.** A worker waiting for a lock or for a CPU is
+  not doing work another worker could do; counting the wait asks for more
+  threads exactly when they make things worse. In the first row above a
+  worker's wall time in the phases was up to twice its CPU time.
+- **Every phase.** A heap with nothing left to compress is still scanned;
+  the old count was 1 whenever nothing was eligible.
+
+The same loads after the fix:
+
+| Load | Workers | What happened |
+|---|---|---|
+| 512 MiB/s for 14 s, node groups off | 3, then 5-6 | ticks 2.2-3.6 s apart; all 1.84 M pages compressed 23.5 s in; one worker again 6.5 s later |
+| 2 + 2 MiB/s, node groups off | 1 | |
+| 4 MiB/s, node groups on | 1 | |
+| 512 MiB/s for 14 s, node groups on | 1, beside the 8 node-group threads | all pages compressed 25.7 s in |
+
+In the last row the groups do the compressing and the default worker's share
+of the CPU time is small, so one is enough; with 2-5 of them before, the
+phases' threads spent more of their time waiting (wall time 2.3-3 times the
+CPU time, against 1.1-2.5) and finished one tick sooner.
+
+Not changed: the CPU-pressure cap, `SMASH_MAX_WORKERS`, `SMASH_TEST_WORKERS`,
+and the node groups, whose thread count is fixed. Not measured: any host
+with more than 8 CPUs, and a heap large enough for the scan to dominate a
+tick (the model in `test_worker_scaling` covers a fixed cost per tick; no run
+here had one).
+
+Guarded by `test_worker_scaling` (the policy) and `test_worker_count_light` /
+`test_worker_count_burst` (the library) ([tests.md](tests.md)).

@@ -70,6 +70,10 @@ smash_add_test(test_slab test_slab.cpp)
 smash_add_test(test_spinlock_park spinlock_park_test.cpp)
 target_link_libraries(test_spinlock_park PRIVATE Threads::Threads)
 set_tests_properties(test_spinlock_park PROPERTIES TIMEOUT 300)
+# The compressor's worker count: ceil(CPU time the tick's phases needed /
+# tick interval), on a model of the tick loop (tests/worker_scaling_test.cpp,
+# issue #8).
+smash_add_test(test_worker_scaling worker_scaling_test.cpp)
 
 # VM region test (no LZ4 dependency)
 smash_add_test(test_vm_region test_vm_region.cpp)
@@ -970,6 +974,22 @@ if(NOT APPLE)
     "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=1" "SMASH_COLD_TIMEOUT_SEC=1"
     "SMASH_DEFER_PHASES_MS=0" "SMASH_TICK_PAGE_BUDGET=1000" $<TARGET_FILE:tick_budget_test>)
   set_tests_properties(test_tick_budget PROPERTIES TIMEOUT 120)
+
+  # The worker count in the running library (worker_count_test.cpp, issue #8):
+  # a light load with half its pages not compressed must not climb to the cap,
+  # and 512 MiB going cold at once must bring more than one worker.
+  add_executable(worker_count_test worker_count_test.cpp)
+  target_link_libraries(worker_count_test PRIVATE ${CMAKE_DL_LIBS})
+  add_test(NAME test_worker_count_light COMMAND ${CMAKE_COMMAND} -E env
+    "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=1" "SMASH_COLD_TIMEOUT_SEC=1"
+    "SMASH_DEFER_PHASES_MS=0" "SMASH_CPU_PRESSURE_CAP=0"
+    $<TARGET_FILE:worker_count_test> light)
+  add_test(NAME test_worker_count_burst COMMAND ${CMAKE_COMMAND} -E env
+    "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=1" "SMASH_COLD_TIMEOUT_SEC=1"
+    "SMASH_DEFER_PHASES_MS=0" "SMASH_CPU_PRESSURE_CAP=0" "SMASH_NUMA_COMPRESSOR=0"
+    "SMASH_TEST_TICK_MS=200"
+    $<TARGET_FILE:worker_count_test> burst)
+  set_tests_properties(test_worker_count_light test_worker_count_burst PROPERTIES TIMEOUT 240)
 
   add_executable(worker_balance_test worker_balance_test.cpp)
   target_link_libraries(worker_balance_test PRIVATE ${CMAKE_DL_LIBS})

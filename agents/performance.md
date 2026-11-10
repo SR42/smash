@@ -953,3 +953,26 @@ faster on the pairs and 18-21% slower with more threads than CPUs.
 Not measured: any host with more than 8 CPUs. The longest backoff after
 losing the race for a free lock is still the 1024 pauses tuned on the 192-core
 host; 64 measured the same here.
+
+## The compressor's worker count (2026-11-10, issue #8)
+
+The count for the next tick is `⌈2 x load⌉`, the load being the CPU time the
+default workers spent in the tick's phases per second of wall time
+(`worker_scaling.h`; the pipeline line's `busy_ms=` is the last tick's CPU
+time, `SMASH_PRESSURE_LOG`'s tick line has `phase_cpu_us=`, `phase_wall_us=`
+and `workers=`). What it replaced, and the measurements, are in
+[defect-history.md](defect-history.md), "The worker count did not follow the
+load".
+
+Two things to know when reading a tick line:
+
+- Under a sustained load the count settles near twice the CPU time per
+  second, not near it: the target is a tick no longer than the sleep between
+  two ticks. 512 MiB/s of data that compresses by half cost 5.3 s of CPU per
+  2.3 s period, a load of 2.3, and ran with 5 workers.
+- `phase_wall_us` above `phase_cpu_us` is workers waiting, for the process's
+  `mmap_lock` or a page lock, and more workers do not shorten it. The count
+  ignores the wait on purpose.
+
+The measurement costs two `clock_gettime(CLOCK_THREAD_CPUTIME_ID)` calls per
+worker per phase, a system call each: at most 80 a tick with 8 workers.

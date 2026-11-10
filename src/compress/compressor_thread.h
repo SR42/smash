@@ -15,6 +15,7 @@
 #include "spill_store.h"
 #include "compress_engine.h"
 #include "compression_roi.h"
+#include "worker_scaling.h"
 #include "yt_stream.h"
 #include "../vm/vm_region.h"
 #include "../vm/page_state.h"
@@ -775,6 +776,9 @@ class CompressorThread {
         std::atomic<uint64_t> workers_last{0};
         // The CPU-pressure cap last computed (0 = none).
         std::atomic<uint64_t> worker_cap{0};
+        // CPU time the default workers spent in the last tick's phases: what
+        // the next tick's worker count is sized by (adaptWorkerCount).
+        std::atomic<uint64_t> busy_ms_last{0};
         std::atomic<uint64_t> p3_pages{0}, p3_calls{0};
         // mprotect calls made by phase 2: escalation to PROT_NONE and the
         // compression snapshot.
@@ -1795,23 +1799,23 @@ private:
     std::atomic<bool> helpers_exit_{false};
     int current_phase_ = 0;  // 1=access, 2=compress, 3=monitor
 
-    // ── Adaptive worker scaling (Little's Law) ─────────────────────────
+    // ── Adaptive worker scaling ────────────────────────────────────────
     //
-    // By Little's Law, the average number of items in a stable queueing
-    // system is L = λ · W, where λ is the arrival rate and W is the mean
-    // service time.  For the compression queue:
+    // The next tick runs with twice as many default workers as there is
+    // work for:
     //
-    //   λ  = pages becoming eligible for compression per tick
-    //   μ  = pages one worker compresses per tick  (service rate = 1/W)
+    //   N = ⌈2 x load⌉
     //
-    // To keep the queue drained (L → 0), total service rate must meet
-    // arrival rate: N · μ ≥ λ.  Solving for the minimum worker count:
-    //
-    //   N_needed = ⌈λ / μ⌉
-    //
-    // Both λ and μ are measured each tick and smoothed with EMAs.
+    // where the load is the CPU time the default workers spent inside this
+    // tick's phases (tick_busy_ns_, added up by executePhase) divided by the
+    // wall time since the previous tick started, smoothed: up at once, down
+    // a quarter of the way per tick. Twice, so that a tick takes no longer
+    // than the sleep between two (worker_scaling.h, which also says why the
+    // measure is CPU time per unit of time and no longer a ratio of page
+    // counts). Every phase counts, not compression alone: a heap with
+    // nothing left to compress still has to be scanned.
     // Workers are pre-allocated up to kMaxCompressorWorkers; helper threads
-    // are lazily created on first scale-up and parked when not needed.
+    // exist from start() and park when not needed.
     int active_workers_{kCompressorWorkers};  // current active count (runtime)
     int helpers_created_ = 0;  // how many helper threads have been pthread_create'd
 
@@ -1846,10 +1850,12 @@ private:
     std::atomic<uint64_t> tick_compressed_max_{0};
     std::atomic<uint64_t> budget_turned_away_{0};
 
-    // Exponential moving averages (fixed-point: multiply by 256 to avoid float)
-    // EMA update: ema = ema + (sample - ema) / 4   (α = 1/4, ~4-tick response)
-    uint32_t lambda_ema_ = 0;  // pages eligible per tick (× 256)
-    uint32_t mu_ema_ = 256;    // pages compressed per worker per tick (× 256, init=1 to avoid /0)
+    // CPU time the default workers have spent in this tick's phases so far
+    // (reset at the start of a tick), when this tick and the one before it
+    // started, and the count they lead to.
+    std::atomic<uint64_t> tick_busy_ns_{0};
+    uint64_t tick_start_ns_ = 0, tick_period_ns_ = 0;
+    WorkerScaler worker_scaler_;
 
     // ── Helper methods ────────────────────────────────────────────────────
 
@@ -4710,6 +4716,14 @@ private:
     void executePhase(int phase, int worker_id) {
         PhaseClocks clocks(pc_, phase);
         PressurePhaseTimer ptimer(worker_id != 0);
+        // What this worker's share of the phase cost, for the worker count
+        // (adaptWorkerCount). CPU time: a wait for a lock or for a CPU is
+        // not work another worker could take.
+        struct BusyTimer {
+            std::atomic<uint64_t>& acc;
+            const uint64_t c0 = pstats::threadCpuNs();
+            ~BusyTimer() { acc.fetch_add(pstats::threadCpuNs() - c0, std::memory_order_relaxed); }
+        } busy{tick_busy_ns_};
         auto& w = worker(worker_id);
         auto& eligible = worker_pages_eligible_[worker_id];
         auto& compressed = worker_pages_compressed_[worker_id];
@@ -8324,6 +8338,16 @@ private:
             worker_pages_eligible_[w].store(0, std::memory_order_relaxed);
             worker_pages_compressed_[w].store(0, std::memory_order_relaxed);
         }
+        tick_busy_ns_.store(0, std::memory_order_relaxed);
+        {
+            // Start to start: the time this tick's work had to arrive in.
+            // The first tick's is the interval it slept.
+            const uint64_t now_ns = pstats::monoNs();
+            tick_period_ns_ = tick_start_ns_ != 0 && now_ns > tick_start_ns_
+                ? now_ns - tick_start_ns_
+                : static_cast<uint64_t>(test_tick_ms_ > 0 ? test_tick_ms_ : kCompressIntervalMs) * 1000000ull;
+            tick_start_ns_ = now_ns;
+        }
 
         // The page range is handed out in slices to whichever worker asks
         // next (executePhase), not partitioned statically: see slice_pages_.
@@ -8548,45 +8572,24 @@ private:
     int cpu_pressure_cached_cap_ = 0;
     int cpu_pressure_sample_age_ = 1000;  // force resample on first call
 
-    // Measures λ (cold arrival rate) and μ (per-worker service rate) each
-    // tick, smooths with EMA (α = 1/4), and sets N = ⌈λ_ema / μ_ema⌉.
+    // Sets the next tick's worker count from the CPU time this tick's phases
+    // took the default workers and the time since the previous tick started:
+    // N = ⌈2 x load⌉ (worker_scaling.h).
+    // The count was ⌈eligible / (compressed per worker)⌉, which is nw x
+    // eligible / compressed: with every eligible page compressed it kept the
+    // count it had, however long the tick took (one worker at 100 % for
+    // ticks of 3-9 s under 512 MiB/s of cold data, seven CPUs idle), and
+    // with pages the default workers did not compress -- declined, or handed
+    // to a node's group -- it went to the cap (8 workers for 20 ms of work a
+    // tick). Its 32-bit fixed point also went negative past 2^23 eligible
+    // pages in a tick (issue #8, test_worker_scaling, test_worker_count_*).
     void adaptWorkerCount(int nw) {
-        // Sum per-worker counters
-        uint32_t total_eligible = 0;
-        uint32_t total_compressed = 0;
-        for (int w = 0; w < nw; ++w) {
-            total_eligible += worker_pages_eligible_[w].load(std::memory_order_relaxed);
-            const uint32_t c = worker_pages_compressed_[w].load(std::memory_order_relaxed);
-            total_compressed += c;
-            worker_total_compressed_[w] += c;
-        }
+        for (int w = 0; w < nw; ++w)
+            worker_total_compressed_[w] += worker_pages_compressed_[w].load(std::memory_order_relaxed);
 
-        // Per-worker throughput (avoid division by zero)
-        uint32_t mu_sample = nw > 0 ? (total_compressed + nw - 1) / nw : 0;
-
-        // Update EMAs: ema += (sample - ema) / 4  (in fixed-point ×256)
-        uint32_t lambda_sample_fp = total_eligible << 8;
-        uint32_t mu_sample_fp = mu_sample << 8;
-
-        lambda_ema_ += (static_cast<int32_t>(lambda_sample_fp) - static_cast<int32_t>(lambda_ema_)) / 4;
-        // Only update μ when we have compression work (avoid decaying μ to 0
-        // during idle periods, which would cause spurious scale-up)
-        if (total_compressed > 0) {
-            mu_ema_ += (static_cast<int32_t>(mu_sample_fp) - static_cast<int32_t>(mu_ema_)) / 4;
-            if (mu_ema_ == 0) mu_ema_ = 1;  // floor to prevent division by zero
-        }
-
-        // N_needed = ⌈λ / μ⌉ (both in same fixed-point scale, so they cancel)
-        int n_needed;
-        if (lambda_ema_ == 0) {
-            n_needed = 1;  // no work → 1 worker is enough
-        } else {
-            n_needed = static_cast<int>((lambda_ema_ + mu_ema_ - 1) / mu_ema_);
-        }
-
-        // Clamp to valid range
-        if (n_needed < 1) n_needed = 1;
-        if (n_needed > max_workers_) n_needed = max_workers_;
+        const uint64_t busy_ns = tick_busy_ns_.load(std::memory_order_relaxed);
+        int n_needed = worker_scaler_.update(busy_ns, tick_period_ns_, max_workers_);
+        pc_.busy_ms_last.store(busy_ns / 1000000ull, std::memory_order_relaxed);
 
         // CPU-pressure cap. The compressor's worker threads compete with
         // application threads for cores; on a saturated machine, scaling up
@@ -9605,6 +9608,7 @@ public:
                 " changed=%llu vma_stop=%llu | faults monitor=%llu shadow=%llu"
                 " compressed=%llu active=%llu alloc_reopen=%llu | phase_ms=%llu/%llu/%llu/%llu"
                 " max=%llu/%llu/%llu/%llu | p1 minflt=%llu range_ms_max=%llu workers=%llu cap=%llu"
+                " busy_ms=%llu"
                 " | p3 armed=%llu calls=%llu p2 mprotect=%llu"
                 " | p5 ms=%llu max=%llu | rearm hot=%llu waits=%llu"
                 " | group nbr_active=%llu restored=%llu\n",
@@ -9618,6 +9622,7 @@ public:
                 v(pc.phase_ms[3]), v(pc.phase_ms[4]), v(pc.phase_ms_max[1]),
                 v(pc.phase_ms_max[2]), v(pc.phase_ms_max[3]), v(pc.phase_ms_max[4]),
                 v(pc.p1_minflt), v(pc.p1_range_ms_max), v(pc.workers_last), v(pc.worker_cap),
+                v(pc.busy_ms_last),
                 v(pc.p3_pages), v(pc.p3_calls), v(pc.p2_mprotect),
                 v(pc.phase_ms[5]), v(pc.phase_ms_max[5]), v(pc.f_monitor_hot),
                 v(pc.p3_backoff), v(pc.f_nbr_active), v(pc.f_group_restored));

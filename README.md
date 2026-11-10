@@ -13,7 +13,7 @@ Smash is a drop-in malloc replacement that monitors page access patterns and com
 - **Transparent compression**: No application changes required, works via malloc interposition.
 - **ROI-driven compression gate**: A return-on-investment model decides *whether* each cold page is worth compressing, weighing its observed compressibility and observed compression cost against its accumulated cold time. libsmash ships **single-tier** (zstd-1); a second deep tier (zstd-9) exists behind a compile flag (`-DSMASH_ENABLE_DEEP_TIER`) but is **off by default** — on real per-page heap data zstd-9 gives ~1.0× the blob size of zstd-1 (its larger match window needs >4 KiB input), so the second tier costs CPU with no RSS gain. See [Compression tiers](#compression-tiers).
 - **Per-origin learning**: Compression-ratio and compression-cost statistics are kept per `(arena, size class)`, so call-site arena routing translates directly into more accurate ROI decisions.
-- **Adaptive worker pool**: The compressor scales its active worker count each tick using Little's Law (`N = ⌈λ/μ⌉`), so an idle process uses one worker and a bulk-allocation phase uses several.
+- **Adaptive worker pool**: The compressor sizes its active worker count each tick by its load (the CPU time its phases took per second, `N = ⌈2 × load⌉`), so an idle process uses one worker and a bulk-allocation phase uses several.
 
 ## How It Works
 
@@ -404,7 +404,7 @@ All runtime behavior is controlled via `SMASH_*` environment variables read once
 |----------|---------|--------|
 | `SMASH_DEFER_PHASES_MS=N` | 0 | Skip Phase 2 (compress) + Phase 3 (monitor) for the first N ms after start. Useful for workloads that establish IPC channels at startup with buffers in smash-managed pages (Firefox sweet spot is 30000). |
 | `SMASH_NO_MONITOR=1` | unset | Disable Phase 3 (PROT_READ access tracking) entirely. Trades cold-detection accuracy for compatibility with code paths that synchronously check page protection. |
-| `SMASH_CPU_PRESSURE_CAP=0` | active | Disable the CPU-pressure cap on adaptive worker count. Default (active) caps `N = ⌈λ/μ⌉` so smash doesn't compete with a saturated app for cores. |
+| `SMASH_CPU_PRESSURE_CAP=0` | active | Disable the CPU-pressure cap on adaptive worker count. Default (active) caps the count so smash doesn't compete with a saturated app for cores. |
 | `SMASH_EAGER_ZERO=1` | unset | Memset newly-allocated buffers to zero on the malloc fast path instead of relying on the compressor thread's deferred zero-on-free pass. Trades throughput for correctness with callers that assume malloc returns zeroed memory (technically UB, but widely relied on). |
 
 **Diagnostics / observability:**
