@@ -2,13 +2,11 @@
 #pragma once
 
 #include <atomic>
-#include <sched.h>
+#include <cerrno>
 #include <cstdint>
-#include "thread_safety.h"
-
-#if defined(SMASH_SIM)
 #include <time.h>
-#endif
+#include "park.h"
+#include "thread_safety.h"
 
 namespace smash {
 
@@ -56,9 +54,11 @@ static inline void spinRelax() {
 #endif
 }
 
-// Test-and-test-and-set spinlock with bounded exponential backoff.
+// A lock for short critical sections: test-and-test-and-set, a bounded spin,
+// then the waiter sleeps until the holder wakes it. (The name is historical:
+// it only spun until issue #49.)
 //
-// The naive test-and-set loop (flag_.test_and_set every iteration) issues a
+// The naive test-and-set loop (an atomic exchange every iteration) issues a
 // bus-locked read-for-ownership on EVERY spin, so N contending threads generate
 // an O(N) cache-line ping-pong storm on the single lock word. On a 192-core
 // EPYC this collapsed the neuron-cc walrus backend's slab-refill path: profiling
@@ -67,19 +67,49 @@ static inline void spinRelax() {
 //
 // TTAS fixes the mechanism: spin on a plain relaxed LOAD (the line stays Shared,
 // generating no coherence traffic while the lock is held), and only issue the
-// atomic exchange when the lock APPEARS free. Exponential backoff further thins
-// the herd of exchanges the instant the lock is released.
+// atomic compare-exchange when the lock APPEARS free. Exponential backoff
+// further thins the herd of exchanges the instant the lock is released.
+//
+// Spinning only pays while the holder is running and about to let go. It used
+// to be all a waiter did (with a sched_yield() every 1024 pauses), on the
+// assumption that no critical section outlasts the spin. Two things broke
+// that: a holder that does something slow under the lock (the slab purge made
+// one madvise per span: every thread on the slab burnt a CPU for 90-820 ms),
+// and a holder the scheduler has taken off its CPU, which is ordinary on a
+// host with more threads than CPUs: waiters that yield and spin again stay
+// runnable and take CPU time the holder needs (16 threads on 2 CPUs did 0.84
+// of the work of 2 threads; 0.90 with waiters that sleep). So after kSpinNs
+// the waiter marks the word and sleeps on it (a futex; util/park.h), as the
+// page locks do, and unlock() wakes one sleeper when the word is marked.
+//
+// What sleeping does not change is how long a waiter waits for a descheduled
+// holder: until the scheduler runs it again, milliseconds on a busy host.
+// Nothing a waiter does can hand the holder its CPU.
+//
+// The spin is bounded by time, not by a count of pause instructions: one
+// takes about a cycle on some arm64 cores, 16 ns on a Zen 3 and more on
+// recent Intel.
+//
+// Signal-safe (a futex is a system call, and the library is linked -z now, so
+// clock_gettime needs no lazy binding), nothing to re-initialise after
+// fork() but the word itself (ForkLockSet::resetAll), and all-zero is free.
 class SMASH_CAPABILITY("mutex") Spinlock {
-    std::atomic<uint8_t> state_{0};   // 0 = free, 1 = held
-    // ~1K pause/yield instructions: tens of microseconds, far longer than
-    // any smash critical section, so an uncontended-but-busy holder never
-    // triggers it; only a descheduled holder does.
-    static constexpr unsigned kSpinsBeforeYield = 1024;
+    // 0 = free, 1 = held, 2 = held and a thread may be asleep on the word.
+    std::atomic<uint32_t> state_{0};
+    // How long a waiter spins before it sleeps: several times a slab refill
+    // or drain (a microsecond or two), about what going to sleep and being
+    // woken costs.
+    static constexpr uint64_t kSpinNs = 20000;
+    // Pause instructions between two looks at the clock.
+    static constexpr unsigned kSpinRound = 64;
+    // The longest pause after losing the race for a free lock: what the
+    // pure spinlock used (tuned on the 192-core host).
+    static constexpr unsigned kMaxBackoff = 1024;
 
 public:
     SMASH_SIM_NOINLINE void lock() SMASH_ACQUIRE() {
         // Fast path: uncontended acquire.
-        if (tryLockRelaxed()) return;
+        if (tryAcquire(1)) [[likely]] return;
 #if defined(SMASH_SIM)
         const uintptr_t ra = reinterpret_cast<uintptr_t>(__builtin_return_address(0));
         const uint64_t t0 = sim::nowNs();
@@ -93,39 +123,83 @@ public:
             }
         } record{ra, t0};
 #endif
-        unsigned backoff = 1;
-        for (;;) {
-            // Read-spin: no atomic RMW, line stays Shared, zero coherence
-            // traffic while another core holds the lock. If the holder is
-            // not running (preempted on an oversubscribed machine), spinning
-            // only burns the time slice it needs: yield after a bounded spin.
-            unsigned spins = 0;
-            while (state_.load(std::memory_order_relaxed) != 0) {
-                spinRelax();
-                if (++spins == kSpinsBeforeYield) { sched_yield(); spins = 0; }
-            }
-            // Lock looks free — attempt the one atomic exchange.
-            if (tryLockRelaxed()) return;
-            // Lost the race; back off to spread out the retry storm.
-            for (unsigned i = 0; i < backoff; ++i) spinRelax();
-            if (backoff < 1024) backoff <<= 1;
-        }
+        lockSlow();
     }
 
     void unlock() SMASH_RELEASE() {
-        state_.store(0, std::memory_order_release);
+        if (state_.exchange(0, std::memory_order_release) == 2) [[unlikely]] wake();
     }
 
     bool tryLock() SMASH_TRY_ACQUIRE(true) {
-        return tryLockRelaxed();
+        return tryAcquire(1);
     }
 
 private:
     // Single atomic acquire attempt. Acquire ordering on success.
-    bool tryLockRelaxed() {
-        uint8_t expected = 0;
+    bool tryAcquire(uint32_t as) {
+        uint32_t expected = 0;
         return state_.compare_exchange_strong(
-            expected, 1, std::memory_order_acquire, std::memory_order_relaxed);
+            expected, as, std::memory_order_acquire, std::memory_order_relaxed);
+    }
+
+    static uint64_t nowNs() {
+        timespec t;
+        clock_gettime(CLOCK_MONOTONIC, &t);
+        return static_cast<uint64_t>(t.tv_sec) * 1000000000ull + static_cast<uint64_t>(t.tv_nsec);
+    }
+
+    [[gnu::noinline]] void wake() {
+        // One sleeper: it takes the lock marked (see lockSlow), so its own
+        // unlock wakes the next.
+        unpark(state_, 1);
+    }
+
+    // Sleep while the word is 2. free() must leave errno alone, and a futex
+    // wait that is interrupted, or finds the word already changed, sets it.
+    [[gnu::noinline]] void sleepOnWord() {
+        const int saved_errno = errno;
+        park(state_, 2);
+        errno = saved_errno;
+    }
+
+    [[gnu::noinline]] void lockSlow() {
+        // A thread that has slept takes the lock as 2: it cannot know whether
+        // it was the only sleeper, and taking it as 1 would leave the others
+        // asleep with nobody to wake them.
+        uint32_t as = 1;
+        unsigned backoff = 1;
+        unsigned since_clock = 0;
+        uint64_t deadline = 0;
+        for (;;) {
+            // Read-spin: no atomic RMW, the line stays Shared, zero coherence
+            // traffic while another core holds the lock.
+            if (state_.load(std::memory_order_relaxed) == 0) {
+                // Lock looks free — attempt the one compare-exchange.
+                if (tryAcquire(as)) return;
+                // Lost the race; back off to spread out the retry storm.
+                for (unsigned i = 0; i < backoff; ++i) spinRelax();
+                since_clock += backoff;
+                if (backoff < kMaxBackoff) backoff <<= 1;
+            } else {
+                spinRelax();
+                ++since_clock;
+            }
+            if (since_clock < kSpinRound) continue;
+            since_clock = 0;
+            const uint64_t now = nowNs();
+            if (deadline == 0) { deadline = now + kSpinNs; continue; }
+            if (now < deadline) continue;
+            // Spun long enough: the holder is slow or not running. Mark the
+            // word and sleep on it. An unlock before the mark leaves 0 here
+            // (the lock is ours, marked, which costs one spare wake); one
+            // after it sees the mark and wakes; one in between changes the
+            // word, and the futex wait returns at once.
+            if (state_.exchange(2, std::memory_order_acquire) == 0) return;
+            sleepOnWord();
+            as = 2;
+            backoff = 1;
+            deadline = 0;
+        }
     }
 };
 

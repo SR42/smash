@@ -25,7 +25,29 @@
 
 namespace smash {
 
-class Slab {
+// Layout. A slab is 256 bytes and cache-line aligned, so what shares a line
+// does not depend on the slab's index:
+//   line 0     lock_, and what init() sets and everyone only reads;
+//   lines 1-2  the span lists, written by whoever holds lock_;
+//   line 3     what freeing threads write without lock_: the deferred-free
+//              stack and its node pool, the magazine depot.
+// Waiters read lock_ in a loop. Whatever the holder writes on that line is
+// fetched back by every waiter and has to be taken from them again, and
+// whatever a freeing thread writes there does the same to the holder.
+//
+// It used to be 200 unaligned bytes, so the lines fell differently for each
+// size class and arena: lock_ shared its line with partial_'s head for most,
+// with none of the lists for one class in eight. Measured with four threads
+// on one slab (M objects/s, issue #49): 64-byte objects 67.6 as it fell,
+// 76.1 with this layout, 54.8 with lock_ beside the deferred-free fields;
+// 80-byte objects 62.5 as it fell (lock_ alone, by chance), 62.0 with this
+// layout, 46.0 with lock_ beside partial_ and full_'s head. The price: a
+// producer/consumer pair, where only two threads ever meet, is 2-4% faster
+// with partial_'s head on the lock's line (one line to hand over instead of
+// two). agents/performance.md, "The slab's cache lines".
+class alignas(64) Slab {
+    // ── Line 0: the lock and the read-only fields ───────────────────────────
+    Spinlock lock_;
     uint8_t size_class_;
     uint8_t arena_id_ = 0;
     // Per-slab per-page slot cap (0 = no cap).  Set by SmashHeap during init
@@ -37,14 +59,20 @@ class Slab {
     using CapFn = uint32_t(*)(void* ctx, uint8_t arena, uint8_t sc);
     CapFn cap_fn_ = nullptr;
     void* cap_ctx_ = nullptr;
-    Spinlock lock_;
-    IntrusiveList<Span> partial_;
-    IntrusiveList<Span> full_;
-    IntrusiveList<Span> empty_;
-    std::atomic<uint32_t> resident_empty_count_{0};  // resident spans in empty_
     PageMap* page_map_;   // set during init, shared across all slabs
     VmRegion* vm_region_ = nullptr;
     PageStateTable* page_states_ = nullptr;
+    // ── Lines 1-2: the span lists, under lock_ ──────────────────────────────
+    alignas(64) IntrusiveList<Span> partial_;
+    IntrusiveList<Span> full_;
+    // Empty spans, in two lists. resident_ holds the ones whose pages are
+    // still resident (retireEmptySpan), newest at the front: empty_tick never
+    // rises towards the back, so the purge takes its victims off the back
+    // without a scan. empty_ holds the rest (decommitted, or never retired).
+    // takeEmptySpan() serves from resident_ first.
+    IntrusiveList<Span> resident_;
+    IntrusiveList<Span> empty_;
+    std::atomic<uint32_t> resident_empty_count_{0};  // spans in resident_, or being purged
     // Per-page cold-tick counter array owned by CompressorThread.  Plumbed
     // into Span so the bitmap walk can clear the cold counter on the page
     // it just handed out a chunk on — pages still receiving allocations
@@ -68,7 +96,8 @@ class Slab {
         uint32_t count;
         PendingNode* next;
     };
-    std::atomic<PendingNode*> pending_head_{nullptr};
+    // ── Line 3: written by freeing threads, without lock_ ───────────────────
+    alignas(64) std::atomic<PendingNode*> pending_head_{nullptr};
     std::atomic<uint32_t> pending_depth_{0};   // node count, for back-pressure
     // Bootstrap node free-pool (recycled; steady-state allocation-free).
     Spinlock pending_pool_lock_;
@@ -215,10 +244,19 @@ class Slab {
             partial_.pushFront(span);
         } else if (span->empty()) {
             partial_.remove(span);
-            retireEmptySpan(span);
-            empty_.pushFront(span);
+            if (retireEmptySpan(span)) resident_.pushFront(span);
+            else empty_.pushFront(span);
         }
     }
+
+    // An empty span to put back into service, or nullptr. A resident one
+    // first, and the newest of those: its pages need no fault and are the
+    // likeliest still in the cache. The caller recommits it.
+    Span* takeEmptySpan() {
+        if (Span* span = resident_.popFront()) return span;
+        return empty_.popFront();
+    }
+    bool hasEmptySpan() const { return !resident_.empty() || !empty_.empty(); }
 
     // Says WHICH kind of exhaustion this is, because the fix differs: few free
     // pages means the live set genuinely outgrew the arena (raise
@@ -299,11 +337,13 @@ class Slab {
     static inline std::atomic<size_t> resident_empty_bytes_{0};
     static inline std::atomic<uint32_t> slab_tick_{0};
 
-    void retireEmptySpan(Span* span) {
+    // True if the span stays resident (it then belongs on resident_), false
+    // if it was decommitted here (empty_).
+    bool retireEmptySpan(Span* span) {
         const size_t bytes = span->page_count * kPageSize;
         if (resident_empty_bytes_.load(std::memory_order_relaxed) + bytes > residentEmptyMaxBytes()) {
             decommitEmptySpan(span);
-            return;
+            return false;
         }
         // Same compressor and page-state steps as decommitEmptySpan(), and
         // like it only for arena pages: a span from a direct mapping (arena
@@ -321,6 +361,7 @@ class Slab {
         span->empty_tick = slab_tick_.load(std::memory_order_relaxed);
         resident_empty_bytes_.fetch_add(bytes, std::memory_order_relaxed);
         resident_empty_count_.fetch_add(1, std::memory_order_relaxed);
+        return true;
     }
 
     void clearResident(Span* span) {
@@ -334,22 +375,84 @@ public:
     static void advanceTick() { slab_tick_.fetch_add(1, std::memory_order_relaxed); }
     static size_t residentEmptyBytes() { return resident_empty_bytes_.load(std::memory_order_relaxed); }
 
-    // Compressor tick: decommit empty spans that have stayed empty for
+    // Compressor tick: decommit the spans that have stayed empty for
     // kResidentEmptyTicks ticks. Cheap when nothing is resident.
-    void purgeResidentEmpty() {
+    //
+    // The madvise runs with the slab lock released. It used to run under it,
+    // one call per span over the whole list: after a large free that was tens
+    // of thousands of system calls in one hold (768 MiB of 256-byte objects:
+    // 49,000 calls, 270 ms), and every malloc that needed a refill from this
+    // slab waited for all of it (issue #49). Now the victims come off the
+    // back of resident_ kPurgeBatch at a time and belong to no list while
+    // their pages are dropped, so no allocation can be handed one; then they
+    // go to empty_. Each hold is a few dozen list operations. Neighbouring
+    // spans are dropped with one call (they empty in the order their objects
+    // were freed, so the list is nearly address-ordered: see
+    // reclaimEmptySpans).
+    //
+    // An allocation that finds both lists empty while a batch is out carves
+    // a new span rather than wait: at most kPurgeBatch spans of extra arena
+    // per slab, and only if it has used up every other empty span first.
+    //
+    // `stop` (the compressor's fork pause) is read between batches: a fork()
+    // waits for the tick, and so for one batch, not for the whole purge.
+    // Should a fork give up on the tick (2 s) while a batch is out, the child
+    // never sees those spans again: address space, nothing else.
+    static constexpr size_t kPurgeBatch = 64;
+    void purgeResidentEmpty(const std::atomic<bool>* stop = nullptr) {
         if (resident_empty_count_.load(std::memory_order_relaxed) == 0) return;
         const uint32_t now = slab_tick_.load(std::memory_order_relaxed);
-        LockGuard guard(lock_);
-        for (Span* sp = empty_.front(); sp; sp = sp->list_next) {
-            if (sp->resident_empty && now - sp->empty_tick >= kResidentEmptyTicks) {
-                clearResident(sp);
-                const size_t bytes = sp->page_count * kPageSize;
-                if (inRegion(sp)) vm::decommitPages(sp->base, bytes);
-                else vm::decommitOwnMapping(sp->base, bytes);
+        Span* batch[kPurgeBatch];
+        for (;;) {
+            if (stop && stop->load(std::memory_order_relaxed)) return;
+            size_t n = 0;
+            {
+                LockGuard guard(lock_);
+                drainPending();
+                while (n < kPurgeBatch) {
+                    Span* sp = resident_.back();
+                    if (!sp || now - sp->empty_tick < kResidentEmptyTicks) break;
+                    resident_.remove(sp);
+                    batch[n++] = sp;
+                }
             }
+            if (n == 0) return;
+            decommitSpans(batch, n);
+            {
+                LockGuard guard(lock_);
+                // Oldest first, as they came off: empty_ keeps their order.
+                for (size_t i = 0; i < n; ++i) {
+                    clearResident(batch[i]);
+                    empty_.pushFront(batch[i]);
+                }
+            }
+            if (n < kPurgeBatch) return;
         }
     }
+
 private:
+    // Drop the pages of empty spans that are in no list. No lock held.
+    void decommitSpans(Span* const* spans, size_t n) {
+        uintptr_t run_lo = 0, run_hi = 0;           // the pending arena run, [lo, hi)
+        auto flush = [&] {
+            if (run_hi == run_lo) return;
+            vm::decommitPages(reinterpret_cast<void*>(run_lo), run_hi - run_lo);
+            run_lo = run_hi = 0;
+        };
+        for (size_t i = 0; i < n; ++i) {
+            const Span* sp = spans[i];
+            const uintptr_t lo = reinterpret_cast<uintptr_t>(sp->base);
+            const uintptr_t hi = lo + sp->page_count * kPageSize;
+            if (!inRegion(sp)) {
+                vm::decommitOwnMapping(sp->base, hi - lo);
+                continue;
+            }
+            if (run_hi != run_lo && lo == run_hi) run_hi = hi;
+            else if (run_hi != run_lo && hi == run_lo) run_lo = lo;
+            else { flush(); run_lo = lo; run_hi = hi; }
+        }
+        flush();
+    }
 
     Span* allocateNewSpan() {
         const auto& info = kSizeClasses[size_class_];
@@ -440,7 +543,7 @@ public:
             releaseRegionRun(reinterpret_cast<void*>(run_lo), (run_hi - run_lo) / kPageSize);
             run_lo = run_hi = 0;
         };
-        while (Span* span = empty_.popFront()) {
+        while (Span* span = takeEmptySpan()) {
             ++n;
             clearResident(span);
             if (!inRegion(span)) {
@@ -540,6 +643,11 @@ public:
               uint8_t arena_id = 0,
               uint32_t max_slots_per_page = 0,
               uint8_t* cold_counts = nullptr) {
+        static_assert(sizeof(Slab) == 256 && alignof(Slab) == 64, "see the layout note above the class");
+        static_assert(offsetof(Slab, lock_) == 0 && offsetof(Slab, page_states_) < 64,
+                      "line 0: the lock and the read-only fields");
+        static_assert(offsetof(Slab, partial_) == 64, "lines 1-2: the span lists");
+        static_assert(offsetof(Slab, pending_head_) == 192, "line 3: what freeing threads write");
         size_class_ = sc;
         arena_id_ = arena_id;
         max_slots_per_page_ = max_slots_per_page;
@@ -596,7 +704,7 @@ public:
             }
         }
 
-        Span* span = empty_.popFront();
+        Span* span = takeEmptySpan();
         if (!span) {
             span = allocateNewSpan();
             if (!span) return nullptr;
@@ -634,7 +742,7 @@ public:
                 // compress. Never allocate a NEW span for this — if the
                 // empty list is dry, consume the fallback (no page-count
                 // growth either way).
-                if (Span* es = empty_.popFront()) {
+                if (Span* es = takeEmptySpan()) {
                     // Rotate the warmless span to the back so the next
                     // allocation doesn't rescan it while it cools.
                     partial_.remove(span);
@@ -654,8 +762,8 @@ public:
             return ptr;
         }
 
-        // Try reusing an empty span (pages were decommitted)
-        span = empty_.popFront();
+        // Try reusing an empty span
+        span = takeEmptySpan();
         if (!span) {
             // Allocate a fresh span
             span = allocateNewSpan();
@@ -717,7 +825,7 @@ public:
         while (allocated < count) {
             Span* span = partial_.front();
             if (!span) {
-                span = empty_.popFront();
+                span = takeEmptySpan();
                 if (!span) {
                     span = allocateNewSpan();
                     if (!span) break;
@@ -734,14 +842,14 @@ public:
                 Span::AllocFallback fb;
                 void* ptr = span->allocateWarm(&fb);
                 if (!ptr && fb.any()) {
-                    if (!redirected && empty_.front()) {
+                    if (!redirected && hasEmptySpan()) {
                         // Rotate the warmless span to the back so it cools
                         // undisturbed; the outer loop picks up the empty
                         // span we just promoted.
                         redirected = true;
                         partial_.remove(span);
                         partial_.pushBack(span);
-                        Span* es = empty_.popFront();
+                        Span* es = takeEmptySpan();
                         recommitEmptySpan(es);
                         partial_.pushFront(es);
                         break;  // outer loop re-reads partial_.front()
@@ -871,7 +979,7 @@ public:
         LockGuard guard(lock_);
         drainPending();
         if (magazineEnabled()) drainMagazines();
-        while (Span* span = empty_.popFront()) {
+        while (Span* span = takeEmptySpan()) {
             releaseSpan(span);
         }
     }

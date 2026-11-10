@@ -1542,8 +1542,11 @@ public:
                     if (!h) return;
                     h->large_alloc_.onTick();
                     Slab::advanceTick();
+                    // A fork() waiting for this tick waits for one purge
+                    // batch, not for the rest of the purge.
+                    const std::atomic<bool>& fork_pause = h->compressor_.forkPauseFlag();
                     const int total = getTotalArenas() * kNumClasses;
-                    for (int i = 0; i < total; ++i) h->slabs_[i].purgeResidentEmpty();
+                    for (int i = 0; i < total; ++i) h->slabs_[i].purgeResidentEmpty(&fork_pause);
                 });
             }
 

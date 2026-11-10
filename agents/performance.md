@@ -896,3 +896,60 @@ threads always gets one worker. Fixed now (load average, floor
 `clamp(nproc/16, 2, 8)`; see config.md) — earlier more workers did not help
 because everything was lock-bound, but with a third of phase time in the run
 queue they now should.
+
+## The slab's cache lines (2026-11-10, issue #49)
+
+A `Slab` was 200 unaligned bytes in a flat array, so slab `i` started
+`(i * 8) mod 64` bytes into a cache line (plus 32 for odd arenas): which of its
+fields shared a line depended on the size class and the arena. Adding one
+24-byte list while fixing the purge moved every benchmark that contends on a
+slab, in both directions, by more than the fix itself. `xbench` (64-byte
+objects unless said, M objects/s, median of 11-15 runs of 2 s, 8 CPUs; "pre"
+is 6cfa4b7):
+
+| Layout | 4 threads on one slab | 4 producer/consumer pairs | 1 producer, 7 consumers |
+|---|---|---|---|
+| pre: 200 bytes as they fell (`lock_` and `partial_`'s head on one line) | 67.6 | 152.4 | 37.1 |
+| the same with one more list, 224 bytes as they fell (`lock_` alone on its line) | 76.4 | 143.8 | 35.7 |
+| ... with 80-byte objects (`lock_`, `partial_` and `full_`'s head on one line) | 46.0, pre 63.1 | 152.1, pre 156.1 | 35.8, pre 37.7 |
+| aligned; `lock_`, `partial_`, `full_`'s head on line 0 | 63.0 | 145.9 | 34.9 |
+| aligned; `lock_` beside the deferred-free fields, lists on their own lines | 54.8 | 142.7 | 34.4 |
+| aligned; `lock_`, read-only fields, `partial_`'s head on line 0 | 65.7 | 148.4 | 35.1 |
+| **aligned; `lock_` and read-only fields on line 0, lists on 1-2, deferred-free on 3** | **76.1** | **144.1** | **35.7** |
+
+(The rows are from separate interleaved runs; pre measured 67.5-68.0,
+151.2-153.7 and 37.1-37.5 across them.)
+
+Waiters read `lock_` in a loop. Whatever the holder writes on that line is
+fetched back by every waiter and has to be taken from them again, and whatever
+a freeing thread writes there does the same to the holder: with several
+threads on a slab the lock's line must hold nothing that is written during a
+hold. The cost is the case where only two threads meet (a producer and its
+consumer): with `partial_`'s head beside the lock one line changes hands
+instead of two, worth 2-4% there. The chosen layout gives the first up for the
+second, for every class instead of for one in eight:
+
+| 64-byte objects | pre | now | |
+|---|---|---|---|
+| 4 threads on one slab | 67.6 | 76.1 | +13% |
+| 8 threads on one slab | 48.8 | 60.8 | +25% |
+| 8 threads, an arena each | 295.9 | 297.4 | |
+| 4 producer/consumer pairs | 152.4 | 144.1 | -5% |
+| 1 producer, 7 consumers | 37.1 | 35.7 | -4% |
+| `tcbench` random replace, 8 threads (ns/op) | 16.2 | 17.0 | +5% |
+
+256-byte objects: +15%, -4%, -3%. 80-byte objects, where pre already had
+`lock_` on its own line: -1%, -4%, -4%. One thread (`tcbench` pair, batch,
+random replace, cross-thread free): within 2%.
+
+What the lock change itself costs was measured with the old slab and the new
+lock: nothing on the pairs (0.99-1.00) and 3-4% on the fan-out, where seven
+threads free to one slab. `unlock()` is now an atomic exchange, because it has
+to learn whether a thread sleeps on the word, and that waits for the line when
+another thread has touched it since; the plain store it replaces did not. A
+variant that kept the plain store and let sleepers wake by timeout was no
+faster on the pairs and 18-21% slower with more threads than CPUs.
+
+Not measured: any host with more than 8 CPUs. The longest backoff after
+losing the race for a free lock is still the 1024 pauses tuned on the 192-core
+host; 64 measured the same here.

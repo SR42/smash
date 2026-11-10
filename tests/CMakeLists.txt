@@ -65,6 +65,11 @@ smash_add_test(test_size_classes test_size_classes.cpp)
 smash_add_test(test_bootstrap test_bootstrap.cpp)
 smash_add_test(test_span test_span.cpp)
 smash_add_test(test_slab test_slab.cpp)
+# Spinlock: a waiter sleeps after a bounded spin and every sleeper is woken
+# (tests/spinlock_park_test.cpp, issue #49).
+smash_add_test(test_spinlock_park spinlock_park_test.cpp)
+target_link_libraries(test_spinlock_park PRIVATE Threads::Threads)
+set_tests_properties(test_spinlock_park PROPERTIES TIMEOUT 300)
 
 # VM region test (no LZ4 dependency)
 smash_add_test(test_vm_region test_vm_region.cpp)
@@ -910,6 +915,24 @@ if(NOT APPLE)
     "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=1" "SMASH_COLD_TIMEOUT_SEC=1"
     "SMASH_DEFER_PHASES_MS=0" $<TARGET_FILE:page_lock_park_test>)
   set_tests_properties(test_page_lock_park PROPERTIES TIMEOUT 120)
+
+  # The purge of long-empty slab spans drops their pages without the slab's
+  # lock, neighbours in one call, and stops for a fork (slab_purge_test.cpp,
+  # issue #49). One arena, so the test's two threads share a slab; a
+  # resident-empty cap above what the test frees, so the free drops nothing.
+  add_executable(slab_purge_test slab_purge_test.cpp)
+  target_link_libraries(slab_purge_test PRIVATE ${CMAKE_DL_LIBS} Threads::Threads)
+  # The test defines madvise(); libsmash must find that definition.
+  set_target_properties(slab_purge_test PROPERTIES ENABLE_EXPORTS ON)
+  add_test(NAME test_slab_purge_unlocked COMMAND ${CMAKE_COMMAND} -E env
+    "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=0" "SMASH_NUM_ARENAS=1"
+    "SMASH_EMPTY_RESIDENT_MB=256" "SMASH_DEFER_PHASES_MS=0"
+    $<TARGET_FILE:slab_purge_test> unlocked)
+  add_test(NAME test_slab_purge_fork COMMAND ${CMAKE_COMMAND} -E env
+    "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=0" "SMASH_NUM_ARENAS=1"
+    "SMASH_EMPTY_RESIDENT_MB=256" "SMASH_DEFER_PHASES_MS=0"
+    $<TARGET_FILE:slab_purge_test> fork)
+  set_tests_properties(test_slab_purge_unlocked test_slab_purge_fork PROPERTIES TIMEOUT 300)
 
   # Root only (CAP_SYS_ADMIN for the idle bitmap): skips otherwise.
   add_executable(idle_direct_snapshot_test idle_direct_snapshot_test.cpp)

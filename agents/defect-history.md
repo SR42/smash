@@ -1455,3 +1455,100 @@ what follows a wrapped mapping. Guarded by `test_alloc_contract_*`'s
 `testMemalignAlignments`: the library before failed 26 checks in full mode and
 22 in large-only (the `SIZE_MAX` calls crash in their own child), and the
 passthrough registration (`SMASH_PASSTHROUGH=1`, the same binary) fails 58.
+
+## A slab lock held across the purge, and waiters that spun (fixed 2026-11-10, issue #49)
+
+Full mode only. Two defects that multiplied each other, and a third thing
+that is not fixed.
+
+**The purge held the slab's lock across one `madvise` per span.**
+`Slab::purgeResidentEmpty()` runs on every compressor tick. It took `lock_`
+and walked the whole empty list, calling `vm::decommitPages` for each span
+that had been empty for two ticks. After a large free that is tens of
+thousands of system calls in one hold, and every `malloc` that needs a refill
+from that slab (same arena, same size class) waits for all of it. Measured on
+the unmodified library, one thread, batches of 64 `malloc` + 64 `free` after
+freeing N MiB of the same size:
+
+| Object size | Freed | Slowest batch before | after |
+|---|---|---|---|
+| 256 B | 256 MiB | 96-98 ms | 1.0-1.3 ms |
+| 256 B | 768 MiB | 285-296 ms | 7.1-7.8 ms |
+| 256 B | 1024 MiB | 388-392 ms | 6.6-7.9 ms |
+| 64 B | 768 MiB | 585-813 ms | 5.9-6.6 ms |
+| 4096 B | 768 MiB | 169-188 ms | 7.1-8.6 ms |
+
+(Three runs each, 8 CPUs. `strace -c`: 49,159 `madvise` calls for the 768 MiB
+of 256-byte objects, 777 now. On the 2-CPU host, where the cap on resident
+empty spans is 122 MiB: 32-33 ms before, 0.6 ms after.)
+
+Resident empty spans now have their own list (`resident_`, newest at the
+front, so the old ones are at its back and the purge needs no scan). The
+purge takes 64 of them off the list under the lock, releases it, drops their
+pages (neighbours in one call: they empty in the order their objects were
+freed, so the list is nearly address-ordered), takes the lock again and puts
+them on `empty_`. While they are off the lists no allocation can be handed
+one. An allocation that finds both lists empty during that window carves a
+new span: at most 64 spans per slab, and only after every other empty span is
+used up. The purge also stops at its next batch when a `fork()` is waiting
+for the tick (`CompressorThread::forkPauseFlag`): a fork during a purge
+waited for all of it.
+
+The 6-8 ms that remain after the larger frees are not the purge: that batch
+is at the first tick after the free (0.8-1.4 s), the purge comes a tick
+later, and the library before has it as its second slowest batch.
+`SMASH_WRITE_TRACK=none` halves it (7.2 to 3.6 ms), and a run with the
+compressor off showed a 6.8 ms batch of its own, so part of it is the write
+tracker's pass over the process (issue #23) and part is the host. Not chased.
+
+**A waiter spun for as long as the hold lasted.** `Spinlock` read the lock
+word in a loop and called `sched_yield()` every 1024 pauses; its comment said
+1024 pauses outlast any critical section. Behind the purge every thread on
+the slab burnt a CPU for the whole hold (four threads on one arena: 344 ms
+each, 1.4 s of CPU for one purge; now their slowest batch is 3.8-4.9 ms with
+0.1 ms of CPU in it). A waiter now spins for about 20 µs, bounded by the clock and not by a count of pause instructions (one takes
+16 ns on the Zen 3 here, about a cycle on some arm64 cores), then marks the
+word (0 free, 1 held, 2 held with a sleeper) and sleeps on it as a futex;
+`unlock()` is an atomic exchange and wakes one sleeper when it finds the
+mark. A thread that has slept takes the lock marked, so its own unlock wakes
+the next. `lock()` saves and restores `errno` around the sleep (`free()` must
+not change it, and an interrupted futex wait sets `EINTR`).
+
+**Not fixed: the wait behind a holder the scheduler has descheduled.** With
+more threads than CPUs a thread is regularly taken off its CPU while it holds
+a slab lock, and whoever needs that slab then waits until the scheduler runs
+the holder again. Sleeping waiters stop competing with the holder for the
+CPU, which recovers throughput, but the wait itself is the scheduler's:
+
+| 64-byte objects, each thread its own FIFO of 1024, 3 s | Throughput against one thread per CPU | Lock waits over 1 ms | Longest | All lock waits together |
+|---|---|---|---|---|
+| 16 threads on the 2-CPU host (4 arenas), before | 0.84 | 1236-1292 | 88-128 ms | 17.9-19.1 s |
+| after | 0.90 | 1240-1296 | 60-86 ms | 17.1-17.8 s |
+| 16 threads pinned to 2 of 8 CPUs, 4 arenas, before | 0.90 | 849-876 | 98-120 ms | 18.2-19.1 s |
+| after | 1.00 | 820-915 | 81-145 ms | 14.8-16.2 s |
+| 4 threads pinned to 1 CPU, 1 arena, before | 0.97 | 406-422 | 27-48 ms | 3.4-3.8 s |
+| after | 0.98 | 324-413 | 10 ms | 1.4-1.7 s |
+
+Nothing a lock does while waiting can shorten that: a futex has no way to
+hand the waiter's time slice to the holder, and priority inheritance does
+nothing between threads of equal priority. It needs the holder not to be
+preempted in the middle of a critical section, which a thread on these
+kernels (6.8) cannot ask for, or the slab not to be shared. With every CPU
+busy the time is not lost to the process, as the throughput column shows.
+glibc does not show these waits: its threads do not share an arena here.
+
+**The slab's layout.** The fix added one list to `Slab` (24 bytes) and the
+benchmarks moved by more than the lock change explains: four threads on one
+slab +13%, producer/consumer pairs -4%, and with 80-byte objects four threads
+on one slab -27%. A slab was 200 unaligned bytes in an array, so which fields shared a cache line depended on the size class and the
+arena; one more list shifted all of it. What matters is the line `lock_` is
+on: waiters read it in a loop, so whatever the holder writes there is fetched
+back by every waiter and has to be taken from them again, and whatever
+freeing threads write there does the same to the holder. A slab is now 256
+bytes and cache-line aligned: `lock_` with the fields only `init()` writes,
+the span lists on the next two lines, the deferred-free fields on the last.
+Numbers and the layouts tried: [performance.md](performance.md), "The slab's
+cache lines".
+
+Guarded by `test_slab_purge_unlocked`, `test_slab_purge_fork` and
+`test_spinlock_park` ([tests.md](tests.md)).

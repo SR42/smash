@@ -1646,6 +1646,9 @@ public:
         fork_mid_tick_ = in_tick_.load(std::memory_order_seq_cst);
     }
     bool forkMidTick() const { return fork_mid_tick_; }
+    // Set while a fork() waits for the tick: work the tick calls out to (the
+    // slab purge) stops at its next batch.
+    const std::atomic<bool>& forkPauseFlag() const { return paused_; }
     size_t resetPageLocksForFork(size_t committed) { return locks_->resetForFork(committed); }
     // Diagnostic / test hook: hold one page's lock on this thread for `ms`,
     // as a thread inside the fault handler does for microseconds.
