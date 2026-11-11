@@ -30,7 +30,9 @@
 //   4. The random block is declined once more, every page of it. With
 //      ROIZ_LOOKS=once (a tracker that reports writes) the gate must have
 //      read at most 64 pages meanwhile; with ROIZ_LOOKS=always (no write
-//      tracking: nothing says a page did not change) at least half of them.
+//      tracking: nothing says a page did not change) at least half of them;
+//      with ROIZ_LOOKS=probes (a scanning tracker) at most one in 16 of
+//      what it declined.
 //   5. The even pages of the random block are overwritten with zeros. They
 //      were declined and found not zero; the write must bring the gate
 //      back to them: at least 95 % compressed within 150 s. The odd pages
@@ -59,7 +61,13 @@
 // the test skips. Under a scanning tracker the gate's own read of a page is
 // what the next scan reports, and step 4 is what shows that phase 1 does not
 // take it for the application's: if it did, the random block would lose its
-// back-off at every scan and be read again each time it is declined.
+// back-off at every scan and be read again each time it is declined (8192
+// reads for 8064 declines, measured). What is left is the probes: a probe
+// is compressed, so its page is read for the snapshot, and nothing tells
+// phase 1 that this read was the compressor's. The probed page loses its
+// back-off, is declined again one floor later, and is read then: 64 pages
+// for each pass over the block's 4096, and two such rounds can fall into
+// the step (128-138 reads for 4101-4219 declines, measured).
 //
 // The counters are the pipeline line's (SMASH_STATS_SIGNAL=1, SIGUSR2),
 // read from a file standing in for stderr.
@@ -235,6 +243,7 @@ int partBlocks() {
     const char* looks = std::getenv("ROIZ_LOOKS");
     const bool looks_once = looks && std::strcmp(looks, "once") == 0;
     const bool looks_always = looks && std::strcmp(looks, "always") == 0;
+    const bool looks_probes = looks && std::strcmp(looks, "probes") == 0;
 
     // 1. Random bytes: the bucket is declined, and stays so (the block is kept).
     Rng rng{88172645463325252ull};
@@ -322,6 +331,9 @@ int partBlocks() {
     if (looks_once && reread > 64)
         return fail("the gate read %llu pages while it declined %llu that were not written since it last read "
                     "them (limit 64)", reread, again);
+    if (looks_probes && reread > again / 16)
+        return fail("the gate read %llu pages while it declined %llu: more than the pages the passes before had "
+                    "probed (limit one in 16)", reread, again);
     if (looks_always && reread < kPages / 2)
         return fail("the gate read %llu pages while it declined %llu, with no write tracking to say they are "
                     "unchanged", reread, again);

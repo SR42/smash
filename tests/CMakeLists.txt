@@ -1409,8 +1409,10 @@ if(NOT APPLE)
   #               declined page is read every time.
   #   _idle, _yt  SMASH_WRITE_TRACK=idle|yt (root; yt with its module): the
   #               gate's read of a page is what the next scan reports, and
-  #               phase 1 must not take it for the application's. They skip
-  #               where the tracker is not the one in use.
+  #               phase 1 must not take it for the application's. A probe's
+  #               snapshot is such a read too and is not recorded, so the
+  #               pages the last pass probed are read again (one in 64).
+  #               They skip where the tracker is not the one in use.
   #   _slots      full mode: pages holding only freed 1024-byte objects.
   add_executable(roi_zero_test roi_zero_test.cpp)
   target_link_libraries(roi_zero_test PRIVATE ${CMAKE_DL_LIBS} Threads::Threads)
@@ -1436,10 +1438,10 @@ if(NOT APPLE)
     "SMASH_WRITE_TRACK=none" "ROIZ_LOOKS=always"
     $<TARGET_FILE:roi_zero_test>)
   add_test(NAME test_roi_gate_zero_pages_idle COMMAND ${CMAKE_COMMAND} -E env ${ROIZ_ENV} ${ROIZ_ONE}
-    "SMASH_WRITE_TRACK=idle" "ROIZ_NEED_TRACK=idle" "ROIZ_LOOKS=once"
+    "SMASH_WRITE_TRACK=idle" "ROIZ_NEED_TRACK=idle" "ROIZ_LOOKS=probes"
     $<TARGET_FILE:roi_zero_test>)
   add_test(NAME test_roi_gate_zero_pages_yt COMMAND ${CMAKE_COMMAND} -E env ${ROIZ_ENV} ${ROIZ_ONE}
-    "SMASH_WRITE_TRACK=yt" "ROIZ_NEED_TRACK=yt" "ROIZ_LOOKS=once"
+    "SMASH_WRITE_TRACK=yt" "ROIZ_NEED_TRACK=yt" "ROIZ_LOOKS=probes"
     $<TARGET_FILE:roi_zero_test>)
   add_test(NAME test_roi_gate_zero_pages_slots COMMAND ${CMAKE_COMMAND} -E env ${ROIZ_ENV}
     "SMASH_TEST_WORKERS=1" "SMASH_NUMA_COMPRESSOR=0" "ROIZ_PART=slots"
