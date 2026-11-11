@@ -1388,6 +1388,68 @@ if(NOT APPLE)
     "SMASH_COLD_TIMEOUT_SEC=2"
     $<TARGET_FILE:roi_gate_test>)
   set_tests_properties(test_roi_gate_recovers test_roi_gate_recovers_timeout_set PROPERTIES TIMEOUT 240)
+
+  # A page that is all zero is compressed whatever the gate thinks of its
+  # bucket (roi_zero_test.cpp, issue #50): a block of random bytes, then zero
+  # pages from the same call site, alone and alternating with random pages;
+  # declined pages are read once and again when they are written; and a
+  # writer strikes pages while they are being compressed.
+  #   (plain)     the default tracker; one worker, so the counter roi_zero
+  #               must account for every zero page.
+  #   _workers    the default worker count and the node groups.
+  #   _watched    SMASH_SOFTDIRTY=0: the pages are watched (PROT_READ).
+  #   _standard   SMASH_DEFERRED_RECLAIM=0: the snapshot follows an mprotect
+  #               of a page that is still writable, which the jitter makes
+  #               slow, so the writer lands between the look and the
+  #               snapshot (roi_stale must say it did).
+  #   _escalated  the same mode with SMASH_SOFTDIRTY=0 and /proc/self/mem
+  #               switched off: a page armed PROT_NONE is read where it is,
+  #               and the fault handler has to let the read run.
+  #   _untracked  SMASH_WRITE_TRACK=none: nothing reports a write, so every
+  #               declined page is read every time.
+  #   _idle, _yt  SMASH_WRITE_TRACK=idle|yt (root; yt with its module): the
+  #               gate's read of a page is what the next scan reports, and
+  #               phase 1 must not take it for the application's. They skip
+  #               where the tracker is not the one in use.
+  #   _slots      full mode: pages holding only freed 1024-byte objects.
+  add_executable(roi_zero_test roi_zero_test.cpp)
+  target_link_libraries(roi_zero_test PRIVATE ${CMAKE_DL_LIBS} Threads::Threads)
+  set(ROIZ_ENV "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_STATS_SIGNAL=1" "SMASH_DEFER_PHASES_MS=0"
+               "SMASH_COLD_TIMEOUT_SEC=2")
+  set(ROIZ_ONE "SMASH_LARGE_ONLY=1" "SMASH_TEST_WORKERS=1" "SMASH_NUMA_COMPRESSOR=0" "ROIZ_ONE_WINDOW=1")
+  add_test(NAME test_roi_gate_zero_pages COMMAND ${CMAKE_COMMAND} -E env ${ROIZ_ENV} ${ROIZ_ONE}
+    "ROIZ_LOOKS=once"
+    $<TARGET_FILE:roi_zero_test>)
+  add_test(NAME test_roi_gate_zero_pages_workers COMMAND ${CMAKE_COMMAND} -E env ${ROIZ_ENV}
+    "SMASH_LARGE_ONLY=1" "ROIZ_LOOKS=once"
+    $<TARGET_FILE:roi_zero_test>)
+  add_test(NAME test_roi_gate_zero_pages_watched COMMAND ${CMAKE_COMMAND} -E env ${ROIZ_ENV} ${ROIZ_ONE}
+    "SMASH_SOFTDIRTY=0" "ROIZ_LOOKS=once"
+    $<TARGET_FILE:roi_zero_test>)
+  add_test(NAME test_roi_gate_zero_pages_standard COMMAND ${CMAKE_COMMAND} -E env ${ROIZ_ENV} ${ROIZ_ONE}
+    "SMASH_DEFERRED_RECLAIM=0" "SMASH_TEST_JITTER_US=2000" "ROIZ_LOOKS=once" "ROIZ_MIN_STALE=1"
+    $<TARGET_FILE:roi_zero_test>)
+  add_test(NAME test_roi_gate_zero_pages_escalated COMMAND ${CMAKE_COMMAND} -E env ${ROIZ_ENV} ${ROIZ_ONE}
+    "SMASH_DEFERRED_RECLAIM=0" "SMASH_SOFTDIRTY=0" "SMASH_TEST_NO_MEM_SNAPSHOT=1" "ROIZ_LOOKS=once"
+    $<TARGET_FILE:roi_zero_test>)
+  add_test(NAME test_roi_gate_zero_pages_untracked COMMAND ${CMAKE_COMMAND} -E env ${ROIZ_ENV} ${ROIZ_ONE}
+    "SMASH_WRITE_TRACK=none" "ROIZ_LOOKS=always"
+    $<TARGET_FILE:roi_zero_test>)
+  add_test(NAME test_roi_gate_zero_pages_idle COMMAND ${CMAKE_COMMAND} -E env ${ROIZ_ENV} ${ROIZ_ONE}
+    "SMASH_WRITE_TRACK=idle" "ROIZ_NEED_TRACK=idle" "ROIZ_LOOKS=once"
+    $<TARGET_FILE:roi_zero_test>)
+  add_test(NAME test_roi_gate_zero_pages_yt COMMAND ${CMAKE_COMMAND} -E env ${ROIZ_ENV} ${ROIZ_ONE}
+    "SMASH_WRITE_TRACK=yt" "ROIZ_NEED_TRACK=yt" "ROIZ_LOOKS=once"
+    $<TARGET_FILE:roi_zero_test>)
+  add_test(NAME test_roi_gate_zero_pages_slots COMMAND ${CMAKE_COMMAND} -E env ${ROIZ_ENV}
+    "SMASH_TEST_WORKERS=1" "SMASH_NUMA_COMPRESSOR=0" "ROIZ_PART=slots"
+    $<TARGET_FILE:roi_zero_test>)
+  set_tests_properties(test_roi_gate_zero_pages test_roi_gate_zero_pages_workers
+                       test_roi_gate_zero_pages_watched test_roi_gate_zero_pages_standard
+                       test_roi_gate_zero_pages_escalated
+                       test_roi_gate_zero_pages_untracked test_roi_gate_zero_pages_idle
+                       test_roi_gate_zero_pages_yt test_roi_gate_zero_pages_slots
+                       PROPERTIES TIMEOUT 600)
 endif()
 
 # The [smash faults] line reports fault-handler time per kind for exactly the

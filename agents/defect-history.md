@@ -1683,6 +1683,7 @@ Not done:
 
 - All-zero pages in a declined bucket are still declined: the gate runs
   before the snapshot that would recognise them (the last sentence of #22).
+  Fixed 2026-11-11 (issue #50, the next section).
 - `kMaxEffectiveFloorTicks` (200) is below `kMaxColdTicks` (254), so the
   back-offs cannot lengthen a timeout above 200 s and at most double one
   above 100 s (the "Related" note in #10). A page's idle count is one byte,
@@ -1695,6 +1696,97 @@ Not done:
 
 Guarded by `test_roi_gate_recovers`, `test_roi_gate_recovers_timeout_set`
 and `test_large_bucket_decline_timeout_set` ([tests.md](tests.md)).
+
+
+## Zero pages in a declined bucket stayed resident (fixed 2026-11-11, issue #50)
+
+The ROI gate declines a page from its bucket's window of compression ratios,
+before the page is read. A page that is all zero is stored as a mark: no
+codec runs, there is no blob, and it is never recorded in the window. So the
+window says nothing about it. It was declined with the rest of its bucket all
+the same, and the probe of #22 did not help: a probe that turns out to be
+zero is stored, but leaves the window as it was, so the pages after it are
+declined again.
+
+Measured at 502c0d6 (x86-64, 8 CPUs, 4 memory nodes, large-only, default
+cold timeout, default workers): one call site allocates 32 MiB of random
+bytes and then blocks of zero pages.
+
+| Zero pages, after the random block | Compressed after 90 s, before | After |
+|---|---|---|
+| Two 32 MiB blocks of zeros, random block kept | 759 of 16384 | 16384, at the first pass (15 s) |
+| The same, random block freed first | 1501 of 16384 | 16384 |
+| One 32 MiB block, zero and random pages alternating | 0 of 4096 | 4096, and 0 random pages |
+| No random block (control) | 16384 of 16384 | 16384 |
+
+Each pass compressed the probes that landed on zero pages, one declined page
+in 64; in the alternating block every probe landed on a random page. In full
+mode the same held for a page whose objects had all been freed: its snapshot
+is zero once `zeroFreeSlots` has run, and the gate declined it before the
+snapshot (64 MiB of 2 KiB objects, 15 of 16 freed: 86 MiB resident for 15 s,
+then 38 MiB; 31 MiB within 5 s after the fix).
+
+The fix, in `compressPage`: a page the window declines is checked for zero
+(`readsAsZero`), and one that reads as zero goes on to the snapshot, which
+decides as before. If the page was written in between, it is declined after
+the snapshot, with the back-off it would have had at the gate. Only the
+window's verdict is set aside: the floor stands, and so does a re-dirty
+discount. A page let through this way does not count towards the next probe.
+
+Reading every declined page was the first version, and it was wrong in two
+ways.
+
+- **A read has consequences.** It brings a swapped page back, sets the
+  accessed bit that the kernel ages pages by and that the `idle` and `yt`
+  trackers read, and can take a NUMA hinting fault. On 2 GiB of random bytes
+  (one worker, five passes, 2.5M declines) phase 2's system time went from
+  0.10-0.13 s to 0.13-0.32 s in five runs and to 2.3 s in a sixth. A declined
+  page backs off, but it is declined again every 200 s for as long as it
+  stays cold, so a cold incompressible heap would have been touched for ever.
+  The gate now reads a page once for each time it may have changed: a page
+  whose back-off count is above 0 has been declined or has failed since its
+  last reported access, every way the count leaves 0 has read the page and
+  found it not zero, and unread it is still not zero. The same 2 GiB: 524280
+  reads for 2.5M declines; phase 2's CPU time (user and system) 801-818 ms
+  before the fix and 816-1078 ms after, medians 812 and 880 over five runs
+  each. With no write tracking
+  (`SMASH_WRITE_TRACK=none`) nothing clears the count, and every declined
+  page is read every time. A page holding nothing but free slots is
+  recognised from its span's bitmap, with no read, whatever its count.
+- **The announcement of a direct read was a dead store.** An ACTIVE page can
+  be PROT_NONE, and a watched page is once it has been escalated; the worker
+  announces a direct read in `t_snapshot_page_plus1` so that the fault
+  handler makes the page readable. The compiler removed the store before the
+  read (it is followed by a store of 0, and the handler's read is invisible
+  to it), and the first escalated page the gate looked at ended the process
+  with "unhandled sig=11 ... state 3". Around the snapshot's `memcpy` the
+  store had survived by luck. The variable is `volatile` now.
+
+Under a scanning tracker the gate's read is what the page's next scan
+reports. Phase 1 would have counted an access, cleared the back-off, and the
+page would have been read again one cold floor later, every time. The read
+is recorded (`own_read_`) and phase 1 takes the next scan's verdict on that
+page for it.
+
+`[smash pipeline]` has three more counters: `roi_zero=` (declined pages that
+went on as zero pages), `roi_look=` (declined pages the gate read) and
+`roi_stale=` (pages that went on as zero and were written before the
+snapshot).
+
+Not done, and known:
+
+- A write the tracker does not report leaves a declined page with its old
+  verdict until it is written again or a probe reaches it. Soft-dirty loses a
+  write that lands between a tick's read of the bits and its clear of them.
+- In a slab page that has been read and declined, objects that are zero and
+  alive next to objects freed later: the page is not all free slots, and it
+  is not read again, so it waits for a write or a probe.
+- The scanning trackers' part (`own_read_`) and the change to a failed
+  unit's back-off (`SMASH_THP_UNIT`: its zero pages keep their count) run
+  only as root.
+
+Guarded by `test_roi_gate_zero_pages` and its registrations
+([tests.md](tests.md)).
 
 
 ## The worker count did not follow the load (fixed 2026-11-10, issue #8)

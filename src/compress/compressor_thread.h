@@ -280,7 +280,14 @@ inline void warmupEnvStatics() {
 // left PROT_NONE faults on the worker, which holds the page's lock; the
 // handler, seeing both, makes the page PROT_RW and lets the read run instead
 // of treating the fault as the state-machine error it would otherwise be.
-inline __attribute__((tls_model("initial-exec"))) constinit thread_local size_t t_snapshot_page_plus1 = 0;
+//
+// volatile: the only reader is the signal handler, which the compiler does
+// not see. To it, the store before the read and the store of 0 after are
+// two stores with nothing between that could read the variable, and the
+// first is dead. Around a memcpy from an address it knows nothing about it
+// kept the store; around a call it could see through (readsAsZero) it
+// removed it, and the worker's fault was fatal.
+inline __attribute__((tls_model("initial-exec"))) constinit thread_local volatile size_t t_snapshot_page_plus1 = 0;
 
 // A faulting thread that cannot make its page accessible at vm.max_map_count
 // (CompressorThread::capStall): when its retries started (CLOCK_MONOTONIC
@@ -460,6 +467,11 @@ class CompressorThread {
     // nor resets it (it may be cold — reset, one hot page would keep its
     // cold neighbours from ever being compressed). Cleared by Phase 1.
     uint8_t* group_unwatched_ = nullptr;
+
+    // 1 for a page the ROI gate read since the page's last scan, under a
+    // scanning tracker (noteOwnRead): the next scan's verdict on it is that
+    // read. Cleared by Phase 1. Written only under idle and yt.
+    uint8_t* own_read_ = nullptr;
 
     // SMASH_THP_UNIT=1 (idle tracking): a transparent huge page is compressed
     // and restored as one unit of kUnitPages pages, so it stays a huge page.
@@ -692,7 +704,13 @@ class CompressorThread {
         std::atomic<uint64_t> cp_attempts{0}, cp_stored{0}, cp_gate_fail{0};
         // Compressions declined by the ROI model before any codec ran, and
         // pages it would have declined that went to the codec as a probe.
-        std::atomic<uint64_t> cp_roi_skip{0}, cp_roi_probe{0};
+        // cp_roi_zero: pages the bucket's statistics declined that went on
+        // because they read as all zero (no codec to run). cp_roi_look:
+        // declined pages the gate read to find that out. cp_roi_stale:
+        // pages that went on as zero and were written before the snapshot
+        // (declined after all; also in cp_roi_skip).
+        std::atomic<uint64_t> cp_roi_skip{0}, cp_roi_probe{0}, cp_roi_zero{0}, cp_roi_look{0},
+                              cp_roi_stale{0};
         // Blobs the store refused (SMASH_BLOB_MAX_MIB, or a region it could
         // not map), and restores that had to wait for the kernel to find a
         // VMA (restorePageContents: mprotect/mmap ENOMEM at vm.max_map_count).
@@ -1450,6 +1468,9 @@ class CompressorThread {
         // size here.
         bool unit_mode = false;
         size_t unit_bytes = 0;
+        // The unit's pages stored as zero pages, a bit each: a unit whose
+        // ratio fails backs off the others only (compressUnit).
+        uint64_t unit_zero[kUnitPages / 64] = {};
 
         // Eligible pages whose node is not known yet. One move_pages call at
         // the end of the range resolves the whole batch (see flushNodeQueries).
@@ -2053,6 +2074,105 @@ private:
         }
     }
 
+    // Would a snapshot of this page be all zero once zeroFreeSlots() has run
+    // on it? True when every byte outside a free slot is zero. `bytes` is
+    // the page itself or a copy of it, or null: then nothing is read, and
+    // the answer is true only for a page that holds nothing but free slots.
+    // The bitmap is read without the slab lock, as zeroFreeSlots() reads it.
+    bool zeroOutsideFreeSlots(const void* bytes, size_t page_idx) const {
+        if (bytes && pageIsAllZero(bytes)) return true;
+        if (!page_map_) return false;
+        const auto page_start = reinterpret_cast<uintptr_t>(vm_->pageAddress(page_idx));
+        if (!page_start) return false;
+        Span* span = page_map_->get(page_start);
+        if (!span || span->is_large || span->object_size == 0) return false;
+        const size_t obj_size = span->object_size;
+        const size_t page_off = page_start - reinterpret_cast<uintptr_t>(span->base);
+        const auto* p = static_cast<const unsigned char*>(bytes);
+        for (size_t off = 0; off < kPageSize;) {
+            const size_t slot = (page_off + off) / obj_size;
+            size_t seg_end = kPageSize;
+            bool is_free = false;
+            if (slot < span->object_count) {
+                const size_t slot_end = (slot + 1) * obj_size - page_off;
+                if (slot_end < seg_end) seg_end = slot_end;
+                const uint64_t w = __atomic_load_n(&span->bitmap[slot / 64], __ATOMIC_ACQUIRE);
+                is_free = (w >> (slot % 64)) & 1;
+            }
+            if (!is_free) {
+                if (!p) return false;
+                for (size_t k = off; k < seg_end; ++k)
+                    if (p[k]) return false;
+            }
+            off = seg_end;
+        }
+        return true;
+    }
+
+    // Does anything tell phase 1 that an ACTIVE page was written? Not
+    // necessarily every write: soft-dirty loses one that lands between a
+    // tick's read of the bits and its clear of them, and PROT_READ
+    // monitoring one to a page that is waiting to be armed.
+    bool writesReported() const {
+        if (write_tracker_ == WriteTracker::kNone) return false;
+        return !(write_tracker_ == WriteTracker::kProtRead && cfg_no_monitor_);
+    }
+
+    // The ROI gate's look at a page its bucket's statistics have declined
+    // (compressPage, page lock held): would its snapshot be all zero? Only
+    // a hint. The page may be written again before the snapshot, and the
+    // snapshot is what decides.
+    //
+    // A page that holds nothing but free slots is answered from the span's
+    // bitmap. Any other page has to be read, and reading it is not free of
+    // consequences: it brings a swapped page back, sets the accessed bit
+    // the kernel ages pages by (and the idle and yt trackers read), and
+    // can take a NUMA hinting fault (reading every declined page of 2 GiB
+    // of random bytes, 2.1M reads: 2.3 s of system time in one of six runs
+    // and 0.13-0.32 s in the others, against 0.10-0.13 s without). So a
+    // page is read once for each time it may have changed: `seen` says it
+    // was declined or failed since its last reported access, which is when
+    // its back-off count was last cleared, and every way that count leaves
+    // 0 has read the page and found it not zero. Unread, it is still not
+    // zero. `looked` is set when the page was read.
+    //
+    // The read stops at the first byte that is not zero. An ACTIVE page is
+    // PROT_RW; one that an earlier reclaim left PROT_NONE is announced like
+    // a direct snapshot read, and the handler makes it PROT_RW. A watched
+    // page the caller made readable is PROT_READ. A watched page that it
+    // did not is PROT_READ or, once escalated, PROT_NONE: that one is read
+    // through /proc/self/mem, which leaves its protection alone, and where
+    // that is not available it is announced too.
+    bool readsAsZero(size_t page_idx, PageState st, bool readable, bool seen,
+                     CompressWorker& worker, bool& looked) {
+        void* page_addr = vm_->pageAddress(page_idx);
+        if (!page_addr) return false;
+        if (seen) return zeroOutsideFreeSlots(nullptr, page_idx);
+        looked = true;
+        pc_.cp_roi_look.fetch_add(1, std::memory_order_relaxed);
+        if (st == PageState::ACTIVE_MONITORING && !readable &&
+            readPageViaMem(page_addr, worker.page_buf))
+            return zeroOutsideFreeSlots(worker.page_buf, page_idx);
+        t_snapshot_page_plus1 = page_idx + 1;
+        const bool zero = zeroOutsideFreeSlots(page_addr, page_idx);
+        t_snapshot_page_plus1 = 0;
+        return zero;
+    }
+
+    // A scanning tracker (idle, yt) takes any read of a page for the
+    // application's, the gate's look included: at the page's next scan the
+    // mark is gone, phase 1 counts an access and clears the back-off count,
+    // and the page, declined again one cold floor later, is read again:
+    // every declined page every floor, for ever, where it used to back off
+    // to kMaxEffectiveFloorTicks. So the look is remembered here, and
+    // phase 1 takes the next scan's verdict on the page for that read. An
+    // access by the application between the look and that scan is lost
+    // with it; the page then keeps its verdict until it is accessed again
+    // or a probe reaches it.
+    void noteOwnRead(size_t page_idx) {
+        if (own_read_ && scanTracker()) own_read_[page_idx] = 1;
+    }
+
     // Phase B's check that a COMPRESSED_SHADOW page is unchanged since its
     // snapshot: the live page against its decompressed blob. The blob came
     // from a snapshot whose free slots zeroFreeSlots() zeroed, while the live
@@ -2169,6 +2289,13 @@ private:
             if (st == PageState::ACTIVE || st == PageState::ACTIVE_MONITORING) {
                 if (settle_ticks_[i]) settle_ticks_[i] = 0;
                 if (idle_track && !idleSliceDue(i)) return;
+                // The ROI gate read this page since its last scan, so this
+                // scan found its mark gone whatever the application did
+                // (noteOwnRead): not an access.
+                if (idle_track && own_read_ && own_read_[i]) {
+                    own_read_[i] = 0;
+                    accessed_[i].store(false, std::memory_order_relaxed);
+                }
                 // Raw WRITE signal (soft-dirty) BEFORE the idle-read augmentation
                 // below folds reads in. The soft-dirty ROI machinery needs the
                 // write-only bit to track data stability independent of reads.
@@ -2563,6 +2690,7 @@ private:
         }
         worker.unit_mode = true;
         worker.unit_bytes = 0;
+        for (uint64_t& w : worker.unit_zero) w = 0;
         size_t done = 0;
         while (done < kUnitPages && compressPage(b + done, worker, false)) ++done;
         worker.unit_mode = false;
@@ -2574,9 +2702,13 @@ private:
             rollbackUnit(b, done);
             if (done == kUnitPages) {
                 // The unit's ratio failed: every page backs off, the way one
-                // page's failed gate does.
+                // page's failed gate does. A zero page keeps its count, which
+                // must only leave 0 for a page that was read and found not
+                // zero (readsAsZero); the unit waits on the other pages.
                 for (size_t q = b; q < b + kUnitPages; ++q) {
-                    if (compress_fail_count_ && compress_fail_count_[q] < 255) compress_fail_count_[q]++;
+                    const bool was_zero = (worker.unit_zero[(q - b) >> 6] >> ((q - b) & 63)) & 1;
+                    if (!was_zero && compress_fail_count_ && compress_fail_count_[q] < 255)
+                        compress_fail_count_[q]++;
                     cold_count_[q] = 0;
                 }
             }
@@ -3537,6 +3669,37 @@ private:
                 worker.sc_stats[stats_idx].redirtyDiscountX256(streak_relief);
         }
 
+        bool roi_ok = CompressionROI::shouldCompress(cold_count_[page_idx], stats_count, stats_sum,
+                                                     redirty_discount_x256);
+        // What the window holds is what the codec made of other pages. A
+        // page that is all zero needs no codec and leaves no blob, and it is
+        // never recorded in the window, so the window says nothing about it
+        // and a probe that turns out to be zero does not restart it. Such
+        // pages were declined with the rest of their bucket: after one block
+        // of random bytes, 16384 zero pages from the same call site were
+        // compressed at one in 64 per pass, and none at all where they
+        // alternated with random ones, every probe landing on one of those
+        // (issue #50). A declined page that reads as zero (readsAsZero)
+        // goes on to the snapshot, which decides whether it is. It is not
+        // counted towards the next probe: probes are for pages that can
+        // tell the window something.
+        //
+        // Only the window's verdict is set aside. The floor stands, and so
+        // does a re-dirty discount: that one says the bucket's pages are
+        // written again soon, which is as true of a zero page.
+        bool roi_zero = false;     // declined by the window, let through as a zero page
+        bool reads_zero = false;   // read as zero, let through or not
+        bool looked = false;       // the gate read the page
+        if (!roi_ok) {
+            const bool seen = compress_fail_count_ && compress_fail_count_[page_idx] != 0 &&
+                              writesReported();
+            reads_zero = readsAsZero(page_idx, st, readable, seen, worker, looked);
+            if (reads_zero && redirty_discount_x256 >= 256 &&
+                cold_count_[page_idx] >= ROIConfig::instance().cold_ticks_floor) {
+                roi_ok = roi_zero = true;
+                pc_.cp_roi_zero.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
         // A bucket the gate declines gets no new samples: the window only
         // changes after a codec run, and the gate is before the codec. So a
         // window of pages that saved nothing declined every later page of
@@ -3546,8 +3709,6 @@ private:
         // kRoiProbeEvery-th declined page goes to the codec anyway. If it is
         // stored, the window starts again from it (below), and the pages
         // after it are judged by what the bucket holds now.
-        bool roi_ok = CompressionROI::shouldCompress(cold_count_[page_idx], stats_count, stats_sum,
-                                                     redirty_discount_x256);
         bool roi_probe = false;
         if (!roi_ok && have_span && sc < kTotalBucketsPerArena &&
             cold_count_[page_idx] >= ROIConfig::instance().cold_ticks_floor &&
@@ -3564,9 +3725,16 @@ private:
             // Phase 3 re-arms it with an mprotect every tick too: random
             // data in a 128 MiB large block took 393040 attempts in 23 s
             // once large blocks had statistics, against 32768 without.
-            if (compress_fail_count_ && compress_fail_count_[page_idx] < 255)
+            //
+            // Except a page that reads as zero and was held back all the
+            // same (below the floor again, or a re-dirty discount): its
+            // count stays, so that a count above 0 keeps meaning "read, and
+            // not zero" (readsAsZero), and it is offered again one floor
+            // later.
+            if (!reads_zero && compress_fail_count_ && compress_fail_count_[page_idx] < 255)
                 compress_fail_count_[page_idx]++;
             cold_count_[page_idx] = 0;
+            if (looked) noteOwnRead(page_idx);
             states_->set(page_idx, PageState::ACTIVE);
             locks_->unlock(page_idx);
             pc_.cp_roi_skip.fetch_add(1, std::memory_order_relaxed);
@@ -3896,6 +4064,28 @@ private:
         // at the first non-zero word.
         const bool zero_page = pageIsAllZero(worker.page_buf);
 
+        // A page its bucket's statistics declined, let through because it
+        // read as zero (roi_zero), and written before the snapshot: the
+        // bucket's verdict stands, and the page backs off as it would have
+        // at the gate. No codec runs and nothing is recorded.
+        if (roi_zero && !zero_page) {
+            if (!deferred) {
+                if (!vm::protectPages(page_addr, kPageSize, true, true)) {
+                    vm::remapPages(page_addr, kPageSize, true, true);
+                }
+                __builtin_memcpy(page_addr, worker.page_buf, kPageSize);
+            }
+            if (compress_fail_count_ && compress_fail_count_[page_idx] < 255)
+                compress_fail_count_[page_idx]++;
+            cold_count_[page_idx] = 0;
+            noteOwnRead(page_idx);
+            states_->set(page_idx, PageState::ACTIVE);
+            locks_->unlock(page_idx);
+            pc_.cp_roi_skip.fetch_add(1, std::memory_order_relaxed);
+            pc_.cp_roi_stale.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+
         // Collect sample for dictionary training (page data in worker's buf)
         if (!zero_page) collectDictSample(page_idx, sc, worker.page_buf);
 
@@ -4059,7 +4249,11 @@ private:
             }
             noteBlobStore(page_idx, worker);
         }
-        if (worker.unit_mode) worker.unit_bytes += zero_page ? 0 : comp_size;
+        if (worker.unit_mode) {
+            worker.unit_bytes += zero_page ? 0 : comp_size;
+            if (zero_page)
+                worker.unit_zero[(page_idx & (kUnitPages - 1)) >> 6] |= uint64_t{1} << (page_idx & 63);
+        }
 
         // Record successful compression ratio and observed cost in the
         // per-(arena, bucket) bucket so future ROI decisions use real data.
@@ -8865,6 +9059,7 @@ public:
         compress_fail_count_ = bootstrapArray<uint8_t>(max_pages);
         rearm_exp_max_ = static_cast<uint8_t>(rearmBackoffMaxFromEnv());
         group_unwatched_ = bootstrapArray<uint8_t>(max_pages);
+        own_read_ = bootstrapArray<uint8_t>(max_pages);
         if (const char* g = std::getenv("SMASH_RESTORE_GRANULE_PAGES"); g && *g) {
             const long n = std::atol(g);
             size_t p2 = 1;
@@ -9604,7 +9799,9 @@ public:
                 "[smash pipeline] ticks=%llu tick_ms=%llu/%llu deferred=%llu"
                 " | p1 accessed=%llu idle=%llu | p2 at_floor=%llu escalated=%llu"
                 " eligible=%llu routed=%llu hint_skip=%llu | compress tried=%llu"
-                " stored=%llu gate_fail=%llu roi_skip=%llu roi_probe=%llu | release checked=%llu released=%llu"
+                " stored=%llu gate_fail=%llu roi_skip=%llu roi_probe=%llu roi_zero=%llu roi_look=%llu"
+                " roi_stale=%llu"
+                " | release checked=%llu released=%llu"
                 " changed=%llu vma_stop=%llu | faults monitor=%llu shadow=%llu"
                 " compressed=%llu active=%llu alloc_reopen=%llu | phase_ms=%llu/%llu/%llu/%llu"
                 " max=%llu/%llu/%llu/%llu | p1 minflt=%llu range_ms_max=%llu workers=%llu cap=%llu"
@@ -9615,7 +9812,8 @@ public:
                 v(pc.ticks), v(pc.tick_ms_last), v(pc.tick_ms_max), v(pc.deferred_ticks),
                 v(pc.p1_accessed), v(pc.p1_idle), v(pc.p2_at_floor), v(pc.p2_escalated),
                 v(pc.p2_eligible), v(pc.p2_routed), v(pc.p2_hint_skip), v(pc.cp_attempts),
-                v(pc.cp_stored), v(pc.cp_gate_fail), v(pc.cp_roi_skip), v(pc.cp_roi_probe), v(pc.rc_checked),
+                v(pc.cp_stored), v(pc.cp_gate_fail), v(pc.cp_roi_skip), v(pc.cp_roi_probe),
+                v(pc.cp_roi_zero), v(pc.cp_roi_look), v(pc.cp_roi_stale), v(pc.rc_checked),
                 v(pc.rc_released),
                 v(pc.rc_changed), v(pc.rc_vma_stop), v(pc.f_monitor), v(pc.f_shadow),
                 v(pc.f_compressed), v(pc.f_active), v(pc.f_alloc_reopen), v(pc.phase_ms[1]), v(pc.phase_ms[2]),
