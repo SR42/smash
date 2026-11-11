@@ -1786,12 +1786,19 @@ Not done, and known:
   probe among them, loses its back-off at its next scan, as it did before
   this change, and the gate now reads it once more when it declines it
   again: 128-138 reads for about 4100 declines as root, against 8192
-  without the record. The same holds for every page of a unit that was
-  rolled back. Not changed here: it decides how often those trackers
-  retry an incompressible page, which nothing has measured.
+  without the record. Confirmed with a library that records that read as
+  well: 0 reads for 8064 declines under both trackers. The same should
+  hold for every page of a unit that was rolled back (not measured). Not
+  changed here: it decides how often those trackers retry a failed
+  compression.
+- Under `idle` and `yt`, a write to a page within one scan interval of
+  the gate's read of it is taken for that read. In the test, 30-55 of
+  2048 declined pages overwritten with zeros were not compressed for that
+  reason; they wait for the next write or a probe.
 - The scanning trackers' part (`own_read_`) and the change to a failed
   unit's back-off (`SMASH_THP_UNIT`: its zero pages keep their count) run
-  only as root.
+  only as root. They ran on claudepc on 2026-11-11 (the suite, and the
+  idle and yt registrations); nothing tests the unit's part by itself.
 
 Guarded by `test_roi_gate_zero_pages` and its registrations
 ([tests.md](tests.md)).
