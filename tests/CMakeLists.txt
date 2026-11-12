@@ -393,6 +393,24 @@ if(NOT APPLE)
       "SMASH_THP_UNIT=1" "THP_UNIT_PART=${part}" $<TARGET_FILE:thp_unit_test>)
     list(APPEND _thp_unit_tests test_thp_unit_${part})
   endforeach()
+  # A unit that is rolled back backs off (issue #52): with the ROI gate off
+  # the unit's ratio fails, with it on a page of the unit is declined. One
+  # worker, so one ratio window, and a scan every tick, so that the attempts
+  # without the back-off are many.
+  set(_thp_backoff_env "SMASH_THP_UNIT=1" "THP_UNIT_PART=backoff" "SMASH_IDLE_SCAN_TICKS=1"
+    "SMASH_TEST_WORKERS=1" "SMASH_NUMA_COMPRESSOR=0")
+  add_test(NAME test_thp_unit_backoff COMMAND ${CMAKE_COMMAND} -E env ${_thp_unit_env} ${_thp_backoff_env}
+    "SMASH_ROI_THRESHOLD=0" $<TARGET_FILE:thp_unit_test>)
+  add_test(NAME test_thp_unit_backoff_declined COMMAND ${CMAKE_COMMAND} -E env ${_thp_unit_env}
+    ${_thp_backoff_env} $<TARGET_FILE:thp_unit_test>)
+  list(APPEND _thp_unit_tests test_thp_unit_backoff test_thp_unit_backoff_declined)
+  # Units that compress well, in a bucket a unit of random bytes has switched
+  # off, are compressed at their first attempt (issue #52). One worker, so
+  # one ratio window.
+  add_test(NAME test_thp_unit_window COMMAND ${CMAKE_COMMAND} -E env ${_thp_unit_env}
+    "SMASH_THP_UNIT=1" "THP_UNIT_PART=window" "SMASH_TEST_WORKERS=1" "SMASH_NUMA_COMPRESSOR=0"
+    $<TARGET_FILE:thp_unit_test>)
+  list(APPEND _thp_unit_tests test_thp_unit_window)
   add_test(NAME test_thp_unit_off COMMAND ${CMAKE_COMMAND} -E env ${_thp_unit_env}
     "SMASH_THP=1" "THP_UNIT_EXPECT=split" $<TARGET_FILE:thp_unit_test>)
   add_test(NAME test_thp_unit_userconf COMMAND ${CMAKE_COMMAND} -E env ${_thp_unit_env}
@@ -1408,11 +1426,14 @@ if(NOT APPLE)
   #   _untracked  SMASH_WRITE_TRACK=none: nothing reports a write, so every
   #               declined page is read every time.
   #   _idle, _yt  SMASH_WRITE_TRACK=idle|yt (root; yt with its module): the
-  #               gate's read of a page is what the next scan reports, and
-  #               phase 1 must not take it for the application's. A probe's
-  #               snapshot is such a read too and is not recorded, so the
-  #               pages the last pass probed are read again (one in 64).
-  #               They skip where the tracker is not the one in use.
+  #               gate's read of a page, and a probe's snapshot of one, are
+  #               what the next scan reports, and phase 1 must not let them
+  #               clear the page's back-off (issue #52). They skip where
+  #               the tracker is not the one in use. _idle_thp and _yt_thp
+  #               are the same on huge pages (SMASH_THP=1; they skip where
+  #               the kernel gives none): one accessed bit answers for 512
+  #               pages there, so a read of one page must not clear the
+  #               back-off of the others either.
   #   _slots      full mode: pages holding only freed 1024-byte objects.
   add_executable(roi_zero_test roi_zero_test.cpp)
   target_link_libraries(roi_zero_test PRIVATE ${CMAKE_DL_LIBS} Threads::Threads)
@@ -1438,19 +1459,55 @@ if(NOT APPLE)
     "SMASH_WRITE_TRACK=none" "ROIZ_LOOKS=always"
     $<TARGET_FILE:roi_zero_test>)
   add_test(NAME test_roi_gate_zero_pages_idle COMMAND ${CMAKE_COMMAND} -E env ${ROIZ_ENV} ${ROIZ_ONE}
-    "SMASH_WRITE_TRACK=idle" "ROIZ_NEED_TRACK=idle" "ROIZ_LOOKS=probes"
+    "SMASH_WRITE_TRACK=idle" "ROIZ_NEED_TRACK=idle" "ROIZ_LOOKS=once"
     $<TARGET_FILE:roi_zero_test>)
   add_test(NAME test_roi_gate_zero_pages_yt COMMAND ${CMAKE_COMMAND} -E env ${ROIZ_ENV} ${ROIZ_ONE}
-    "SMASH_WRITE_TRACK=yt" "ROIZ_NEED_TRACK=yt" "ROIZ_LOOKS=probes"
+    "SMASH_WRITE_TRACK=yt" "ROIZ_NEED_TRACK=yt" "ROIZ_LOOKS=once"
+    $<TARGET_FILE:roi_zero_test>)
+  add_test(NAME test_roi_gate_zero_pages_idle_thp COMMAND ${CMAKE_COMMAND} -E env ${ROIZ_ENV} ${ROIZ_ONE}
+    "SMASH_WRITE_TRACK=idle" "ROIZ_NEED_TRACK=idle" "ROIZ_LOOKS=once" "SMASH_THP=1" "ROIZ_WANT_HUGE=1"
+    $<TARGET_FILE:roi_zero_test>)
+  add_test(NAME test_roi_gate_zero_pages_yt_thp COMMAND ${CMAKE_COMMAND} -E env ${ROIZ_ENV} ${ROIZ_ONE}
+    "SMASH_WRITE_TRACK=yt" "ROIZ_NEED_TRACK=yt" "ROIZ_LOOKS=once" "SMASH_THP=1" "ROIZ_WANT_HUGE=1"
     $<TARGET_FILE:roi_zero_test>)
   add_test(NAME test_roi_gate_zero_pages_slots COMMAND ${CMAKE_COMMAND} -E env ${ROIZ_ENV}
     "SMASH_TEST_WORKERS=1" "SMASH_NUMA_COMPRESSOR=0" "ROIZ_PART=slots"
     $<TARGET_FILE:roi_zero_test>)
+  # A page whose compression failed backs off under every tracker
+  # (fail_backoff_test.cpp, issue #52): random bytes with the ROI gate off
+  # (the ratio gate fails every attempt), and half-compressible bytes against
+  # a capped blob store (the store refuses every attempt). The plain
+  # registrations run the default tracker; _idle and _yt need root (yt its
+  # module) and skip otherwise. A scan every tick, so that the attempts
+  # without the back-off are many.
+  add_executable(fail_backoff_test fail_backoff_test.cpp)
+  target_link_libraries(fail_backoff_test PRIVATE ${CMAKE_DL_LIBS})
+  set(FB_ENV "LD_PRELOAD=$<TARGET_FILE:smash>" "SMASH_LARGE_ONLY=1" "SMASH_STATS_SIGNAL=1"
+             "SMASH_DEFER_PHASES_MS=0" "SMASH_COLD_TIMEOUT_SEC=2" "SMASH_TEST_WORKERS=1"
+             "SMASH_NUMA_COMPRESSOR=0" "SMASH_IDLE_SCAN_TICKS=1")
+  set(_fb_tests "")
+  foreach(mode ratio store)
+    if(mode STREQUAL "ratio")
+      set(FB_MODE_ENV "FB_MODE=ratio" "SMASH_ROI_THRESHOLD=0")
+    else()
+      set(FB_MODE_ENV "FB_MODE=store" "SMASH_BLOB_MAX_MIB=2")
+    endif()
+    add_test(NAME test_fail_backoff_${mode} COMMAND ${CMAKE_COMMAND} -E env ${FB_ENV} ${FB_MODE_ENV}
+      $<TARGET_FILE:fail_backoff_test>)
+    add_test(NAME test_fail_backoff_${mode}_idle COMMAND ${CMAKE_COMMAND} -E env ${FB_ENV} ${FB_MODE_ENV}
+      "SMASH_WRITE_TRACK=idle" "FB_NEED_TRACK=idle" $<TARGET_FILE:fail_backoff_test>)
+    add_test(NAME test_fail_backoff_${mode}_yt COMMAND ${CMAKE_COMMAND} -E env ${FB_ENV} ${FB_MODE_ENV}
+      "SMASH_WRITE_TRACK=yt" "FB_NEED_TRACK=yt" $<TARGET_FILE:fail_backoff_test>)
+    list(APPEND _fb_tests test_fail_backoff_${mode} test_fail_backoff_${mode}_idle test_fail_backoff_${mode}_yt)
+  endforeach()
+  set_tests_properties(${_fb_tests} PROPERTIES TIMEOUT 300)
+
   set_tests_properties(test_roi_gate_zero_pages test_roi_gate_zero_pages_workers
                        test_roi_gate_zero_pages_watched test_roi_gate_zero_pages_standard
                        test_roi_gate_zero_pages_escalated
                        test_roi_gate_zero_pages_untracked test_roi_gate_zero_pages_idle
-                       test_roi_gate_zero_pages_yt test_roi_gate_zero_pages_slots
+                       test_roi_gate_zero_pages_yt test_roi_gate_zero_pages_idle_thp
+                       test_roi_gate_zero_pages_yt_thp test_roi_gate_zero_pages_slots
                        PROPERTIES TIMEOUT 600)
 endif()
 

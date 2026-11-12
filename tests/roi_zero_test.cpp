@@ -30,13 +30,13 @@
 //   4. The random block is declined once more, every page of it. With
 //      ROIZ_LOOKS=once (a tracker that reports writes) the gate must have
 //      read at most 64 pages meanwhile; with ROIZ_LOOKS=always (no write
-//      tracking: nothing says a page did not change) at least half of them;
-//      with ROIZ_LOOKS=probes (a scanning tracker) at most one in 16 of
-//      what it declined.
+//      tracking: nothing says a page did not change) at least half of them.
 //   5. The even pages of the random block are overwritten with zeros. They
 //      were declined and found not zero; the write must bring the gate
-//      back to them: at least 95 % compressed within 150 s. The odd pages
-//      must still hold their random bytes.
+//      back to them: at least 95 % compressed within 150 s. Pages still
+//      not compressed after 50 s are written again, at most twice: under
+//      a scanning tracker one write can be taken for the compressor's own
+//      read. The odd pages must still hold their random bytes.
 //   6. A block of zeros with a second thread writing a mark into a page the
 //      moment it sees it being compressed. The look at the page and its
 //      snapshot are not one step, so a page can read as zero and be written
@@ -58,16 +58,20 @@
 //
 // ROIZ_NEED_TRACK=idle|yt: the registration is for that tracker, which needs
 // root (and yt its kernel module). When the stats line names another one,
-// the test skips. Under a scanning tracker the gate's own read of a page is
-// what the next scan reports, and step 4 is what shows that phase 1 does not
-// take it for the application's: if it did, the random block would lose its
-// back-off at every scan and be read again each time it is declined (8192
-// reads for 8064 declines, measured). What is left is the probes: a probe
-// is compressed, so its page is read for the snapshot, and nothing tells
-// phase 1 that this read was the compressor's. The probed page loses its
-// back-off, is declined again one floor later, and is read then: 64 pages
-// for each pass over the block's 4096, and two such rounds can fall into
-// the step (128-138 reads for 4101-4219 declines, measured).
+// the test skips. Under a scanning tracker a compressor thread's read of a
+// page is what the page's next scan reports, and step 4 is what shows that
+// phase 1 does not let such a read clear the page's back-off. Measured as
+// root, reads for declines in step 4: 8192 for 8064 when phase 1 ignores
+// the record (every declined page is read again each time); 128-134 for
+// about 4100 when only the gate's read is recorded and a probe's snapshot
+// is not (issue #52: the pages the passes before had probed); 0 with both.
+//
+// ROIZ_WANT_HUGE=1 (with SMASH_THP=1): the same on huge pages; the test
+// skips unless the random block is on them (AnonHugePages). A huge page has
+// one accessed bit for its 512 pages, so there a compressor thread's read
+// of one page is reported for all of them, and the record has to cover
+// them all: kept for the one page only, every probe took the back-off
+// count of the other 511 pages of its huge page.
 //
 // The counters are the pipeline line's (SMASH_STATS_SIGNAL=1, SIGUSR2),
 // read from a file standing in for stderr.
@@ -102,10 +106,22 @@ struct Rng {
 // The one call site every block comes from. The store after the call keeps
 // it from becoming a tail call, which would make the callers' lines the
 // call sites.
+bool g_want_huge = false;   // ROIZ_WANT_HUGE=1
 __attribute__((noinline)) unsigned char* allocBlock(size_t bytes) {
     auto* p = static_cast<unsigned char*>(std::malloc(bytes));
     if (p) *static_cast<volatile unsigned char*>(p) = 0;
     return p;
+}
+
+long anonHugeKib() {
+    FILE* f = std::fopen("/proc/self/smaps_rollup", "r");
+    if (!f) return -1;
+    char line[256];
+    long v = -1;
+    while (std::fgets(line, sizeof line, f))
+        if (!std::strncmp(line, "AnonHugePages:", 14)) { v = std::atol(line + 14); break; }
+    std::fclose(f);
+    return v;
 }
 
 // The same for the small objects of the slots part.
@@ -243,7 +259,6 @@ int partBlocks() {
     const char* looks = std::getenv("ROIZ_LOOKS");
     const bool looks_once = looks && std::strcmp(looks, "once") == 0;
     const bool looks_always = looks && std::strcmp(looks, "always") == 0;
-    const bool looks_probes = looks && std::strcmp(looks, "probes") == 0;
 
     // 1. Random bytes: the bucket is declined, and stays so (the block is kept).
     Rng rng{88172645463325252ull};
@@ -252,6 +267,23 @@ int partBlocks() {
     if (!r) return fail("malloc");
     for (size_t i = 0; i < kBlock / 8; ++i) reinterpret_cast<uint64_t*>(r)[i] = rng.next();
     const int arena_r = arena_for(r);
+    if (g_want_huge) {
+        // Every block of the test is a multiple of 2 MiB, and the arena
+        // hands them out back to back from a 2 MiB boundary: no huge page
+        // holds pages of two blocks, so nothing the test does to one block
+        // is an access to its neighbour's last pages. Checked, not assumed.
+        const long huge = anonHugeKib();
+        dprintf(g_saved_err, "random block at %p, AnonHugePages %ld KiB\n", static_cast<void*>(r), huge);
+        if (reinterpret_cast<uintptr_t>(r) % (size_t{2} << 20) != 0) {
+            dprintf(g_saved_err, "SKIP: the block does not start on a 2 MiB boundary\n");
+            return 77;
+        }
+        if (huge < static_cast<long>(kBlock / 1024)) {
+            dprintf(g_saved_err, "SKIP: the kernel gave the %zu KiB block %ld KiB of huge pages (THP off, or no "
+                    "memory)\n", kBlock / 1024, huge);
+            return 77;
+        }
+    }
     if (int rc = declineRandomBlock(r, "random block", kPages)) return rc;
     const Counters c1 = readCounters();
 
@@ -331,28 +363,33 @@ int partBlocks() {
     if (looks_once && reread > 64)
         return fail("the gate read %llu pages while it declined %llu that were not written since it last read "
                     "them (limit 64)", reread, again);
-    if (looks_probes && reread > again / 16)
-        return fail("the gate read %llu pages while it declined %llu: more than the pages the passes before had "
-                    "probed (limit one in 16)", reread, again);
     if (looks_always && reread < kPages / 2)
         return fail("the gate read %llu pages while it declined %llu, with no write tracking to say they are "
                     "unchanged", reread, again);
 
-    // 5. A declined page overwritten with zeros.
-    for (size_t pg = 0; pg < kPages; pg += 2) std::memset(r + pg * kPage, 0, kPage);
+    // 5. A declined page overwritten with zeros. Written again, up to twice,
+    //    where it is still not compressed after 50 s: under a scanning
+    //    tracker a write within one scan of a compressor thread's read of
+    //    the page (of its huge page, on huge pages) is taken for that read.
     size_t zr = 0;
-    for (waited = 0; waited < 150; ++waited) {
-        sleep(1);
-        zr = compressedPages(r, kBlock, 0);
-        if (zr >= want_m) break;
+    int rounds = 0, total_wait = 0;
+    for (; rounds < 3 && zr < want_m; ++rounds) {
+        for (size_t pg = 0; pg < kPages; pg += 2)
+            if (!isCompressed(r + pg * kPage)) std::memset(r + pg * kPage, 0, kPage);
+        for (waited = 0; waited < 50; ++waited) {
+            sleep(1);
+            ++total_wait;
+            zr = compressedPages(r, kBlock, 0);
+            if (zr >= want_m) break;
+        }
     }
     const Counters c5 = readCounters();
-    dprintf(g_saved_err, "random block, even pages overwritten with zeros, %d s: %zu of %zu compressed; "
-            "roi_zero=%llu roi_look=%llu\n", waited + 1, zr, kPages / 2, c5.roi_zero - c4.roi_zero,
-            c5.roi_look - c4.roi_look);
+    dprintf(g_saved_err, "random block, even pages overwritten with zeros, %d s and %d write(s): %zu of %zu "
+            "compressed; roi_zero=%llu roi_look=%llu\n", total_wait, rounds, zr, kPages / 2,
+            c5.roi_zero - c4.roi_zero, c5.roi_look - c4.roi_look);
     if (zr < want_m)
         return fail("%llu of %llu declined pages were compressed in 150 s after they were overwritten with "
-                    "zeros: the gate did not come back to them", zr, kPages / 2);
+                    "zeros three times: the gate did not come back to them", zr, kPages / 2);
     Rng rchk = random_seed;
     for (size_t pg = 0; pg < kPages; ++pg) {
         const unsigned char* page = r + pg * kPage;
@@ -518,6 +555,7 @@ int main() {
     g_saved_err = dup(2);
     dup2(g_log_fd, 2);
 
+    g_want_huge = envNum("ROIZ_WANT_HUGE", 0) != 0;
     if (const char* need = std::getenv("ROIZ_NEED_TRACK"); need && *need) {
         // The tracker is chosen at the compressor's first tick with something
         // to track.

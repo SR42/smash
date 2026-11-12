@@ -1782,25 +1782,97 @@ Not done, and known:
   alive next to objects freed later: the page is not all free slots, and it
   is not read again, so it waits for a write or a probe.
 - Under `idle` and `yt` a snapshot is a read the next scan reports, and
-  only the gate's look is recorded. A page whose compression failed, a
-  probe among them, loses its back-off at its next scan, as it did before
-  this change, and the gate now reads it once more when it declines it
-  again: 128-138 reads for about 4100 declines as root, against 8192
-  without the record. Confirmed with a library that records that read as
-  well: 0 reads for 8064 declines under both trackers. The same should
-  hold for every page of a unit that was rolled back (not measured). Not
-  changed here: it decides how often those trackers retry a failed
-  compression.
-- Under `idle` and `yt`, a write to a page within one scan interval of
-  the gate's read of it is taken for that read. In the test, 30-55 of
-  2048 declined pages overwritten with zeros were not compressed for that
-  reason; they wait for the next write or a probe.
+  only the gate's look was recorded here: 128-138 reads for about 4100
+  declines as root, against 8192 without the record. Fixed 2026-11-11
+  (issue #52, the next section).
+- Under `idle` and `yt`, a write to a page within one scan interval of a
+  compressor thread's read of it is taken for that read (on huge pages:
+  of any page of its huge page). The page keeps its verdict until the
+  next write or a probe.
 - The scanning trackers' part (`own_read_`) and the change to a failed
   unit's back-off (`SMASH_THP_UNIT`: its zero pages keep their count) run
   only as root. They ran on claudepc on 2026-11-11 (the suite, and the
   idle and yt registrations); nothing tests the unit's part by itself.
 
 Guarded by `test_roi_gate_zero_pages` and its registrations
+([tests.md](tests.md)).
+
+
+## Under idle and yt the compressor's own read cleared a page's back-off (fixed 2026-11-11, issue #52)
+
+The scanning trackers (`SMASH_WRITE_TRACK=idle`, `yt`) protect nothing: an
+access is whatever set a page's accessed bit since its last scan. A
+compressor thread's read of a page does that too. At the page's next scan
+phase 1 counted an access and cleared the page's back-off count
+(`compress_fail_count_`), which is two things: the count a failed attempt
+has just raised, so that the next attempt needs twice the idle time, and
+what tells the ROI gate that it has read the page since its last access
+(#50).
+
+Measured as root (x86-64, 6.8, 2 CPUs, youngtrace loaded), cold timeout 2 s,
+a scan every tick, counts over the 60 s after every page was tried once:
+
+| What | Before, idle / yt | After | Default tracker |
+|---|---|---|---|
+| 16 MiB of random bytes, ROI gate off: codec attempts per page | 15.00 / 15.00 | 4.00 / 4.00 | 4.00 |
+| 16 MiB half-compressible, store capped at 2 MiB: refusals per refused page | 14.99 / 15.00 | 4.00 / 4.00 | 4.00 |
+| Pages the gate read again while it declined a 16 MiB random block once more | 134 of 4101 / 128 of 4219 | 0 of 7997 / 0 of 7939 | 0 |
+| Four units of random bytes (`SMASH_THP_UNIT`), ROI gate off: attempts per unit | 20 | 5 | |
+| Eight units that compress well, in a block with one of random bytes: out of RSS | not in 60 s (46 roll-backs) | 17 s (2 roll-backs) | |
+| 16 MiB random block on huge pages (`SMASH_THP=1`): pages the gate read again | 4096 of 8001 / 4096 of 8001 | 0 of 8064 / 0 of 8064 | |
+| `test_thp_unit_mixed`: seconds until the units that compress well are out | 34-99 | 14 | |
+
+A page whose compression fails every time went to the codec every 4 s, for
+as long as it stayed cold; the other trackers back it off to
+`kMaxEffectiveFloorTicks`. A unit whose ratio failed was compressed again,
+all 512 pages, every 3 s. #50 had recorded one such read, the gate's look
+at a declined page (`own_read_`); a probe's snapshot was not recorded, so
+the probed page lost its count and the gate read it again, and on huge
+pages, where one bit answers for 512 pages, so did the rest of its huge
+page: every other time the gate declined a page there, it read it.
+
+The fix:
+
+- Every read that leaves the page ACTIVE is recorded (`noteOwnRead`): the
+  gate's look, the snapshot of a compression that the ratio gate fails or
+  the store refuses, and the snapshots of a unit that is rolled back. Not a
+  snapshot that failed its verify: that page was written.
+- Phase 1, at the scan that reports a recorded read, clears the cold count
+  as for any access and keeps the back-off count. #50 had treated the page
+  as not accessed at all; but whether the application touched it as well
+  cannot be told, and a page must never look idle through an access.
+- A large folio has one accessed bit for all of its pages: the idle bitmap
+  answers through the folio's head, and yt reports a huge page as one item.
+  A read of one page is therefore reported for all 512, and recorded for the
+  one page only it took the back-off count of the others, which were read
+  or compressed again one floor later, and so on. The scan carries the
+  record to every page that shares the bit (`idleScan`, `ytMarkItem`).
+- Inside a unit, the ROI gate starts the bucket's ratio window again at the
+  unit's first page when the window would decline it. The ratio that
+  counts is the unit's, and the window holds what the codec made of other
+  units; a window that declined a unit's first page declined the unit
+  unseen, each time it was offered, until a probe came round, and a unit's
+  attempt is one decline in the 64 a probe takes. With the window started
+  again the unit's own first 8 pages are the sample. `test_thp_unit_mixed`
+  (four units that compress well, in a block with one of random bytes) took
+  34 to 99 s before; with the first version of this fix, which kept the
+  back-off and nothing else, 83 s on the normal build and more than its
+  120 s under UBSan, where it failed; 14 s now.
+
+Known limits:
+
+- A change of content between a compressor thread's read and the scan that
+  reports it is not seen: a failed compression waits out its back-off before
+  the codec sees the new bytes, and a page the gate declined keeps its
+  verdict until it is accessed again or a probe reaches it. On huge pages
+  this covers the whole huge page.
+- Inside a unit the ROI gate judges the unit by its first 8 pages when the
+  bucket's window is against it: a unit that starts with pages that do not
+  compress and compresses well after them is rolled back every time.
+
+Guarded by `test_fail_backoff_*`, `test_thp_unit_backoff`,
+`test_thp_unit_backoff_declined`, `test_thp_unit_window` and the `_idle`,
+`_yt`, `_idle_thp` and `_yt_thp` registrations of `test_roi_gate_zero_pages`
 ([tests.md](tests.md)).
 
 

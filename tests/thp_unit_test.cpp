@@ -28,6 +28,28 @@
 //            is the unit's); a unit of random bytes is rolled back and stays
 //            one huge page; a unit with one page read every 200 ms is never
 //            compressed and stays one huge page.
+//   backoff  four units of random bytes. Each is tried and rolled back,
+//            and then has to wait out a back-off that doubles: at most 9
+//            attempts each in the 60 s after the first. An attempt reads
+//            the unit's pages, and to the idle tracker a read of any page
+//            of a huge page is an access to all 512: it used to clear the
+//            back-off at the unit's next scan (issue #52). Registered
+//            twice. With the ROI gate off (SMASH_ROI_THRESHOLD=0) every
+//            page gets through, the unit's ratio fails and all 512 pages
+//            back off. With the gate on, the bucket's window declines a
+//            page of the unit after the first few and only that page backs
+//            off: the unit waits on it, as long as the gate's read of it
+//            does not take the count away again.
+//   window   unit 0 is random bytes, units 1..8 compress well, all in one
+//            block and so one bucket. Unit 0 fills the bucket's ratio
+//            window with pages that saved nothing; the others must still be
+//            compressed at their first attempt: they are read every 200 ms
+//            until unit 0 has been tried, and when they have then left RSS
+//            no more than 5 units have been rolled back (unit 0, two or
+//            three times). A unit's attempt starts the window again, so its own
+//            first pages decide. Without that the gate declined the first
+//            page of every one of them, each time they were offered, until
+//            a probe came round (9 roll-backs in the first pass alone).
 //   syscall  write() from, read() and pread() into compressed units (the
 //            EFAULT retry faults them in): every byte right, each touched unit
 //            a huge page again.
@@ -412,6 +434,105 @@ int partMixed() {
     return 0;
 }
 
+int partBackoff() {
+    constexpr size_t kUnits = 4;
+    constexpr uint64_t kMaxPerUnit = 9;
+    char* a = nullptr;
+    if (int r = prepare(a, kUnits, 4)) return r == 2 ? 77 : 1;
+    // No copy of the bytes is kept: 8 MiB of random bytes in a second block
+    // would be four more such units, on huge pages like these, and the
+    // roll-backs are counted for the process (the first version of this
+    // part counted 40 for "4 units": it had 8).
+    constexpr uint64_t kSeed = 88172645463325252ull;
+    uint64_t x = kSeed;
+    auto rnd = [&] { x ^= x << 13; x ^= x >> 7; x ^= x << 17; return x; };
+    const size_t words = kUnits * kUnit / 8;
+    for (size_t k = 0; k < words; ++k) reinterpret_cast<uint64_t*>(a)[k] = rnd();
+    if (hugeUnits(a, 0, kUnits) < kUnits) {
+        std::printf("SKIP: the rewrite left %zu of %zu units huge\n", hugeUnits(a, 0, kUnits), kUnits);
+        return 77;
+    }
+    // Every unit tried once.
+    Counts c = counts();
+    int waited = 0;
+    for (; waited < 600 && c.rolled_back < kUnits; ++waited) {
+        usleep(100 * 1000);
+        c = counts();
+    }
+    printCounts("each unit tried");
+    CHECK(c.rolled_back >= kUnits, "the units of random bytes were tried %llu times in 60 s, fewer than once each",
+          (unsigned long long)c.rolled_back);
+    CHECK(c.rolled_back == kUnits, "%llu roll-backs when each of the %zu units has been tried once: there are "
+          "other units of random bytes in the process, and the count below would be theirs too",
+          (unsigned long long)c.rolled_back, kUnits);
+    sleep(60);
+    c = counts();
+    printCounts("60 s later");
+    std::printf("  %llu attempts on %zu units of random bytes in the 60 s after the first (limit %llu each)\n",
+                (unsigned long long)c.rolled_back, kUnits, (unsigned long long)kMaxPerUnit);
+    CHECK(c.compressed == 0, "%llu units of random bytes were compressed", (unsigned long long)c.compressed);
+    CHECK(c.rolled_back >= 2 * kUnits, "the units were tried %llu times in 60 s, fewer than twice each: the "
+          "compressor stopped trying", (unsigned long long)c.rolled_back);
+    CHECK(c.rolled_back <= kMaxPerUnit * kUnits, "%llu attempts on %zu units whose ratio fails every time (limit "
+          "%llu each): they do not back off", (unsigned long long)c.rolled_back, kUnits,
+          (unsigned long long)kMaxPerUnit);
+    CHECK(resident(a, kUnits * kUnit) == kUnits * kUnitPages && hugeUnits(a, 0, kUnits) == kUnits,
+          "the rolled-back units are not resident huge pages (%zu pages resident, %zu huge)",
+          resident(a, kUnits * kUnit), hugeUnits(a, 0, kUnits));
+    x = kSeed;
+    for (size_t k = 0; k < words; ++k)
+        CHECK(reinterpret_cast<const uint64_t*>(a)[k] == rnd(), "word %zu changed", k);
+    std::printf("thp_unit_test backoff: all checks passed\n");
+    return 0;
+}
+
+int partWindow() {
+    constexpr size_t kUnits = 9;
+    constexpr uint64_t kMaxRolledBack = 5;
+    char* a = nullptr;
+    if (int r = prepare(a, kUnits, 5)) return r == 2 ? 77 : 1;
+    constexpr uint64_t kSeed = 88172645463325252ull;
+    uint64_t x = kSeed;
+    auto rnd = [&] { x ^= x << 13; x ^= x >> 7; x ^= x << 17; return x; };
+    for (size_t k = 0; k < kUnit / 8; ++k) reinterpret_cast<uint64_t*>(a)[k] = rnd();
+    if (hugeUnits(a, 0, kUnits) < kUnits) {
+        std::printf("SKIP: the rewrite left %zu of %zu units huge\n", hugeUnits(a, 0, kUnits), kUnits);
+        return 77;
+    }
+    // Units 1..8 are kept warm until unit 0 has been tried, so that their
+    // first attempt meets the window it filled.
+    int warm = 0;
+    for (; warm < 300 && counts().rolled_back < 1; ++warm) {
+        for (size_t u = 1; u < kUnits; ++u) {
+            volatile char v = a[u * kUnit + 7 * kPage];
+            (void)v;
+        }
+        usleep(200 * 1000);
+    }
+    printCounts("unit 0 tried");
+    CHECK(counts().rolled_back >= 1, "the unit of random bytes was not tried in 60 s: nothing filled the window");
+    CHECK(counts().compressed == 0, "%llu units were compressed while they were being read every 200 ms",
+          (unsigned long long)counts().compressed);
+    const bool out = waitOut(a + kUnit, (kUnits - 1) * kUnit, 64, 60);
+    const Counts c = counts();
+    printCounts("units 1..8 out");
+    CHECK(out, "the units that compress well never left RSS (%zu pages resident): the bucket's window, filled "
+          "by the unit of random bytes, keeps declining them", resident(a + kUnit, (kUnits - 1) * kUnit));
+    CHECK(c.compressed >= kUnits - 1, "%llu units compressed, want %zu", (unsigned long long)c.compressed,
+          kUnits - 1);
+    CHECK(c.rolled_back <= kMaxRolledBack, "%llu units were rolled back before the %zu that compress well were "
+          "out (limit %llu): they were declined on their first page and had to be offered again",
+          (unsigned long long)c.rolled_back, kUnits - 1, (unsigned long long)kMaxRolledBack);
+    CHECK(resident(a, kUnit) == kUnitPages && unitIsHuge(a), "the unit of random bytes is not one resident huge page");
+    x = kSeed;
+    for (size_t k = 0; k < kUnit / 8; ++k)
+        CHECK(reinterpret_cast<const uint64_t*>(a)[k] == rnd(), "random unit word %zu changed", k);
+    const long b = bad(a + kUnit, (kUnits - 1) * kUnit, 5, kUnitPages);
+    CHECK(b < 0, "page %ld of the compressed units reads wrong", b);
+    std::printf("thp_unit_test window: all checks passed\n");
+    return 0;
+}
+
 int partSyscall() {
     constexpr size_t kUnits = 8, kLen = kUnits * kUnit;
     char* a = nullptr;
@@ -552,6 +673,8 @@ int main() {
     const std::string p = part ? part : "unit";
     if (p == "unit") return partUnit();
     if (p == "mixed") return partMixed();
+    if (p == "backoff") return partBackoff();
+    if (p == "window") return partWindow();
     if (p == "syscall") return partSyscall();
     if (p == "fork") return partFork();
     if (p == "shrink") return partShrink();

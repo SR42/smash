@@ -468,9 +468,10 @@ class CompressorThread {
     // cold neighbours from ever being compressed). Cleared by Phase 1.
     uint8_t* group_unwatched_ = nullptr;
 
-    // 1 for a page the ROI gate read since the page's last scan, under a
-    // scanning tracker (noteOwnRead): the next scan's verdict on it is that
-    // read. Cleared by Phase 1. Written only under idle and yt.
+    // 1 for a page a compressor thread read since the page's last scan and
+    // left uncompressed, under a scanning tracker (noteOwnRead): the next
+    // scan reports that read. Cleared by Phase 1. Written only under idle
+    // and yt.
     uint8_t* own_read_ = nullptr;
 
     // SMASH_THP_UNIT=1 (idle tracking): a transparent huge page is compressed
@@ -2160,15 +2161,36 @@ private:
     }
 
     // A scanning tracker (idle, yt) takes any read of a page for the
-    // application's, the gate's look included: at the page's next scan the
-    // mark is gone, phase 1 counts an access and clears the back-off count,
-    // and the page, declined again one cold floor later, is read again:
-    // every declined page every floor, for ever, where it used to back off
-    // to kMaxEffectiveFloorTicks. So the look is remembered here, and
-    // phase 1 takes the next scan's verdict on the page for that read. An
-    // access by the application between the look and that scan is lost
-    // with it; the page then keeps its verdict until it is accessed again
-    // or a probe reaches it.
+    // application's: the gate's look at a declined page, and the snapshot
+    // of a page whose compression then fails or whose unit is rolled back.
+    // At the page's next scan the mark is gone and phase 1 counts an
+    // access, which clears the back-off count: the count the failed attempt
+    // has just raised, and the one that tells the gate it has read the page
+    // (readsAsZero). So a failed compression was tried again one cold floor
+    // later, every time, where the other trackers back it off to
+    // kMaxEffectiveFloorTicks, and the gate read a declined page again each
+    // time a probe had sent it to the codec (issue #52).
+    //
+    // Every read that leaves the page ACTIVE is recorded here, and phase 1
+    // lets the page keep its back-off count through the scan that reports
+    // the read. The cold count is cleared as for any access: whether the
+    // application touched the page as well cannot be told, and a page must
+    // never look idle through an access. What is lost is a change of
+    // content made between the read and that scan: the count stays, so a
+    // failed compression waits out its back-off before the codec sees the
+    // new bytes, and a page the gate declined keeps its verdict until it is
+    // accessed again or a probe reaches it.
+    //
+    // A large folio has one accessed bit for all of its pages (the idle
+    // bitmap answers through the folio's head, yt reports a huge page as
+    // one item), so a read of one page is reported for every page of it.
+    // The scan carries the record to each of them (idleScan, ytMarkItem):
+    // recorded for the one page only, a look or a probe took the back-off
+    // count of the other 511, which were then read again one floor later,
+    // and so on for ever (four units of random bytes under SMASH_THP_UNIT:
+    // 51 attempts in 60 s, 45 with the record kept per page).
+    //
+    // Not after a snapshot that failed its verify: that page was written.
     void noteOwnRead(size_t page_idx) {
         if (own_read_ && scanTracker()) own_read_[page_idx] = 1;
     }
@@ -2289,13 +2311,12 @@ private:
             if (st == PageState::ACTIVE || st == PageState::ACTIVE_MONITORING) {
                 if (settle_ticks_[i]) settle_ticks_[i] = 0;
                 if (idle_track && !idleSliceDue(i)) return;
-                // The ROI gate read this page since its last scan, so this
-                // scan found its mark gone whatever the application did
-                // (noteOwnRead): not an access.
-                if (idle_track && own_read_ && own_read_[i]) {
-                    own_read_[i] = 0;
-                    accessed_[i].store(false, std::memory_order_relaxed);
-                }
+                // A compressor thread read this page since its last scan,
+                // so this scan found its mark gone whatever the application
+                // did (noteOwnRead): an access, but not one that makes the
+                // last attempt's verdict stale.
+                const bool own_read = idle_track && own_read_ && own_read_[i];
+                if (own_read) own_read_[i] = 0;
                 // Raw WRITE signal (soft-dirty) BEFORE the idle-read augmentation
                 // below folds reads in. The soft-dirty ROI machinery needs the
                 // write-only bit to track data stability independent of reads.
@@ -2332,7 +2353,7 @@ private:
                     cold_count_[i] = 0;
                     // Access can change contents — the incompressibility
                     // verdict behind the ratio-gate backoff is stale.
-                    compress_fail_count_[i] = 0;
+                    if (!own_read) compress_fail_count_[i] = 0;
                     accessed_[i].store(false, std::memory_order_relaxed);
                     if (group_unwatched_) group_unwatched_[i] = 0;
                 } else if (group_unwatched_ && group_unwatched_[i]) {
@@ -2737,7 +2758,11 @@ private:
     }
 
     // The first n pages of a unit compressUnit gave up on: back to ACTIVE,
-    // blobs released. Never protected, so nothing else to undo.
+    // blobs released. Never protected, so nothing else to undo. Each was
+    // read for its snapshot, which the unit's next scan will report
+    // (noteOwnRead): without the record, a unit whose ratio failed lost its
+    // back-off at that scan and all 512 pages went to the codec again one
+    // cold floor later, for as long as the unit stayed cold.
     void rollbackUnit(size_t b, size_t n) {
         for (size_t q = b; q < b + n; ++q) {
             locks_->lock(q);
@@ -2746,6 +2771,7 @@ private:
                 compressed_[q] = {};
                 if (shadow_tick_) shadow_tick_[q] = 0;
                 if (page_tier_) page_tier_[q] = kTierNone;
+                noteOwnRead(q);
                 states_->set(q, PageState::ACTIVE);
             }
             locks_->unlock(q);
@@ -3671,6 +3697,27 @@ private:
 
         bool roi_ok = CompressionROI::shouldCompress(cold_count_[page_idx], stats_count, stats_sum,
                                                      redirty_discount_x256);
+        // SMASH_THP_UNIT: the ratio that counts is the unit's, and the
+        // window holds what the codec made of other units. A window that
+        // declines a unit's first page declined the unit unseen, every time
+        // it was offered, and only a probe let one through: one page in 64
+        // that the gate declines, and a unit's attempt is one decline. Four
+        // compressible units next to one of random bytes got through
+        // because nothing backed off (issue #52): each was offered every
+        // few seconds, so the 64th decline came soon. With the back-off
+        // working it comes after minutes. So a unit's attempt starts the
+        // window again: its own first pages are the sample (the gate passes
+        // a bucket with fewer than 8), and the rest of the unit is judged
+        // by them. A unit of random bytes costs 8 codec runs an attempt,
+        // and the page the gate then declines backs the unit off.
+        if (!roi_ok && worker.unit_mode && (page_idx & (kUnitPages - 1)) == 0 &&
+            have_span && sc < kTotalBucketsPerArena && redirty_discount_x256 >= 256 &&
+            cold_count_[page_idx] >= ROIConfig::instance().cold_ticks_floor) {
+            worker.sc_stats[stats_idx].restartRatios();
+            stats_count = 0;
+            stats_sum = 0;
+            roi_ok = true;
+        }
         // What the window holds is what the codec made of other pages. A
         // page that is all zero needs no codec and leaves no blob, and it is
         // never recorded in the window, so the window says nothing about it
@@ -4202,9 +4249,12 @@ private:
             // for the next attempt (see phase2Range). The count resets only
             // on a real access — an idle page's contents cannot change, so
             // retries stay capped at one per kMaxEffectiveFloorTicks streak.
+            // Under a scanning tracker the snapshot just taken is itself an
+            // access to the next scan; noteOwnRead keeps the count through it.
             if (compress_fail_count_ && compress_fail_count_[page_idx] < 255)
                 compress_fail_count_[page_idx]++;
             cold_count_[page_idx] = 0;
+            noteOwnRead(page_idx);
             states_->set(page_idx, PageState::ACTIVE);
             locks_->unlock(page_idx);
             pc_.cp_gate_fail.fetch_add(1, std::memory_order_relaxed);
@@ -4234,6 +4284,7 @@ private:
                 if (compress_fail_count_ && compress_fail_count_[page_idx] < 255)
                     compress_fail_count_[page_idx]++;
                 cold_count_[page_idx] = 0;
+                noteOwnRead(page_idx);
                 states_->set(page_idx, PageState::ACTIVE);
                 locks_->unlock(page_idx);
                 if (pc_.cp_store_fail.fetch_add(1, std::memory_order_relaxed) == 0) {
@@ -6650,6 +6701,20 @@ private:
             pages += ne;
             std::sort(ent, ent + ne, [](const Ent& a, const Ent& b) { return a.pfn < b.pfn; });
             if (ne && kpageflags_fd_ >= 0) { ++calls; idleFolioHeads(ent, ne); }
+            // One bit answers for every page of a large folio. If a
+            // compressor thread read one of them since the last scan
+            // (noteOwnRead), the bit's verdict is that read for all of
+            // them: carry the record to each page that shares the bit.
+            if (own_read_) {
+                for (size_t x = 0; x < ne;) {
+                    size_t y = x + 1;
+                    bool own = own_read_[i + ent[x].off] != 0;
+                    for (; y < ne && ent[y].pfn == ent[x].pfn; ++y) own |= own_read_[i + ent[y].off] != 0;
+                    if (own && y - x > 1)
+                        for (size_t k = x; k < y; ++k) own_read_[i + ent[k].off] = 1;
+                    x = y;
+                }
+            }
             // SMASH_THP_UNIT: a unit is one folio when all of its pages are
             // resident, ACTIVE and share a head. Units of this batch only (a
             // batch is 1024 aligned pages, two units); a unit not scanned this
@@ -7097,6 +7162,23 @@ private:
         if (addr >= arena_hi || n > (arena_hi - base) / kPageSize) return 0;
         const uint64_t s = addr < base ? base : addr;
         const uint64_t e = addr + n * kPageSize < arena_hi ? addr + n * kPageSize : arena_hi;
+        // A huge page has one accessed bit for all of its pages. If a
+        // compressor thread read one of them since the last scan
+        // (noteOwnRead), this item is that read for all of them: carry the
+        // record to each page of the huge page. A run is so many members
+        // of one size, each with its own bit.
+        const uint64_t bit_pages = (w & yt::kItemRun)
+            ? uint64_t{1} << ((w & yt::kItemSizeMask) >> yt::kItemSizeShift) : n;
+        if (own_read_ && bit_pages > 1) {
+            for (uint64_t g = addr; g < addr + n * kPageSize; g += bit_pages * kPageSize) {
+                const uint64_t gs = g < s ? s : g;
+                const uint64_t ge = g + bit_pages * kPageSize < e ? g + bit_pages * kPageSize : e;
+                bool own = false;
+                for (uint64_t x = gs; x < ge && !own; x += kPageSize) own = own_read_[(x - base) / kPageSize] != 0;
+                if (own)
+                    for (uint64_t x = gs; x < ge; x += kPageSize) own_read_[(x - base) / kPageSize] = 1;
+            }
+        }
         const uint64_t node = (w >> yt::kItemNodeShift) & yt::kItemNodeMask;
         if (!yt_node_hints_ || !page_node_ || numa_node_limit_ == 0 || node >= numa_node_limit_) {
             for (uint64_t x = s; x < e; x += kPageSize) ytMarkPage((x - base) / kPageSize);
@@ -10953,6 +11035,7 @@ public:
             page_bucket_[i] = 0;
             (void)states_->takeAllocReopened(i);
             compress_fail_count_[i] = 0;
+            if (own_read_) own_read_[i] = 0;
             accessed_[i].store(false, std::memory_order_relaxed);
             locks_->unlock(i);
         }
